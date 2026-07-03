@@ -33,9 +33,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 let hit = f.payload.windows(mk.len()).any(|w| w == mk);
                 if hit {
                     hits += 1;
-                    let txt = String::from_utf8_lossy(&f.payload);
-                    println!("  ✅ HIT #{hits}: {}B rssi={:?} src={:?} payload={:?}",
-                             f.payload.len(), f.rssi_dbm, f.addr, &txt[..txt.len().min(40)]);
+                    let txt: String = String::from_utf8_lossy(&f.payload).chars().take(40).collect();
+                    println!("  ✅ HIT #{hits}: {}B rssi={:?} src={:?} payload={txt:?}",
+                             f.payload.len(), f.rssi_dbm, f.addr);
                 }
             }
             _ => {}

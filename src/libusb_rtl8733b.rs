@@ -17,7 +17,7 @@
 //!   [`FrameIo`](ndn_frame_io::FrameIo) + [`WifiRadio`](ndn_frame_io::WifiRadio).
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ndn_transport::FaceError;
 use rusb::{Context, Device, DeviceHandle, Direction, TransferType, UsbContext};
@@ -43,6 +43,75 @@ const CTRL_TIMEOUT: Duration = Duration::from_millis(500);
 // `chip_ver = R8(REG_SYS_CFG1 + 1) >> 4`.
 const REG_SYS_CFG1: u16 = 0x00F0;
 const REG_SYS_CFG2: u16 = 0x00FC;
+
+// ── M2: power-on (card enable) sequence ──────────────────────────────────────
+// Transcribed from the vendor `card_en_flow_8733b` = CARDDIS_TO_CARDEMU +
+// CARDEMU_TO_ACT, **pre-filtered to the USB interface** (SDIO-only steps
+// dropped). Each step is a read-modify-write `(cur & ~msk) | (val & msk)` or a
+// poll-until `(read8 & msk) == (val & msk)`, exactly as the halmac pwr_seq
+// parser executes them. `0x0002` is SYS_FUNC_EN (BB/RF reset toggles); the
+// `0x001F`/`0x0077` toggles to `0x87` bring the RF path up.
+#[derive(Clone, Copy)]
+enum PwrCmd {
+    Write,
+    Poll,
+}
+
+struct PwrStep {
+    cmd: PwrCmd,
+    offset: u16,
+    msk: u8,
+    val: u8,
+}
+
+const W: PwrCmd = PwrCmd::Write;
+const P: PwrCmd = PwrCmd::Poll;
+
+const POWER_ON_8733B: &[PwrStep] = &[
+    // TRANS_CARDDIS_TO_CARDEMU (USB steps only)
+    step(W, 0x0005, 0x08, 0x00), // clear APS_FSMCO BIT3
+    step(W, 0x004A, 0x01, 0x00), // USB: clear BIT0
+    // TRANS_CARDEMU_TO_ACT
+    step(P, 0x0006, 0x02, 0x02), // wait power-ready
+    step(W, 0x0006, 0x01, 0x01),
+    step(W, 0x0005, 0x01, 0x01), // trigger power-on
+    step(P, 0x0005, 0x01, 0x00), // wait power-on done
+    step(W, 0x1002, 0x01, 0x01),
+    // SYS_FUNC_EN 0x0002 — BB/RF reset toggles (ends enabled)
+    step(W, 0x0002, 0x03, 0x00),
+    step(W, 0x0002, 0x03, 0x03),
+    step(W, 0x0002, 0x03, 0x00),
+    step(W, 0x0002, 0x03, 0x03),
+    step(W, 0x0002, 0x03, 0x00),
+    step(W, 0x0002, 0x03, 0x03),
+    // RF control 0x001F / 0x0077 — toggle to 0x87 (RF path up)
+    step(W, 0x001F, 0xFF, 0x00),
+    step(W, 0x0077, 0xFF, 0x00),
+    step(W, 0x001F, 0xFF, 0x87),
+    step(W, 0x0077, 0xFF, 0x87),
+    step(W, 0x001F, 0xFF, 0x00),
+    step(W, 0x0077, 0xFF, 0x00),
+    step(W, 0x001F, 0xFF, 0x87),
+    step(W, 0x0077, 0xFF, 0x87),
+    step(W, 0x001F, 0xFF, 0x00),
+    step(W, 0x0077, 0xFF, 0x00),
+    step(W, 0x001F, 0xFF, 0x87),
+    step(W, 0x0077, 0xFF, 0x87),
+];
+
+const fn step(cmd: PwrCmd, offset: u16, msk: u8, val: u8) -> PwrStep {
+    PwrStep {
+        cmd,
+        offset,
+        msk,
+        val,
+    }
+}
+
+/// The MAC control register — non-zero once the MAC is active.
+const REG_CR: u16 = 0x0100;
+/// SYS_FUNC_EN — after power-on its low two bits (BB/RF enable) read back set.
+const REG_SYS_FUNC_EN: u16 = 0x0002;
 
 /// A minimal M1 handle to an 8731bu/8733bu: an open, claimed USB device with
 /// register I/O. Grows into a full [`FrameIo`](ndn_frame_io::FrameIo) backend as
@@ -155,6 +224,58 @@ impl Rtl8733buBackend {
         })
     }
 
+    /// **M2**: run the card-enable power-on sequence, bringing the MAC from
+    /// card-disable/emulation to the active state (BB/RF out of reset, RF path
+    /// up). Errors if any poll step times out (~200 ms budget each).
+    pub fn power_on(&self) -> Result<(), FaceError> {
+        for s in POWER_ON_8733B {
+            match s.cmd {
+                PwrCmd::Write => {
+                    let cur = self.read8(s.offset)?;
+                    self.write8(s.offset, (cur & !s.msk) | (s.val & s.msk))?;
+                }
+                PwrCmd::Poll => {
+                    let deadline = Instant::now() + Duration::from_millis(200);
+                    loop {
+                        let got = self.read8(s.offset)? & s.msk;
+                        if got == (s.val & s.msk) {
+                            break;
+                        }
+                        if Instant::now() >= deadline {
+                            return Err(io_err(format!(
+                                "8733b power-on: poll timeout at 0x{:04x} (msk 0x{:02x}, want 0x{:02x}, got 0x{:02x})",
+                                s.offset,
+                                s.msk,
+                                s.val & s.msk,
+                                got
+                            )));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether the MAC reads as powered-on. A card-disabled MAC returns the
+    /// `0xEA` "not-ready" sentinel on `REG_CR` (and `0xFF` on a dead bus);
+    /// power-on takes it to `0x00` (enabled, awaiting MAC init) and sets
+    /// SYS_FUNC_EN's BB/RF-enable bits. So: BB/RF bits set **and** CR left the
+    /// disabled sentinel. (The CR functional bits are set later, in MAC init.)
+    pub fn is_powered(&self) -> Result<bool, FaceError> {
+        let func_en = self.read8(REG_SYS_FUNC_EN)?;
+        let cr = self.read8(REG_CR)?;
+        Ok((func_en & 0x03) == 0x03 && cr != 0xEA && cr != 0xFF)
+    }
+
+    /// Read the post-power-on control registers (for M2 reporting / M3+).
+    pub fn read_cr(&self) -> Result<u8, FaceError> {
+        self.read8(REG_CR)
+    }
+    pub fn read_sys_func_en(&self) -> Result<u8, FaceError> {
+        self.read8(REG_SYS_FUNC_EN)
+    }
+
     /// The discovered bulk endpoints (for the later TX/RX milestones).
     pub fn bulk_out(&self) -> u8 {
         self.bulk_out
@@ -173,4 +294,8 @@ fn not_found(msg: &str) -> FaceError {
         std::io::ErrorKind::NotFound,
         msg.to_string(),
     ))
+}
+
+fn io_err(msg: String) -> FaceError {
+    FaceError::Io(std::io::Error::other(msg))
 }

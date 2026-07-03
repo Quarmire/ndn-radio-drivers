@@ -23,7 +23,22 @@ const SYNC0: u8 = 0x4E;
 const SYNC1: u8 = 0x44;
 const T_INJECT: u8 = 0x01;
 const T_CHANNEL: u8 = 0x02;
+const T_RATE: u8 = 0x04; // wifi_set_tx_data_rate code
+const T_BW40: u8 = 0x05; // wext_set_bw40_enable
 const T_RX: u8 = 0x81;
+
+/// BW16 fixed TX-rate codes for [`Bw16SerialBackend::set_tx_rate`]
+/// (`wifi_set_tx_data_rate`). CCK 0x00–0x03, OFDM 0x04–0x0b, HT MCS0–7 0x0c–0x13,
+/// `0xFF` = auto rate adaptation.
+pub mod rate {
+    pub const CCK_1M: u8 = 0x00;
+    pub const CCK_11M: u8 = 0x03;
+    pub const OFDM_6M: u8 = 0x04;
+    pub const OFDM_54M: u8 = 0x0b;
+    pub const HT_MCS0: u8 = 0x0c;
+    pub const HT_MCS7: u8 = 0x13;
+    pub const AUTO: u8 = 0xFF;
+}
 
 /// Baud the firmware opens `Serial` at — the RTL8720 LOG UART's native rate,
 /// shared with WiFi-driver debug (the deframer picks our SYNC'd frames out).
@@ -86,6 +101,17 @@ impl Bw16SerialBackend {
     /// Retune the board's radio (2.4 or 5 GHz channel).
     pub fn set_channel(&self, channel: u8) -> Result<(), FaceError> {
         self.send_framed(T_CHANNEL, &[channel])
+    }
+
+    /// Pin the on-air TX rate (a [`rate`] code; `wifi_set_tx_data_rate`). Whether
+    /// it affects the raw-inject path is empirical — verify by capturing the MCS.
+    pub fn set_tx_rate(&self, code: u8) -> Result<(), FaceError> {
+        self.send_framed(T_RATE, &[code])
+    }
+
+    /// Enable/disable 40 MHz channel bandwidth (`wext_set_bw40_enable`).
+    pub fn set_bw40(&self, enable: bool) -> Result<(), FaceError> {
+        self.send_framed(T_BW40, &[enable as u8])
     }
 }
 
@@ -165,9 +191,14 @@ impl WifiRadio for Bw16SerialBackend {
 }
 
 impl RadioKnobs for Bw16SerialBackend {
-    fn set_channel(&self, channel: u8, _bw: Bandwidth) -> Result<(), FaceError> {
-        Bw16SerialBackend::set_channel(self, channel)
+    fn set_channel(&self, channel: u8, bw: Bandwidth) -> Result<(), FaceError> {
+        Bw16SerialBackend::set_channel(self, channel)?;
+        // Map the HAL bandwidth to the board's 40 MHz enable (the widest this SDK
+        // exposes): Bw20 → off, wider → on.
+        self.set_bw40(!matches!(bw, Bandwidth::Bw20))
     }
+    // set_tx_power: wifi_set_txpower isn't linked in this AmebaD SDK build, so TX
+    // power isn't a knob here — the default no-op stands.
 }
 
 fn io_err(msg: String) -> FaceError {

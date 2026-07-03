@@ -24,11 +24,23 @@
 #include "packet-injection.h" // GPLv3 submodule: wifi_tx_raw_frame(frame, len)
 #include "WiFi.h"
 extern "C" {
-#include "wifi_conf.h" // wifi_on, wifi_set_channel, wifi_set_promisc
+#include "wifi_conf.h" // wifi_on, wifi_set_channel, wifi_set_promisc, wifi_set_txpower, wifi_set_tx_data_rate
+int wext_set_bw40_enable(unsigned char enable);   // 40 MHz enable (wext, not in wifi_conf.h)
+int wifi_set_tx_data_rate(unsigned char data_rate); // fixed TX rate (internal, not in wifi_conf.h)
 }
 
 static const uint8_t SYNC0 = 0x4E, SYNC1 = 0x44;
-enum { T_INJECT = 0x01, T_CHANNEL = 0x02, T_RX = 0x81, T_LOG = 0x82 };
+// host->board: 0x01 inject, 0x02 channel, 0x03 txpower[idx], 0x04 rate[code],
+//              0x05 bw40[0/1]; board->host: 0x81 rx, 0x82 log.
+enum {
+  T_INJECT = 0x01,
+  T_CHANNEL = 0x02,
+  T_TXPOWER = 0x03,
+  T_RATE = 0x04,
+  T_BW40 = 0x05,
+  T_RX = 0x81,
+  T_LOG = 0x82,
+};
 static const size_t MAX_FRAME = 1600;
 
 static void send_framed(uint8_t type, const uint8_t *payload, uint16_t len) {
@@ -100,7 +112,18 @@ void loop() {
       wifi_tx_raw_frame(rxbuf, len); // FCS + seq added by hardware
       break;
     case T_CHANNEL:
-      if (len >= 1) wifi_set_channel(rxbuf[0]);
+      if (len >= 1) wifi_set_channel((int)rxbuf[0]);
+      break;
+    case T_TXPOWER:
+      // wifi_set_txpower is declared in wifi_conf.h but not linked in this SDK
+      // build (undefined reference) — TX power isn't exposable here. No-op.
+      logmsg("txpower unavailable in this SDK build");
+      break;
+    case T_RATE:
+      if (len >= 1) wifi_set_tx_data_rate(rxbuf[0]); // MGN_* rate code
+      break;
+    case T_BW40:
+      if (len >= 1) wext_set_bw40_enable(rxbuf[0] ? 1 : 0);
       break;
     default:
       break;

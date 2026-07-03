@@ -534,6 +534,11 @@ mod golden {
     //! verified without hardware and regressions are caught. These values are the
     //! ground truth to cross-check captured reference-driver USB traffic against
     //! (usbmon on a host with the real device — the vendor `rtl8733bu` driver).
+    //!
+    //! Cross-checked on real silicon (an RTL8731BU, 0bda:f72b, unbound, on the OPi
+    //! via libusb): the chip reads back `chip_id=0x16` (matching the golden decode),
+    //! `chip_ver=3`, `sys_cfg1=0x0069333d` — so the VENQT reg-read encoding and
+    //! chip-id decode (M1) are correct against the hardware, not just self-consistent.
     use super::*;
 
     /// The halmac firmware header decodes to exactly these values for the shipped

@@ -37,6 +37,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 h.nonsecure_len() == fw.len() as u32,
                 secure,
             );
+
+            // M4: TX-descriptor + reserved-page write, verified by BCN_VALID.
+            print!("M4  fw_dl_setup … ");
+            dev.fw_dl_setup()?;
+            // Diagnostic: did the setup registers actually stick?
+            println!(
+                "\n    regs after setup: CR=0x{:02x} CR+1=0x{:02x} RQPN=0x{:08x} DWBCN0=0x{:08x} EXT_FUNC=0x{:08x} EXT_CLK=0x{:02x}",
+                dev.read8(0x0100)?, dev.read8(0x0101)?, dev.read32(0x0200)?,
+                dev.read32(0x0208)?, dev.read32(0x1000)?, dev.read8(0x1008)?,
+            );
+            let page = [0xA5u8; 128];
+            match dev.dl_rsvd_page(0, &page) {
+                Ok(()) => println!("dl_rsvd_page(128B @ pg0): BCN_VALID ✓ (reserved-page path works)"),
+                Err(e) => println!("dl_rsvd_page: {e}"),
+            }
         }
         Err(e) => println!("FAILED: {e}"),
     }

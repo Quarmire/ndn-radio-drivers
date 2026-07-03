@@ -133,6 +133,38 @@ const OFF_EMEM_SIZE: usize = 52;
 const OFF_EMEM_ADDR: usize = 56;
 const OFF_IMEM_ADDR: usize = 60;
 
+// ── M4: TX descriptor + reserved-page (beacon) write ─────────────────────────
+// The 87xx pushes firmware (and any reserved page) as a bulk-OUT packet: a
+// 40-byte TX descriptor + payload, landed in the packet buffer's beacon page,
+// with completion signalled by BCN_VALID. Register map (halmac_reg_8733b):
+const TX_DESC_SIZE: usize = 40;
+const REG_TXDMA_PQ_MAP: u16 = 0x010C; // +1 = queue→DMA priority map
+const REG_RQPN_CTRL_HLPQ: u16 = 0x0200; // hi/low/pub queue page counts
+const REG_DWBCN0_CTRL: u16 = 0x0208; // +1 = bcn head page, +2 bit0 = BCN_VALID (W1C)
+const REG_FWHW_TXQ_CTRL: u16 = 0x0420; // +2 bit6 = bcn-queue enable
+const REG_BCN_CTRL: u16 = 0x0550;
+const REG_EXT_SYS_FUNC_EN: u16 = 0x1000;
+const REG_EXT_SYS_CLK_CTRL: u16 = 0x1008;
+const QSLT_MGNT: u32 = 0x12; // management queue-select for the download descriptor
+const DMA_MAPPING_HIGH: u8 = 3; // HALMAC_DMA_MAPPING_HIGH — HIQ priority
+const BIT_HCI_TXDMA_EN: u8 = 0x01; // REG_CR BIT(0)
+const BIT_TXDMA_EN: u8 = 0x04; // REG_CR BIT(2)
+
+/// Build the 40-byte TX descriptor for a reserved-page download packet: payload
+/// length in TXPKTSIZE, header length in OFFSET, management queue-select. (Per
+/// the vendor `fill_fake_txdesc`; rate fields are irrelevant — the packet is
+/// stored in the beacon page, not transmitted.)
+fn download_txdesc(payload_len: usize) -> [u8; TX_DESC_SIZE] {
+    let mut d = [0u8; TX_DESC_SIZE];
+    // dword0: [0:16] TXPKTSIZE, [16:24] OFFSET
+    let dw0 = (payload_len as u32 & 0xFFFF) | ((TX_DESC_SIZE as u32 & 0xFF) << 16);
+    d[0..4].copy_from_slice(&dw0.to_le_bytes());
+    // dword1: [8:13] QSEL
+    let dw1 = (QSLT_MGNT & 0x1F) << 8;
+    d[4..8].copy_from_slice(&dw1.to_le_bytes());
+    d
+}
+
 /// The parsed 8733b firmware header — the section addresses/sizes that drive the
 /// DMA download.
 #[derive(Debug, Clone, Copy)]
@@ -195,6 +227,9 @@ impl FwHeader {
 pub struct Rtl8733buBackend {
     handle: Arc<DeviceHandle<Context>>,
     bulk_out: u8,
+    /// All bulk-OUT endpoints, in descriptor order — Realtek USB chips expose one
+    /// per TX queue priority; the reserved-page/HIQ path may need a specific one.
+    bulk_outs: Vec<u8>,
     bulk_in: u8,
 }
 
@@ -240,7 +275,8 @@ impl Rtl8733buBackend {
         handle.claim_interface(0).map_err(usb_err)?;
 
         let config = device.active_config_descriptor().map_err(usb_err)?;
-        let (mut bulk_in, mut bulk_out) = (None, None);
+        let mut bulk_in = None;
+        let mut bulk_outs = Vec::new();
         for iface in config.interfaces() {
             for desc in iface.descriptors() {
                 for ep in desc.endpoint_descriptors() {
@@ -249,7 +285,11 @@ impl Rtl8733buBackend {
                     }
                     match ep.direction() {
                         Direction::In if bulk_in.is_none() => bulk_in = Some(ep.address()),
-                        Direction::Out if bulk_out.is_none() => bulk_out = Some(ep.address()),
+                        Direction::Out => {
+                            if !bulk_outs.contains(&ep.address()) {
+                                bulk_outs.push(ep.address());
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -257,7 +297,10 @@ impl Rtl8733buBackend {
         }
         Ok(Self {
             handle,
-            bulk_out: bulk_out.ok_or_else(|| not_found("RTL8733B exposes no bulk OUT endpoint"))?,
+            bulk_out: *bulk_outs
+                .first()
+                .ok_or_else(|| not_found("RTL8733B exposes no bulk OUT endpoint"))?,
+            bulk_outs,
             bulk_in: bulk_in.ok_or_else(|| not_found("RTL8733B exposes no bulk IN endpoint"))?,
         })
     }
@@ -284,6 +327,14 @@ impl Rtl8733buBackend {
     pub fn write8(&self, addr: u16, val: u8) -> Result<(), FaceError> {
         self.handle
             .write_control(VENQT_WRITE, VENQT_REQ, addr, 0, &[val], CTRL_TIMEOUT)
+            .map_err(usb_err)?;
+        Ok(())
+    }
+
+    /// Write a 32-bit register (little-endian on the wire).
+    pub fn write32(&self, addr: u16, val: u32) -> Result<(), FaceError> {
+        self.handle
+            .write_control(VENQT_WRITE, VENQT_REQ, addr, 0, &val.to_le_bytes(), CTRL_TIMEOUT)
             .map_err(usb_err)?;
         Ok(())
     }
@@ -367,9 +418,94 @@ impl Rtl8733buBackend {
         FwHeader::parse(FW_NIC_8733B)
     }
 
+    /// **M4**: the minimal TX-DMA setup the firmware-download / reserved-page path
+    /// needs before any `dl_rsvd_page` — enable platform clock + IRAM power, map
+    /// HIQ to high priority, enable TXDMA, set the download queue page counts, and
+    /// disable beacon functions. (The prologue of the vendor `download_firmware`.)
+    pub fn fw_dl_setup(&self) -> Result<(), FaceError> {
+        self.write8(REG_EXT_SYS_CLK_CTRL, self.read8(REG_EXT_SYS_CLK_CTRL)? | 0x02)?;
+        self.write32(
+            REG_EXT_SYS_FUNC_EN,
+            (self.read32(REG_EXT_SYS_FUNC_EN)? | 0x0000_3000) & 0xFFFF_FF3F,
+        )?;
+        self.write8(REG_TXDMA_PQ_MAP + 1, DMA_MAPPING_HIGH << 6)?; // HIQ hi-priority
+        self.write8(REG_CR, BIT_HCI_TXDMA_EN | BIT_TXDMA_EN)?; // TXDMA on
+        // Download queue page config (hi=0xD0, pub=0x20, boundary=0x80).
+        self.write8(REG_RQPN_CTRL_HLPQ, 0xD0)?;
+        self.write8(REG_RQPN_CTRL_HLPQ + 1, 0x00)?;
+        self.write8(REG_RQPN_CTRL_HLPQ + 2, 0x20)?;
+        self.write8(REG_RQPN_CTRL_HLPQ + 3, 0x80)?;
+        // Disable beacon-related functions during download.
+        let bcn = self.read8(REG_BCN_CTRL)?;
+        self.write8(REG_BCN_CTRL, (bcn & !(1 << 3)) | (1 << 4))?;
+        Ok(())
+    }
+
+    /// **M4**: download one reserved page — a TX descriptor + `data` sent over
+    /// bulk-OUT, landed in the beacon page `pg_addr`, confirmed by BCN_VALID.
+    /// This is the transport the firmware sections ride on (M5). Returns `Ok(())`
+    /// only when the hardware raised BCN_VALID (the packet reached the buffer).
+    pub fn dl_rsvd_page(&self, pg_addr: u8, data: &[u8]) -> Result<(), FaceError> {
+        // Set beacon head page and clear BCN_VALID (write-1-to-clear at +2 bit0).
+        self.write8(REG_DWBCN0_CTRL + 1, pg_addr)?;
+        self.write8(REG_DWBCN0_CTRL + 2, self.read8(REG_DWBCN0_CTRL + 2)? | 0x01)?;
+        // Enable sw-beacon mode, mask the beacon queue (saved/restored).
+        let cr1 = self.read8(REG_CR + 1)?;
+        self.write8(REG_CR + 1, cr1 | 0x01)?;
+        let txq2 = self.read8(REG_FWHW_TXQ_CTRL + 2)?;
+        self.write8(REG_FWHW_TXQ_CTRL + 2, txq2 & !(1 << 6))?;
+
+        // Build TXDESC + payload; USB pads so the length isn't an exact multiple
+        // of 512 (the vendor +1 rule) to avoid the zero-length-packet ambiguity.
+        let mut pkt = Vec::with_capacity(TX_DESC_SIZE + data.len() + 1);
+        pkt.extend_from_slice(&download_txdesc(data.len()));
+        pkt.extend_from_slice(data);
+        if pkt.len() % 512 == 0 {
+            pkt.push(0);
+        }
+        // The reserved-page/HIQ write goes to the highest-priority OUT endpoint
+        // (the last one), not the default data endpoint.
+        let ep = *self.bulk_outs.last().unwrap_or(&self.bulk_out);
+        let wrote = self
+            .handle
+            .write_bulk(ep, &pkt, Duration::from_secs(1))
+            .map_err(usb_err)?;
+        if wrote != pkt.len() {
+            return Err(io_err(format!(
+                "dl_rsvd_page: short bulk write {wrote}/{}",
+                pkt.len()
+            )));
+        }
+
+        // Poll BCN_VALID (bit0 of REG_DWBCN0_CTRL+2) — the packet reached the page.
+        let deadline = Instant::now() + Duration::from_millis(200);
+        let mut valid = false;
+        while Instant::now() < deadline {
+            if self.read8(REG_DWBCN0_CTRL + 2)? & 0x01 != 0 {
+                valid = true;
+                break;
+            }
+        }
+
+        // Restore: re-arm valid + the saved queue/CR bits.
+        self.write8(REG_DWBCN0_CTRL + 2, self.read8(REG_DWBCN0_CTRL + 2)? | 0x01)?;
+        self.write8(REG_FWHW_TXQ_CTRL + 2, txq2)?;
+        self.write8(REG_CR + 1, cr1)?;
+
+        if valid {
+            Ok(())
+        } else {
+            Err(io_err("dl_rsvd_page: BCN_VALID poll timeout".into()))
+        }
+    }
+
     /// The discovered bulk endpoints (for the later TX/RX milestones).
     pub fn bulk_out(&self) -> u8 {
         self.bulk_out
+    }
+    /// All bulk-OUT endpoints (one per TX queue priority).
+    pub fn bulk_outs(&self) -> &[u8] {
+        &self.bulk_outs
     }
     pub fn bulk_in(&self) -> u8 {
         self.bulk_in

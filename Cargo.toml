@@ -1,0 +1,20 @@
+[package]
+name = "ndn-radio-drivers"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+license = "MPL-2.0"
+description = "Userspace USB Wi-Fi monitor-mode driver backends (RTL8812EU/8822E, RTL8821CU, MT7612U, RTL8812AU) over the ndn-radio-hal contract."
+
+[dependencies]
+ndn-radio-hal = { path = "../ndn-rs/crates/core/ndn-radio-hal" }
+ndn-frame-io  = { path = "../ndn-rs/crates/core/ndn-frame-io" }
+ndn-transport = { path = "../ndn-rs/crates/core/ndn-transport" }
+async-trait = "0.1"
+tracing = "0.1"
+bytes = { version = "1", features = ["std"] }
+tokio = { version = "1", features = ["sync", "rt", "net", "time", "rt-multi-thread"] }
+rusb = "0.9"
+libusb1-sys = "0.7"
+
+[workspace]

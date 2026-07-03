@@ -47,6 +47,13 @@ static void promisc_cb(unsigned char *buf, unsigned int len, void *userdata) {
   (void)userdata;
   int8_t rssi = 0;
   if (len == 0 || len > MAX_FRAME - 1) return;
+  // NDN-radio filter: forward only NDN frames — an 802.11 non-QoS DATA frame
+  // (FC type bits == data) carrying our ethertype 0x8624 after the 24-byte header
+  // + 6-byte LLC/SNAP. Drops the ambient beacon/mgmt flood so the 115200 serial
+  // link isn't swamped (the RX is an NDN bearer, not a sniffer).
+  if (len < 32) return;
+  if ((buf[0] & 0x0C) != 0x08) return;             // must be a DATA frame
+  if (buf[30] != 0x86 || buf[31] != 0x24) return;  // must carry the NDN ethertype
   static uint8_t out[MAX_FRAME];
   out[0] = (uint8_t)rssi;
   memcpy(out + 1, buf, len);

@@ -526,3 +526,53 @@ fn not_found(msg: &str) -> FaceError {
 fn io_err(msg: String) -> FaceError {
     FaceError::Io(std::io::Error::other(msg))
 }
+
+#[cfg(test)]
+mod golden {
+    //! Golden-frame tests: pin the bytes the 8731bu/8733bu driver constructs and
+    //! its decode of the *real* embedded firmware, so the M1–M4 wire format is
+    //! verified without hardware and regressions are caught. These values are the
+    //! ground truth to cross-check captured reference-driver USB traffic against
+    //! (usbmon on a host with the real device — the vendor `rtl8733bu` driver).
+    use super::*;
+
+    /// The halmac firmware header decodes to exactly these values for the shipped
+    /// `fw/rtl8733b_fw_nic.bin` — golden.
+    #[test]
+    fn fw_header_matches_embedded_image() {
+        let h = FwHeader::parse(FW_NIC_8733B).expect("parse embedded fw header");
+        assert_eq!(h.signature, 0x8723, "halmac signature");
+        assert_eq!(h.version, 1);
+        assert_eq!(h.subversion, 25);
+        assert_eq!(h.dmem_addr, 0x1420_0000);
+        assert_eq!(h.dmem_size, 16_008);
+        assert_eq!(h.imem_addr, 0x1404_0000);
+        assert_eq!(h.imem_size, 105_920);
+        assert!(!h.has_emem, "the NIC image has no EMEM section");
+        assert_eq!(h.emem_size, 0);
+    }
+
+    /// The strongest check: the header decode reproduces the real file length
+    /// (header + each present section + its 8-byte checksum). If the offsets or
+    /// masking were wrong this would not add up.
+    #[test]
+    fn nonsecure_len_reproduces_file_length() {
+        let h = FwHeader::parse(FW_NIC_8733B).unwrap();
+        assert_eq!(h.nonsecure_len() as usize, FW_NIC_8733B.len());
+        assert_eq!(FW_NIC_8733B.len(), 122_008);
+    }
+
+    /// The reserved-page download descriptor for a 64-byte payload — golden bytes
+    /// plus the field decode (TXPKTSIZE / OFFSET / QSEL).
+    #[test]
+    fn download_txdesc_golden() {
+        let d = download_txdesc(64);
+        let mut want = [0u8; TX_DESC_SIZE];
+        want[..8].copy_from_slice(&[0x40, 0x00, 0x28, 0x00, 0x00, 0x12, 0x00, 0x00]);
+        assert_eq!(d, want, "download_txdesc(64) golden bytes");
+        assert_eq!(u16::from_le_bytes([d[0], d[1]]), 64, "TXPKTSIZE = payload len");
+        assert_eq!(d[2], TX_DESC_SIZE as u8, "OFFSET = descriptor size");
+        let qsel = (u32::from_le_bytes([d[4], d[5], d[6], d[7]]) >> 8) & 0x1F;
+        assert_eq!(qsel, QSLT_MGNT & 0x1F, "QSEL = management queue");
+    }
+}

@@ -11,12 +11,17 @@
  * into the Ameba image via the Arduino build (see build-bw16-rs.sh).
  */
 
+#include <stdio.h> // snprintf
 #include "packet-injection.h" // GPLv3: wifi_tx_raw_frame(void*, size_t)
 #include "WiFi.h"
 extern "C" {
 #include "wifi_conf.h"
 int wext_set_bw40_enable(unsigned char enable);
 int wifi_set_tx_data_rate(unsigned char data_rate);
+// wifi_set_txpower() is behind `#if 0 //Not ready` in wifi_conf.c, so it's not
+// linkable — but its one-liner (wext_private_command "txpower patha=N") is, since
+// wext_private_command (wifi_util.c) is live. We reimplement it below.
+int wext_private_command(const char *ifname, char *cmd, int show_msg);
 }
 
 // --- Rust entry points (in libbw16_rs.a) ---
@@ -38,6 +43,11 @@ extern "C" void c_wifi_tx_raw_frame(const unsigned char *buf, unsigned int len) 
 }
 extern "C" void c_wifi_set_tx_data_rate(unsigned char code) { wifi_set_tx_data_rate(code); }
 extern "C" void c_wext_set_bw40(unsigned char en) { wext_set_bw40_enable(en); }
+extern "C" void c_wifi_set_txpower(int idx) {
+  char buf[24];
+  snprintf(buf, sizeof(buf), "txpower patha=%d", idx);
+  wext_private_command("wlan0", buf, 0);
+}
 
 // SDK promisc callback -> Rust
 static void promisc_trampoline(unsigned char *buf, unsigned int len, void *ud) {

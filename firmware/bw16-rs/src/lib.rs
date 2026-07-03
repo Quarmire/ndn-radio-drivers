@@ -31,12 +31,14 @@ extern "C" {
     fn c_wifi_set_promisc_enable();
     fn c_wifi_set_tx_data_rate(code: u8);
     fn c_wext_set_bw40(enable: u8);
+    fn c_wifi_set_txpower(idx: i32);
 }
 
 const SYNC0: u8 = 0x4E;
 const SYNC1: u8 = 0x44;
 const T_INJECT: u8 = 0x01;
 const T_CHANNEL: u8 = 0x02;
+const T_TXPOWER: u8 = 0x03;
 const T_RATE: u8 = 0x04;
 const T_BW40: u8 = 0x05;
 const T_RX: u8 = 0x81;
@@ -141,6 +143,7 @@ pub extern "C" fn rust_loop() {
         match ty {
             T_INJECT => c_wifi_tx_raw_frame(cmd.as_ptr(), len as u32),
             T_CHANNEL if len >= 1 => c_wifi_set_channel(cmd[0] as i32),
+            T_TXPOWER if len >= 1 => c_wifi_set_txpower(cmd[0] as i32),
             T_RATE if len >= 1 => c_wifi_set_tx_data_rate(cmd[0]),
             T_BW40 if len >= 1 => c_wext_set_bw40((cmd[0] != 0) as u8),
             _ => {}

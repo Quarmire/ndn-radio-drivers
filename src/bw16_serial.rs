@@ -23,6 +23,7 @@ const SYNC0: u8 = 0x4E;
 const SYNC1: u8 = 0x44;
 const T_INJECT: u8 = 0x01;
 const T_CHANNEL: u8 = 0x02;
+const T_TXPOWER: u8 = 0x03; // wext "txpower patha=N" power index
 const T_RATE: u8 = 0x04; // wifi_set_tx_data_rate code
 const T_BW40: u8 = 0x05; // wext_set_bw40_enable
 const T_RX: u8 = 0x81;
@@ -113,6 +114,12 @@ impl Bw16SerialBackend {
     pub fn set_bw40(&self, enable: bool) -> Result<(), FaceError> {
         self.send_framed(T_BW40, &[enable as u8])
     }
+
+    /// Set the TX power index (wext `txpower patha=<idx>`). Only reachable on the
+    /// Rust firmware, which reimplements the SDK's `#if 0`-disabled wifi_set_txpower.
+    pub fn set_txpower(&self, idx: u8) -> Result<(), FaceError> {
+        self.send_framed(T_TXPOWER, &[idx])
+    }
 }
 
 /// Background reader: accumulate serial bytes, deframe RX packets, parse each as
@@ -197,8 +204,11 @@ impl RadioKnobs for Bw16SerialBackend {
         // exposes): Bw20 → off, wider → on.
         self.set_bw40(!matches!(bw, Bandwidth::Bw20))
     }
-    // set_tx_power: wifi_set_txpower isn't linked in this AmebaD SDK build, so TX
-    // power isn't a knob here — the default no-op stands.
+    fn set_tx_power(&self, idx: u32) -> Result<(), FaceError> {
+        // Reachable on the Rust firmware (reimplemented txpower). Index is clamped
+        // into a byte for the wext command.
+        self.set_txpower(idx.min(u8::MAX as u32) as u8)
+    }
 }
 
 fn io_err(msg: String) -> FaceError {

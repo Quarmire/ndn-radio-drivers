@@ -40,10 +40,21 @@ impl Bw16SerialBackend {
     /// Open the BW16 at `path` (e.g. `/dev/tty.usbserial-XXXX`) and spawn the RX
     /// reader that deframes captured 802.11 frames off the serial link.
     pub fn open(path: &str) -> Result<Self, FaceError> {
-        let port = serialport::new(path, BW16_BAUD)
+        let mut port = serialport::new(path, BW16_BAUD)
             .timeout(Duration::from_millis(50))
             .open()
             .map_err(|e| io_err(format!("bw16 open {path}: {e}")))?;
+        // Reset the board into our firmware via DTR→CEN so a freshly-flashed board
+        // comes up without a manual reset: settle low, pulse the reset, then let it
+        // boot (~900 ms to `ready`).
+        let _ = port.write_request_to_send(false);
+        let _ = port.write_data_terminal_ready(false);
+        std::thread::sleep(Duration::from_millis(150));
+        let _ = port.write_data_terminal_ready(true);
+        std::thread::sleep(Duration::from_millis(120));
+        let _ = port.write_data_terminal_ready(false);
+        std::thread::sleep(Duration::from_millis(1000));
+        let _ = port.clear(serialport::ClearBuffer::Input);
         let reader = port
             .try_clone()
             .map_err(|e| io_err(format!("bw16 clone: {e}")))?;

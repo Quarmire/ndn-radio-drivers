@@ -41,6 +41,31 @@ extern "C" void c_wifi_set_channel(int ch) { wifi_set_channel(ch); }
 extern "C" void c_wifi_tx_raw_frame(const unsigned char *buf, unsigned int len) {
   wifi_tx_raw_frame((void *)buf, (size_t)len);
 }
+
+// Rate-controllable raw inject: same management-TX primitives as wifi_tx_raw_frame
+// (alloc_mgtxmitframe / update_mgntframe_attrib / dump_mgntframe — SDK symbols;
+// the adapter/xmit-frame offsets are the tesa-klebeband GPLv3 lib's discovered
+// ABI facts), but after update_mgntframe_attrib fills the default (legacy) attribs
+// we poke `n` [offset,value] byte pairs into the pkt_attrib (at xmit_frame+8)
+// before dump. That lets the host sweep for the rate field (and set it to an
+// MGN_MCS code) — escaping the fixed-rate mgmt path. `pairs` = [off0,val0,...].
+extern "C" void c_wifi_tx_raw_frame_attr(const unsigned char *frame, unsigned int len,
+                                         const unsigned char *pairs, unsigned int n_pairs) {
+  unsigned char *ptr = (unsigned char *)**(uint32_t **)(rltk_wlan_info + 0x10);
+  unsigned char *xf = (unsigned char *)alloc_mgtxmitframe(ptr + 0xa80);
+  if (!xf) return;
+  unsigned char *pattrib = xf + 8;
+  update_mgntframe_attrib(ptr, pattrib);
+  for (unsigned int i = 0; i < n_pairs; i++) {
+    pattrib[pairs[2 * i]] = pairs[2 * i + 1];
+  }
+  memset((void *)*(uint32_t *)(xf + 0x80), 0, 0x68);
+  unsigned char *fd = (unsigned char *)*(uint32_t *)(xf + 0x80) + 0x28;
+  memcpy(fd, frame, len);
+  *(uint32_t *)(xf + 0x14) = len;
+  *(uint32_t *)(xf + 0x18) = len;
+  dump_mgntframe(ptr, xf);
+}
 extern "C" void c_wifi_set_tx_data_rate(unsigned char code) { wifi_set_tx_data_rate(code); }
 extern "C" void c_wext_set_bw40(unsigned char en) { wext_set_bw40_enable(en); }
 extern "C" void c_wifi_set_txpower(int idx) {

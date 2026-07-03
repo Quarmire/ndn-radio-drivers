@@ -26,6 +26,7 @@ const T_CHANNEL: u8 = 0x02;
 const T_TXPOWER: u8 = 0x03; // wext "txpower patha=N" power index
 const T_RATE: u8 = 0x04; // wifi_set_tx_data_rate code
 const T_BW40: u8 = 0x05; // wext_set_bw40_enable
+const T_INJECT_ATTR: u8 = 0x06; // poke pkt_attrib bytes, then inject
 const T_RX: u8 = 0x81;
 
 /// BW16 fixed TX-rate codes for [`Bw16SerialBackend::set_tx_rate`]
@@ -119,6 +120,20 @@ impl Bw16SerialBackend {
     /// Rust firmware, which reimplements the SDK's `#if 0`-disabled wifi_set_txpower.
     pub fn set_txpower(&self, idx: u8) -> Result<(), FaceError> {
         self.send_framed(T_TXPOWER, &[idx])
+    }
+
+    /// Inject a complete 802.11 frame after poking `(offset, value)` bytes into the
+    /// driver's `pkt_attrib` (Rust firmware, `T_INJECT_ATTR`). The RE harness for
+    /// the TX-descriptor rate field: sweep the offset, set MGN_MCSx, watch the MCS.
+    pub fn inject_attr(&self, frame: &[u8], pairs: &[(u8, u8)]) -> Result<(), FaceError> {
+        let mut payload = Vec::with_capacity(1 + 2 * pairs.len() + frame.len());
+        payload.push(pairs.len() as u8);
+        for (o, v) in pairs {
+            payload.push(*o);
+            payload.push(*v);
+        }
+        payload.extend_from_slice(frame);
+        self.send_framed(T_INJECT_ATTR, &payload)
     }
 }
 

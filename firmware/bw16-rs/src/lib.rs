@@ -28,6 +28,7 @@ extern "C" {
     fn c_wifi_on_sta();
     fn c_wifi_set_channel(ch: i32);
     fn c_wifi_tx_raw_frame(buf: *const u8, len: u32);
+    fn c_wifi_tx_raw_frame_attr(frame: *const u8, len: u32, pairs: *const u8, n_pairs: u32);
     fn c_wifi_set_promisc_enable();
     fn c_wifi_set_tx_data_rate(code: u8);
     fn c_wext_set_bw40(enable: u8);
@@ -41,6 +42,7 @@ const T_CHANNEL: u8 = 0x02;
 const T_TXPOWER: u8 = 0x03;
 const T_RATE: u8 = 0x04;
 const T_BW40: u8 = 0x05;
+const T_INJECT_ATTR: u8 = 0x06; // [n_pairs][off,val]xN[frame]: poke pkt_attrib then inject
 const T_RX: u8 = 0x81;
 const T_LOG: u8 = 0x82;
 const MAX_FRAME: usize = 1600;
@@ -142,6 +144,15 @@ pub extern "C" fn rust_loop() {
         let cmd = &RXBUF[..len];
         match ty {
             T_INJECT => c_wifi_tx_raw_frame(cmd.as_ptr(), len as u32),
+            T_INJECT_ATTR if len >= 1 => {
+                let n = cmd[0] as usize;
+                let foff = 1 + 2 * n;
+                if foff <= len {
+                    let pairs = &cmd[1..foff];
+                    let frame = &cmd[foff..];
+                    c_wifi_tx_raw_frame_attr(frame.as_ptr(), frame.len() as u32, pairs.as_ptr(), n as u32);
+                }
+            }
             T_CHANNEL if len >= 1 => c_wifi_set_channel(cmd[0] as i32),
             T_TXPOWER if len >= 1 => c_wifi_set_txpower(cmd[0] as i32),
             T_RATE if len >= 1 => c_wifi_set_tx_data_rate(cmd[0]),

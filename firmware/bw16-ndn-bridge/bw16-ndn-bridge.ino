@@ -41,9 +41,11 @@ static void logmsg(const char *s) { send_framed(T_LOG, (const uint8_t *)s, strle
 
 /* Promiscuous RX: forward every captured 802.11 frame + its RSSI to the host. */
 static void promisc_cb(unsigned char *buf, unsigned int len, void *userdata) {
-  // AmebaD hands the 802.11 frame in `buf`; RSSI rides the rx_info in userdata.
+  // AmebaD hands the raw 802.11 frame in `buf`. Per-frame RSSI format varies by
+  // SDK version (no stable rx-info struct here) — forward 0 for now; refine once
+  // RX is confirmed on air.
+  (void)userdata;
   int8_t rssi = 0;
-  if (userdata) rssi = (int8_t)(((rtw_rx_info_t *)userdata)->rssi);
   if (len == 0 || len > MAX_FRAME - 1) return;
   static uint8_t out[MAX_FRAME];
   out[0] = (uint8_t)rssi;
@@ -52,11 +54,19 @@ static void promisc_cb(unsigned char *buf, unsigned int len, void *userdata) {
 }
 
 void setup() {
-  Serial.begin(921600);
-  wifi_on(RTW_MODE_PROMISC);
+  // The RTL8720 LOG UART (where the USB-TTL sits) is native 115200 and shared
+  // with the WiFi driver's debug; match it and let the host deframer pick our
+  // SYNC'd frames out of the noise. Emit per-step markers so a hang in WiFi init
+  // is visible. RX (promisc) is enabled last — TX/inject is the priority.
+  Serial.begin(115200);
+  delay(200);
+  logmsg("boot");
+  wifi_on(RTW_MODE_STA);
+  logmsg("wifi_on");
   wifi_set_channel(6);
+  logmsg("ch6");
   wifi_set_promisc(RTW_PROMISC_ENABLE_2, promisc_cb, 1);
-  logmsg("bw16-ndn-bridge up (ch6, promisc)");
+  logmsg("ready");
 }
 
 /* Read one framed command from the host; inject or retune. */

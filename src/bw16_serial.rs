@@ -25,8 +25,9 @@ const T_INJECT: u8 = 0x01;
 const T_CHANNEL: u8 = 0x02;
 const T_RX: u8 = 0x81;
 
-/// Baud the firmware opens `Serial` at.
-pub const BW16_BAUD: u32 = 921_600;
+/// Baud the firmware opens `Serial` at — the RTL8720 LOG UART's native rate,
+/// shared with WiFi-driver debug (the deframer picks our SYNC'd frames out).
+pub const BW16_BAUD: u32 = 115_200;
 
 /// A BW16 reached over its USB-serial port.
 pub struct Bw16SerialBackend {

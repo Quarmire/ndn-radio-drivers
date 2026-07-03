@@ -28,6 +28,14 @@ pub use rtl8812au::{ChipInfo, IqkResult, RTL8812AU_PIDS, Rtl8812auBackend};
 mod libusb_rtl8733b;
 pub use libusb_rtl8733b::{ChipVersion, FW_NIC_8733B, FwHeader, RTL8733B_PIDS, Rtl8733buBackend};
 
+// BW16 (RTL8720DN) serial-bridged backend — a dual-band 802.11 injector/capturer
+// driven over USB-serial (firmware/bw16-ndn-bridge), implementing the same
+// FrameIo/WifiRadio/RadioKnobs contract as the USB drivers.
+#[cfg(feature = "bw16")]
+mod bw16_serial;
+#[cfg(feature = "bw16")]
+pub use bw16_serial::{BW16_BAUD, Bw16SerialBackend};
+
 // The control-plane `RadioKnobs` impls for the driver backends. These live with
 // the driver types (the trait is from `ndn-radio-hal`, the types are declared
 // here) — the orphan rule requires the impl travel with the local type. The

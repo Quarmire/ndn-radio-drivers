@@ -112,6 +112,82 @@ const fn step(cmd: PwrCmd, offset: u16, msk: u8, val: u8) -> PwrStep {
 const REG_CR: u16 = 0x0100;
 /// SYS_FUNC_EN — after power-on its low two bits (BB/RF enable) read back set.
 const REG_SYS_FUNC_EN: u16 = 0x0002;
+/// Secure-boot control (halmac_fw_87xx): `(R8 & 0x03) == 0` selects the secure
+/// firmware-download path; otherwise the non-secure path.
+const REG_SECURE_CTRL: u16 = 0x0014;
+
+// ── M3: firmware image + header ──────────────────────────────────────────────
+/// The NIC firmware for the 8733b (halmac non-secure image, signature 0x8723),
+/// embedded from the vendor `array_mp_8733b_fw_nic`. Downloaded (M3+) via the
+/// bulk-OUT reserved-page path + DDMA into the wlan CPU's DMEM/IMEM.
+pub const FW_NIC_8733B: &[u8] = include_bytes!("../fw/rtl8733b_fw_nic.bin");
+
+// FW header field offsets (halmac_fw_info.h).
+const FW_HDR_SIZE: u32 = 64;
+const FW_HDR_CHKSUM_SIZE: u32 = 8;
+const OFF_MEM_USAGE: usize = 24;
+const OFF_DMEM_ADDR: usize = 32;
+const OFF_DMEM_SIZE: usize = 36;
+const OFF_IMEM_SIZE: usize = 48;
+const OFF_EMEM_SIZE: usize = 52;
+const OFF_EMEM_ADDR: usize = 56;
+const OFF_IMEM_ADDR: usize = 60;
+
+/// The parsed 8733b firmware header — the section addresses/sizes that drive the
+/// DMA download.
+#[derive(Debug, Clone, Copy)]
+pub struct FwHeader {
+    pub signature: u16,
+    pub version: u16,
+    pub subversion: u8,
+    pub dmem_addr: u32,
+    pub dmem_size: u32,
+    pub imem_addr: u32,
+    pub imem_size: u32,
+    pub emem_addr: u32,
+    pub emem_size: u32,
+    /// Whether an EMEM section is present (`MEM_USAGE & BIT(4)`).
+    pub has_emem: bool,
+}
+
+impl FwHeader {
+    /// Parse the 64-byte halmac firmware header (little-endian fields), masking
+    /// the top address bit the hardware ignores.
+    pub fn parse(fw: &[u8]) -> Result<Self, FaceError> {
+        if fw.len() < FW_HDR_SIZE as usize {
+            return Err(io_err("firmware shorter than its 64-byte header".into()));
+        }
+        let u16a = |o: usize| u16::from_le_bytes([fw[o], fw[o + 1]]);
+        let u32a = |o: usize| u32::from_le_bytes([fw[o], fw[o + 1], fw[o + 2], fw[o + 3]]);
+        Ok(FwHeader {
+            signature: u16a(0),
+            version: u16a(4),
+            subversion: fw[6],
+            dmem_addr: u32a(OFF_DMEM_ADDR) & !(1 << 31),
+            dmem_size: u32a(OFF_DMEM_SIZE),
+            imem_addr: u32a(OFF_IMEM_ADDR) & !(1 << 31),
+            imem_size: u32a(OFF_IMEM_SIZE),
+            emem_addr: u32a(OFF_EMEM_ADDR) & !(1 << 31),
+            emem_size: u32a(OFF_EMEM_SIZE),
+            has_emem: fw[OFF_MEM_USAGE] & (1 << 4) != 0,
+        })
+    }
+
+    /// Expected file length for the **non-secure** layout: header + each present
+    /// section plus its 8-byte checksum. Matching the actual length confirms the
+    /// header decode (and that this is the non-secure image).
+    pub fn nonsecure_len(&self) -> u32 {
+        let emem = if self.has_emem {
+            self.emem_size + FW_HDR_CHKSUM_SIZE
+        } else {
+            0
+        };
+        FW_HDR_SIZE
+            + (self.dmem_size + FW_HDR_CHKSUM_SIZE)
+            + (self.imem_size + FW_HDR_CHKSUM_SIZE)
+            + emem
+    }
+}
 
 /// A minimal M1 handle to an 8731bu/8733bu: an open, claimed USB device with
 /// register I/O. Grows into a full [`FrameIo`](ndn_frame_io::FrameIo) backend as
@@ -274,6 +350,21 @@ impl Rtl8733buBackend {
     }
     pub fn read_sys_func_en(&self) -> Result<u8, FaceError> {
         self.read8(REG_SYS_FUNC_EN)
+    }
+
+    /// **M3**: whether the chip selects the secure firmware-download path
+    /// (`(REG_SECURE_CTRL & 0x03) == 0`). Our NIC image is the non-secure layout,
+    /// so this is expected to read `false`.
+    pub fn fw_secure(&self) -> Result<bool, FaceError> {
+        Ok((self.read8(REG_SECURE_CTRL)? & 0x03) == 0x00)
+    }
+
+    /// The embedded NIC firmware and its parsed header (M3 groundwork).
+    pub fn firmware() -> &'static [u8] {
+        FW_NIC_8733B
+    }
+    pub fn fw_header() -> Result<FwHeader, FaceError> {
+        FwHeader::parse(FW_NIC_8733B)
     }
 
     /// The discovered bulk endpoints (for the later TX/RX milestones).

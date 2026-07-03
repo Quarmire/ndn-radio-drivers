@@ -25,6 +25,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if !ok {
                 eprintln!("warning: sequence completed but MAC does not read as powered");
             }
+
+            // M3 groundwork: firmware image + header decode + secure path.
+            let fw = ndn_radio_drivers::Rtl8733buBackend::firmware();
+            let h = ndn_radio_drivers::Rtl8733buBackend::fw_header()?;
+            let secure = dev.fw_secure()?;
+            println!(
+                "M3  fw {} B  sig=0x{:04x} v{}.{}  dmem={}B@0x{:08x} imem={}B@0x{:08x} emem={}B  hdr_ok={}  secure_path={}",
+                fw.len(), h.signature, h.version, h.subversion,
+                h.dmem_size, h.dmem_addr, h.imem_size, h.imem_addr, h.emem_size,
+                h.nonsecure_len() == fw.len() as u32,
+                secure,
+            );
         }
         Err(e) => println!("FAILED: {e}"),
     }

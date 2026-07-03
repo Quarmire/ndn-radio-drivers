@@ -1,0 +1,21 @@
+# Standalone (thumbv8m/no_std) — not part of the host ndn-radio-drivers workspace.
+[workspace]
+
+[package]
+name = "bw16-rs"
+version = "0.1.0"
+edition = "2021"
+description = "Rust no_std firmware core for the BW16 (RTL8720DN) — the named-radio serial bridge, linked into the Ameba image"
+license = "MIT OR Apache-2.0"
+
+# A staticlib linked into the Ameba (Arduino) image alongside the closed WiFi
+# blobs. All firmware logic (framing, dispatch, promisc NDN filter, knobs) lives
+# here in Rust; a ~40-line C++ shim only wraps the Arduino/SDK C calls.
+[lib]
+crate-type = ["staticlib"]
+
+[profile.release]
+panic = "abort"
+opt-level = "z"
+lto = true
+codegen-units = 1

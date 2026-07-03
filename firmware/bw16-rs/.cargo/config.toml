@@ -1,0 +1,8 @@
+# The RTL8720DN KM4 core: Cortex-M33, hard-float, FPU — matches the Ameba SDK's
+# -march=armv8-m.main+dsp -mfloat-abi=hard -mfpu=fpv5-sp-d16 so the ABI (esp.
+# float-abi) lines up with the C objects we link against.
+[build]
+target = "thumbv8m.main-none-eabihf"
+
+[target.thumbv8m.main-none-eabihf]
+rustflags = ["-C", "target-feature=+dsp"]

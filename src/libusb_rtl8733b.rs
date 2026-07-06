@@ -966,6 +966,19 @@ struct IqkBackup {
     rf: [[u32; 2]; 5], // [reg][path]
 }
 
+/// IQK measurement results — the per-path TX/RX correction coefficients.
+#[derive(Default, Debug, Clone, Copy)]
+pub struct IqkInfo {
+    /// Band: 0 = 2.4 GHz (G-mode), 1 = 5 GHz (A-mode).
+    pub band: u8,
+    /// TX IQ coefficients `[path][x, y]`.
+    pub txxy: [[u32; 2]; 2],
+    /// RX IQ coefficients `[path][x, y][LNA small, LNA large]`.
+    pub rxxy: [[[u32; 2]; 2]; 2],
+    /// Whether the RX IQK succeeded (gates the RX-IQK correction enable).
+    pub rxk_ok: bool,
+}
+
 impl Rtl8733buBackend {
     /// Masked baseband read/write (`odm_get_bb_reg` / `odm_set_bb_reg`).
     #[allow(dead_code)] // used by the LOK/TXK/RXK result reads (M7 part 2)
@@ -1094,6 +1107,249 @@ impl Rtl8733buBackend {
             self.bb_set(0x1bcc, 0x0000_003F, 0)?;
         }
         Ok(())
+    }
+
+    /// NCTL one-shot: if `0x2d9c[7:0]` is 0, trigger `0x1b00` BIT0 and poll
+    /// `0x2d9c[7:0]` for `0x55` (measurement done), up to 10 × `step_ms`.
+    fn nctl_one_shot(&self, step_ms: u64) -> Result<bool, FaceError> {
+        if self.bb_get(0x2d9c, 0xFF)? == 0 {
+            self.bb_set(0x1b00, 1 << 0, 1)?;
+            for _ in 0..10 {
+                std::thread::sleep(Duration::from_millis(step_ms));
+                if self.bb_get(0x2d9c, 0xFF)? == 0x55 {
+                    return Ok(true);
+                }
+            }
+        }
+        if std::env::var("IQKDBG").is_ok() {
+            eprintln!("  [nctl] not converged (0x2d9c=0x{:02x})", self.bb_get(0x2d9c, 0xFF)?);
+        }
+        Ok(false)
+    }
+
+    /// TXK RF setup (`_iqk_txk_rf_setting_8733b`). `band`: 0=G, 1=A.
+    fn iqk_txk_rf_setting(&self, path: u8, band: u8) -> Result<(), FaceError> {
+        self.rf_set(0, 0xde, 0xFE000, 0x3f)?;
+        self.rf_set(1, 0xde, 0xFE000, 0x3f)?;
+        if path == 0 {
+            self.rf_set(0, 0x60, 0x00007, 0x7)?;
+            if band == 0 {
+                self.rf_set(0, 0x51, 1 << 19, 0)?;
+                self.rf_set(0, 0x51, 1 << 11, 0)?;
+                self.rf_set(0, 0x52, 1 << 11, 0)?;
+            }
+        } else {
+            self.rf_set(0, 0x51, 1 << 19, 0)?;
+            self.rf_set(0, 0x51, 1 << 11, 0)?;
+            self.rf_set(0, 0x52, 1 << 11, 0)?;
+            self.rf_set(1, 0x51, 1 << 19, 0)?;
+            self.rf_set(1, 0x51, 1 << 11, 0)?;
+            self.rf_set(1, 0x52, 1 << 11, 0)?;
+        }
+        self.rf_set(0, 0x55, 1 << 0, 0)?;
+        self.rf_set(1, 0x55, 1 << 0, 0)?;
+        self.rf_set(0, 0xef, 1 << 2, 1)?;
+        self.rf_set(1, 0xef, 1 << 2, 1)?;
+        self.rf_set(0, 0xdf, 1 << 2, 0)?;
+        self.rf_set(1, 0xdf, 1 << 2, 0)?;
+        if band == 0 {
+            self.rf_set(0, 0x33, 0x003FF, 0x000)?;
+            self.rf_set(1, 0x33, 0x003FF, 0x000)?;
+        } else {
+            self.rf_set(0, 0x33, 0x003FF, 0x100)?;
+        }
+        self.rf_set(0, 0x00, 0xFFFF0, 0x403E)?;
+        self.rf_set(1, 0x00, 0xFFFF0, 0x403E)?;
+        self.rf_set(0, 0x56, 0x0FFFF, 0xe0e4)?;
+        if path == 1 {
+            self.rf_set(1, 0x56, 0x0FFFF, 0xe0e4)?;
+        }
+        let tx_pi = self.rf_get(path, 0x00, 0xFFFFF)?;
+        self.bb_set(0x1b20, 0x000F_FFFF, tx_pi)?;
+        self.bb_set(0x1b20, 0x0F00_0000, 0)?;
+        self.bb_set(0x1bbc, 0x3000_0000, 0)?;
+        self.bb_set(0x1b1c, 0x0001_C000, 0)?;
+        self.bb_set(0x1bb8, 1 << 20, 0)?;
+        Ok(())
+    }
+
+    /// RXK RF setup (`_iqk_rxk_rf_setting_8733b`) — IQKPLL on.
+    fn iqk_rxk_rf_setting(&self, path: u8, band: u8) -> Result<(), FaceError> {
+        self.bb_set(0x1860, 1 << 30, 0)?; // DAC off
+        if path == 0 {
+            self.rf_set(0, 0x00, 0xF0000, 0x7)?;
+            self.rf_set(1, 0x00, 0xF0000, 0x3)?;
+        } else {
+            self.rf_set(0, 0x00, 0xF0000, 0x3)?;
+            self.rf_set(1, 0x00, 0xF0000, 0x7)?;
+            self.rf_set(1, 0x88, 0x0000F, 0x3)?;
+        }
+        if band == 0 {
+            self.rf_set(path, 0x20, 1 << 8, 1)?;
+        } else {
+            self.rf_set(path, 0x20, 1 << 7, 1)?;
+        }
+        let r1f = self.rf_get(path, 0x18, 0xFFFFF)?;
+        self.rf_set(path, 0x1f, 0xFFFFF, r1f)?;
+        self.rf_set(path, 0x1e, 0x0003F, 0x13)?;
+        self.rf_set(path, 0x1e, 1 << 19, 0)?;
+        self.rf_set(path, 0x1e, 1 << 19, 1)?;
+        std::thread::sleep(Duration::from_millis(1));
+        Ok(())
+    }
+
+    /// LOK (LO-leakage cal, coarse + fine) — the active NCTL path.
+    fn iqk_lok_by_path(&self, path: u8) -> Result<(), FaceError> {
+        self.rf_set(0, 0xf5, 1 << 17, 1)?; // clock gating on
+        if path == 1 {
+            self.rf_set(1, 0xf5, 1 << 17, 1)?;
+        }
+        // ---- coarse ----
+        self.bb_set(0x1b10, 0xFF, 0)?; // reset 0x2d9c
+        if path == 0 {
+            self.bb_set(0x1b00, 0xFFFF_0000, 0x3c00)?;
+            self.bb_set(0x1880, 1 << 21, 1)?;
+            self.bb_set(0x1bcc, 0x3F, 0x9)?;
+            self.bb_set(0x1b2c, 0xFFFF_FFFF, 0x0024_0024)?;
+            self.bb_set(0x1b00, 0x0000_1FFF, 0x018)?;
+        } else {
+            self.bb_set(0x1b00, 0xFFFF_0000, 0x4c00)?;
+            self.bb_set(0x1880, 1 << 21, 1)?;
+            self.bb_set(0x1bcc, 0x3F, 0x9)?;
+            self.bb_set(0x1b2c, 0x0000_0FFF, 0x024)?;
+            self.bb_set(0x1b00, 0x0000_1FFF, 0x028)?;
+        }
+        self.nctl_one_shot(1)?;
+        self.bb_set(0x1880, 1 << 21, 0)?;
+        self.bb_set(0x1bd4, 0xFFFF_FFFF, 0x002c_0001)?;
+        let r = self.read32(0x1bfc)?;
+        let idac_ic = ((r >> 25) & 0x1F) + u32::from(r & (1 << 24) != 0);
+        let idac_qc = ((r >> 5) & 0x1F) + u32::from(r & (1 << 4) != 0);
+        self.rf_set(path, 0x08, 0xF8000, idac_ic)?;
+        self.rf_set(path, 0x08, 0x003E0, idac_qc)?;
+        // ---- fine ----
+        self.bb_set(0x1b10, 0xFF, 0)?;
+        self.bb_set(0x1880, 1 << 21, 1)?;
+        self.bb_set(0x1bcc, 0x3F, 0x9)?;
+        self.bb_set(0x1b2c, 0xFFFF_FFFF, 0x0024_0024)?;
+        self.bb_set(0x1b00, 0x0000_1FFF, if path == 0 { 0x118 } else { 0x128 })?;
+        self.nctl_one_shot(1)?;
+        self.bb_set(0x1880, 1 << 21, 0)?;
+        self.bb_set(0x1bd4, 0xFFFF_FFFF, 0x002c_0001)?;
+        std::thread::sleep(Duration::from_millis(5));
+        let r = self.read32(0x1bfc)?;
+        let idac_if = ((r >> 26) & 0xF) + u32::from(r & (1 << 25) != 0);
+        let idac_qf = ((r >> 6) & 0xF) + u32::from(r & (1 << 5) != 0);
+        self.rf_set(path, 0x09, 0xF0000, idac_if)?;
+        self.rf_set(path, 0x09, 0x003C0, idac_qf)?;
+        self.rf_set(path, 0x08, 0xF8000, idac_ic)?; // re-apply coarse
+        self.rf_set(path, 0x08, 0x003E0, idac_qc)?;
+        self.rf_set(0, 0xf5, 1 << 17, 0)?; // clock gating off
+        if path == 1 {
+            self.rf_set(1, 0xf5, 1 << 17, 0)?;
+        }
+        Ok(())
+    }
+
+    /// TX IQK — one-shot, store `txxy[path]` on success (`0x1b08` BIT26 == 0).
+    fn iqk_txk_by_path(&self, info: &mut IqkInfo, path: u8) -> Result<(), FaceError> {
+        let p = path as usize;
+        self.bb_set(0x1b10, 0xFF, 0)?;
+        self.bb_set(0x1bcc, 0x3F, 0x09)?;
+        self.bb_set(0x1b2c, 0xFFFF_FFFF, 0x0024_0024)?;
+        self.bb_set(0x1b00, 0x0000_1FFF, if path == 0 { 0x218 } else { 0x228 })?;
+        if self.nctl_one_shot(1)? && self.bb_get(0x1b08, 1 << 26)? == 0 {
+            info.txxy[p][0] = self.bb_get(0x1b38, 0x7FF0_0000)?;
+            info.txxy[p][1] = self.bb_get(0x1b38, 0x0007_FF00)?;
+        }
+        Ok(())
+    }
+
+    /// RX IQK — LNA-small then LNA-large one-shots, store `rxxy[path]`.
+    fn iqk_rxk_by_path(&self, info: &mut IqkInfo, path: u8) -> Result<(), FaceError> {
+        let (p, band) = (path as usize, info.band);
+        let reg1b00 = if path == 0 { 0x418 } else { 0x428 };
+        for lna in 0..2usize {
+            // -- RF LNA gain (small=0 / large=1) --
+            if band == 0 {
+                let (rf00, rf83) = if lna == 0 { (0x1cc, 0x79) } else { (0x342, 0x7e) };
+                self.rf_set(0, 0x00, 0x03FF0, rf00)?;
+                self.rf_set(1, 0x00, 0x03FF0, rf00)?;
+                self.rf_set(path, 0x83, 0x00300, 0x2)?;
+                self.rf_set(path, 0x83, 0x1FC00, rf83)?;
+            } else {
+                self.rf_set(0, 0x00, 0x03FF0, if lna == 0 { 0x1c8 } else { 0x348 })?;
+                self.rf_set(path, 0x8c, 0x00180, 0x1)?;
+                self.rf_set(path, 0x8c, 0x0007F, 0x07)?;
+            }
+            if lna == 0 {
+                let rx_pi = self.rf_get(path, 0x00, 0xFFFFF)?;
+                self.bb_set(0x1b24, 0x000F_FFFF, rx_pi)?;
+            }
+            self.bb_set(0x1b10, 0xFF, 0)?;
+            self.bb_set(0x1b34, 0x0000_007C, if lna == 0 { 0x07 } else { 0x0D })?;
+            self.bb_set(0x1bb8, 1 << 20, 1)?;
+            self.bb_set(0x1bcc, 0x3F, 0x3f)?;
+            self.bb_set(0x1b2c, 0x0FFF_0000, 0x044)?;
+            self.bb_set(0x1b00, 0x0000_1FFF, reg1b00)?;
+            if self.nctl_one_shot(2)? && self.bb_get(0x1b08, 1 << 26)? == 0 {
+                let r = self.read32(0x1b3c)?;
+                info.rxxy[p][0][lna] = (r >> 20) & 0x7FF;
+                info.rxxy[p][1][lna] = (r >> 8) & 0x7FF;
+                info.rxk_ok = true;
+            }
+        }
+        // disable RXIQKPLL
+        self.rf_set(path, 0x20, if band == 0 { 1 << 8 } else { 1 << 7 }, 0)?;
+        self.rf_set(path, 0x1e, 1 << 19, 0)?;
+        self.bb_set(0x1860, 1 << 30, 1)?; // DAC on
+        Ok(())
+    }
+
+    /// Apply the measured coefficients to the correction registers
+    /// (`_iqk_fill_iqk_xy_8733b`).
+    fn iqk_fill_iqk_xy(&self, info: &IqkInfo, path: u8) -> Result<(), FaceError> {
+        let p = path as usize;
+        self.bb_set(0x1b38, 0x3, if path == 0 { 0x1 } else { 0x3 })?;
+        self.bb_set(0x1b38, 0x7FF0_0000, info.txxy[p][0])?;
+        self.bb_set(0x1b38, 0x0007_FF00, info.txxy[p][1])?;
+        self.bb_set(0x1b34, 0x0000_007C, 0x07)?; // LNA small
+        self.bb_set(0x1b3c, 0x7FF0_0000, info.rxxy[p][0][0])?;
+        self.bb_set(0x1b3c, 0x0007_FF00, info.rxxy[p][1][0])?;
+        self.bb_set(0x1b34, 0x0000_007C, 0x0D)?; // LNA large
+        self.bb_set(0x1b3c, 0x7FF0_0000, info.rxxy[p][0][1])?;
+        self.bb_set(0x1b3c, 0x0007_FF00, info.rxxy[p][1][1])?;
+        self.bb_set(0x1b38, 0x3, 0x0)?;
+        Ok(())
+    }
+
+    /// **M7**: full IQK calibration. Backup → AFE-on → preset → per-path
+    /// (LOK → TXK → RXK) → apply coefficients → preset-restore → AFE-off →
+    /// restore. 1x1 path A, 2.4 GHz. Returns the measured [`IqkInfo`].
+    pub fn phy_iq_calibrate(&self) -> Result<IqkInfo, FaceError> {
+        let mut info = IqkInfo {
+            band: 0,
+            ..Default::default()
+        };
+        let path = 0u8;
+        let backup = self.iqk_backup()?;
+        self.iqk_afe_setting(true)?;
+        // _iqk_start_iqk: backup RF mode → preset(true) → LOK/TXK/RXK → preset(false).
+        let pa_mode = self.rf_get(0, 0x0, 0xF0000)?;
+        self.iqk_preset(true)?;
+        self.iqk_txk_rf_setting(path, info.band)?;
+        self.iqk_lok_by_path(path)?;
+        self.iqk_txk_by_path(&mut info, path)?;
+        self.iqk_rxk_rf_setting(path, info.band)?;
+        self.iqk_rxk_by_path(&mut info, path)?;
+        self.iqk_preset(false)?;
+        self.rf_set(0, 0x0, 0xF0000, pa_mode)?;
+        self.iqk_afe_setting(false)?;
+        self.iqk_fill_iqk_xy(&info, path)?;
+        self.iqk_restore(&backup)?;
+        // Enable the RX-IQK correction if RXK succeeded (`_iqk_restore_mac_bb`).
+        self.bb_set(0x180c, 1 << 31, u32::from(!info.rxk_ok))?;
+        Ok(info)
     }
 
     /// **M7 (part 1) self-test**: exercise the IQK setup/teardown scaffold —

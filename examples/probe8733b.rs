@@ -96,12 +96,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         ),
                         Err(e) => println!("FAILED: {e}"),
                     }
-                    // M7 part 1: IQK setup/teardown scaffold (accessors + backup/restore).
-                    print!("M7a iqk_setup_selftest … ");
-                    match dev.iqk_setup_selftest() {
-                        Ok((before, after)) => println!(
-                            "✓ (0x09f0 {before:08x}→{after:08x} restored={})",
-                            before == after
+                    // M7: full IQK calibration (LOK → TXK → RXK → apply coefficients).
+                    print!("M7 phy_iq_calibrate … ");
+                    match dev.phy_iq_calibrate() {
+                        Ok(info) => println!(
+                            "✓ txxy=[{:03x},{:03x}] rxxy_s=[{:03x},{:03x}] rxxy_l=[{:03x},{:03x}] rxk_ok={}",
+                            info.txxy[0][0], info.txxy[0][1],
+                            info.rxxy[0][0][0], info.rxxy[0][1][0],
+                            info.rxxy[0][0][1], info.rxxy[0][1][1],
+                            info.rxk_ok,
                         ),
                         Err(e) => println!("FAILED: {e}"),
                     }

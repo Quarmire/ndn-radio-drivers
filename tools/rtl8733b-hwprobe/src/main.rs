@@ -45,11 +45,12 @@ const REG_FWHW_TXQ_CTRL: u16 = 0x0420;
 const REG_BCN_CTRL: u16 = 0x0550;
 const REG_EXT_SYS_FUNC_EN: u16 = 0x1000;
 const REG_EXT_SYS_CLK_CTRL: u16 = 0x1008;
-const QSLT_MGNT: u32 = 0x12;
+const QSLT_BEACON: u32 = 0x10; // vendor uses BEACON qsel for the rsvd-page download
 const DMA_MAPPING_HIGH: u8 = 3;
 const BIT_HCI_TXDMA_EN: u8 = 0x01;
 const BIT_TXDMA_EN: u8 = 0x04;
-const TX_DESC_SIZE: usize = 40;
+const TX_DESC_SIZE: usize = 48; // HALMAC_TX_DESC_SIZE_8733B (NOT the generic 87xx 40)
+const USB_BULK_SIZE: usize = 512; // USB2 (f72b enumerates @ 480M)
 
 #[derive(Clone, Copy)]
 enum Pwr {
@@ -94,13 +95,46 @@ const POWER_ON: &[Step] = &[
     s(W, 0x0077, 0xFF, 0x87),
 ];
 
-fn download_txdesc(payload_len: usize, qsel: u32) -> [u8; TX_DESC_SIZE] {
+// card_dis power-off (USB rows only), halmac_pwr_seq_8733b.c
+// TRANS_ACT_TO_CARDEMU_card_dis + TRANS_CARDEMU_TO_CARDDIS — a clean MAC reset.
+const POWER_OFF: &[Step] = &[
+    s(W, 0x00CD, 0x01, 0x00),
+    s(W, 0x0005, 0x02, 0x02),
+    s(P, 0x0005, 0x02, 0x00),
+    s(W, 0x0005, 0x08, 0x08),
+    s(W, 0x0006, 0xC0, 0x00),
+    s(W, 0x0007, 0xFF, 0x10),
+    s(W, 0x1004, 0x0F, 0x02),
+    s(W, 0x0024, 0x0F, 0x00),
+    s(W, 0x0025, 0xF0, 0x10),
+    s(W, 0x0021, 0xF0, 0x70),
+    s(W, 0x004A, 0x01, 0x01),
+];
+
+/// Build the full USB packet (48-byte 8733b TX descriptor + optional 8-byte
+/// packet-offset gap + payload) exactly as the vendor `usb_write_data_not_xmitframe`
+/// does: dw0 [0:16]=TXPKTSIZE, [16:24]=OFFSET(=desclen, +8 if padded); dw1 [8:13]=
+/// QSEL, [24:29]=PKT_OFFSET(=1 if padded). Pad by 8 (PACKET_OFFSET_SZ) when
+/// desclen+payload is a multiple of the USB bulk size (ZLP avoidance).
+fn build_dl_pkt(payload: &[u8], qsel: u32) -> Vec<u8> {
+    let desclen = TX_DESC_SIZE;
+    let pad = (desclen + payload.len()) % USB_BULK_SIZE == 0;
+    let offset = if pad { desclen + 8 } else { desclen };
     let mut d = [0u8; TX_DESC_SIZE];
-    let dw0 = (payload_len as u32 & 0xFFFF) | ((TX_DESC_SIZE as u32 & 0xFF) << 16);
+    let dw0 = (payload.len() as u32 & 0xFFFF) | ((offset as u32 & 0xFF) << 16);
     d[0..4].copy_from_slice(&dw0.to_le_bytes());
-    let dw1 = (qsel & 0x1F) << 8;
+    let mut dw1 = (qsel & 0x1F) << 8;
+    if pad {
+        dw1 |= 1 << 24;
+    }
     d[4..8].copy_from_slice(&dw1.to_le_bytes());
-    d
+    let mut pkt = Vec::with_capacity(offset + payload.len());
+    pkt.extend_from_slice(&d);
+    if pad {
+        pkt.extend_from_slice(&[0u8; 8]);
+    }
+    pkt.extend_from_slice(payload);
+    pkt
 }
 
 struct Dev {
@@ -162,8 +196,8 @@ impl Dev {
         Ok((self.r8(REG_SYS_CFG2)?, self.r8(REG_SYS_CFG1 + 1)? >> 4, self.r32(REG_SYS_CFG1)?))
     }
 
-    fn power_on(&self) -> R<()> {
-        for st in POWER_ON {
+    fn run_seq(&self, steps: &[Step]) -> R<()> {
+        for st in steps {
             match st.cmd {
                 Pwr::W => {
                     let cur = self.r8(st.off)?;
@@ -176,13 +210,21 @@ impl Dev {
                             break;
                         }
                         if Instant::now() >= deadline {
-                            return Err(format!("power-on poll timeout @0x{:04x}", st.off).into());
+                            return Err(format!("pwr-seq poll timeout @0x{:04x}", st.off).into());
                         }
                     }
                 }
             }
         }
         Ok(())
+    }
+    fn power_on(&self) -> R<()> {
+        self.run_seq(POWER_ON)
+    }
+    /// Card-disable (power off) — bring the MAC down so the next power_on is a clean
+    /// reset (recovers a wedged TX-DMA without a physical replug).
+    fn power_off(&self) -> R<()> {
+        self.run_seq(POWER_OFF)
     }
 
     fn is_powered(&self) -> R<bool> {
@@ -230,12 +272,7 @@ impl Dev {
         let txq2 = self.r8(REG_FWHW_TXQ_CTRL + 2)?;
         self.w8(REG_FWHW_TXQ_CTRL + 2, txq2 & !(1 << 6))?;
 
-        let mut pkt = Vec::with_capacity(TX_DESC_SIZE + data.len() + 1);
-        pkt.extend_from_slice(&download_txdesc(data.len(), qsel));
-        pkt.extend_from_slice(data);
-        if pkt.len() % 512 == 0 {
-            pkt.push(0);
-        }
+        let pkt = build_dl_pkt(data, qsel);
         let wrote = self.h.write_bulk(ep, &pkt, Duration::from_millis(600));
         let write_res = match wrote {
             Ok(n) if n == pkt.len() => Ok(()),
@@ -267,10 +304,14 @@ fn main() -> R<()> {
     let dev = Dev::open()?;
     let (id, ver, cfg1) = dev.chip_version()?;
     println!("M1  chip_id=0x{id:02x} chip_ver={ver} sys_cfg1=0x{cfg1:08x}  (golden id==0x16: {})", id == 0x16);
-    // Clear residual download-mode state left by prior runs (no remote power-cycle):
-    // MCUFW_CTRL BIT0 persists and puts the chip in FW-download mode → writes stall.
+    // Clean per-run reset: card-disable (power off) then power on, so accumulated
+    // download-mode/TX-DMA state from a prior run doesn't confound this one.
     dev.w8(REG_MCUFW_CTRL, 0)?;
     dev.w8(REG_MCUFW_CTRL + 1, 0)?;
+    if std::env::var("PWROFF").is_ok() {
+        let off = dev.power_off();
+        println!("reset: power_off {}", if off.is_ok() { "ok" } else { "err" });
+    }
     dev.power_on()?;
     println!("M2  power_on ok: powered={} CR=0x{:02x} func_en=0x{:02x}", dev.is_powered()?, dev.r8(REG_CR)?, dev.r8(REG_SYS_FUNC_EN)?);
     // Vendor download order: cpu_en(0) + reset pulse, THEN (re-)apply the page
@@ -278,15 +319,23 @@ fn main() -> R<()> {
     dev.trx_init()?;
     dev.fw_dl_setup()?;
     println!("M4  fw_dl_setup ok: CR=0x{:02x} EXT_FUNC=0x{:08x}", dev.r8(REG_CR)?, dev.r32(REG_EXT_SYS_FUNC_EN)?);
-    // CLEAN BASELINE on a fresh chip: no pltfm_reset pulse (it toggles 0x1002 BIT0
-    // and kills the TX-DMA write — confirmed on a fresh Mac chip, not just a dirty
-    // one). Write succeeds; BCN_VALID does not assert — the remaining nut.
-    // NEXT (needs the card_dis power-off reset first, pwr_seq_8733b.c:795, for a
-    // reliable per-run reset): systematically find what arms BCN_VALID.
-    let ep = *dev.bulk_outs.last().unwrap();
-    match dev.dl_rsvd_page(0x80, &[0u8; 64], ep, 0x12) {
-        Ok(()) => println!("M4.5 dl_rsvd_page (MGNT): BCN_VALID OK — reserved-page DRAINED!"),
-        Err(e) => println!("M4.5 dl_rsvd_page (MGNT): {e}  (write ok on fresh chip → BCN_VALID is the nut)"),
+    // start_dlfw: FW-download-mode enable (MCUFW_CTRL BIT0, keep bits in mask 0x3800).
+    let hi = dev.r8(REG_MCUFW_CTRL + 1)? & 0x38;
+    dev.w8(REG_MCUFW_CTRL, 0x01)?;
+    dev.w8(REG_MCUFW_CTRL + 1, hi)?;
+    println!("M4.5 MCUFW_CTRL BIT0 (download mode)");
+    // Vendor-exact descriptor now: 48-byte 8733b TX desc, QSEL=BEACON(0x10), and
+    // the HIGH bulk-OUT endpoint (bulkout id 0 = first ep), which is where the
+    // beacon/rsvd-page write must go to raise BCN_VALID.
+    // Sweep all bulk-OUT endpoints with the correct 48B BEACON descriptor + pg=0.
+    // Which physical ep is the HIGH/beacon queue (raises BCN_VALID) is the last
+    // assumption to nail. Each dl_rsvd_page clears BCN_VALID first, so it's safe.
+    let eps = dev.bulk_outs.clone();
+    for ep in eps {
+        match dev.dl_rsvd_page(0x00, &[0u8; 64], ep, QSLT_BEACON) {
+            Ok(()) => println!("M4.5 ep 0x{ep:02x}: BCN_VALID OK — reserved-page DRAINED via this endpoint!"),
+            Err(e) => println!("M4.5 ep 0x{ep:02x}: {e}"),
+        }
     }
     Ok(())
 }

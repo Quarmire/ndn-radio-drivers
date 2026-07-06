@@ -96,6 +96,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         ),
                         Err(e) => println!("FAILED: {e}"),
                     }
+                    // Tune to a 2.4 GHz channel (prerequisite for calibration convergence).
+                    print!("set_channel(6) … ");
+                    dev.set_channel(6)?;
+                    println!("✓ (RF18=0x{:05x})", dev.rf_read(0x18)?);
+                    // NCTL mirror diagnostic: 0x1b10[7:0] should route to 0x2d9c[7:0].
+                    let v = (dev.read32(0x1b10)? & !0xFF) | 0x33;
+                    dev.write32(0x1b10, v)?;
+                    println!(
+                        "NCTL mirror: wrote 0x1b10[7:0]=0x33 → 0x2d9c[7:0]=0x{:02x} (0x1b10 rb=0x{:08x})",
+                        dev.read32(0x2d9c)? & 0xFF,
+                        dev.read32(0x1b10)?
+                    );
                     // M7: full IQK calibration (LOK → TXK → RXK → apply coefficients).
                     print!("M7 phy_iq_calibrate … ");
                     match dev.phy_iq_calibrate() {

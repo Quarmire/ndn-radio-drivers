@@ -1070,6 +1070,10 @@ impl Rtl8733buBackend {
             self.bb_set(0x09b4, 0x000E_0000, 3)?;
             self.bb_set(0x1c20, 1 << 5, 1)?;
             self.bb_set(0x1c38, 0xFFFF_FFFF, 0xFFFF_FFFF)?; // release ADDA fifo
+            // Re-assert KIP power ON *after* the IQK clock (0x1cd0) is up — the very
+            // first afe write of 0x1b08=0x80 is lost because the KIP block has no clock
+            // yet, so the NCTL engine never powers on without this.
+            self.bb_set(0x1b08, 0xFFFF_FFFF, 0x80)?;
         } else {
             self.bb_set(0x1c38, 0xFFFF_FFFF, 0xffa1_005e)?;
             self.bb_set(0x1830, 1 << 30, 1)?;
@@ -1106,6 +1110,29 @@ impl Rtl8733buBackend {
             self.bb_set(0x1bb8, 0xFFFF_FFFF, 0)?;
             self.bb_set(0x1bcc, 0x0000_003F, 0)?;
         }
+        Ok(())
+    }
+
+    /// Tune the RF to a 2.4 GHz channel (`config_phydm_switch_channel_8733b`, G-band
+    /// path): clear the band/channel bits of RF 0x18 and set the channel, write both
+    /// paths with the cut-D settle loop (poll RF 0xc5 BIT15), restore RF 0x19, and
+    /// select the 2.4 GHz RX AGC table. Prerequisite for calibration + TX/RX.
+    pub fn set_channel(&self, ch: u8) -> Result<(), FaceError> {
+        let mut rf18 = self.rf_get(0, 0x18, RFREG_MASK)?;
+        let rf19 = self.rf_get(0, 0x19, RFREG_MASK)?;
+        // 2.4 GHz: clear band bits (17,16,9,8) + channel byte, set channel.
+        rf18 = (rf18 & !((1 << 17) | (1 << 16) | (1 << 9) | (1 << 8) | 0xFF)) | (ch as u32);
+        for _ in 0..20 {
+            self.rf_set(0, 0x18, RFREG_MASK, rf18)?;
+            self.rf_set(1, 0x18, RFREG_MASK, rf18)?;
+            std::thread::sleep(Duration::from_micros(250));
+            if self.rf_get(0, 0xc5, 0x8000)? != 0 {
+                break; // channel-setting ready
+            }
+        }
+        self.rf_set(0, 0x19, RFREG_MASK, rf19)?;
+        self.rf_set(1, 0x19, RFREG_MASK, rf19)?;
+        self.bb_set(0x1ea8, 1 << 7, 1)?; // 2.4 GHz RX idle AGC table
         Ok(())
     }
 
@@ -1334,6 +1361,15 @@ impl Rtl8733buBackend {
         let path = 0u8;
         let backup = self.iqk_backup()?;
         self.iqk_afe_setting(true)?;
+        if std::env::var("IQKDBG").is_ok() {
+            let v = (self.read32(0x1b10)? & !0xFF) | 0x33;
+            self.write32(0x1b10, v)?;
+            eprintln!(
+                "  [kip] after afe-on: 0x1b10 wrote 0x33 → rb=0x{:08x}, 0x1b08 rb=0x{:08x}",
+                self.read32(0x1b10)?,
+                self.read32(0x1b08)?
+            );
+        }
         // _iqk_start_iqk: backup RF mode → preset(true) → LOK/TXK/RXK → preset(false).
         let pa_mode = self.rf_get(0, 0x0, 0xF0000)?;
         self.iqk_preset(true)?;

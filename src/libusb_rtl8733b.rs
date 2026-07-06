@@ -550,13 +550,6 @@ impl Rtl8733buBackend {
         let hdr = Self::fw_header()?;
         let fw = FW_NIC_8733B;
 
-        // Extra init the reference driver performs around FW download (from the
-        // usbmon capture): a clock/PLL reg (0x0073), the C2H-event reg (0x01A0 =
-        // REG_C2HEVT), and a CPU-region reg (0x1103). One of these gates the CPU boot.
-        self.write8(0x0073, 0x04)?;
-        self.write8(0x01A0, 0xFD)?;
-        self.write8(0x1103, 0x0C)?;
-
         // wlan_cpu_en(0): hold the WLAN CPU off during the download.
         let v = self.read8(REG_SYS_FUNC_EN + 1)?;
         self.write8(REG_SYS_FUNC_EN + 1, v & !(1 << 2))?;
@@ -576,9 +569,6 @@ impl Rtl8733buBackend {
         // CPU never sets the FW-booted bit 15 even though the download + checksums pass).
         let mcufw = self.read16(REG_MCUFW_CTRL)? & 0x3800;
         self.write16(REG_MCUFW_CTRL, mcufw | 0x2000 | 0x0001)?;
-        // Reset the DDMA checksum accumulator.
-        let ctrl = self.read32(REG_DDMA_CH0CTRL)?;
-        self.write32(REG_DDMA_CH0CTRL, ctrl | DDMA_RESET_CHKSUM)?;
 
         // Section layout: header(64) | DMEM(size+8) | IMEM(size+8).
         let hdr_sz = FW_HDR_SIZE as usize;
@@ -596,6 +586,10 @@ impl Rtl8733buBackend {
     /// `FW_CHUNK`-byte pieces, IDDMA-copying each into `dest_base`, then flag the
     /// section's download/checksum-OK bits in `REG_MCUFW_CTRL`.
     fn dlfw_section(&self, data: &[u8], dest_base: u32) -> Result<(), FaceError> {
+        // Reset the DDMA checksum accumulator at the start of each section (vendor
+        // dlfw_to_mem does this per section, not once).
+        let ctrl = self.read32(REG_DDMA_CH0CTRL)?;
+        self.write32(REG_DDMA_CH0CTRL, ctrl | DDMA_RESET_CHKSUM)?;
         let mut off = 0usize;
         let mut first = true;
         while off < data.len() {

@@ -52,7 +52,7 @@ const QSLT_BEACON: u32 = 0x10; // vendor uses BEACON qsel for the rsvd-page down
 const DMA_MAPPING_HIGH: u8 = 3;
 const BIT_HCI_TXDMA_EN: u8 = 0x01;
 const BIT_TXDMA_EN: u8 = 0x04;
-const TX_DESC_SIZE: usize = 48; // HALMAC_TX_DESC_SIZE_8733B (NOT the generic 87xx 40)
+const TX_DESC_SIZE: usize = 40; // real download desc size (OFFSET=0x28 in the usbmon capture)
 const USB_BULK_SIZE: usize = 512; // USB2 (f72b enumerates @ 480M)
 
 #[derive(Clone, Copy)]
@@ -131,6 +131,15 @@ fn build_dl_pkt(payload: &[u8], qsel: u32) -> Vec<u8> {
         dw1 |= 1 << 24;
     }
     d[4..8].copy_from_slice(&dw1.to_le_bytes());
+    // TX-descriptor checksum at offset 0x1C[0:16] = ~(XOR of the first 16 u16 words,
+    // checksum field left 0). Decoded from the vendor's usbmon capture; the HW drops
+    // packets with a wrong checksum (which is why the all-zero-checksum probe failed).
+    let mut ck: u16 = 0;
+    for i in 0..16 {
+        ck ^= u16::from_le_bytes([d[2 * i], d[2 * i + 1]]);
+    }
+    ck = !ck;
+    d[0x1C..0x1E].copy_from_slice(&ck.to_le_bytes());
     let mut pkt = Vec::with_capacity(offset + payload.len());
     pkt.extend_from_slice(&d);
     if pad {

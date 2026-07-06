@@ -1170,7 +1170,7 @@ impl Rtl8821cuBackend {
         let body = &buf[off + hdr_off..off + hdr_off + pkt_len];
         // Strip the trailing FCS (4 bytes) that monitor RX appends.
         let body = if body.len() >= 4 { &body[..body.len() - 4] } else { body };
-        let decoded = frame::parse_dot11(self.format, body, rssi, Some(rate))
+        let decoded = frame::parse_dot11(self.format, body, rssi, Some(rate), None)
             .into_iter()
             .collect();
         Some((decoded, stride.max(8)))

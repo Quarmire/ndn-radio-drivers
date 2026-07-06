@@ -1264,7 +1264,7 @@ impl Mt7612uBackend {
         }
         let rssi = burst.get(18).map(|&b| b as i8);
         let dot11 = &burst[MT76_RXD_LEN..burst.len() - 4];
-        crate::frame::parse_dot11(self.format, dot11, rssi, None)
+        crate::frame::parse_dot11(self.format, dot11, rssi, None, None)
     }
 
     /// Build an A-MSDU MPDU body: one QoS-data frame (FC subtype 8, A-MSDU-Present

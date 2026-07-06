@@ -1634,6 +1634,7 @@ impl Rtl8812auBackend {
                     group: Some(group),
                     rssi_dbm: None,
                     mcs_index: None,
+                    stamp: None,
                 });
             }
             off += (start + pkt_len + 7) & !7; // next subframe, 8-byte aligned

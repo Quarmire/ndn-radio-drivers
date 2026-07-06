@@ -153,7 +153,7 @@ fn reader_loop(
                 while let Some((ty, payload, consumed)) = deframe(&acc) {
                     if ty == T_RX && !payload.is_empty() {
                         let rssi = payload[0] as i8;
-                        if let Some(cap) = frame::parse_dot11(format, &payload[1..], Some(rssi), None) {
+                        if let Some(cap) = frame::parse_dot11(format, &payload[1..], Some(rssi), None, None) {
                             if tx.send(cap).is_err() {
                                 return; // backend dropped
                             }

@@ -4930,7 +4930,7 @@ impl LibUsbRtl88xxBackend {
             let ethertype = match self.format {
                 FrameFormat::RawNdn { ethertype } => ethertype,
                 other => {
-                    return crate::frame::parse_dot11(other, frame, rssi_dbm, mcs_index)
+                    return crate::frame::parse_dot11(other, frame, rssi_dbm, mcs_index, None)
                         .into_iter()
                         .collect();
                 }
@@ -4977,6 +4977,7 @@ impl LibUsbRtl88xxBackend {
                             group: Some(da),
                             rssi_dbm,
                             mcs_index,
+                            stamp: None,
                         });
                     }
                     p += (14 + len + 3) & !3; // next subframe (4-byte aligned)
@@ -4998,6 +4999,7 @@ impl LibUsbRtl88xxBackend {
                 group: Some(addr1),
                 rssi_dbm,
                 mcs_index,
+                stamp: None,
             }]
         })();
         Some((decoded, advance))

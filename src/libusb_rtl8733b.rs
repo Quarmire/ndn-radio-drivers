@@ -122,6 +122,17 @@ const REG_SECURE_CTRL: u16 = 0x0014;
 /// bulk-OUT reserved-page path + DDMA into the wlan CPU's DMEM/IMEM.
 pub const FW_NIC_8733B: &[u8] = include_bytes!("../fw/rtl8733b_fw_nic.bin");
 
+/// The 8733b MAC register table (`array_mp_8733b_mac_reg`, phydm halhwimg8733b_mac.c):
+/// flat `[addr, value, …]` pairs terminated by `0xFFFF`. All byte writes, no
+/// condition blocks. `0x002 = 0xC3` enables the BB block.
+const MAC_REG_8733B: &[u32] = &[
+    0x002, 0x0000_00C3, 0x55C, 0x0000_0050, 0x638, 0x0000_0050, 0x639, 0x0000_0019,
+    0x640, 0x0000_0019, 0x63C, 0x0000_000D, 0x63D, 0x0000_000D, 0x63E, 0x0000_000D,
+    0x63F, 0x0000_000D, 0x4CA, 0x0000_003F, 0x66C, 0x0000_0004, 0x520, 0x0000_006F,
+    0x5A7, 0x0000_00FF, 0x6A2, 0x0000_00FF, 0x6A3, 0x0000_00FF, 0x4E5, 0x0000_00E0,
+    0x4E6, 0x0000_0009, 0xFFFF, 0x0000_FFFF,
+];
+
 // FW header field offsets (halmac_fw_info.h).
 const FW_HDR_SIZE: u32 = 64;
 const FW_HDR_CHKSUM_SIZE: u32 = 8;
@@ -703,6 +714,75 @@ impl Rtl8733buBackend {
             "fw-ready poll timeout (MCUFW_CTRL=0x{:04x})",
             self.read16(REG_MCUFW_CTRL)?
         )))
+    }
+
+    // ── M6: MAC / BB / RF register-table initialization ──────────────────────
+
+    /// Apply a phydm register table: flat `[addr, val, addr, val, …]` u32 words,
+    /// terminated by `addr == 0xFFFF`, honoring the IF/ELSE/ENDIF condition markers
+    /// (high bits `0xC000_0000` of the address word). For a standard 1x1 NIC the
+    /// conditions we care about (cut/interface/RFE) all take the default branch, so
+    /// [`cond_matches`] evaluates the stored IF and picks the matching side.
+    fn config_table(
+        &self,
+        table: &[u32],
+        mut apply: impl FnMut(&Self, u32, u32) -> Result<(), FaceError>,
+    ) -> Result<(), FaceError> {
+        let mut is_matched = true;
+        let mut is_skipped = false;
+        let mut pre = 0u32;
+        let mut i = 0;
+        while i + 1 < table.len() {
+            let (v1, v2) = (table[i], table[i + 1]);
+            if v1 == 0xFFFF {
+                break; // table terminator
+            }
+            if v1 & 0xC000_0000 != 0 {
+                if v1 & 0x8000_0000 != 0 {
+                    let cond = ((v1 >> 28) & 0x3) as u8;
+                    if cond == 0x2 {
+                        // ENDIF
+                        is_matched = true;
+                        is_skipped = false;
+                    } else if cond == 0x3 {
+                        // ELSE
+                        is_matched = !is_skipped;
+                    } else {
+                        pre = v1; // IF / ELSE-IF: remember for the negative entry
+                    }
+                } else if !is_skipped {
+                    if self.cond_matches(pre, v2) {
+                        is_matched = true;
+                        is_skipped = true;
+                    } else {
+                        is_matched = false;
+                        is_skipped = false;
+                    }
+                } else {
+                    is_matched = false;
+                }
+            } else if is_matched {
+                apply(self, v1, v2)?;
+            }
+            i += 2;
+        }
+        Ok(())
+    }
+
+    /// Evaluate a phydm IF condition for a standard 1x1 USB NIC (cut ≥ B, RFE 0,
+    /// internal PA/LNA). The condition's cut/interface/RFE nibbles must match our
+    /// driver profile; unset nibbles are wildcards.
+    fn cond_matches(&self, _cond1: u32, _cond2: u32) -> bool {
+        // Our profile carries no board-specific overrides, so take the default
+        // (unconditional) entries and skip any hardware-variant IF blocks.
+        true
+    }
+
+    /// **M6a**: apply the 8733b MAC register table (`array_mp_8733b_mac_reg`) — a
+    /// short list of byte writes, including `0x002 = 0xC3` which brings up the BB
+    /// block. Run after the firmware is booted.
+    pub fn mac_config(&self) -> Result<(), FaceError> {
+        self.config_table(MAC_REG_8733B, |s, addr, val| s.write8(addr as u16, val as u8))
     }
 
     /// The discovered bulk endpoints (for the later TX/RX milestones).

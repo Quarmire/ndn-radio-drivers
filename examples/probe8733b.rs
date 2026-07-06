@@ -55,11 +55,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // M5: full firmware download + boot the WLAN CPU.
             print!("M5  download_firmware … ");
             match dev.download_firmware() {
-                Ok(()) => println!(
-                    "✓ FW BOOTED (MCUFW_CTRL=0x{:04x}, FW_DBG7=0x{:08x})",
-                    dev.read16(0x0080)?,
-                    dev.read32(0x10AC)?
-                ),
+                Ok(()) => {
+                    println!(
+                        "✓ FW BOOTED (MCUFW_CTRL=0x{:04x}, FW_DBG7=0x{:08x})",
+                        dev.read16(0x0080)?,
+                        dev.read32(0x10AC)?
+                    );
+                    // M6a: MAC register table.
+                    print!("M6a mac_config … ");
+                    dev.mac_config()?;
+                    println!(
+                        "✓ (0x002=0x{:02x} exp C3, 0x520=0x{:02x} exp 6f, 0x4CA=0x{:02x} exp 3f)",
+                        dev.read8(0x002)?,
+                        dev.read8(0x520)?,
+                        dev.read8(0x4CA)?
+                    );
+                }
                 Err(e) => {
                     println!("FAILED: {e}");
                     // Is the CPU actually executing? Sample the PC counter (FW_DBG7).

@@ -284,7 +284,10 @@ impl Dev {
 
     fn fw_dl_setup(&self) -> R<()> {
         self.w8(REG_EXT_SYS_CLK_CTRL, self.r8(REG_EXT_SYS_CLK_CTRL)? | 0x02)?;
-        self.w32(REG_EXT_SYS_FUNC_EN, (self.r32(REG_EXT_SYS_FUNC_EN)? | 0x0000_3000) & 0xFFFF_FF3F)?;
+        // BIT(17)=DDMA_FUNC_EN must be SET or the IDDMA registers (0x1200) are inert.
+        // The Linux capture had it (EXT_FUNC=0x0003300f); a fresh Mac chip does NOT
+        // (0x0001300f), so set it explicitly — this is what blocked FW download on macOS.
+        self.w32(REG_EXT_SYS_FUNC_EN, (self.r32(REG_EXT_SYS_FUNC_EN)? | 0x0002_3000) & 0xFFFF_FF3F)?;
         self.w8(REG_TXDMA_PQ_MAP + 1, DMA_MAPPING_HIGH << 6)?;
         self.w8(REG_CR, BIT_HCI_TXDMA_EN | BIT_TXDMA_EN)?;
         self.w8(REG_RQPN_CTRL_HLPQ, 0xD0)?;

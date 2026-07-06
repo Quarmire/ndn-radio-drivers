@@ -469,9 +469,14 @@ impl Rtl8733buBackend {
     /// disable beacon functions. (The prologue of the vendor `download_firmware`.)
     pub fn fw_dl_setup(&self) -> Result<(), FaceError> {
         self.write8(REG_EXT_SYS_CLK_CTRL, self.read8(REG_EXT_SYS_CLK_CTRL)? | 0x02)?;
+        // BIT(17) = DDMA_FUNC_EN gates the IDDMA registers (0x1200): if it is clear the
+        // DMA engine is inert and the firmware never reaches IMEM. The Linux capture had
+        // it set (EXT_FUNC=0x0003300f) by power-on default; a fresh macOS-side chip has
+        // it clear (0x0001300f), which is exactly what blocked FW download on macOS —
+        // set it explicitly so both platforms enable the DMA.
         self.write32(
             REG_EXT_SYS_FUNC_EN,
-            (self.read32(REG_EXT_SYS_FUNC_EN)? | 0x0000_3000) & 0xFFFF_FF3F,
+            (self.read32(REG_EXT_SYS_FUNC_EN)? | 0x0002_3000) & 0xFFFF_FF3F,
         )?;
         self.write8(REG_TXDMA_PQ_MAP + 1, DMA_MAPPING_HIGH << 6)?; // HIQ hi-priority
         self.write8(REG_CR, BIT_HCI_TXDMA_EN | BIT_TXDMA_EN)?; // TXDMA on
@@ -553,9 +558,13 @@ impl Rtl8733buBackend {
     /// `start_dlfw` / `dlfw_end_flow`, verified against a usbmon capture.)
     ///
     /// Verified on Linux: `MCUFW_CTRL=0xe079` (bit 15 booted) + a live `FW_DBG7` PC.
-    /// NOTE: on macOS the identical flow downloads and passes both checksums but the
-    /// CPU never boots (`MCUFW_CTRL` stuck at `0x6078`) — a macOS USB-stack timing
-    /// quirk in the bulk/control interleave, not a logic error. Run this on Linux.
+    ///
+    /// Works on macOS too, after fixing two platform issues: (1) macOS caps bulk-OUT
+    /// transfers at 4096 B, so a 4096-byte chunk (4136 with the txdesc) lost its tail —
+    /// fixed by [`FW_CHUNK`] = 2048. (2) The IDDMA registers (0x1200) appeared inert on
+    /// macOS because `DDMA_FUNC_EN` (BIT(17) of `REG_EXT_SYS_FUNC_EN`) was clear — the
+    /// Linux/OPi chip had it set by power-on default, a fresh macOS-side chip did not —
+    /// so `fw_dl_setup` now sets it explicitly. Verified on both: `MCUFW_CTRL=0xe079`.
     pub fn download_firmware(&self) -> Result<(), FaceError> {
         let hdr = Self::fw_header()?;
         let fw = FW_NIC_8733B;

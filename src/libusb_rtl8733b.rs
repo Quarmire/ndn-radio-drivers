@@ -145,23 +145,29 @@ const REG_FWHW_TXQ_CTRL: u16 = 0x0420; // +2 bit6 = bcn-queue enable
 const REG_BCN_CTRL: u16 = 0x0550;
 const REG_EXT_SYS_FUNC_EN: u16 = 0x1000;
 const REG_EXT_SYS_CLK_CTRL: u16 = 0x1008;
-const QSLT_MGNT: u32 = 0x12; // management queue-select for the download descriptor
+const QSLT_BEACON: u32 = 0x10; // beacon queue-select — the vendor's download qsel
 const DMA_MAPPING_HIGH: u8 = 3; // HALMAC_DMA_MAPPING_HIGH — HIQ priority
 const BIT_HCI_TXDMA_EN: u8 = 0x01; // REG_CR BIT(0)
 const BIT_TXDMA_EN: u8 = 0x04; // REG_CR BIT(2)
 
-/// Build the 40-byte TX descriptor for a reserved-page download packet: payload
-/// length in TXPKTSIZE, header length in OFFSET, management queue-select. (Per
-/// the vendor `fill_fake_txdesc`; rate fields are irrelevant — the packet is
-/// stored in the beacon page, not transmitted.)
+/// Build the 40-byte TX descriptor for a reserved-page download packet, exactly as
+/// the vendor `usb_write_data_not_xmitframe` → `rtl8733b_cal_txdesc_chksum`:
+/// TXPKTSIZE + OFFSET(=40) in dword0, QSEL=BEACON in dword1, and a TX-descriptor
+/// checksum at offset 0x1C = `~(XOR of the 40-byte descriptor's u16 words)`. The
+/// checksum is mandatory: the hardware silently drops packets with a wrong one
+/// (verified on air against the reference driver's usbmon capture).
 fn download_txdesc(payload_len: usize) -> [u8; TX_DESC_SIZE] {
     let mut d = [0u8; TX_DESC_SIZE];
-    // dword0: [0:16] TXPKTSIZE, [16:24] OFFSET
     let dw0 = (payload_len as u32 & 0xFFFF) | ((TX_DESC_SIZE as u32 & 0xFF) << 16);
     d[0..4].copy_from_slice(&dw0.to_le_bytes());
-    // dword1: [8:13] QSEL
-    let dw1 = (QSLT_MGNT & 0x1F) << 8;
+    let dw1 = (QSLT_BEACON & 0x1F) << 8;
     d[4..8].copy_from_slice(&dw1.to_le_bytes());
+    // Checksum: field at 0x1C stays 0 while XORing the 20 little-endian u16 words.
+    let mut ck: u16 = 0;
+    for i in 0..TX_DESC_SIZE / 2 {
+        ck ^= u16::from_le_bytes([d[2 * i], d[2 * i + 1]]);
+    }
+    d[0x1C..0x1E].copy_from_slice(&(!ck).to_le_bytes());
     d
 }
 
@@ -463,9 +469,10 @@ impl Rtl8733buBackend {
         if pkt.len() % 512 == 0 {
             pkt.push(0);
         }
-        // The reserved-page/HIQ write goes to the highest-priority OUT endpoint
-        // (the last one), not the default data endpoint.
-        let ep = *self.bulk_outs.last().unwrap_or(&self.bulk_out);
+        // The beacon/reserved-page write goes to the HIGH-priority queue, which maps
+        // to bulkout_id 0 = the FIRST OUT endpoint (verified against the reference
+        // driver's usbmon capture — Bo:…:ep5, the lowest-numbered OUT ep).
+        let ep = *self.bulk_outs.first().unwrap_or(&self.bulk_out);
         let wrote = self
             .handle
             .write_bulk(ep, &pkt, Duration::from_secs(1))
@@ -568,16 +575,17 @@ mod golden {
     }
 
     /// The reserved-page download descriptor for a 64-byte payload — golden bytes
-    /// plus the field decode (TXPKTSIZE / OFFSET / QSEL).
+    /// (TXPKTSIZE / OFFSET=40 / QSEL=BEACON) + the TX-desc checksum at 0x1C. The
+    /// checksum = ~(XOR of the u16 words): word0 0x0040 ^ word2 0x0028 (OFFSET) ^
+    /// word2 0x1000 (QSEL) = 0x1068 → ~ = 0xEF97 (LE bytes 97 EF).
     #[test]
     fn download_txdesc_golden() {
         let d = download_txdesc(64);
-        let mut want = [0u8; TX_DESC_SIZE];
-        want[..8].copy_from_slice(&[0x40, 0x00, 0x28, 0x00, 0x00, 0x12, 0x00, 0x00]);
-        assert_eq!(d, want, "download_txdesc(64) golden bytes");
+        assert_eq!(&d[..8], &[0x40, 0x00, 0x28, 0x00, 0x00, 0x10, 0x00, 0x00], "dw0/dw1");
+        assert_eq!(&d[0x1C..0x1E], &[0x97, 0xEF], "TX-desc checksum (~XOR)");
         assert_eq!(u16::from_le_bytes([d[0], d[1]]), 64, "TXPKTSIZE = payload len");
-        assert_eq!(d[2], TX_DESC_SIZE as u8, "OFFSET = descriptor size");
+        assert_eq!(d[2], TX_DESC_SIZE as u8, "OFFSET = descriptor size (40)");
         let qsel = (u32::from_le_bytes([d[4], d[5], d[6], d[7]]) >> 8) & 0x1F;
-        assert_eq!(qsel, QSLT_MGNT & 0x1F, "QSEL = management queue");
+        assert_eq!(qsel, QSLT_BEACON & 0x1F, "QSEL = beacon queue");
     }
 }

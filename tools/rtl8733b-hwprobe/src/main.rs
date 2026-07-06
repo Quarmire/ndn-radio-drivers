@@ -48,6 +48,12 @@ const REG_FWHW_TXQ_CTRL: u16 = 0x0420;
 const REG_BCN_CTRL: u16 = 0x0550;
 const REG_EXT_SYS_FUNC_EN: u16 = 0x1000;
 const REG_EXT_SYS_CLK_CTRL: u16 = 0x1008;
+const REG_TXDMA_STATUS: u16 = 0x0210;
+const REG_DDMA_CH0SA: u16 = 0x1200;
+const REG_DDMA_CH0DA: u16 = 0x1204;
+const REG_DDMA_CH0CTRL: u16 = 0x1208;
+const IDDMA_SRC: u32 = 0x1878_0028; // OCPBASE_TXBUF + 40 (skip txdesc)
+static FW_NIC: &[u8] = include_bytes!("../../../fw/rtl8733b_fw_nic.bin");
 const QSLT_BEACON: u32 = 0x10; // vendor uses BEACON qsel for the rsvd-page download
 const DMA_MAPPING_HIGH: u8 = 3;
 const BIT_HCI_TXDMA_EN: u8 = 0x01;
@@ -349,6 +355,101 @@ impl Dev {
             Ok(()) => Err("BCN_VALID poll timeout".into()),
         }
     }
+
+    // ---- M5: full firmware download (identical flow to the driver) ----
+    fn download_firmware(&self) -> R<()> {
+        let fw = FW_NIC;
+        let dmem_addr = u32::from_le_bytes([fw[32], fw[33], fw[34], fw[35]]);
+        let dmem_size = u32::from_le_bytes([fw[36], fw[37], fw[38], fw[39]]) as usize;
+        let imem_size = u32::from_le_bytes([fw[48], fw[49], fw[50], fw[51]]) as usize;
+        let imem_addr = u32::from_le_bytes([fw[60], fw[61], fw[62], fw[63]]);
+
+        // cpu_en(0)
+        let v = self.r8(REG_SYS_FUNC_EN + 1)?;
+        self.w8(REG_SYS_FUNC_EN + 1, v & !(1 << 2))?;
+        // pltfm_reset: toggle 0x1002 BIT0
+        let r = self.r8(REG_EXT_SYS_FUNC_EN + 2)?;
+        self.w8(REG_EXT_SYS_FUNC_EN + 2, r & !1)?;
+        let r = self.r8(REG_EXT_SYS_FUNC_EN + 2)?;
+        self.w8(REG_EXT_SYS_FUNC_EN + 2, r | 1)?;
+        // MCUFW download-enable + MCU boot-select bit13
+        let m = self.r16(REG_MCUFW_CTRL)? & 0x3800;
+        self.w16(REG_MCUFW_CTRL, m | 0x2000 | 0x0001)?;
+
+        let hdr = 64;
+        let dlen = dmem_size + 8;
+        let ilen = imem_size + 8;
+        self.dlfw_section(&fw[hdr..hdr + dlen], dmem_addr)?;
+        self.dlfw_section(&fw[hdr + dlen..hdr + dlen + ilen], imem_addr)?;
+        self.dlfw_end_flow()
+    }
+
+    fn dlfw_section(&self, data: &[u8], dest: u32) -> R<()> {
+        let ctrl = self.r32(REG_DDMA_CH0CTRL)?;
+        self.w32(REG_DDMA_CH0CTRL, ctrl | (1 << 25))?; // reset chksum
+        let ep = *self.bulk_outs.first().unwrap();
+        let (mut off, mut first) = (0usize, true);
+        while off < data.len() {
+            let n = 4096.min(data.len() - off);
+            self.dl_rsvd_page(0, &data[off..off + n], ep, QSLT_BEACON)?;
+            self.iddma(dest + off as u32, n as u32, first)?;
+            off += n;
+            first = false;
+        }
+        if self.r32(REG_DDMA_CH0CTRL)? & (1 << 27) != 0 {
+            return Err(format!("section @0x{dest:08x} checksum error").into());
+        }
+        let bits = if dest >= 0x1420_0000 { 0x60 } else { 0x18 };
+        let v = self.r8(REG_MCUFW_CTRL)?;
+        self.w8(REG_MCUFW_CTRL, v | bits)?;
+        Ok(())
+    }
+
+    fn iddma(&self, dest: u32, len: u32, first: bool) -> R<()> {
+        self.poll_ddma()?;
+        let mut ctrl = (1u32 << 31) | (1 << 29) | (len & 0x3FFFF);
+        if !first {
+            ctrl |= 1 << 24;
+        }
+        self.w32(REG_DDMA_CH0SA, IDDMA_SRC)?;
+        self.w32(REG_DDMA_CH0DA, dest)?;
+        self.w32(REG_DDMA_CH0CTRL, ctrl)?;
+        self.poll_ddma()
+    }
+
+    fn poll_ddma(&self) -> R<()> {
+        let deadline = Instant::now() + Duration::from_millis(200);
+        while Instant::now() < deadline {
+            if self.r32(REG_DDMA_CH0CTRL)? & (1 << 31) == 0 {
+                return Ok(());
+            }
+        }
+        Err("IDDMA OWN timeout".into())
+    }
+
+    fn dlfw_end_flow(&self) -> R<()> {
+        self.w8(REG_TXDMA_PQ_MAP + 1, 0)?;
+        self.w8(REG_CR, 0)?;
+        self.w8(REG_RQPN_CTRL_HLPQ, 0)?;
+        self.w8(REG_RQPN_CTRL_HLPQ + 1, 0)?;
+        self.w8(REG_RQPN_CTRL_HLPQ + 2, 0)?;
+        self.w8(REG_BCN_CTRL, 0x14)?;
+        self.w32(REG_TXDMA_STATUS, 0x0004)?;
+        let fw = self.r16(REG_MCUFW_CTRL)?;
+        if fw & 0x50 != 0x50 {
+            return Err(format!("checksums not ok 0x{fw:04x}").into());
+        }
+        self.w16(REG_MCUFW_CTRL, (fw | 0x4000) & !1)?;
+        let v = self.r8(REG_SYS_FUNC_EN + 1)?;
+        self.w8(REG_SYS_FUNC_EN + 1, v | (1 << 2))?;
+        let deadline = Instant::now() + Duration::from_millis(300);
+        while Instant::now() < deadline {
+            if self.r16(REG_MCUFW_CTRL)? & 0xC078 == 0xC078 {
+                return Ok(());
+            }
+        }
+        Err(format!("fw-ready timeout MCUFW=0x{:04x}", self.r16(REG_MCUFW_CTRL)?).into())
+    }
 }
 
 fn main() -> R<()> {
@@ -395,5 +496,18 @@ fn main() -> R<()> {
     }
     println!("pktbuf scan: {found} bytes of 0xA5 in first 4KB → write {} land",
         if found >= 64 { "DID" } else { "did NOT" });
+
+    // M5: full firmware download + boot (run under usbmon for the self-diff).
+    if std::env::var("M5").is_ok() {
+        match dev.download_firmware() {
+            Ok(()) => println!("M5 FW BOOTED MCUFW=0x{:04x} FW_DBG7=0x{:08x}", dev.r16(0x0080)?, dev.r32(0x10AC)?),
+            Err(e) => {
+                println!("M5 download_firmware: {e}");
+                for _ in 0..3 {
+                    println!("  MCUFW=0x{:04x} FW_DBG7=0x{:08x}", dev.r16(0x0080)?, dev.r32(0x10AC)?);
+                }
+            }
+        }
+    }
     Ok(())
 }

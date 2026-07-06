@@ -546,6 +546,11 @@ impl Rtl8733buBackend {
     /// checksums, then release the CPU and poll for firmware-ready. On success the
     /// on-chip WLAN CPU is running the NIC firmware. (Vendor `download_firmware` /
     /// `start_dlfw` / `dlfw_end_flow`, verified against a usbmon capture.)
+    ///
+    /// Verified on Linux: `MCUFW_CTRL=0xe079` (bit 15 booted) + a live `FW_DBG7` PC.
+    /// NOTE: on macOS the identical flow downloads and passes both checksums but the
+    /// CPU never boots (`MCUFW_CTRL` stuck at `0x6078`) — a macOS USB-stack timing
+    /// quirk in the bulk/control interleave, not a logic error. Run this on Linux.
     pub fn download_firmware(&self) -> Result<(), FaceError> {
         let hdr = Self::fw_header()?;
         let fw = FW_NIC_8733B;

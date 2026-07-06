@@ -278,14 +278,15 @@ fn main() -> R<()> {
     dev.trx_init()?;
     dev.fw_dl_setup()?;
     println!("M4  fw_dl_setup ok: CR=0x{:02x} EXT_FUNC=0x{:08x}", dev.r8(REG_CR)?, dev.r32(REG_EXT_SYS_FUNC_EN)?);
-    // QSEL sweep on the HIQ endpoint (write-succeeds mode): which queue-select
-    // routes the reserved page into the beacon buffer (raises BCN_VALID)?
+    // CLEAN BASELINE on a fresh chip: no pltfm_reset pulse (it toggles 0x1002 BIT0
+    // and kills the TX-DMA write — confirmed on a fresh Mac chip, not just a dirty
+    // one). Write succeeds; BCN_VALID does not assert — the remaining nut.
+    // NEXT (needs the card_dis power-off reset first, pwr_seq_8733b.c:795, for a
+    // reliable per-run reset): systematically find what arms BCN_VALID.
     let ep = *dev.bulk_outs.last().unwrap();
-    for (name, qsel) in [("BEACON", 0x10u32), ("HIGH", 0x11), ("MGNT", 0x12)] {
-        match dev.dl_rsvd_page(0x80, &[0u8; 64], ep, qsel) {
-            Ok(()) => println!("M4.5 QSEL {name} (0x{qsel:02x}) ep 0x{ep:02x}: BCN_VALID OK — DRAINED!"),
-            Err(e) => println!("M4.5 QSEL {name} (0x{qsel:02x}): {e}"),
-        }
+    match dev.dl_rsvd_page(0x80, &[0u8; 64], ep, 0x12) {
+        Ok(()) => println!("M4.5 dl_rsvd_page (MGNT): BCN_VALID OK — reserved-page DRAINED!"),
+        Err(e) => println!("M4.5 dl_rsvd_page (MGNT): {e}  (write ok on fresh chip → BCN_VALID is the nut)"),
     }
     Ok(())
 }

@@ -96,6 +96,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         ),
                         Err(e) => println!("FAILED: {e}"),
                     }
+                    // M7 part 1: IQK setup/teardown scaffold (accessors + backup/restore).
+                    print!("M7a iqk_setup_selftest … ");
+                    match dev.iqk_setup_selftest() {
+                        Ok((before, after)) => println!(
+                            "✓ (0x09f0 {before:08x}→{after:08x} restored={})",
+                            before == after
+                        ),
+                        Err(e) => println!("FAILED: {e}"),
+                    }
                 }
                 Err(e) => {
                     println!("FAILED: {e}");

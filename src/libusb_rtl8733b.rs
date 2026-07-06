@@ -946,6 +946,172 @@ fn io_err(msg: String) -> FaceError {
     FaceError::Io(std::io::Error::other(msg))
 }
 
+// ── M7: IQK (IQ-imbalance) calibration — faithful port of halrf_iqk_8733b.c ──
+// Part 1: masked BB/RF accessors, register backup/restore, AFE + preset setup.
+// (LOK → TXK → RXK → fill_iqk_xy follow in subsequent parts.)
+
+/// IQK register backup lists (halrf_iqk_8733b.c `_phy_iq_calibrate_8733b`).
+const IQK_MAC_REGS: [u16; 1] = [0x0520];
+const IQK_BB_REGS: [u16; 11] = [
+    0x09f0, 0x09b4, 0x1c38, 0x1860, 0x1cd0, 0x0824, 0x2a24, 0x1d40, 0x1c20, 0x1880, 0x180c,
+];
+const IQK_RF_REGS: [u32; 5] = [0x05, 0xde, 0xdf, 0xef, 0x1f];
+const RFREG_MASK: u32 = 0x000F_FFFF; // RF registers are 20-bit
+
+/// Backed-up register state, restored after calibration.
+#[derive(Default)]
+struct IqkBackup {
+    mac: [u32; 1],
+    bb: [u32; 11],
+    rf: [[u32; 2]; 5], // [reg][path]
+}
+
+impl Rtl8733buBackend {
+    /// Masked baseband read/write (`odm_get_bb_reg` / `odm_set_bb_reg`).
+    #[allow(dead_code)] // used by the LOK/TXK/RXK result reads (M7 part 2)
+    fn bb_get(&self, addr: u16, mask: u32) -> Result<u32, FaceError> {
+        Ok((self.read32(addr)? & mask) >> mask.trailing_zeros())
+    }
+    fn bb_set(&self, addr: u16, mask: u32, data: u32) -> Result<(), FaceError> {
+        if mask == 0xFFFF_FFFF {
+            self.write32(addr, data)
+        } else {
+            let sh = mask.trailing_zeros();
+            let v = (self.read32(addr)? & !mask) | ((data << sh) & mask);
+            self.write32(addr, v)
+        }
+    }
+
+    /// The BB-space window for a path-A/B RF register (0x3C00 / 0x4C00 base).
+    fn rf_win(path: u8, addr: u32) -> u16 {
+        ((if path == 0 { 0x3C00u32 } else { 0x4C00 }) + ((addr & 0xFF) << 2)) as u16
+    }
+    /// Masked RF read/write (`odm_get_rf_reg` / `odm_set_rf_reg`, 20-bit).
+    fn rf_get(&self, path: u8, addr: u32, mask: u32) -> Result<u32, FaceError> {
+        let v = self.read32(Self::rf_win(path, addr))? & RFREG_MASK;
+        Ok((v & mask) >> mask.trailing_zeros())
+    }
+    fn rf_set(&self, path: u8, addr: u32, mask: u32, data: u32) -> Result<(), FaceError> {
+        let m = mask & RFREG_MASK;
+        let w = Self::rf_win(path, addr);
+        let cur = self.read32(w)? & RFREG_MASK;
+        self.write32(w, (cur & !m) | ((data << m.trailing_zeros()) & m))?;
+        std::thread::sleep(Duration::from_micros(1));
+        Ok(())
+    }
+
+    /// Back up the MAC/BB/RF registers the IQK perturbs.
+    fn iqk_backup(&self) -> Result<IqkBackup, FaceError> {
+        let mut b = IqkBackup::default();
+        for (i, &r) in IQK_MAC_REGS.iter().enumerate() {
+            b.mac[i] = self.read32(r)?;
+        }
+        for (i, &r) in IQK_BB_REGS.iter().enumerate() {
+            b.bb[i] = self.read32(r)?;
+        }
+        for (i, &r) in IQK_RF_REGS.iter().enumerate() {
+            b.rf[i][0] = self.rf_get(0, r, RFREG_MASK)?;
+            b.rf[i][1] = self.rf_get(1, r, RFREG_MASK)?;
+        }
+        Ok(b)
+    }
+    fn iqk_restore(&self, b: &IqkBackup) -> Result<(), FaceError> {
+        for (i, &r) in IQK_MAC_REGS.iter().enumerate() {
+            self.write32(r, b.mac[i])?;
+        }
+        for (i, &r) in IQK_BB_REGS.iter().enumerate() {
+            self.write32(r, b.bb[i])?;
+        }
+        for (i, &r) in IQK_RF_REGS.iter().enumerate() {
+            self.rf_set(0, r, RFREG_MASK, b.rf[i][0])?;
+            self.rf_set(1, r, RFREG_MASK, b.rf[i][1])?;
+        }
+        Ok(())
+    }
+
+    /// AFE on/off for IQK mode (`_iqk_afe_setting_8733b`): ADDA on + clk gating +
+    /// CCA block for `do_iqk`, else restore normal AFE.
+    fn iqk_afe_setting(&self, do_iqk: bool) -> Result<(), FaceError> {
+        if do_iqk {
+            self.bb_set(0x1b08, 0xFFFF_FFFF, 0x80)?; // IQK/DPK KIP power on
+            self.bb_set(0x1e24, 1 << 31, 0)?;
+            self.bb_set(0x1e28, 0xF, 1)?;
+            self.bb_set(0x0824, 0x000F_0000, 1)?;
+            self.bb_set(0x1cd0, 0xF000_0000, 7)?; // IQK clk on
+            self.bb_set(0x2a24, 1 << 13, 1)?; // block CCK CCA
+            self.bb_set(0x1c68, 1 << 24, 1)?; // block OFDM CCA
+            self.bb_set(0x1864, 1 << 31, 1)?; // trx gating clk force on
+            self.bb_set(0x180c, 1 << 27, 1)?;
+            self.bb_set(0x180c, 1 << 30, 1)?;
+            self.bb_set(0x1e24, 1 << 17, 1)?;
+            self.bb_set(0x1c38, 0xFFFF_FFFF, 0x0)?; // ADDA fifo force off
+            self.bb_set(0x1830, 1 << 30, 0)?; // force ADDA
+            self.bb_set(0x1860, 0xF000_0000, 0xf)?; // ADDA all on
+            self.bb_set(0x1860, 0x0FFF_F000, 0x0041)?;
+            self.bb_set(0x09f0, 0x0000_FFFF, 0xbbbb)?; // DAC clk 80M
+            self.bb_set(0x1d40, 1 << 3, 1)?;
+            self.bb_set(0x1d40, 0x7, 3)?;
+            self.bb_set(0x09b4, 0x0000_0700, 3)?;
+            self.bb_set(0x09b4, 0x0000_3800, 3)?;
+            self.bb_set(0x09b4, 0x0001_C000, 3)?;
+            self.bb_set(0x09b4, 0x000E_0000, 3)?;
+            self.bb_set(0x1c20, 1 << 5, 1)?;
+            self.bb_set(0x1c38, 0xFFFF_FFFF, 0xFFFF_FFFF)?; // release ADDA fifo
+        } else {
+            self.bb_set(0x1c38, 0xFFFF_FFFF, 0xffa1_005e)?;
+            self.bb_set(0x1830, 1 << 30, 1)?;
+            self.bb_set(0x1e24, 1 << 31, 1)?;
+            self.bb_set(0x2a24, 1 << 13, 0)?;
+            self.bb_set(0x1c68, 1 << 24, 0)?;
+            self.bb_set(0x1864, 1 << 31, 0)?;
+            self.bb_set(0x180c, 1 << 27, 0)?;
+            self.bb_set(0x180c, 1 << 30, 0)?;
+            self.bb_set(0x1880, 1 << 21, 0)?;
+        }
+        Ok(())
+    }
+
+    /// IQK preset / register restore (`_iqk_preset_8733b`).
+    fn iqk_preset(&self, do_iqk: bool) -> Result<(), FaceError> {
+        if do_iqk {
+            self.rf_set(0, 0x05, 1 << 0, 0)?; // RF not controlled by BB
+            self.rf_set(1, 0x05, 1 << 0, 0)?;
+        } else {
+            self.rf_set(0, 0x05, 1 << 0, 1)?;
+            self.rf_set(1, 0x05, 1 << 0, 1)?;
+            self.rf_set(0, 0xdf, 1 << 12, 0)?;
+            self.rf_set(1, 0xdf, 1 << 12, 0)?;
+            self.rf_set(0, 0xef, 1 << 2, 0)?;
+            self.rf_set(1, 0xef, 1 << 2, 0)?;
+            self.rf_set(0, 0xde, 0xFE000, 0)?;
+            self.rf_set(1, 0xde, 0xFE000, 0)?;
+            self.rf_set(0, 0xef, 1 << 2, 0)?;
+            self.rf_set(1, 0xef, 1 << 2, 0)?;
+            self.bb_set(0x1b08, 0xFFFF_FFFF, 0)?;
+            self.bb_set(0x1b34, 0x0000_007C, 0)?;
+            self.bb_set(0x1b38, 1 << 0, 0)?;
+            self.bb_set(0x1bb8, 0xFFFF_FFFF, 0)?;
+            self.bb_set(0x1bcc, 0x0000_003F, 0)?;
+        }
+        Ok(())
+    }
+
+    /// **M7 (part 1) self-test**: exercise the IQK setup/teardown scaffold —
+    /// backup → AFE-on → preset-on → preset-off → AFE-off → restore — and confirm
+    /// the backed-up registers round-trip. The LOK/TXK/RXK measurement core lands
+    /// in later parts; this validates the accessors + backup/restore on hardware.
+    pub fn iqk_setup_selftest(&self) -> Result<(u32, u32), FaceError> {
+        let probe = self.read32(IQK_BB_REGS[0])?;
+        let backup = self.iqk_backup()?;
+        self.iqk_afe_setting(true)?;
+        self.iqk_preset(true)?;
+        self.iqk_preset(false)?;
+        self.iqk_afe_setting(false)?;
+        self.iqk_restore(&backup)?;
+        Ok((probe, self.read32(IQK_BB_REGS[0])?))
+    }
+}
+
 #[cfg(test)]
 mod golden {
     //! Golden-frame tests: pin the bytes the 8731bu/8733bu driver constructs and

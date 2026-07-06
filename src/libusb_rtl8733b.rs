@@ -138,7 +138,6 @@ const MAC_REG_8733B: &[u32] = &[
 /// little-endian `u32` `.bin`s.
 const PHY_REG_8733B: &[u8] = include_bytes!("../fw/rtl8733b/rtl8733b_phy_reg.bin");
 const AGC_TAB_8733B: &[u8] = include_bytes!("../fw/rtl8733b/rtl8733b_agc_tab.bin");
-#[allow(dead_code)] // M6c (RF/radioA via LSSI) — wired next
 const RADIOA_8733B: &[u8] = include_bytes!("../fw/rtl8733b/rtl8733b_radioa.bin");
 
 // FW header field offsets (halmac_fw_info.h).
@@ -836,6 +835,36 @@ impl Rtl8733buBackend {
         self.config_table_bin(PHY_REG_8733B, |s, a, d| s.bb_write(a, d))?;
         self.config_table_bin(AGC_TAB_8733B, |s, a, d| s.bb_write(a, d))?;
         Ok(())
+    }
+
+    /// One RF (radioA) write. The 8733b maps each path-A RF register directly into
+    /// the BB address space (`config_phydm_direct_write_rf_reg_8733b`): `RF[addr]`
+    /// → BB `0x3C00 + (addr<<2)`, a 20-bit (`RFREG_MASK`) value — no 3-wire LSSI.
+    /// `addr` may be a delay opcode.
+    fn rf_write(&self, addr: u32, data: u32) -> Result<(), FaceError> {
+        match addr {
+            0xffe => std::thread::sleep(Duration::from_millis(50)),
+            0xfe => std::thread::sleep(Duration::from_micros(100)),
+            0xffff => std::thread::sleep(Duration::from_micros(1)),
+            _ => {
+                let direct = (0x3C00 + ((addr & 0xFF) << 2)) as u16;
+                let v = (self.read32(direct)? & !0x000F_FFFF) | (data & 0x000F_FFFF);
+                self.write32(direct, v)?;
+                std::thread::sleep(Duration::from_micros(1));
+            }
+        }
+        Ok(())
+    }
+
+    /// **M6c**: RF init — apply the radioA table (`array_mp_8733b_radioa`) through the
+    /// direct RF-write window. Run after [`bb_config`].
+    pub fn rf_config(&self) -> Result<(), FaceError> {
+        self.config_table_bin(RADIOA_8733B, |s, a, d| s.rf_write(a, d))
+    }
+
+    /// Read a path-A RF register (for verifying [`rf_config`]) via the direct window.
+    pub fn rf_read(&self, addr: u32) -> Result<u32, FaceError> {
+        Ok(self.read32((0x3C00 + ((addr & 0xFF) << 2)) as u16)? & 0x000F_FFFF)
     }
 
     /// **M6a**: apply the 8733b MAC register table (`array_mp_8733b_mac_reg`) — a

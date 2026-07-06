@@ -78,6 +78,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         dev.read32(0x804)?,
                         dev.read32(0x808)?
                     );
+                    // M6c: RF/radioA.
+                    print!("M6c rf_config … ");
+                    dev.rf_config()?;
+                    println!(
+                        "✓ (RF-0x00=0x{:05x}, RF-0x18=0x{:05x})",
+                        dev.rf_read(0x00)?,
+                        dev.rf_read(0x18)?
+                    );
                 }
                 Err(e) => {
                     println!("FAILED: {e}");

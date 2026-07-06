@@ -35,6 +35,9 @@ const CTRL: Duration = Duration::from_millis(500);
 // Registers (halmac_reg_8733b, verified against the driver).
 const REG_SYS_FUNC_EN: u16 = 0x0002;
 const REG_MCUFW_CTRL: u16 = 0x0080;
+const REG_PKTBUF_DBG_CTRL: u16 = 0x0140;
+const REG_PKTBUF_DBG_DATA_L: u16 = 0x0144;
+const REG_PKTBUF_DBG_DATA_H: u16 = 0x0148;
 const REG_CR: u16 = 0x0100;
 const REG_SYS_CFG1: u16 = 0x00F0;
 const REG_SYS_CFG2: u16 = 0x00FC;
@@ -191,6 +194,27 @@ impl Dev {
         self.h.write_control(VENQT_WRITE, VENQT_REQ, a, 0, &v.to_le_bytes(), CTRL)?;
         Ok(())
     }
+    fn r16(&self, a: u16) -> R<u16> {
+        let mut b = [0u8; 2];
+        self.h.read_control(VENQT_READ, VENQT_REQ, a, 0, &mut b, CTRL)?;
+        Ok(u16::from_le_bytes(b))
+    }
+    fn w16(&self, a: u16, v: u16) -> R<()> {
+        self.h.write_control(VENQT_WRITE, VENQT_REQ, a, 0, &v.to_le_bytes(), CTRL)?;
+        Ok(())
+    }
+    /// Read 8 bytes from the TX/RX packet buffer at byte `addr` via the debug
+    /// window (REG_PKTBUF_DBG_CTRL selects the 8-byte unit; DATA_L/H return it).
+    fn read_pktbuf8(&self, addr: u32) -> R<[u8; 8]> {
+        let ctrl = self.r16(REG_PKTBUF_DBG_CTRL)? & 0xF000;
+        self.w16(REG_PKTBUF_DBG_CTRL, ((addr >> 3) as u16 & 0x0FFF) | ctrl)?;
+        let lo = self.r32(REG_PKTBUF_DBG_DATA_L)?;
+        let hi = self.r32(REG_PKTBUF_DBG_DATA_H)?;
+        let mut b = [0u8; 8];
+        b[0..4].copy_from_slice(&lo.to_le_bytes());
+        b[4..8].copy_from_slice(&hi.to_le_bytes());
+        Ok(b)
+    }
 
     fn chip_version(&self) -> R<(u8, u8, u32)> {
         Ok((self.r8(REG_SYS_CFG2)?, self.r8(REG_SYS_CFG1 + 1)? >> 4, self.r32(REG_SYS_CFG1)?))
@@ -338,9 +362,22 @@ fn main() -> R<()> {
     // beacon/rsvd-page write must go to raise BCN_VALID.
     let ep = *dev.bulk_outs.first().unwrap();
     let mcufw = if std::env::var("MCUFW").is_ok() { "MCUFW" } else { "no-MCUFW" };
-    match dev.dl_rsvd_page(0x00, &[0xA5u8; 128], ep, QSLT_BEACON) {
-        Ok(()) => println!("M4.5 dl_rsvd_page (BEACON, pg=0, ep 0x{ep:02x}, {mcufw}): BCN_VALID OK — DRAINED!"),
-        Err(e) => println!("M4.5 dl_rsvd_page (BEACON, pg=0, ep 0x{ep:02x}, {mcufw}): {e}"),
+    let r = dev.dl_rsvd_page(0x00, &[0xA5u8; 128], ep, QSLT_BEACON);
+    println!("M4.5 dl_rsvd_page (BEACON, pg=0, ep 0x{ep:02x}, {mcufw}): {}",
+        match &r { Ok(()) => "BCN_VALID OK — DRAINED!".to_string(), Err(e) => e.to_string() });
+    // Decisive: did the 0xA5 payload actually land in the packet buffer? Scan the
+    // first 512 bytes (pg 0 area) for a run of 0xA5 — independent of BCN_VALID.
+    let mut found = 0;
+    for off in (0..512u32).step_by(8) {
+        if let Ok(b) = dev.read_pktbuf8(off) {
+            let n = b.iter().filter(|&&x| x == 0xA5).count();
+            found += n;
+            if off < 64 || n > 0 {
+                println!("  pktbuf[0x{off:03x}] = {b:02x?}");
+            }
+        }
     }
+    println!("pktbuf scan: {found} bytes of 0xA5 found → write {} land",
+        if found >= 64 { "DID" } else { "did NOT" });
     Ok(())
 }

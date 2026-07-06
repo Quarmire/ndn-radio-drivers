@@ -1,11 +1,24 @@
 //! RTL8731BU/8733BU hardware probe — the M4.5 reverse-engineering bench.
 //!
 //! Self-contained (rusb only) so it builds on the OPi via nix-shell against the
-//! real f72b. Carries the exact VENQT reg-I/O + M1–M4 sequence from the driver
-//! (`src/libusb_rtl8733b.rs`); reaching `dl_rsvd_page` reproduces the M4 blocker
-//! (reserved-page bulk write times out). M4.5 (`trx_init`) is the slot to fill:
-//! program the TX-FIFO page allocation + boundary + RQPN so the write drains.
-//! A sequence verified here ports back into the driver verbatim.
+//! real f72b. Carries the exact VENQT reg-I/O + M1–M4 sequence from the driver.
+//!
+//! M4.5 findings (mapped on silicon; the reserved-page write must raise BCN_VALID):
+//!  - BASELINE (cpu_en(0) + fw_dl_setup, MGNT desc, HIQ ep): bulk write SUCCEEDS,
+//!    but BCN_VALID never asserts — the packet lands in a TX queue, not the beacon
+//!    page. That's the nut to crack.
+//!  - Vendor order (download_firmware_87xx): EXT_CLK/IRAM → cpu_en(0) → PQ_MAP →
+//!    CR → RQPN(D0/00/20/80) → BCN_CTRL → pltfm_reset → start_dlfw(MCUFW BIT0 →
+//!    send_fwpkt → dl_rsvd_page). QSLT_BEACON=0x10 QSLT_HIGH=0x11 QSLT_MGNT=0x12.
+//!  - pltfm_reset = toggle BIT0 of 0x1002, THEN re-apply EXT_CLK/IRAM/PQ_MAP/CR/
+//!    RQPN (a full re-init, not just the pulse) — doing only the pulse breaks TX.
+//!  - MCUFW_CTRL(0x0080) BIT0 = FW-download mode; setting it makes the bulk write
+//!    stall (download DMA wants an allocated page) — needs the full pltfm_reset.
+//!  - CAUTION: MCUFW BIT0 + reset-pulses WEDGE the WLAN TX-DMA across runs; neither
+//!    software power_on, a MCUFW clear, nor a USB port reset recovers it — only a
+//!    PHYSICAL replug of the f72b does. Iterate with a power-cycle between attempts.
+//! NEXT: implement pltfm_reset's full re-apply body, then MCUFW, then dl_rsvd_page
+//! with QSLT_BEACON — on a freshly-replugged chip.
 
 use rusb::{Direction, TransferType};
 use std::time::{Duration, Instant};
@@ -81,11 +94,11 @@ const POWER_ON: &[Step] = &[
     s(W, 0x0077, 0xFF, 0x87),
 ];
 
-fn download_txdesc(payload_len: usize) -> [u8; TX_DESC_SIZE] {
+fn download_txdesc(payload_len: usize, qsel: u32) -> [u8; TX_DESC_SIZE] {
     let mut d = [0u8; TX_DESC_SIZE];
     let dw0 = (payload_len as u32 & 0xFFFF) | ((TX_DESC_SIZE as u32 & 0xFF) << 16);
     d[0..4].copy_from_slice(&dw0.to_le_bytes());
-    let dw1 = (QSLT_MGNT & 0x1F) << 8;
+    let dw1 = (qsel & 0x1F) << 8;
     d[4..8].copy_from_slice(&dw1.to_le_bytes());
     d
 }
@@ -97,6 +110,13 @@ struct Dev {
 
 impl Dev {
     fn open() -> R<Dev> {
+        // USB port reset first — re-enumerate the device to clear accumulated chip
+        // state from prior runs (no physical power-cycle available on the OPi).
+        if let Some(h0) = rusb::open_device_with_vid_pid(VID, PID) {
+            let _ = h0.reset();
+            drop(h0);
+            std::thread::sleep(Duration::from_millis(800));
+        }
         let h = rusb::open_device_with_vid_pid(VID, PID).ok_or("f72b not found")?;
         let dev = h.device();
         let cfg = dev.active_config_descriptor()?;
@@ -193,28 +213,16 @@ impl Dev {
         // wlan_cpu_en(0): disable the WLAN CPU (clear BIT2 of REG_SYS_FUNC_EN+1) so
         // it doesn't own the TX/beacon buffer during a manual reserved-page write —
         // the piece of the vendor download_firmware prologue our fw_dl_setup missed.
-        // Piece 1 — wlan_cpu_en(0): disable the WLAN CPU (clear BIT2 of
-        // REG_SYS_FUNC_EN+1) so it doesn't own the TX/beacon buffer. Verified this
-        // alone still leaves BCN_VALID low (write succeeds, validate times out).
+        // wlan_cpu_en(0): disable the WLAN CPU (clear BIT2 of SYS_FUNC_EN+1). The
+        // reset pulse (0x1002 BIT0 toggle) is NOT done here — it broke the write
+        // (all endpoints timed out); pltfm_reset needs its full re-apply body.
         let v = self.r8(REG_SYS_FUNC_EN + 1)?;
         self.w8(REG_SYS_FUNC_EN + 1, v & !(1 << 2))?;
-
-        // LEAD — Piece 2 (start_dlfw): FW-download-mode enable, REG_MCUFW_CTRL BIT0
-        // (mask 0x3800). Observed: setting this alone flips the failure from
-        // BCN_VALID-timeout to *bulk-write*-timeout — download mode expects the
-        // packet at an allocated page, so it needs Piece 3 too. Left off until then.
-        //   let hi = self.r8(REG_MCUFW_CTRL + 1)? & 0x38;
-        //   self.w8(REG_MCUFW_CTRL, 0x01)?; self.w8(REG_MCUFW_CTRL + 1, hi)?;
-
-        // TODO — Piece 3: the TX-FIFO page boundary (txff_alloc.rsvd_boundary via
-        // REG_FIFOPAGE/TDECTRL) so the download page is allocated; then re-enable
-        // Piece 2 and BCN_VALID should assert.
-        let _ = REG_MCUFW_CTRL;
-        println!("M4.5 wlan_cpu_en(0) applied (SYS_FUNC_EN+1 -> 0x{:02x})", self.r8(REG_SYS_FUNC_EN + 1)?);
+        println!("M4.5 cpu_en(0)");
         Ok(())
     }
 
-    fn dl_rsvd_page(&self, pg_addr: u8, data: &[u8]) -> R<()> {
+    fn dl_rsvd_page(&self, pg_addr: u8, data: &[u8], ep: u8, qsel: u32) -> R<()> {
         self.w8(REG_DWBCN0_CTRL + 1, pg_addr)?;
         self.w8(REG_DWBCN0_CTRL + 2, self.r8(REG_DWBCN0_CTRL + 2)? | 0x01)?;
         let cr1 = self.r8(REG_CR + 1)?;
@@ -223,13 +231,12 @@ impl Dev {
         self.w8(REG_FWHW_TXQ_CTRL + 2, txq2 & !(1 << 6))?;
 
         let mut pkt = Vec::with_capacity(TX_DESC_SIZE + data.len() + 1);
-        pkt.extend_from_slice(&download_txdesc(data.len()));
+        pkt.extend_from_slice(&download_txdesc(data.len(), qsel));
         pkt.extend_from_slice(data);
         if pkt.len() % 512 == 0 {
             pkt.push(0);
         }
-        let ep = *self.bulk_outs.last().ok_or("no bulk-OUT ep")?;
-        let wrote = self.h.write_bulk(ep, &pkt, Duration::from_secs(1));
+        let wrote = self.h.write_bulk(ep, &pkt, Duration::from_millis(600));
         let write_res = match wrote {
             Ok(n) if n == pkt.len() => Ok(()),
             Ok(n) => Err(format!("short bulk write {n}/{}", pkt.len())),
@@ -260,14 +267,25 @@ fn main() -> R<()> {
     let dev = Dev::open()?;
     let (id, ver, cfg1) = dev.chip_version()?;
     println!("M1  chip_id=0x{id:02x} chip_ver={ver} sys_cfg1=0x{cfg1:08x}  (golden id==0x16: {})", id == 0x16);
+    // Clear residual download-mode state left by prior runs (no remote power-cycle):
+    // MCUFW_CTRL BIT0 persists and puts the chip in FW-download mode → writes stall.
+    dev.w8(REG_MCUFW_CTRL, 0)?;
+    dev.w8(REG_MCUFW_CTRL + 1, 0)?;
     dev.power_on()?;
     println!("M2  power_on ok: powered={} CR=0x{:02x} func_en=0x{:02x}", dev.is_powered()?, dev.r8(REG_CR)?, dev.r8(REG_SYS_FUNC_EN)?);
+    // Vendor download order: cpu_en(0) + reset pulse, THEN (re-)apply the page
+    // config, THEN download-enable, THEN the reserved-page write.
+    dev.trx_init()?;
     dev.fw_dl_setup()?;
     println!("M4  fw_dl_setup ok: CR=0x{:02x} EXT_FUNC=0x{:08x}", dev.r8(REG_CR)?, dev.r32(REG_EXT_SYS_FUNC_EN)?);
-    dev.trx_init()?;
-    match dev.dl_rsvd_page(0x80, &[0u8; 64]) {
-        Ok(()) => println!("M4.5 dl_rsvd_page: BCN_VALID OK — reserved-page write DRAINED"),
-        Err(e) => println!("M4.5 dl_rsvd_page: {e}  (expected before trx_init is filled)"),
+    // QSEL sweep on the HIQ endpoint (write-succeeds mode): which queue-select
+    // routes the reserved page into the beacon buffer (raises BCN_VALID)?
+    let ep = *dev.bulk_outs.last().unwrap();
+    for (name, qsel) in [("BEACON", 0x10u32), ("HIGH", 0x11), ("MGNT", 0x12)] {
+        match dev.dl_rsvd_page(0x80, &[0u8; 64], ep, qsel) {
+            Ok(()) => println!("M4.5 QSEL {name} (0x{qsel:02x}) ep 0x{ep:02x}: BCN_VALID OK — DRAINED!"),
+            Err(e) => println!("M4.5 QSEL {name} (0x{qsel:02x}): {e}"),
+        }
     }
     Ok(())
 }

@@ -176,6 +176,12 @@ const REG_TXDMA_STATUS: u16 = 0x0210;
 const REG_DDMA_CH0SA: u16 = 0x1200; // DDMA ch0 source address
 const REG_DDMA_CH0DA: u16 = 0x1204; // DDMA ch0 destination address
 const REG_DDMA_CH0CTRL: u16 = 0x1208; // DDMA ch0 control
+// M6 tail — normal-mode TRX/queue init (init_trx_cfg_8733b).
+const REG_RQPN_NPQ: u16 = 0x0214;
+const REG_BCNQ_BDNY: u16 = 0x0424;
+const REG_BCNQ2_BDNY: u16 = 0x0455;
+const REG_AUTO_LLT: u16 = 0x0224;
+const REG_TXDMA_OFFSET_CHK: u16 = 0x020C;
 const IDDMA_SRC: u32 = 0x1878_0028; // OCPBASE_TXBUF + 40 (skip the txdesc); constant per capture
 const DDMA_OWN: u32 = 1 << 31; // BIT_DDMACH0_OWN (start / busy)
 const DDMA_CHKSUM_EN: u32 = 1 << 29; // BIT_DDMACH0_CHKSUM_EN
@@ -865,6 +871,44 @@ impl Rtl8733buBackend {
     /// Read a path-A RF register (for verifying [`rf_config`]) via the direct window.
     pub fn rf_read(&self, addr: u32) -> Result<u32, FaceError> {
         Ok(self.read32((0x3C00 + ((addr & 0xFF) << 2)) as u16)? & 0x000F_FFFF)
+    }
+
+    /// **M6 tail**: normal-mode TRX/queue init (`init_trx_cfg_8733b`). Switches the
+    /// download-mode page/RQPN config over to the normal-operation layout so the data
+    /// path can run: queue→DMA map, enable all TRX, normal RQPN + reserved-page
+    /// boundary, then the hardware auto-LLT (poll `REG_AUTO_LLT` BIT16 until it
+    /// clears). All values are the reference driver's, taken from its usbmon capture.
+    /// Run after the BB/RF tables ([`rf_config`]).
+    pub fn init_trx(&self) -> Result<(), FaceError> {
+        self.write16(REG_TXDMA_PQ_MAP, 0xF5A0)?; // queue → DMA mapping (normal)
+        self.write8(REG_CR, 0x00)?;
+        self.write8(REG_CR, 0xFF)?; // MAC_TRX_ENABLE — enable all TX/RX engines
+        // RQPN: high=8, low=8, pub=211; normal=8, extra=0; then trigger.
+        self.write32(REG_RQPN_CTRL_HLPQ, 0x00D3_0808)?;
+        self.write32(REG_RQPN_NPQ, 0x0000_0008)?;
+        self.write8(REG_RQPN_CTRL_HLPQ + 3, 0x80)?;
+        // Reserved-page boundary (236) across the beacon-queue boundary regs.
+        self.write8(REG_DWBCN0_CTRL + 1, 0xEC)?;
+        self.write8(REG_BCNQ_BDNY, 0xEC)?;
+        self.write8(REG_BCNQ2_BDNY, 0xEC)?;
+        // Block-descriptor count + TXDMA offset check.
+        self.write8(REG_DWBCN0_CTRL, 0x30)?;
+        self.write16(REG_TXDMA_OFFSET_CHK, 0x0200)?; // +1 BIT1
+        // Hardware auto-LLT: set BIT16 (+ params), poll until it self-clears.
+        self.write32(REG_AUTO_LLT, 0x0001_2020)?;
+        let deadline = Instant::now() + Duration::from_millis(200);
+        let mut done = false;
+        while Instant::now() < deadline {
+            if self.read32(REG_AUTO_LLT)? & (1 << 16) == 0 {
+                done = true;
+                break;
+            }
+        }
+        if !done {
+            return Err(io_err("init_trx: AUTO_LLT BIT16 poll timeout".into()));
+        }
+        self.write8(REG_CR + 3, 0x00)?; // transfer mode = normal
+        Ok(())
     }
 
     /// **M6a**: apply the 8733b MAC register table (`array_mp_8733b_mac_reg`) — a

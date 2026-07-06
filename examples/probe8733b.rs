@@ -86,6 +86,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         dev.rf_read(0x00)?,
                         dev.rf_read(0x18)?
                     );
+                    // M6 tail: normal-mode TRX/queue init (auto-LLT completion validates).
+                    print!("M6d init_trx … ");
+                    match dev.init_trx() {
+                        Ok(()) => println!(
+                            "✓ LLT done (CR=0x{:02x} exp ff, RQPN=0x{:08x})",
+                            dev.read8(0x0100)?,
+                            dev.read32(0x0200)?
+                        ),
+                        Err(e) => println!("FAILED: {e}"),
+                    }
                 }
                 Err(e) => {
                     println!("FAILED: {e}");

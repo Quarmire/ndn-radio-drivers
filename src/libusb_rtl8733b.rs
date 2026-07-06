@@ -150,6 +150,23 @@ const DMA_MAPPING_HIGH: u8 = 3; // HALMAC_DMA_MAPPING_HIGH — HIQ priority
 const BIT_HCI_TXDMA_EN: u8 = 0x01; // REG_CR BIT(0)
 const BIT_TXDMA_EN: u8 = 0x04; // REG_CR BIT(2)
 
+// M5 firmware download — the IDDMA (internal DMA) copy from the reserved-page
+// packet buffer into the CPU's IMEM/DMEM, then the boot handshake. Register
+// addresses + values verified against the reference driver's usbmon capture.
+const REG_MCUFW_CTRL: u16 = 0x0080;
+const REG_TXDMA_STATUS: u16 = 0x0210;
+const REG_DDMA_CH0SA: u16 = 0x1200; // DDMA ch0 source address
+const REG_DDMA_CH0DA: u16 = 0x1204; // DDMA ch0 destination address
+const REG_DDMA_CH0CTRL: u16 = 0x1208; // DDMA ch0 control
+const IDDMA_SRC: u32 = 0x1878_0028; // OCPBASE_TXBUF + 40 (skip the txdesc); constant per capture
+const DDMA_OWN: u32 = 1 << 31; // BIT_DDMACH0_OWN (start / busy)
+const DDMA_CHKSUM_EN: u32 = 1 << 29; // BIT_DDMACH0_CHKSUM_EN
+const DDMA_CHKSUM_STS: u32 = 1 << 27; // BIT_DDMACH0_CHKSUM_STS (1 = error)
+const DDMA_RESET_CHKSUM: u32 = 1 << 25; // BIT_DDMACH0_RESET_CHKSUM_STS
+const DDMA_CHKSUM_CONT: u32 = 1 << 24; // BIT_DDMACH0_CHKSUM_CONT
+const DDMA_DLEN_MASK: u32 = 0x3FFFF; // 18-bit length
+const FW_CHUNK: usize = 4096; // reserved-page chunk size (per capture)
+
 /// Build the 40-byte TX descriptor for a reserved-page download packet, exactly as
 /// the vendor `usb_write_data_not_xmitframe` → `rtl8733b_cal_txdesc_chksum`:
 /// TXPKTSIZE + OFFSET(=40) in dword0, QSEL=BEACON in dword1, and a TX-descriptor
@@ -329,6 +346,23 @@ impl Rtl8733buBackend {
         Ok(u32::from_le_bytes(buf))
     }
 
+    /// Read a 16-bit register (little-endian on the wire).
+    pub fn read16(&self, addr: u16) -> Result<u16, FaceError> {
+        let mut buf = [0u8; 2];
+        self.handle
+            .read_control(VENQT_READ, VENQT_REQ, addr, 0, &mut buf, CTRL_TIMEOUT)
+            .map_err(usb_err)?;
+        Ok(u16::from_le_bytes(buf))
+    }
+
+    /// Write a 16-bit register (little-endian on the wire).
+    pub fn write16(&self, addr: u16, val: u16) -> Result<(), FaceError> {
+        self.handle
+            .write_control(VENQT_WRITE, VENQT_REQ, addr, 0, &val.to_le_bytes(), CTRL_TIMEOUT)
+            .map_err(usb_err)?;
+        Ok(())
+    }
+
     /// Write one register byte over the `VENQT` control pipe.
     pub fn write8(&self, addr: u16, val: u8) -> Result<(), FaceError> {
         self.handle
@@ -504,6 +538,143 @@ impl Rtl8733buBackend {
         } else {
             Err(io_err("dl_rsvd_page: BCN_VALID poll timeout".into()))
         }
+    }
+
+    /// **M5**: download the firmware and boot the WLAN CPU. Enable download mode,
+    /// push each memory section (DMEM then IMEM) to the reserved page in 4 KB
+    /// chunks and IDDMA-copy it into the CPU's IMEM/DMEM, verify per-section
+    /// checksums, then release the CPU and poll for firmware-ready. On success the
+    /// on-chip WLAN CPU is running the NIC firmware. (Vendor `download_firmware` /
+    /// `start_dlfw` / `dlfw_end_flow`, verified against a usbmon capture.)
+    pub fn download_firmware(&self) -> Result<(), FaceError> {
+        let hdr = Self::fw_header()?;
+        let fw = FW_NIC_8733B;
+
+        // Extra init the reference driver performs around FW download (from the
+        // usbmon capture): a clock/PLL reg (0x0073), the C2H-event reg (0x01A0 =
+        // REG_C2HEVT), and a CPU-region reg (0x1103). One of these gates the CPU boot.
+        self.write8(0x0073, 0x04)?;
+        self.write8(0x01A0, 0xFD)?;
+        self.write8(0x1103, 0x0C)?;
+
+        // wlan_cpu_en(0): hold the WLAN CPU off during the download.
+        let v = self.read8(REG_SYS_FUNC_EN + 1)?;
+        self.write8(REG_SYS_FUNC_EN + 1, v & !(1 << 2))?;
+
+        // pltfm_reset: toggle BIT0 of REG_EXT_SYS_FUNC_EN+2 (0x1002), clear then set —
+        // the platform reset the vendor does after fw_dl_setup and before download
+        // mode. Without it the CPU never boots (bit 15 stays clear) even though the
+        // download and checksums pass.
+        let r = self.read8(REG_EXT_SYS_FUNC_EN + 2)?;
+        self.write8(REG_EXT_SYS_FUNC_EN + 2, r & !1)?;
+        let r = self.read8(REG_EXT_SYS_FUNC_EN + 2)?;
+        self.write8(REG_EXT_SYS_FUNC_EN + 2, r | 1)?;
+
+        // start_dlfw: enter FW-download mode. FWDL_EN (BIT0) + the MCU boot-select
+        // bit 13 (0x2000): the reference driver had it set in REG_MCUFW_CTRL & 0x3800
+        // before download; a fresh chip reads 0, so set it explicitly (without it the
+        // CPU never sets the FW-booted bit 15 even though the download + checksums pass).
+        let mcufw = self.read16(REG_MCUFW_CTRL)? & 0x3800;
+        self.write16(REG_MCUFW_CTRL, mcufw | 0x2000 | 0x0001)?;
+        // Reset the DDMA checksum accumulator.
+        let ctrl = self.read32(REG_DDMA_CH0CTRL)?;
+        self.write32(REG_DDMA_CH0CTRL, ctrl | DDMA_RESET_CHKSUM)?;
+
+        // Section layout: header(64) | DMEM(size+8) | IMEM(size+8).
+        let hdr_sz = FW_HDR_SIZE as usize;
+        let dmem_len = (hdr.dmem_size + FW_HDR_CHKSUM_SIZE) as usize;
+        let imem_len = (hdr.imem_size + FW_HDR_CHKSUM_SIZE) as usize;
+        let dmem = &fw[hdr_sz..hdr_sz + dmem_len];
+        let imem = &fw[hdr_sz + dmem_len..hdr_sz + dmem_len + imem_len];
+        self.dlfw_section(dmem, hdr.dmem_addr)?;
+        self.dlfw_section(imem, hdr.imem_addr)?;
+
+        self.dlfw_end_flow()
+    }
+
+    /// Download one firmware memory section: stream it through the reserved page in
+    /// `FW_CHUNK`-byte pieces, IDDMA-copying each into `dest_base`, then flag the
+    /// section's download/checksum-OK bits in `REG_MCUFW_CTRL`.
+    fn dlfw_section(&self, data: &[u8], dest_base: u32) -> Result<(), FaceError> {
+        let mut off = 0usize;
+        let mut first = true;
+        while off < data.len() {
+            let n = FW_CHUNK.min(data.len() - off);
+            self.dl_rsvd_page(0, &data[off..off + n])?;
+            self.iddma_copy(dest_base + off as u32, n as u32, first)?;
+            off += n;
+            first = false;
+        }
+        // Checksum status (0 = OK) after the section.
+        if self.read32(REG_DDMA_CH0CTRL)? & DDMA_CHKSUM_STS != 0 {
+            return Err(io_err(format!("fw section @0x{dest_base:08x}: DDMA checksum error")));
+        }
+        // Flag DW_OK|CHKSUM_OK: DMEM (base >= 0x14200000) = 0x60, IMEM = 0x18.
+        let bits = if dest_base >= 0x1420_0000 { 0x60 } else { 0x18 };
+        let v = self.read8(REG_MCUFW_CTRL)?;
+        self.write8(REG_MCUFW_CTRL, v | bits)?;
+        Ok(())
+    }
+
+    /// One IDDMA copy: packet buffer ([`IDDMA_SRC`]) → `dest`, `len` bytes, waiting
+    /// for the channel to be free before and after.
+    fn iddma_copy(&self, dest: u32, len: u32, first: bool) -> Result<(), FaceError> {
+        self.poll_ddma_idle()?;
+        let mut ctrl = DDMA_OWN | DDMA_CHKSUM_EN | (len & DDMA_DLEN_MASK);
+        if !first {
+            ctrl |= DDMA_CHKSUM_CONT;
+        }
+        self.write32(REG_DDMA_CH0SA, IDDMA_SRC)?;
+        self.write32(REG_DDMA_CH0DA, dest)?;
+        self.write32(REG_DDMA_CH0CTRL, ctrl)?;
+        self.poll_ddma_idle()
+    }
+
+    fn poll_ddma_idle(&self) -> Result<(), FaceError> {
+        let deadline = Instant::now() + Duration::from_millis(200);
+        while Instant::now() < deadline {
+            if self.read32(REG_DDMA_CH0CTRL)? & DDMA_OWN == 0 {
+                return Ok(());
+            }
+        }
+        Err(io_err("IDDMA: OWN poll timeout".into()))
+    }
+
+    /// Release the WLAN CPU and wait for firmware-ready. Verifies both section
+    /// checksums, sets FW_DW_RDY + clears FWDL_EN, enables the CPU, and polls
+    /// `REG_MCUFW_CTRL & 0xC078 == 0xC078` (both ready bits + all download/checksum
+    /// bits).
+    fn dlfw_end_flow(&self) -> Result<(), FaceError> {
+        // Restore the MAC registers the download prologue changed — the CPU needs a
+        // clean TX-DMA state to boot (values per the reference driver's restore).
+        self.write8(REG_TXDMA_PQ_MAP + 1, 0)?;
+        self.write8(REG_CR, 0)?;
+        self.write8(REG_RQPN_CTRL_HLPQ, 0)?;
+        self.write8(REG_RQPN_CTRL_HLPQ + 1, 0)?;
+        self.write8(REG_RQPN_CTRL_HLPQ + 2, 0)?;
+        self.write8(REG_BCN_CTRL, 0x14)?;
+
+        self.write32(REG_TXDMA_STATUS, 0x0004)?; // clear TXDMA
+        let fw_ctrl = self.read16(REG_MCUFW_CTRL)?;
+        if fw_ctrl & 0x50 != 0x50 {
+            return Err(io_err(format!("fw checksums not OK (MCUFW_CTRL=0x{fw_ctrl:04x})")));
+        }
+        // Set FW_DW_RDY (BIT14), clear FWDL_EN (BIT0).
+        self.write16(REG_MCUFW_CTRL, (fw_ctrl | 0x4000) & !0x0001)?;
+        // wlan_cpu_en(1): set REG_SYS_FUNC_EN+1 BIT2.
+        let v = self.read8(REG_SYS_FUNC_EN + 1)?;
+        self.write8(REG_SYS_FUNC_EN + 1, v | (1 << 2))?;
+        // Poll FW-ready: both ready bits (0xC000) + DW/checksum bits (0x78).
+        let deadline = Instant::now() + Duration::from_millis(300);
+        while Instant::now() < deadline {
+            if self.read16(REG_MCUFW_CTRL)? & 0xC078 == 0xC078 {
+                return Ok(());
+            }
+        }
+        Err(io_err(format!(
+            "fw-ready poll timeout (MCUFW_CTRL=0x{:04x})",
+            self.read16(REG_MCUFW_CTRL)?
+        )))
     }
 
     /// The discovered bulk endpoints (for the later TX/RX milestones).

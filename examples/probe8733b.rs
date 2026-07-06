@@ -52,6 +52,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Ok(()) => println!("dl_rsvd_page(128B @ pg0): BCN_VALID ✓ (reserved-page path works)"),
                 Err(e) => println!("dl_rsvd_page: {e}"),
             }
+            // M5: full firmware download + boot the WLAN CPU.
+            print!("M5  download_firmware … ");
+            match dev.download_firmware() {
+                Ok(()) => println!(
+                    "✓ FW BOOTED (MCUFW_CTRL=0x{:04x}, FW_DBG7=0x{:08x})",
+                    dev.read16(0x0080)?,
+                    dev.read32(0x10AC)?
+                ),
+                Err(e) => {
+                    println!("FAILED: {e}");
+                    // Is the CPU actually executing? Sample the PC counter (FW_DBG7).
+                    for _ in 0..4 {
+                        println!(
+                            "    MCUFW=0x{:04x} FW_DBG7=0x{:08x}",
+                            dev.read16(0x0080)?,
+                            dev.read32(0x10AC)?
+                        );
+                    }
+                }
+            }
         }
         Err(e) => println!("FAILED: {e}"),
     }

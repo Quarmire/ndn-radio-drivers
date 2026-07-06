@@ -165,7 +165,12 @@ const DDMA_CHKSUM_STS: u32 = 1 << 27; // BIT_DDMACH0_CHKSUM_STS (1 = error)
 const DDMA_RESET_CHKSUM: u32 = 1 << 25; // BIT_DDMACH0_RESET_CHKSUM_STS
 const DDMA_CHKSUM_CONT: u32 = 1 << 24; // BIT_DDMACH0_CHKSUM_CONT
 const DDMA_DLEN_MASK: u32 = 0x3FFFF; // 18-bit length
-const FW_CHUNK: usize = 4096; // reserved-page chunk size (per capture)
+// Reserved-page chunk size. The vendor uses 4096, but that makes each bulk write
+// TX_DESC_SIZE + 4096 = 4136 bytes, and the macOS USB stack truncates bulk transfers
+// at 4096 — silently dropping the last 40 bytes of every chunk and corrupting the
+// firmware in IMEM (the CPU then boots into garbage). 2048 keeps each transfer at
+// 2088 bytes, well under the cap, and works identically on Linux.
+const FW_CHUNK: usize = 2048;
 
 /// Build the 40-byte TX descriptor for a reserved-page download packet, exactly as
 /// the vendor `usb_write_data_not_xmitframe` → `rtl8733b_cal_txdesc_chksum`:
@@ -663,10 +668,25 @@ impl Rtl8733buBackend {
         // wlan_cpu_en(1): set REG_SYS_FUNC_EN+1 BIT2.
         let v = self.read8(REG_SYS_FUNC_EN + 1)?;
         self.write8(REG_SYS_FUNC_EN + 1, v | (1 << 2))?;
+        let dbg = std::env::var("M5DBG").is_ok();
+        if dbg {
+            eprintln!(
+                "  [end_flow] pre-boot fw_ctrl=0x{fw_ctrl:04x}  MCUFW after boot-write=0x{:04x}  SYS_FUNC_EN+1=0x{:02x} (bit2={})",
+                self.read16(REG_MCUFW_CTRL)?,
+                self.read8(REG_SYS_FUNC_EN + 1)?,
+                self.read8(REG_SYS_FUNC_EN + 1)? & 0x04 != 0,
+            );
+        }
         // Poll FW-ready: both ready bits (0xC000) + DW/checksum bits (0x78).
         let deadline = Instant::now() + Duration::from_millis(300);
+        let mut ticks = 0u32;
         while Instant::now() < deadline {
-            if self.read16(REG_MCUFW_CTRL)? & 0xC078 == 0xC078 {
+            let m = self.read16(REG_MCUFW_CTRL)?;
+            if dbg && ticks < 6 {
+                eprintln!("  [poll {ticks}] MCUFW=0x{m:04x} FW_DBG7=0x{:08x}", self.read32(0x10AC)?);
+            }
+            ticks += 1;
+            if m & 0xC078 == 0xC078 {
                 return Ok(());
             }
         }

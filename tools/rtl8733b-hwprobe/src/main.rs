@@ -390,7 +390,7 @@ impl Dev {
         let ep = *self.bulk_outs.first().unwrap();
         let (mut off, mut first) = (0usize, true);
         while off < data.len() {
-            let n = 4096.min(data.len() - off);
+            let n = 2048.min(data.len() - off);
             self.dl_rsvd_page(0, &data[off..off + n], ep, QSLT_BEACON)?;
             self.iddma(dest + off as u32, n as u32, first)?;
             off += n;
@@ -415,6 +415,18 @@ impl Dev {
         self.w32(REG_DDMA_CH0DA, dest)?;
         self.w32(REG_DDMA_CH0CTRL, ctrl)?;
         self.poll_ddma()
+    }
+
+    /// Reverse-DDMA: copy `out.len()` bytes from CPU memory `src` into the TX buffer
+    /// base, then read them back through the pktbuf window — lets us verify what
+    /// actually landed in IMEM/DMEM after a download.
+    fn ddma_read(&self, src: u32, out: &mut [u8]) -> R<()> {
+        self.poll_ddma()?;
+        self.w32(REG_DDMA_CH0SA, src)?;
+        self.w32(REG_DDMA_CH0DA, 0x1878_0000)?;
+        self.w32(REG_DDMA_CH0CTRL, (1u32 << 31) | (out.len() as u32 & 0x3FFFF))?;
+        self.poll_ddma()?;
+        self.read_pktbuf(0, out)
     }
 
     fn poll_ddma(&self) -> R<()> {
@@ -497,16 +509,41 @@ fn main() -> R<()> {
     println!("pktbuf scan: {found} bytes of 0xA5 in first 4KB → write {} land",
         if found >= 64 { "DID" } else { "did NOT" });
 
+    // Large-chunk delivery test: write 4096 bytes of a known pattern to the reserved
+    // page, read it back from the packet buffer, count mismatches. Isolates whether
+    // the macOS bulk stack delivers big writes intact (the FW chunks are 4096 B).
+    if let Ok(sz) = std::env::var("BIGWRITE") {
+        let n: usize = sz.parse().unwrap_or(4096);
+        let pat: Vec<u8> = (0..n).map(|i| (i as u32).wrapping_mul(2654435761) as u8).collect();
+        let ep = *dev.bulk_outs.first().unwrap();
+        let r = dev.dl_rsvd_page(0, &pat, ep, QSLT_BEACON);
+        let mut back = vec![0u8; n + 0x28];
+        dev.read_pktbuf(0, &mut back)?;
+        let payload = &back[0x28..0x28 + n];
+        let bad = payload.iter().zip(&pat).filter(|(a, b)| a != b).count();
+        let first_bad = payload.iter().zip(&pat).position(|(a, b)| a != b);
+        println!("BIGWRITE {n}B: dl_rsvd_page={:?}  mismatches={bad}/{n}  first_bad_off={:?}",
+            r.map(|_| "OK").unwrap_or("timeout"), first_bad);
+    }
+
     // M5: full firmware download + boot (run under usbmon for the self-diff).
     if std::env::var("M5").is_ok() {
-        match dev.download_firmware() {
+        let r = dev.download_firmware();
+        match &r {
             Ok(()) => println!("M5 FW BOOTED MCUFW=0x{:04x} FW_DBG7=0x{:08x}", dev.r16(0x0080)?, dev.r32(0x10AC)?),
-            Err(e) => {
-                println!("M5 download_firmware: {e}");
-                for _ in 0..3 {
-                    println!("  MCUFW=0x{:04x} FW_DBG7=0x{:08x}", dev.r16(0x0080)?, dev.r32(0x10AC)?);
-                }
-            }
+            Err(e) => println!("M5 download_firmware: {e}  MCUFW=0x{:04x} FW_DBG7=0x{:08x}", dev.r16(0x0080)?, dev.r32(0x10AC)?),
+        }
+        // Verify IMEM/DMEM actually got the firmware (reverse-DDMA readback vs file).
+        let fw = FW_NIC;
+        let dmem_size = u32::from_le_bytes([fw[36], fw[37], fw[38], fw[39]]) as usize;
+        let imem_addr = u32::from_le_bytes([fw[60], fw[61], fw[62], fw[63]]);
+        let dmem_addr = u32::from_le_bytes([fw[32], fw[33], fw[34], fw[35]]);
+        for (name, addr, foff) in [("DMEM", dmem_addr, 64usize), ("IMEM", imem_addr, 64 + dmem_size + 8)] {
+            let mut back = vec![0u8; 64];
+            dev.ddma_read(addr, &mut back)?;
+            let exp = &fw[foff..foff + 64];
+            let bad = back.iter().zip(exp).filter(|(a, b)| a != b).count();
+            println!("  {name}@0x{addr:08x} readback: {bad}/64 mismatches  got={:02x?} exp={:02x?}", &back[..8], &exp[..8]);
         }
     }
     Ok(())

@@ -203,17 +203,27 @@ impl Dev {
         self.h.write_control(VENQT_WRITE, VENQT_REQ, a, 0, &v.to_le_bytes(), CTRL)?;
         Ok(())
     }
-    /// Read 8 bytes from the TX/RX packet buffer at byte `addr` via the debug
-    /// window (REG_PKTBUF_DBG_CTRL selects the 8-byte unit; DATA_L/H return it).
-    fn read_pktbuf8(&self, addr: u32) -> R<[u8; 8]> {
+    /// Read `out.len()` bytes from the TX/RSVD packet buffer at byte `byte_off`,
+    /// per read_buf_87xx: start_pg = (off>>12)+0x780 into REG_PKTBUF_DBG_CTRL, then
+    /// the 4KB data window at register 0x8000+residue, 4 bytes at a time.
+    fn read_pktbuf(&self, byte_off: u32, out: &mut [u8]) -> R<()> {
+        let start_pg = ((byte_off >> 12) + 0x780) as u16;
+        let residue = (byte_off & 0xFFF) as u16;
         let ctrl = self.r16(REG_PKTBUF_DBG_CTRL)? & 0xF000;
-        self.w16(REG_PKTBUF_DBG_CTRL, ((addr >> 3) as u16 & 0x0FFF) | ctrl)?;
-        let lo = self.r32(REG_PKTBUF_DBG_DATA_L)?;
-        let hi = self.r32(REG_PKTBUF_DBG_DATA_H)?;
-        let mut b = [0u8; 8];
-        b[0..4].copy_from_slice(&lo.to_le_bytes());
-        b[4..8].copy_from_slice(&hi.to_le_bytes());
-        Ok(b)
+        self.w16(REG_PKTBUF_DBG_CTRL, start_pg | ctrl)?;
+        let mut cnt = 0usize;
+        let mut i = 0x8000u16.wrapping_add(residue);
+        while cnt < out.len() && i <= 0x8FFF {
+            let w = self.r32(i)?.to_le_bytes();
+            for b in w {
+                if cnt < out.len() {
+                    out[cnt] = b;
+                    cnt += 1;
+                }
+            }
+            i = i.wrapping_add(4);
+        }
+        Ok(())
     }
 
     fn chip_version(&self) -> R<(u8, u8, u32)> {
@@ -365,19 +375,16 @@ fn main() -> R<()> {
     let r = dev.dl_rsvd_page(0x00, &[0xA5u8; 128], ep, QSLT_BEACON);
     println!("M4.5 dl_rsvd_page (BEACON, pg=0, ep 0x{ep:02x}, {mcufw}): {}",
         match &r { Ok(()) => "BCN_VALID OK — DRAINED!".to_string(), Err(e) => e.to_string() });
-    // Decisive: did the 0xA5 payload actually land in the packet buffer? Scan the
-    // first 512 bytes (pg 0 area) for a run of 0xA5 — independent of BCN_VALID.
-    let mut found = 0;
-    for off in (0..512u32).step_by(8) {
-        if let Ok(b) = dev.read_pktbuf8(off) {
-            let n = b.iter().filter(|&&x| x == 0xA5).count();
-            found += n;
-            if off < 64 || n > 0 {
-                println!("  pktbuf[0x{off:03x}] = {b:02x?}");
-            }
-        }
+    // Decisive: did the 0xA5 payload land in the TX packet buffer? Read the first
+    // 4KB and count 0xA5 — independent of BCN_VALID.
+    let mut buf = vec![0u8; 4096];
+    dev.read_pktbuf(0, &mut buf)?;
+    let found = buf.iter().filter(|&&x| x == 0xA5).count();
+    // Show where the 0xA5 run starts (should be right after a 48B descriptor).
+    if let Some(pos) = buf.windows(8).position(|w| w.iter().all(|&x| x == 0xA5)) {
+        println!("  first 0xA5 run at pktbuf offset 0x{pos:x}; head = {:02x?}", &buf[..16.min(buf.len())]);
     }
-    println!("pktbuf scan: {found} bytes of 0xA5 found → write {} land",
+    println!("pktbuf scan: {found} bytes of 0xA5 in first 4KB → write {} land",
         if found >= 64 { "DID" } else { "did NOT" });
     Ok(())
 }

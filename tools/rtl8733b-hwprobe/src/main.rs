@@ -381,6 +381,16 @@ impl Dev {
         let ilen = imem_size + 8;
         self.dlfw_section(&fw[hdr..hdr + dlen], dmem_addr)?;
         self.dlfw_section(&fw[hdr + dlen..hdr + dlen + ilen], imem_addr)?;
+        if std::env::var("M5CHK").is_ok() {
+            // Read IMEM/DMEM back BEFORE releasing the CPU (clean — CPU not yet running).
+            for (name, addr, foff) in [("DMEM", dmem_addr, hdr), ("IMEM", imem_addr, hdr + dlen)] {
+                let mut back = vec![0u8; 64];
+                let _ = self.ddma_read(addr, &mut back);
+                let exp = &fw[foff..foff + 64];
+                let bad = back.iter().zip(exp).filter(|(a, b)| a != b).count();
+                eprintln!("  pre-boot {name}@0x{addr:08x}: {bad}/64 mismatches got={:02x?} exp={:02x?}", &back[..8], &exp[..8]);
+            }
+        }
         self.dlfw_end_flow()
     }
 
@@ -406,26 +416,43 @@ impl Dev {
     }
 
     fn iddma(&self, dest: u32, len: u32, first: bool) -> R<()> {
-        self.poll_ddma()?;
+        // Settle before (prior DMA): a fixed delay, since CH0CTRL OWN reads are stale
+        // on macOS (the 0x1200 range reads back unreliably even when writes latch).
+        std::thread::sleep(Duration::from_millis(2));
         let mut ctrl = (1u32 << 31) | (1 << 29) | (len & 0x3FFFF);
         if !first {
             ctrl |= 1 << 24;
         }
-        self.w32(REG_DDMA_CH0SA, IDDMA_SRC)?;
-        self.w32(REG_DDMA_CH0DA, dest)?;
-        self.w32(REG_DDMA_CH0CTRL, ctrl)?;
-        self.poll_ddma()
+        // Write CH0SA+CH0DA+CH0CTRL (0x1200-0x120B, contiguous) as ONE 12-byte
+        // control transfer — the 8812au writes the 0x1200 window multi-byte and it
+        // works on macOS, whereas small 4-byte writes to this range don't land.
+        // CH0CTRL (with OWN) is last, so the DMA triggers after SA/DA are set.
+        let mut blk = [0u8; 12];
+        blk[0..4].copy_from_slice(&IDDMA_SRC.to_le_bytes());
+        blk[4..8].copy_from_slice(&dest.to_le_bytes());
+        blk[8..12].copy_from_slice(&ctrl.to_le_bytes());
+        self.wblk(REG_DDMA_CH0SA, &blk)?;
+        std::thread::sleep(Duration::from_millis(2)); // let this DMA finish
+        Ok(())
+    }
+
+    /// Write a contiguous register block in a single control transfer.
+    fn wblk(&self, addr: u16, data: &[u8]) -> R<()> {
+        self.h.write_control(0x40, 0x05, addr, 0, data, Duration::from_millis(500))?;
+        Ok(())
     }
 
     /// Reverse-DDMA: copy `out.len()` bytes from CPU memory `src` into the TX buffer
     /// base, then read them back through the pktbuf window — lets us verify what
     /// actually landed in IMEM/DMEM after a download.
     fn ddma_read(&self, src: u32, out: &mut [u8]) -> R<()> {
-        self.poll_ddma()?;
-        self.w32(REG_DDMA_CH0SA, src)?;
-        self.w32(REG_DDMA_CH0DA, 0x1878_0000)?;
-        self.w32(REG_DDMA_CH0CTRL, (1u32 << 31) | (out.len() as u32 & 0x3FFFF))?;
-        self.poll_ddma()?;
+        std::thread::sleep(Duration::from_millis(2));
+        let mut blk = [0u8; 12];
+        blk[0..4].copy_from_slice(&src.to_le_bytes());
+        blk[4..8].copy_from_slice(&0x1878_0000u32.to_le_bytes());
+        blk[8..12].copy_from_slice(&((1u32 << 31) | (out.len() as u32 & 0x3FFFF)).to_le_bytes());
+        self.wblk(REG_DDMA_CH0SA, &blk)?;
+        std::thread::sleep(Duration::from_millis(2));
         self.read_pktbuf(0, out)
     }
 
@@ -478,6 +505,31 @@ fn main() -> R<()> {
     }
     dev.power_on()?;
     println!("M2  power_on ok: powered={} CR=0x{:02x} func_en=0x{:02x}", dev.is_powered()?, dev.r8(REG_CR)?, dev.r8(REG_SYS_FUNC_EN)?);
+
+    // Isolated register-access probe (right after power-on, before ANY bulk traffic):
+    // does the DDMA register block (0x1200) accept writes on this platform?
+    if std::env::var("REGTEST").is_ok() {
+        // Non-destructive: DDMA CH0SA/DA/CTRL (0x1200-0x1208) are side-effect-free
+        // address/ctrl latches (act only when CH0CTRL OWN triggers). 0x1008 is
+        // restored. Finding: on macOS the 0x1200 range silently drops writes
+        // (readback 0) while 0x1008 works — blocks the firmware DDMA load.
+        let orig = dev.r32(0x1008)?;
+        dev.w32(0x1008, 0x1234_5678)?;
+        println!("REGTEST 0x1008 (control): wrote 0x12345678 readback=0x{:08x}", dev.r32(0x1008)?);
+        dev.w32(0x1008, orig)?;
+
+        // 4-byte write to 0x1200 (the failing path).
+        dev.w32(0x1200, 0x1234_5678)?;
+        println!("REGTEST 0x1200 4-byte-w32:  readback=0x{:08x}", dev.r32(0x1200)?);
+        // 12-byte block write covering CH0SA/DA/CTRL (the 8812au multi-byte pattern).
+        let blk = [0x11u8, 0x11, 0x11, 0x11, 0x22, 0x22, 0x22, 0x22, 0x33, 0x33, 0x33, 0x33];
+        dev.wblk(0x1200, &blk)?;
+        println!("REGTEST 0x1200 12-byte-blk:  SA=0x{:08x} DA=0x{:08x} CTRL=0x{:08x}",
+            dev.r32(0x1200)?, dev.r32(0x1204)?, dev.r32(0x1208)?);
+        dev.wblk(0x1200, &[0u8; 12])?;
+        return Ok(());
+    }
+
     // Vendor download order: cpu_en(0) + reset pulse, THEN (re-)apply the page
     // config, THEN download-enable, THEN the reserved-page write.
     dev.trx_init()?;

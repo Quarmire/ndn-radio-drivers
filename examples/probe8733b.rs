@@ -70,6 +70,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         dev.read8(0x520)?,
                         dev.read8(0x4CA)?
                     );
+                    // M6b: baseband (phy_reg + agc_tab).
+                    print!("M6b bb_config … ");
+                    dev.bb_config()?;
+                    println!(
+                        "✓ (0x804=0x{:08x} exp d6300000, 0x808=0x{:08x} exp 60156024)",
+                        dev.read32(0x804)?,
+                        dev.read32(0x808)?
+                    );
                 }
                 Err(e) => {
                     println!("FAILED: {e}");

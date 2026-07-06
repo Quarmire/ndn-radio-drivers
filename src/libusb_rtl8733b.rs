@@ -133,6 +133,14 @@ const MAC_REG_8733B: &[u32] = &[
     0x4E6, 0x0000_0009, 0xFFFF, 0x0000_FFFF,
 ];
 
+/// 8733b baseband tables (`array_mp_8733b_phy_reg` / `_agc_tab`) and the RF/radioA
+/// table (`array_mp_8733b_radioa`), extracted from the vendor phydm C arrays to
+/// little-endian `u32` `.bin`s.
+const PHY_REG_8733B: &[u8] = include_bytes!("../fw/rtl8733b/rtl8733b_phy_reg.bin");
+const AGC_TAB_8733B: &[u8] = include_bytes!("../fw/rtl8733b/rtl8733b_agc_tab.bin");
+#[allow(dead_code)] // M6c (RF/radioA via LSSI) — wired next
+const RADIOA_8733B: &[u8] = include_bytes!("../fw/rtl8733b/rtl8733b_radioa.bin");
+
 // FW header field offsets (halmac_fw_info.h).
 const FW_HDR_SIZE: u32 = 64;
 const FW_HDR_CHKSUM_SIZE: u32 = 8;
@@ -769,13 +777,65 @@ impl Rtl8733buBackend {
         Ok(())
     }
 
-    /// Evaluate a phydm IF condition for a standard 1x1 USB NIC (cut ≥ B, RFE 0,
-    /// internal PA/LNA). The condition's cut/interface/RFE nibbles must match our
-    /// driver profile; unset nibbles are wildcards.
-    fn cond_matches(&self, _cond1: u32, _cond2: u32) -> bool {
-        // Our profile carries no board-specific overrides, so take the default
-        // (unconditional) entries and skip any hardware-variant IF blocks.
-        true
+    /// Evaluate a phydm IF condition against our driver profile (`check_positive`):
+    /// value-check cut[27:24] / pkg[15:12] / interface[11:8] (a zero cond nibble is a
+    /// wildcard), then an exact RFE low-byte match. Profile: a 1x1 USB NIC — cut D
+    /// (chip_ver 3), USB interface (0x2), package wildcard, RFE type 0 (internal
+    /// PA/LNA). Branches for other RFE/cut variants are skipped, so their ELSE/default
+    /// entries apply instead.
+    fn cond_matches(&self, cond1: u32, _cond2: u32) -> bool {
+        const CUT: u32 = 3; // ODM_CUT_D
+        const PKG: u32 = 15; // package_type 0 → 15
+        const IFACE: u32 = 0x2; // ODM_ITRF_USB & 0x0F
+        const RFE: u32 = 0; // internal PA/LNA
+        if cond1 & 0x0F00_0000 != 0 && (cond1 >> 24) & 0xF != CUT {
+            return false;
+        }
+        if cond1 & 0x0000_F000 != 0 && (cond1 >> 12) & 0xF != PKG {
+            return false;
+        }
+        if cond1 & 0x0000_0F00 != 0 && (cond1 >> 8) & 0xF != IFACE {
+            return false;
+        }
+        cond1 & 0xFF == RFE
+    }
+
+    /// Apply a phydm table stored as little-endian `u32` bytes (a `.bin` extracted
+    /// from the vendor's `array_mp_8733b_*`).
+    fn config_table_bin(
+        &self,
+        bin: &[u8],
+        apply: impl FnMut(&Self, u32, u32) -> Result<(), FaceError>,
+    ) -> Result<(), FaceError> {
+        let words: Vec<u32> = bin
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        self.config_table(&words, apply)
+    }
+
+    /// One baseband-table write: a delay opcode (`0xfe..0xf9`, `0xffff`) or a 32-bit
+    /// BB register write (`odm_config_bb_phy_8733b` → `odm_set_bb_reg`, full dword).
+    fn bb_write(&self, addr: u32, data: u32) -> Result<(), FaceError> {
+        match addr {
+            0xfe | 0xffe => std::thread::sleep(Duration::from_millis(50)),
+            0xfd => std::thread::sleep(Duration::from_millis(5)),
+            0xfc => std::thread::sleep(Duration::from_millis(1)),
+            0xfb => std::thread::sleep(Duration::from_micros(50)),
+            0xfa => std::thread::sleep(Duration::from_micros(5)),
+            0xf9 | 0xffff => std::thread::sleep(Duration::from_micros(1)),
+            _ => self.write32(addr as u16, data)?,
+        }
+        Ok(())
+    }
+
+    /// **M6b**: baseband init — apply the BB PHY-register table then the AGC table
+    /// (`array_mp_8733b_phy_reg` + `array_mp_8733b_agc_tab`). The BB block is already
+    /// powered by [`mac_config`] (`0x002 = 0xC3`). Run after [`mac_config`].
+    pub fn bb_config(&self) -> Result<(), FaceError> {
+        self.config_table_bin(PHY_REG_8733B, |s, a, d| s.bb_write(a, d))?;
+        self.config_table_bin(AGC_TAB_8733B, |s, a, d| s.bb_write(a, d))?;
+        Ok(())
     }
 
     /// **M6a**: apply the 8733b MAC register table (`array_mp_8733b_mac_reg`) — a

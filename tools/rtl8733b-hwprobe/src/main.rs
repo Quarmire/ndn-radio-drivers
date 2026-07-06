@@ -244,6 +244,14 @@ impl Dev {
         self.w8(REG_RQPN_CTRL_HLPQ + 3, 0x80)?;
         let bcn = self.r8(REG_BCN_CTRL)?;
         self.w8(REG_BCN_CTRL, (bcn & !(1 << 3)) | (1 << 4))?;
+        if std::env::var("PLTFM_RST").is_ok() {
+            // pltfm_reset: toggle BIT0 of REG_EXT_SYS_FUNC_EN+2 (0x1002).
+            let r = self.r8(REG_EXT_SYS_FUNC_EN + 2)?;
+            self.w8(REG_EXT_SYS_FUNC_EN + 2, r & !1)?;
+            let r = self.r8(REG_EXT_SYS_FUNC_EN + 2)?;
+            self.w8(REG_EXT_SYS_FUNC_EN + 2, r | 1)?;
+            println!("(pltfm_reset applied)");
+        }
         Ok(())
     }
 
@@ -319,23 +327,20 @@ fn main() -> R<()> {
     dev.trx_init()?;
     dev.fw_dl_setup()?;
     println!("M4  fw_dl_setup ok: CR=0x{:02x} EXT_FUNC=0x{:08x}", dev.r8(REG_CR)?, dev.r32(REG_EXT_SYS_FUNC_EN)?);
-    // start_dlfw: FW-download-mode enable (MCUFW_CTRL BIT0, keep bits in mask 0x3800).
-    let hi = dev.r8(REG_MCUFW_CTRL + 1)? & 0x38;
-    dev.w8(REG_MCUFW_CTRL, 0x01)?;
-    dev.w8(REG_MCUFW_CTRL + 1, hi)?;
-    println!("M4.5 MCUFW_CTRL BIT0 (download mode)");
+    if std::env::var("MCUFW").is_ok() {
+        let hi = dev.r8(REG_MCUFW_CTRL + 1)? & 0x38;
+        dev.w8(REG_MCUFW_CTRL, 0x01)?;
+        dev.w8(REG_MCUFW_CTRL + 1, hi)?;
+        println!("M4.5 MCUFW_CTRL BIT0 (download mode)");
+    }
     // Vendor-exact descriptor now: 48-byte 8733b TX desc, QSEL=BEACON(0x10), and
     // the HIGH bulk-OUT endpoint (bulkout id 0 = first ep), which is where the
     // beacon/rsvd-page write must go to raise BCN_VALID.
-    // Sweep all bulk-OUT endpoints with the correct 48B BEACON descriptor + pg=0.
-    // Which physical ep is the HIGH/beacon queue (raises BCN_VALID) is the last
-    // assumption to nail. Each dl_rsvd_page clears BCN_VALID first, so it's safe.
-    let eps = dev.bulk_outs.clone();
-    for ep in eps {
-        match dev.dl_rsvd_page(0x00, &[0u8; 64], ep, QSLT_BEACON) {
-            Ok(()) => println!("M4.5 ep 0x{ep:02x}: BCN_VALID OK — reserved-page DRAINED via this endpoint!"),
-            Err(e) => println!("M4.5 ep 0x{ep:02x}: {e}"),
-        }
+    let ep = *dev.bulk_outs.first().unwrap();
+    let mcufw = if std::env::var("MCUFW").is_ok() { "MCUFW" } else { "no-MCUFW" };
+    match dev.dl_rsvd_page(0x00, &[0xA5u8; 128], ep, QSLT_BEACON) {
+        Ok(()) => println!("M4.5 dl_rsvd_page (BEACON, pg=0, ep 0x{ep:02x}, {mcufw}): BCN_VALID OK — DRAINED!"),
+        Err(e) => println!("M4.5 dl_rsvd_page (BEACON, pg=0, ep 0x{ep:02x}, {mcufw}): {e}"),
     }
     Ok(())
 }

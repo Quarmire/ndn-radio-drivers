@@ -21,6 +21,7 @@ const CTRL: Duration = Duration::from_millis(500);
 
 // Registers (halmac_reg_8733b, verified against the driver).
 const REG_SYS_FUNC_EN: u16 = 0x0002;
+const REG_MCUFW_CTRL: u16 = 0x0080;
 const REG_CR: u16 = 0x0100;
 const REG_SYS_CFG1: u16 = 0x00F0;
 const REG_SYS_CFG2: u16 = 0x00FC;
@@ -189,6 +190,27 @@ impl Dev {
     /// reserved-page bulk write below actually drains. Empty for now: the first run
     /// should reproduce the dl_rsvd_page timeout, confirming the blocker on silicon.
     fn trx_init(&self) -> R<()> {
+        // wlan_cpu_en(0): disable the WLAN CPU (clear BIT2 of REG_SYS_FUNC_EN+1) so
+        // it doesn't own the TX/beacon buffer during a manual reserved-page write —
+        // the piece of the vendor download_firmware prologue our fw_dl_setup missed.
+        // Piece 1 — wlan_cpu_en(0): disable the WLAN CPU (clear BIT2 of
+        // REG_SYS_FUNC_EN+1) so it doesn't own the TX/beacon buffer. Verified this
+        // alone still leaves BCN_VALID low (write succeeds, validate times out).
+        let v = self.r8(REG_SYS_FUNC_EN + 1)?;
+        self.w8(REG_SYS_FUNC_EN + 1, v & !(1 << 2))?;
+
+        // LEAD — Piece 2 (start_dlfw): FW-download-mode enable, REG_MCUFW_CTRL BIT0
+        // (mask 0x3800). Observed: setting this alone flips the failure from
+        // BCN_VALID-timeout to *bulk-write*-timeout — download mode expects the
+        // packet at an allocated page, so it needs Piece 3 too. Left off until then.
+        //   let hi = self.r8(REG_MCUFW_CTRL + 1)? & 0x38;
+        //   self.w8(REG_MCUFW_CTRL, 0x01)?; self.w8(REG_MCUFW_CTRL + 1, hi)?;
+
+        // TODO — Piece 3: the TX-FIFO page boundary (txff_alloc.rsvd_boundary via
+        // REG_FIFOPAGE/TDECTRL) so the download page is allocated; then re-enable
+        // Piece 2 and BCN_VALID should assert.
+        let _ = REG_MCUFW_CTRL;
+        println!("M4.5 wlan_cpu_en(0) applied (SYS_FUNC_EN+1 -> 0x{:02x})", self.r8(REG_SYS_FUNC_EN + 1)?);
         Ok(())
     }
 

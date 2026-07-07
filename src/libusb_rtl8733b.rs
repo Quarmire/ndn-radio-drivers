@@ -407,11 +407,10 @@ impl Rtl8733buBackend {
                     }
                     match ep.direction() {
                         Direction::In if bulk_in.is_none() => bulk_in = Some(ep.address()),
-                        Direction::Out => {
-                            if !bulk_outs.contains(&ep.address()) {
+                        Direction::Out
+                            if !bulk_outs.contains(&ep.address()) => {
                                 bulk_outs.push(ep.address());
                             }
-                        }
                         _ => {}
                     }
                 }
@@ -2195,8 +2194,8 @@ impl Rtl8733buBackend {
         self.txgapk_diff_calc()?;
         let mut ta = [0u32; 10];
         self.bb_set(0x1bf4, 0x0000_0F00, 0x8)?;
-        for i in 0..5 {
-            ta[i] = self.bb_get(0x1bfc, 0x3f << (i * 6))?;
+        for (i, slot) in ta.iter_mut().take(5).enumerate() {
+            *slot = self.bb_get(0x1bfc, 0x3f << (i * 6))?;
         }
         self.bb_set(0x1bf4, 0x0000_0F00, 0x9)?;
         for i in 0..5 {
@@ -2207,16 +2206,16 @@ impl Rtl8733buBackend {
         }
         if track {
             self.rf_set(path, 0xee, 1 << 15, 1)?;
-            for i in 0..10usize {
+            for (i, &t) in ta.iter().enumerate() {
                 self.rf_set(path, 0x5c, 0x3f800, 3 + i as u32 * 6)?;
-                self.rf_set(path, 0x3f, 0x0003f, ta[i])?;
+                self.rf_set(path, 0x3f, 0x0003f, t)?;
             }
             self.rf_set(path, 0xee, 1 << 15, 0)?;
         } else {
             self.rf_set(path, 0xee, 1 << 18, 1)?;
-            for i in 0..10usize {
+            for (i, &t) in ta.iter().enumerate() {
                 self.rf_set(path, 0x5e, 0x3f000, 1 + i as u32 * 3)?;
-                self.rf_set(path, 0x3f, 0x0003f, ta[i])?;
+                self.rf_set(path, 0x3f, 0x0003f, t)?;
             }
             self.rf_set(path, 0xee, 1 << 18, 0)?;
         }
@@ -2534,13 +2533,12 @@ impl Rtl8733buBackend {
                 u32::from_le_bytes([data[off + 8], data[off + 9], data[off + 10], data[off + 11]]);
             let is_c2h = dw2 & (1 << 28) != 0;
             let fstart = off + 24 + drvinfo + shift;
-            if !is_c2h && fstart + pkt_len <= data.len() {
-                if let Some(cap) =
+            if !is_c2h && fstart + pkt_len <= data.len()
+                && let Some(cap) =
                     frame::parse_dot11(self.format, &data[fstart..fstart + pkt_len], None, None, None)
                 {
                     q.push_back(cap);
                 }
-            }
             off += (24 + drvinfo + shift + pkt_len + 7) & !7;
         }
     }

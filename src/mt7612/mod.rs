@@ -446,7 +446,7 @@ impl Mt7612uBackend {
         let mut pos = 0usize;
         let mut idx = 0usize;
         while pos < data.len() {
-            if dbg && (idx == 0 || idx % 32 == 0 || idx + 1 == nchunks) {
+            if dbg && (idx == 0 || idx.is_multiple_of(32) || idx + 1 == nchunks) {
                 eprintln!("    chunk {idx}/{nchunks}");
             }
             let cur = (data.len() - pos).min(chunk);
@@ -967,8 +967,8 @@ impl Mt7612uBackend {
 
     /// Tune the RF/BB to the monitor channel by replaying [`CHANSET_REPLAY`] (the
     /// kernel's `set monitor; set channel 6` op-stream: 194 RF/BB register writes
-    /// + 32 calibration MCU commands). `bring_up` only does init (firmware + MAC/
-    /// BB), which leaves the RF untuned — without this the receiver delivers 0
+    /// and 32 calibration MCU commands). `bring_up` only does init (firmware + MAC/
+    /// BB), which leaves the RF untuned — without this the receiver delivers no
     /// frames. Call after `bring_up`, before listening. Channel 6 (2.4GHz).
     pub fn set_channel_ch6(&self) -> Result<(), FaceError> {
         self.tx_bw.store(0, std::sync::atomic::Ordering::Relaxed); // 20MHz

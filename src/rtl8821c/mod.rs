@@ -863,11 +863,10 @@ impl Rtl8821cuBackend {
         // 8d) Ad-hoc (IBSS) operating mode — the TX-radiate path. Sets REG_CR
         //     network-type to ADHOC + EDCA + BSSID so the firmware keys injected
         //     TX (monitor's NO_LINK opmode gates it). `NDN_RADIO_IBSS=1`.
-        if std::env::var("NDN_RADIO_IBSS").is_ok() {
-            if let Err(e) = self.setup_ibss() {
+        if std::env::var("NDN_RADIO_IBSS").is_ok()
+            && let Err(e) = self.setup_ibss() {
                 eprintln!("8821cu setup_ibss failed: {e}");
             }
-        }
 
         // 9) USB RX burst + aggregation config — LAST (rtw_hci_start ordering),
         //    so the BB table load / channel set can't clobber REG_RXDMA_MODE.

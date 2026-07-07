@@ -225,7 +225,7 @@ impl Rtl8821cuBackend {
     fn send_firmware_pkt(&self, chunk: &[u8]) -> Result<(), FaceError> {
         let mut size = chunk.len();
         // USB +1 pad when (size + desc) is an exact multiple of 512.
-        let pad = if (size + TX_DESC_SIZE) % 512 == 0 { 1 } else { 0 };
+        let pad = if (size + TX_DESC_SIZE).is_multiple_of(512) { 1 } else { 0 };
 
         let mut pkt = vec![0u8; TX_DESC_SIZE + size + pad];
         size += pad;

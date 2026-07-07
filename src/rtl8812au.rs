@@ -955,7 +955,7 @@ impl Rtl8812auBackend {
         };
         let xs = rx_x >> 1;
         let ys = rx_y >> 1;
-        if xs >= 0x112 || (ys >= 0x12 && ys <= 0x3ee) {
+        if xs >= 0x112 || (0x12..=0x3ee).contains(&ys) {
             self.bb_set(reg, 0x0000_03ff, 0x100)?;
             self.bb_set(reg, 0x03ff_0000, 0)?;
         } else {

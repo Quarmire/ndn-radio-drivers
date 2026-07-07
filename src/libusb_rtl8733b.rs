@@ -16,9 +16,13 @@
 //!   channel/TX-power, RX-DMA, TX inject, RX capture — implementing
 //!   [`FrameIo`](ndn_frame_io::FrameIo) + [`WifiRadio`](ndn_frame_io::WifiRadio).
 
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use async_trait::async_trait;
+use ndn_frame_io::{frame, CapturedFrame, FrameFormat, FrameIo, InjectFrame};
+use ndn_radio_hal::{Bandwidth, McsDescriptor, RadioKnobs, WifiRadio};
 use ndn_transport::FaceError;
 use rusb::{Context, Device, DeviceHandle, Direction, TransferType, UsbContext};
 
@@ -318,6 +322,14 @@ pub struct Rtl8733buBackend {
     /// per TX queue priority; the reserved-page/HIQ path may need a specific one.
     bulk_outs: Vec<u8>,
     bulk_in: u8,
+    /// On-air frame format for the [`FrameIo`] backend (default `RawNdn`).
+    format: FrameFormat,
+    /// Fixed TX HwRate for [`FrameIo::inject`] (default 6 Mbps OFDM `0x04`).
+    tx_rate: std::sync::atomic::AtomicU8,
+    /// Rolling 12-bit SW sequence number for injected frames.
+    tx_seq: std::sync::atomic::AtomicU16,
+    /// Parsed RX frames buffered between bulk-IN reads (one read yields many).
+    rx_pending: std::sync::Mutex<std::collections::VecDeque<CapturedFrame>>,
 }
 
 /// What [`Rtl8733buBackend::chip_version`] reads back.
@@ -389,7 +401,17 @@ impl Rtl8733buBackend {
                 .ok_or_else(|| not_found("RTL8733B exposes no bulk OUT endpoint"))?,
             bulk_outs,
             bulk_in: bulk_in.ok_or_else(|| not_found("RTL8733B exposes no bulk IN endpoint"))?,
+            format: FrameFormat::default(),
+            tx_rate: std::sync::atomic::AtomicU8::new(0x04), // 6 Mbps OFDM
+            tx_seq: std::sync::atomic::AtomicU16::new(0),
+            rx_pending: std::sync::Mutex::new(std::collections::VecDeque::new()),
         })
+    }
+
+    /// Select the on-air frame format for the [`FrameIo`] backend (default `RawNdn`).
+    pub fn with_format(mut self, format: FrameFormat) -> Self {
+        self.format = format;
+        self
     }
 
     /// Read one register byte over the `VENQT` control pipe.
@@ -952,7 +974,7 @@ impl Rtl8733buBackend {
     /// descriptor (QSEL=MGT, USE_RATE + DISDATAFB fixed-rate, no encryption, SW seq)
     /// and sends `[desc][frame]` to the HIGH bulk-OUT endpoint (0x05). `rate` is a
     /// HwRate code (0x00 = 1M CCK, 0x04 = 6M OFDM). Run after [`init_trx`].
-    pub fn inject(&self, frame: &[u8], rate: u8, seq: u16) -> Result<(), FaceError> {
+    pub fn inject_raw(&self, frame: &[u8], rate: u8, seq: u16) -> Result<(), FaceError> {
         let bcast = frame.len() > 4 && frame[4] & 0x01 != 0; // 802.11 addr1[0] group bit
         let desc = build_data_txdesc(frame.len(), rate, seq, bcast);
         let mut pkt = Vec::with_capacity(desc.len() + frame.len() + 1);
@@ -1258,7 +1280,7 @@ impl Rtl8733buBackend {
     /// path): clear the band/channel bits of RF 0x18 and set the channel, write both
     /// paths with the cut-D settle loop (poll RF 0xc5 BIT15), restore RF 0x19, and
     /// select the 2.4 GHz RX AGC table. Prerequisite for calibration + TX/RX.
-    pub fn set_channel(&self, ch: u8) -> Result<(), FaceError> {
+    pub fn tune_channel(&self, ch: u8) -> Result<(), FaceError> {
         let mut rf18 = self.rf_get(0, 0x18, RFREG_MASK)?;
         let rf19 = self.rf_get(0, 0x19, RFREG_MASK)?;
         // 2.4 GHz: clear band bits (17,16,9,8) + channel byte, set channel.
@@ -1872,6 +1894,151 @@ impl Rtl8733buBackend {
         self.iqk_afe_setting(false)?;
         self.iqk_restore(&backup)?;
         Ok((probe, self.read32(IQK_BB_REGS[0])?))
+    }
+}
+
+// ── M8 async FrameIo backend + the full radio-knob surface ───────────────────
+
+impl Rtl8733buBackend {
+    /// Set the fixed TX HwRate for injection (0x00=1M CCK … 0x03=11M, 0x04=6M OFDM …
+    /// 0x0b=54M, 0x0c..0x13 = HT MCS0-7). Default 6 Mbps OFDM.
+    pub fn set_tx_rate(&self, hw_rate: u8) {
+        self.tx_rate.store(hw_rate, Ordering::Relaxed);
+    }
+
+    /// Set bandwidth / narrowband. 5 & 10 MHz narrowband (the vendor `narrowband`
+    /// knob) are `0x9b0[7:6] = 1/2` on top of a 20 MHz channel; 20 vs 40 MHz is the
+    /// BB path-width mode (`0x1900[3:0]` = 6/7 + the 40 MHz enables).
+    pub fn set_bandwidth(&self, bw: Bandwidth) -> Result<(), FaceError> {
+        let nb = match bw {
+            Bandwidth::Nb5 => 1,
+            Bandwidth::Nb10 => 2,
+            _ => 0,
+        };
+        self.bb_set(0x09b0, 0xC0, nb)?;
+        match bw {
+            Bandwidth::Bw40 | Bandwidth::Bw80 => {
+                self.bb_set(0x1900, 0xF, 7)?; // BW mode 40
+                self.bb_set(0x0c10, 1 << 9, 1)?;
+                self.bb_set(0x0db4, 1 << 0, 1)?;
+                self.bb_set(0x0818, 1 << 11, 1)?;
+                self.bb_set(0x1940, 1 << 31, 1)?;
+            }
+            _ => {
+                self.bb_set(0x1900, 0xF, 6)?; // BW mode 20 (narrowband rides on top)
+            }
+        }
+        Ok(())
+    }
+
+    /// Set the reference TX-power index (0..0x7f) for path A OFDM + CCK
+    /// (`config_phydm_write_txagc_ref`, reg 0x4308). Effective because this userspace
+    /// bring-up runs with tx-power-by-rate / power-limit disabled.
+    pub fn set_tx_power_idx(&self, idx: u8) -> Result<(), FaceError> {
+        let p = (idx & 0x7f) as u32;
+        self.bb_set(0x4308, 0x0000_007f, p)?; // OFDM path A
+        self.bb_set(0x4308, 0x0000_7f00, p)?; // CCK path A
+        Ok(())
+    }
+
+    /// Split a bulk-IN transfer into 802.11 frames and queue the parsed
+    /// [`CapturedFrame`]s (used by [`FrameIo::recv_frame`]).
+    fn parse_rx_into_pending(&self, data: &[u8]) {
+        let mut q = self.rx_pending.lock().unwrap();
+        let mut off = 0usize;
+        while off + 24 <= data.len() {
+            let dw0 = u32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]]);
+            let pkt_len = (dw0 & 0x3FFF) as usize;
+            if pkt_len == 0 {
+                break;
+            }
+            let drvinfo = ((dw0 >> 16) & 0xF) as usize * 8;
+            let shift = ((dw0 >> 24) & 0x3) as usize;
+            let dw2 =
+                u32::from_le_bytes([data[off + 8], data[off + 9], data[off + 10], data[off + 11]]);
+            let is_c2h = dw2 & (1 << 28) != 0;
+            let fstart = off + 24 + drvinfo + shift;
+            if !is_c2h && fstart + pkt_len <= data.len() {
+                if let Some(cap) =
+                    frame::parse_dot11(self.format, &data[fstart..fstart + pkt_len], None, None, None)
+                {
+                    q.push_back(cap);
+                }
+            }
+            off += (24 + drvinfo + shift + pkt_len + 7) & !7;
+        }
+    }
+}
+
+/// The 8733b as an async monitor radio: inject NDN-framed 802.11 at the current fixed
+/// rate and capture every frame on the channel. Blocking USB I/O runs on the blocking
+/// pool so the async reactor is never stalled.
+#[async_trait]
+impl FrameIo for Rtl8733buBackend {
+    async fn inject(&self, frame_in: InjectFrame) -> Result<(), FaceError> {
+        let dot11 = frame::build_dot11(self.format, &frame_in)?;
+        let rate = self.tx_rate.load(Ordering::Relaxed);
+        let seq = self.tx_seq.fetch_add(1, Ordering::Relaxed) & 0xFFF;
+        let bcast = dot11.len() > 4 && dot11[4] & 0x01 != 0;
+        let desc = build_data_txdesc(dot11.len(), rate, seq, bcast);
+        let mut buf = Vec::with_capacity(desc.len() + dot11.len() + 1);
+        buf.extend_from_slice(&desc);
+        buf.extend_from_slice(&dot11);
+        if buf.len() % 512 == 0 {
+            buf.push(0);
+        }
+        let handle = self.handle.clone();
+        let ep = self.bulk_out;
+        tokio::task::spawn_blocking(move || {
+            handle
+                .write_bulk(ep, &buf, Duration::from_millis(500))
+                .map(|_| ())
+                .map_err(usb_err)
+        })
+        .await
+        .map_err(|e| io_err(format!("inject join: {e}")))?
+    }
+
+    async fn recv_frame(&self) -> Result<CapturedFrame, FaceError> {
+        loop {
+            if let Some(f) = self.rx_pending.lock().unwrap().pop_front() {
+                return Ok(f);
+            }
+            let handle = self.handle.clone();
+            let ep = self.bulk_in;
+            let (buf, n) = tokio::task::spawn_blocking(move || {
+                let mut buf = vec![0u8; 16384];
+                match handle.read_bulk(ep, &mut buf, Duration::from_millis(200)) {
+                    Ok(n) => Ok((buf, n)),
+                    Err(rusb::Error::Timeout) => Ok((buf, 0)),
+                    Err(e) => Err(usb_err(e)),
+                }
+            })
+            .await
+            .map_err(|e| io_err(format!("recv join: {e}")))??;
+            if n > 0 {
+                self.parse_rx_into_pending(&buf[..n]);
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl WifiRadio for Rtl8733buBackend {
+    async fn inject_at(&self, frame_in: InjectFrame, _mcs: McsDescriptor) -> Result<(), FaceError> {
+        // The current fixed rate (set_tx_rate) applies; per-frame rate control is via
+        // set_tx_rate before inject.
+        self.inject(frame_in).await
+    }
+}
+
+impl RadioKnobs for Rtl8733buBackend {
+    fn set_channel(&self, channel: u8, bw: Bandwidth) -> Result<(), FaceError> {
+        self.tune_channel(channel)?;
+        self.set_bandwidth(bw)
+    }
+    fn set_tx_power(&self, idx: u32) -> Result<(), FaceError> {
+        self.set_tx_power_idx(idx.min(0x7f) as u8)
     }
 }
 

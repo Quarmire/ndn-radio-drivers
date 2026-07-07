@@ -102,7 +102,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     println!("✓ (cal-init microcode loaded)");
                     // Tune to a 2.4 GHz channel (prerequisite for calibration convergence).
                     print!("set_channel(6) … ");
-                    dev.set_channel(6)?;
+                    dev.tune_channel(6)?;
                     println!("✓ (RF18=0x{:05x})", dev.rf_read(0x18)?);
                     if std::env::var("NCTLDBG").is_ok() {
                         dev.nctl_debug()?;
@@ -126,7 +126,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         Err(e) => println!("FAILED: {e}"),
                     }
                     // M8: monitor-mode RX capture (ambient frames) + TX inject.
-                    dev.set_channel(1)?;
+                    dev.tune_channel(1)?;
                     dev.set_monitor()?;
                     print!("M8 capture (2s ambient, ch1) … ");
                     let mut total = 0usize;
@@ -152,7 +152,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     frame.extend_from_slice(&[0x00, 0x00]); // seq
                     frame.extend_from_slice(b"NDN8733B-TEST-INJECT");
                     print!("M8 inject (1M CCK) … ");
-                    match dev.inject(&frame, 0x00, 1) {
+                    match dev.inject_raw(&frame, 0x00, 1) {
                         Ok(()) => println!("✓ sent {} bytes to air", frame.len()),
                         Err(e) => println!("FAILED: {e}"),
                     }

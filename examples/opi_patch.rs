@@ -10,16 +10,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ch: u8 = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(36);
     let d = Rtl8733buBackend::open()?;
     d.bring_up_monitor(ch)?;
-    // BB regs (addr, vendor value) from the clean diff.
-    let bb: [(u16, u32); 8] = [
-        (0x0808, 0x6015_6040),
-        (0x081c, 0x8605_0009),
-        (0x084c, 0xa8b0_5555),
-        (0x09b0, 0x0000_0000),
-        (0x0c30, 0x140c_9494),
-        (0x180c, 0x17f4_3863),
-        (0x18ac, 0x0006_5a60),
-        (0x1968, 0x3663_2640),
+    // TX AGC to the vendor's values: 0x3a00 per-rate = 0xc0 (mine was 0x2d), 0x4308 ref.
+    let bb: [(u16, u32); 6] = [
+        (0x3a00, 0xc0c0_c0c0),
+        (0x3a04, 0xc0c0_c0c0),
+        (0x3a08, 0xc0c0_c0c0),
+        (0x3a0c, 0xc0c0_c0c0),
+        (0x3a10, 0xc0c0_c0c0),
+        (0x4308, 0x5c54_5c50),
     ];
     for (a, v) in bb {
         let _ = d.write32(a, v);

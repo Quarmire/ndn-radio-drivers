@@ -68,7 +68,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let txagc0 = dut.read32(0x3a00)?;
     dut.set_txagc_table(0x3f)?; // per-rate TX AGC table — 0 without this = no RF
     dut.configure_trsw(true)?; // route the external TRSW antenna switch (TX path)
+    dut.enable_tx_path()?; // RF mode table -> TX + enable BB CCK TX
     println!("  TXAGC table 0x3a00: 0x{txagc0:08x} -> 0x{:08x}", dut.read32(0x3a00)?);
+    println!(
+        "  post-enable: 0x1800=0x{:05x} (exp 33312)  0x2a00=0x{:08x} (bit1?)  0x1884=0x{:08x}  RF0=0x{:05x}",
+        dut.read32(0x1800)? & 0xfffff,
+        dut.read32(0x2a00)?,
+        dut.read32(0x1884)?,
+        dut.rf_read(0x00)?
+    );
     let rf18 = dut.rf_read(0x18)?;
     let txpause = dut.read8(0x0522)?;
     dut.write8(0x0522, 0x00)?; // REG_TXPAUSE: unpause ALL TX queues (cal leaves it set)

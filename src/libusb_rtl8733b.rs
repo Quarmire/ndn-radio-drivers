@@ -2021,6 +2021,46 @@ impl Rtl8733buBackend {
         Ok(())
     }
 
+    /// BB reset (`phydm_bb_reset_8733b`): toggle `SYS_FUNC_EN[0]` (FEN_BBRSTB, bit 16
+    /// of the dword at MAC `0x0`) 1→0→1 so BB config changes latch.
+    fn bb_reset(&self) -> Result<(), FaceError> {
+        for v in [1u32, 0, 1] {
+            let cur = self.read32(0x0)?;
+            self.write32(0x0, (cur & !(1 << 16)) | (v << 16))?;
+        }
+        Ok(())
+    }
+
+    /// IGI toggle (`phydm_igi_toggle_8733b`): nudge `0x1d70[6:0]` down 2 then back, to
+    /// force the RF to (re)enter its mode after the mode-table change.
+    fn igi_toggle(&self) -> Result<(), FaceError> {
+        let igi = self.bb_get(0x1d70, 0x7f)?;
+        if igi > 2 {
+            self.bb_set(0x1d70, 0x7f, igi - 2)?;
+        }
+        self.bb_set(0x1d70, 0x7f, igi)?;
+        Ok(())
+    }
+
+    /// **Enable the RF TX path for normal operation** (`config_phydm_trx_mode_8733b` +
+    /// `phydm_dis_cck_trx_8733b(SET)`, path A 1×1). Programs the RF mode table
+    /// (`0x1800`, nibbles `0=shutdown/1=standby/2=TX/3=RX`) to a TX-capable state,
+    /// selects path A (`0x1884`), enables BB CCK TX (`0x2a00[1]=0`) + CCK CCA
+    /// (`0x2a24[13]=0`), and resets the BB. Without this the RF never enters TX mode on
+    /// a MAC transmit, so injected frames don't radiate.
+    pub fn enable_tx_path(&self) -> Result<(), FaceError> {
+        self.bb_set(0x1800, 0x000F_FFFF, 0x33311)?; // RF mode table (pre)
+        self.bb_set(0x1884, 1 << 21, 0)?; // sw-control s0/s1
+        self.bb_set(0x1884, 1 << 20, 0)?; // tx = rx = path A
+        self.bb_set(0x1800, 0x000F_FFFF, 0x33312)?; // RF mode table (TX-capable)
+        self.bb_reset()?;
+        self.igi_toggle()?;
+        self.bb_set(0x2a24, 1 << 13, 0)?; // enable CCK CCA
+        self.bb_set(0x2a00, 1 << 1, 0)?; // enable BB CCK TX
+        self.bb_reset()?;
+        Ok(())
+    }
+
     /// Route the TX/RX antenna-switch (TRSW) control GPIOs
     /// (`phydm_init_hw_info_by_rfe_type_8733b`). `ext = true` is the external-TRSW
     /// board config (rfe 1/3/4/5, "pin usecase E9") most USB dongles use; without it

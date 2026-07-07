@@ -1041,9 +1041,10 @@ impl Rtl8733buBackend {
         self.bb_config()?;
         self.rf_config()?;
         self.init_trx()?;
-        self.rfk_init()?; // NCTL/KIP microcode (TXGAPK cal one-shots need it)
         self.tune_channel(channel)?;
-        let _ = self.phy_txgapk(); // TX Gain-K → RF gain LUT → drives RF 0x01 (TX AGC)
+        // NOTE: RF 0x01=0 at idle is NORMAL (the vendor reads 0 too when not actively
+        // transmitting; the HW sets the TX AGC per-transmit). The earlier TXGAPK call
+        // here was chasing a non-bug and left cal residue in the RF/BB state — removed.
         self.set_monitor()?;
         self.enable_tx_path()?; // RF mode table → TX + BB CCK TX (normal-op TX enable)
         self.set_txagc_table(0x2d)?; // per-rate TX gain (0 by default → no output)

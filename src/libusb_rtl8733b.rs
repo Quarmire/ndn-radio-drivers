@@ -234,7 +234,13 @@ fn download_txdesc(payload_len: usize) -> [u8; TX_DESC_SIZE] {
 /// TXPKTSIZE + OFFSET=48, QSEL=MGT, disable-agg, USE_RATE + DISDATAFB/DISRTSFB (fixed
 /// rate), retry-limit-enable, SEC_TYPE=0 (raw), EN_HWSEQ=0 with a 12-bit SW sequence,
 /// and the TX-desc checksum (`~XOR` of the first 32 bytes' u16 words) at 0x1C.
-fn build_data_txdesc(frame_len: usize, rate: u8, seq: u16, bcast: bool) -> [u8; DATA_TX_DESC_SIZE] {
+fn build_data_txdesc(
+    frame_len: usize,
+    rate: u8,
+    seq: u16,
+    bcast: bool,
+    flags: u8,
+) -> [u8; DATA_TX_DESC_SIZE] {
     let mut d = [0u8; DATA_TX_DESC_SIZE];
     let mut dw0 = (frame_len as u32 & 0xFFFF) | ((DATA_TX_DESC_SIZE as u32 & 0xFF) << 16);
     if bcast {
@@ -245,6 +251,16 @@ fn build_data_txdesc(frame_len: usize, rate: u8, seq: u16, bcast: bool) -> [u8; 
     d[8..12].copy_from_slice(&(1u32 << 16).to_le_bytes()); // dw2: BK (disable aggregation)
     d[12..16].copy_from_slice(&((1u32 << 8) | (1 << 9) | (1 << 10)).to_le_bytes()); // dw3: USE_RATE|DISRTSFB|DISDATAFB
     d[16..20].copy_from_slice(&((rate as u32 & 0x7F) | (1 << 17)).to_le_bytes()); // dw4: DATARATE|RTY_LMT_EN
+    // dw5: DATA_SHORT/SGI(BIT4), DATA_BW[6:5], DATA_LDPC(BIT7), DATA_STBC[9:8].
+    let sgi = (flags >> 1) & 1;
+    let stbc = (flags >> 2) & 1;
+    let ldpc = flags & 1;
+    let bw = (flags >> 3) & 1; // 0=20, 1=40 MHz
+    let dw5 = ((sgi as u32) << 4)
+        | ((bw as u32) << 5)
+        | ((ldpc as u32) << 7)
+        | ((stbc as u32) << 8);
+    d[20..24].copy_from_slice(&dw5.to_le_bytes());
     d[36..40].copy_from_slice(&(((seq as u32) & 0xFFF) << 12).to_le_bytes()); // dw9: SW_SEQ
     // Checksum over the FIRST 32 bytes (16 u16 words, dw0..dw7) with the field at 0x1C
     // left zero — NOT the whole descriptor (dw8/dw9 hold the seq and are excluded).
@@ -328,6 +344,9 @@ pub struct Rtl8733buBackend {
     tx_rate: std::sync::atomic::AtomicU8,
     /// Rolling 12-bit SW sequence number for injected frames.
     tx_seq: std::sync::atomic::AtomicU16,
+    /// TX PHY flags for the descriptor: bit0 LDPC, bit1 short-GI, bit2 STBC,
+    /// bit3 40 MHz (see [`set_tx_flags`](Rtl8733buBackend::set_tx_flags)).
+    tx_flags: std::sync::atomic::AtomicU8,
     /// Parsed RX frames buffered between bulk-IN reads (one read yields many).
     rx_pending: std::sync::Mutex<std::collections::VecDeque<CapturedFrame>>,
 }
@@ -404,6 +423,7 @@ impl Rtl8733buBackend {
             format: FrameFormat::default(),
             tx_rate: std::sync::atomic::AtomicU8::new(0x04), // 6 Mbps OFDM
             tx_seq: std::sync::atomic::AtomicU16::new(0),
+            tx_flags: std::sync::atomic::AtomicU8::new(0),
             rx_pending: std::sync::Mutex::new(std::collections::VecDeque::new()),
         })
     }
@@ -976,7 +996,7 @@ impl Rtl8733buBackend {
     /// HwRate code (0x00 = 1M CCK, 0x04 = 6M OFDM). Run after [`init_trx`].
     pub fn inject_raw(&self, frame: &[u8], rate: u8, seq: u16) -> Result<(), FaceError> {
         let bcast = frame.len() > 4 && frame[4] & 0x01 != 0; // 802.11 addr1[0] group bit
-        let desc = build_data_txdesc(frame.len(), rate, seq, bcast);
+        let desc = build_data_txdesc(frame.len(), rate, seq, bcast, self.tx_flags.load(Ordering::Relaxed));
         let mut pkt = Vec::with_capacity(desc.len() + frame.len() + 1);
         pkt.extend_from_slice(&desc);
         pkt.extend_from_slice(frame);
@@ -1280,11 +1300,30 @@ impl Rtl8733buBackend {
     /// path): clear the band/channel bits of RF 0x18 and set the channel, write both
     /// paths with the cut-D settle loop (poll RF 0xc5 BIT15), restore RF 0x19, and
     /// select the 2.4 GHz RX AGC table. Prerequisite for calibration + TX/RX.
+    /// Tune to `ch` on either band (`config_phydm_switch_channel_8733b`). `ch` ≤ 14 is
+    /// 2.4 GHz; any higher value is treated as a 5 GHz channel number
+    /// (`ch = (freq_MHz − 5000) / 5`) — the channel byte is written verbatim with no
+    /// regulatory channel-list restriction, so arbitrary 5 GHz centres (the libc0607
+    /// "unlock frequency" feature, ~5080–6030 MHz) are reachable. Combine with
+    /// [`set_bandwidth`](Self::set_bandwidth) `Nb5`/`Nb10` for narrowband.
     pub fn tune_channel(&self, ch: u8) -> Result<(), FaceError> {
+        let is_2g = ch <= 14;
         let mut rf18 = self.rf_get(0, 0x18, RFREG_MASK)?;
-        let rf19 = self.rf_get(0, 0x19, RFREG_MASK)?;
-        // 2.4 GHz: clear band bits (17,16,9,8) + channel byte, set channel.
-        rf18 = (rf18 & !((1 << 17) | (1 << 16) | (1 << 9) | (1 << 8) | 0xFF)) | (ch as u32);
+        let mut rf19 = self.rf_get(0, 0x19, RFREG_MASK)?;
+        if is_2g {
+            // 2.4 GHz: clear band bits (17,16,9,8) + channel byte, set channel.
+            rf18 = (rf18 & !((1 << 17) | (1 << 16) | (1 << 9) | (1 << 8) | 0xFF)) | (ch as u32);
+        } else {
+            // 5 GHz: band markers BIT16|BIT8, channel in the low byte.
+            rf18 = (rf18 & !((1 << 17) | (1 << 9) | 0xFF)) | (1 << 16) | (1 << 8) | (ch as u32);
+            // 5G sub-band select: >144 → BIT19, 5400<f≤5720 (ch>80) → BIT18.
+            rf19 &= !((1 << 19) | (1 << 18));
+            if ch > 144 {
+                rf19 |= 1 << 19;
+            } else if ch > 80 {
+                rf19 |= 1 << 18;
+            }
+        }
         for _ in 0..20 {
             self.rf_set(0, 0x18, RFREG_MASK, rf18)?;
             self.rf_set(1, 0x18, RFREG_MASK, rf18)?;
@@ -1295,7 +1334,7 @@ impl Rtl8733buBackend {
         }
         self.rf_set(0, 0x19, RFREG_MASK, rf19)?;
         self.rf_set(1, 0x19, RFREG_MASK, rf19)?;
-        self.bb_set(0x1ea8, 1 << 7, 1)?; // 2.4 GHz RX idle AGC table
+        self.bb_set(0x1ea8, 1 << 7, is_2g as u32)?; // RX idle AGC table: 1=2.4G, 0=5G
         Ok(())
     }
 
@@ -1906,6 +1945,15 @@ impl Rtl8733buBackend {
         self.tx_rate.store(hw_rate, Ordering::Relaxed);
     }
 
+    /// Set the TX PHY flags applied to every injected frame's descriptor: `ldpc`
+    /// (LDPC coding), `stbc` (space-time block coding), `sgi` (short guard interval),
+    /// and `bw40` (mark the frame 40 MHz — pair with [`set_bandwidth`] `Bw40`). These
+    /// only affect HT (MCS) rates; a legacy CCK/OFDM frame ignores them.
+    pub fn set_tx_flags(&self, ldpc: bool, stbc: bool, sgi: bool, bw40: bool) {
+        let f = (ldpc as u8) | ((sgi as u8) << 1) | ((stbc as u8) << 2) | ((bw40 as u8) << 3);
+        self.tx_flags.store(f, Ordering::Relaxed);
+    }
+
     /// Set bandwidth / narrowband. 5 & 10 MHz narrowband (the vendor `narrowband`
     /// knob) are `0x9b0[7:6] = 1/2` on top of a 20 MHz channel; 20 vs 40 MHz is the
     /// BB path-width mode (`0x1900[3:0]` = 6/7 + the 40 MHz enables).
@@ -1980,7 +2028,7 @@ impl FrameIo for Rtl8733buBackend {
         let rate = self.tx_rate.load(Ordering::Relaxed);
         let seq = self.tx_seq.fetch_add(1, Ordering::Relaxed) & 0xFFF;
         let bcast = dot11.len() > 4 && dot11[4] & 0x01 != 0;
-        let desc = build_data_txdesc(dot11.len(), rate, seq, bcast);
+        let desc = build_data_txdesc(dot11.len(), rate, seq, bcast, self.tx_flags.load(Ordering::Relaxed));
         let mut buf = Vec::with_capacity(desc.len() + dot11.len() + 1);
         buf.extend_from_slice(&desc);
         buf.extend_from_slice(&dot11);

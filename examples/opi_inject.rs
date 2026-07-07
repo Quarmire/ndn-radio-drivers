@@ -13,8 +13,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let d = Rtl8733buBackend::open()?;
     d.bring_up_monitor(ch)?;
     if std::env::var("CAL").is_ok() {
-        // M11: LOK — the TX-carrier keystone. rfk_init loads the KIP microcode the NCTL
-        // one-shot needs; phy_lok cals the LO leakage so the TX mixer emits a carrier.
+        // M10b efuse trim (crystal cap) → the analog baseline the cals need.
+        println!("trim: {:?}", d.apply_efuse_trim());
+        // M11 LOK — the TX-carrier keystone.
         let _ = d.rfk_init();
         println!("lok: {:?}", d.phy_lok(ch > 14));
     }

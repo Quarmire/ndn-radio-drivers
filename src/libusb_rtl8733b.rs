@@ -1019,6 +1019,64 @@ impl Rtl8733buBackend {
         Ok(map)
     }
 
+    /// Decode the header-encoded physical efuse into the logical map (1/2-byte-header
+    /// block format; word_en bit=0 → word present).
+    fn decode_efuse(phys: &[u8]) -> Vec<u8> {
+        let mut logi = vec![0xffu8; 0x200];
+        let mut i = 0usize;
+        while i < phys.len() {
+            let hdr = phys[i];
+            i += 1;
+            if hdr == 0xff {
+                break;
+            }
+            let (offset, word_en) = if (hdr & 0x1f) == 0x0f {
+                if i >= phys.len() {
+                    break;
+                }
+                let h2 = phys[i];
+                i += 1;
+                ((((h2 & 0xf0) >> 1) | ((hdr & 0xe0) >> 5)) as usize, h2 & 0x0f)
+            } else {
+                (((hdr & 0xf0) >> 4) as usize, hdr & 0x0f)
+            };
+            for w in 0..4usize {
+                if word_en & (1 << w) == 0 {
+                    for b in 0..2 {
+                        if i < phys.len() {
+                            let a = offset * 8 + w * 2 + b;
+                            if a < logi.len() {
+                                logi[a] = phys[i];
+                            }
+                            i += 1;
+                        }
+                    }
+                }
+            }
+        }
+        logi
+    }
+
+    /// **M10b**: read the efuse, decode it, and apply the analog trim the cals need — the
+    /// crystal cap (Xtal frequency) from logical 0xB9. Returns `(crystal_cap, thermal)`.
+    /// The vendor applies this before the RF cals; without it the cal search over-ranges.
+    pub fn apply_efuse_trim(&self) -> Result<(u8, u8), FaceError> {
+        let logi = Self::decode_efuse(&self.read_efuse(512)?);
+        let xtal = logi[0xB9];
+        let thermal = logi[0xBA];
+        let cap = if xtal != 0xff {
+            (xtal & 0x3f) as u32
+        } else {
+            0x3f
+        };
+        // crystal_cap → MAC 0x24[30:25] and 0x28[6:1].
+        let v24 = (self.read32(0x24)? & !0x7e00_0000) | (cap << 25);
+        self.write32(0x24, v24)?;
+        let v28 = (self.read32(0x28)? & !0x7e) | (cap << 1);
+        self.write32(0x28, v28)?;
+        Ok((cap as u8, thermal))
+    }
+
     // ── M8: TX/RX data path (monitor-mode inject/capture) ────────────────────
 
     /// **M8**: inject a raw 802.11 frame at a fixed rate. Builds the 48-byte data TX

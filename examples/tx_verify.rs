@@ -13,23 +13,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ── Witness: RTL8812AU monitor bring-up ──
     println!("bringing up 8812au witness on ch{ch} …");
     let wit = Rtl8812auBackend::open()?;
-    wit.power_on()?;
-    wit.download_firmware()?;
-    wit.mac_config()?;
-    wit.bb_config()?;
-    wit.rf_config()?;
-    wit.mac_init_queues()?;
-    wit.mac_enable_dma()?;
-    wit.set_channel(ch)?;
-    match wit.iq_calibrate() {
-        Ok(_) => println!("  witness IQK ok"),
-        Err(e) => println!("  witness IQK: {e}"),
-    }
-    match wit.lc_calibrate() {
-        Ok(()) => println!("  witness LCK ok"),
-        Err(e) => println!("  witness LCK: {e}"),
-    }
-    wit.start_rx_dma()?;
+    wit.bring_up_monitor(ch)?;
 
     // Sanity: confirm the witness hears ambient traffic before trusting a null result.
     let mut buf = vec![0u8; 16384];

@@ -1580,6 +1580,26 @@ impl Rtl8812auBackend {
         Ok(())
     }
 
+    /// Full monitor-mode bring-up in the **correct order** — the ordering matters:
+    /// [`mac_enable_dma`](Self::mac_enable_dma) zeroes `REG_CR` before setting
+    /// `DMA_ENABLE`, so it must run *before* [`mac_init_queues`](Self::mac_init_queues)
+    /// (which sets `MACTXEN|MACRXEN` last); the reverse silently disables RX. After
+    /// this the dongle captures every frame on `channel`.
+    pub fn bring_up_monitor(&self, channel: u8) -> Result<(), FaceError> {
+        self.power_on()?;
+        self.download_firmware()?;
+        self.mac_config()?;
+        self.mac_enable_dma()?; // clears CR then sets DMA_EN — MUST precede init_queues
+        self.mac_init_queues()?; // sets MACTXEN|MACRXEN last
+        self.bb_config()?;
+        self.rf_config()?;
+        self.set_channel(channel)?;
+        let _ = self.iq_calibrate(); // best-effort; tunes RX EVM, not the on-air gate
+        let _ = self.lc_calibrate();
+        self.start_rx_dma()?;
+        Ok(())
+    }
+
     /// One raw bulk-IN read (diagnostic): returns the byte count without parsing
     /// (0 on timeout). Use to confirm RX DMA is delivering to the IN endpoint.
     pub fn rx_raw(&self, buf: &mut [u8]) -> Result<usize, FaceError> {

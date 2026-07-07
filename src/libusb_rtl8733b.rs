@@ -2007,6 +2007,20 @@ impl Rtl8733buBackend {
         Ok(())
     }
 
+    /// Write the **per-rate TX AGC table** (`phydm_write_txagc_1byte`, base `0x3a00`)
+    /// with a uniform gain index for CCK (`0x00–0x03`), OFDM (`0x04–0x0b`), and HT
+    /// MCS0–7 (`0x0c–0x13`). This is the gain the PHY applies to the RF during
+    /// transmit — it starts at 0 without a tx-power apply, so nothing radiates until
+    /// it is set. `idx` is a raw AGC index (≈ 0.5 dB/step); try `0x2d`–`0x3f`.
+    pub fn set_txagc_table(&self, idx: u8) -> Result<(), FaceError> {
+        for rate in 0u16..=0x13 {
+            let reg = 0x3a00 + (rate & 0xfc);
+            let mask = 0xFFu32 << ((rate & 0x3) * 8);
+            self.bb_set(reg, mask, idx as u32)?;
+        }
+        Ok(())
+    }
+
     /// Split a bulk-IN transfer into 802.11 frames and queue the parsed
     /// [`CapturedFrame`]s (used by [`FrameIo::recv_frame`]).
     fn parse_rx_into_pending(&self, data: &[u8]) {

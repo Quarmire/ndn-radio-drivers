@@ -992,6 +992,33 @@ impl Rtl8733buBackend {
         Ok(())
     }
 
+    /// **M10**: read `size` bytes from the physical efuse (`read_hw_efuse_87xx`) via the
+    /// `REG_EFUSE_CTRL` (0x30) protocol: set the 10-bit address in `[17:8]`, write with
+    /// `EF_FLAG` (bit31) cleared to trigger, poll until it sets, take the data byte
+    /// `[7:0]`. The efuse holds the tx-power calibration + RF/PA/Xtal trim the TX path
+    /// needs — the M10 base the vendor sets that a bare bring-up skips.
+    pub fn read_efuse(&self, size: u16) -> Result<Vec<u8>, FaceError> {
+        let mut map = Vec::with_capacity(size as usize);
+        let mut v = self.read32(0x30)?;
+        for addr in 0..size as u32 {
+            v &= !(0xff | (0x3ff << 8)); // clear data + addr fields
+            v |= (addr & 0x3ff) << 8; // set the byte address
+            self.write32(0x30, v & !(1 << 31))?; // trigger read (EF_FLAG=0)
+            let deadline = Instant::now() + Duration::from_millis(100);
+            loop {
+                let t = self.read32(0x30)?;
+                if t & (1 << 31) != 0 {
+                    map.push((t & 0xff) as u8);
+                    break;
+                }
+                if Instant::now() > deadline {
+                    return Err(io_err(format!("efuse read timeout at 0x{addr:03x}")));
+                }
+            }
+        }
+        Ok(map)
+    }
+
     // ── M8: TX/RX data path (monitor-mode inject/capture) ────────────────────
 
     /// **M8**: inject a raw 802.11 frame at a fixed rate. Builds the 48-byte data TX

@@ -2279,7 +2279,11 @@ impl Rtl8733buBackend {
         self.bb_set(0x1b10, 0x0000_00FF, 0x00)?;
         self.bb_set(0x1b00, 0xFFFF_0000, 0x3c00)?; // rfc_base_address (path A)
         self.bb_set(0x1880, 1 << 21, 0x1)?; // r_iqk_IO_RFC_en
-        self.bb_set(0x1bcc, 0x0000_003F, 0x9)?; // ItQt
+        let itqt = std::env::var("IQK_ITQT")
+            .ok()
+            .and_then(|s| u32::from_str_radix(&s, 16).ok())
+            .unwrap_or(0x9);
+        self.bb_set(0x1bcc, 0x0000_003F, itqt)?; // ItQt (tone level)
         self.bb_set(0x1b2c, 0xFFFF_FFFF, 0x0024_0024)?; // Tx_tone_idx
         self.bb_set(0x1b00, 0x0000_1FFF, 0x018)?; // cal_path/process = LOK coarse
         let mut ms = 0;
@@ -2297,14 +2301,10 @@ impl Rtl8733buBackend {
         self.bb_set(0x1880, 1 << 21, 0x0)?;
         self.bb_set(0x1bd4, 0xFFFF_FFFF, 0x002c_0001)?; // select IDAC readout
         let reg = self.read32(0x1bfc)?;
-        let mut idac_ic = (reg >> 25) & 0x1F;
-        let mut idac_qc = (reg >> 5) & 0x1F;
-        if reg & (1 << 24) != 0 {
-            idac_ic += 1;
-        }
-        if reg & (1 << 4) != 0 {
-            idac_qc += 1;
-        }
+        let mut idac_ic = ((reg >> 25) & 0x1F) + ((reg >> 24) & 1);
+        let mut idac_qc = ((reg >> 5) & 0x1F) + ((reg >> 4) & 1);
+        idac_ic = idac_ic.min(0x1f); // clamp — the 5-bit RF 0x08 field wraps at 0x20
+        idac_qc = idac_qc.min(0x1f);
         self.rf_set(0, 0x08, 0xF8000, idac_ic)?; // apply LO-leakage I
         self.rf_set(0, 0x08, 0x003E0, idac_qc)?; // apply LO-leakage Q
         if dbg {

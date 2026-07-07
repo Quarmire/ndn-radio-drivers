@@ -14,12 +14,17 @@ use std::time::{Duration, Instant};
 const MARKER: &[u8] = b"NDN8733B-TEST-INJECT";
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let ch = 1u8;
+    // Channel from arg (default 1). Both dongles are dual-band; a marker hit confirms
+    // the witness is genuinely on this band (don't trust `iw`'s reported channel).
+    let ch: u8 = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(1);
 
     // ── Witness: RTL8812AU monitor bring-up ──
     println!("bringing up 8812au witness on ch{ch} …");
     let wit = Arc::new(Rtl8812auBackend::open()?);
     wit.bring_up_monitor(ch)?;
+    // Verify the witness's ACTUAL tuned channel (RF18 low byte) — don't trust the set.
+    let wrf18 = wit.rf_read(ndn_radio_drivers::RfPath::A, 0x18).unwrap_or(0);
+    println!("witness RF18=0x{wrf18:05x} → tuned channel {} (asked {ch})", wrf18 & 0xff);
 
     // Continuous witness RX on its own thread: keeps the 8812au's libusb context
     // serviced (so the 8733b context isn't starved) and counts marker hits.
@@ -50,40 +55,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::thread::sleep(Duration::from_millis(1500));
     println!("witness ambient sanity: {} reads in 1.5s", reads.load(Ordering::Relaxed));
 
-    // ── DUT: RTL8733BU full bring-up (cal chain primes the TX AFE/BB path) ──
-    println!("bringing up 8733b DUT …");
+    // ── DUT: RTL8733BU bring-up on ch{ch}. bring_up_monitor applies the whole path:
+    //    40-byte-descriptor TX, full BB channel/BW config, enable_tx_path (RF mode
+    //    table + CCK TX), per-rate AGC table, TRSW routing. ──
+    println!("bringing up 8733b DUT on ch{ch} …");
     let dut = Rtl8733buBackend::open()?;
-    dut.power_on()?;
-    dut.fw_dl_setup()?;
-    dut.download_firmware()?;
-    dut.mac_config()?;
-    dut.bb_config()?;
-    dut.rf_config()?;
-    dut.init_trx()?;
-    dut.rfk_init()?;
-    dut.tune_channel(ch)?; // tune + calibrate on the SAME channel we inject on
-    let _ = dut.phy_iq_calibrate();
-    dut.set_monitor()?;
+    dut.bring_up_monitor(ch)?;
     dut.set_tx_power_idx(0x7f)?; // max reference TX power
-    let txagc0 = dut.read32(0x3a00)?;
-    dut.set_txagc_table(0x3f)?; // per-rate TX AGC table — 0 without this = no RF
-    dut.configure_trsw(true)?; // route the external TRSW antenna switch (TX path)
-    dut.enable_tx_path()?; // RF mode table -> TX + enable BB CCK TX
-    println!("  TXAGC table 0x3a00: 0x{txagc0:08x} -> 0x{:08x}", dut.read32(0x3a00)?);
-    println!(
-        "  post-enable: 0x1800=0x{:05x} (exp 33312)  0x2a00=0x{:08x} (bit1?)  0x1884=0x{:08x}  RF0=0x{:05x}",
-        dut.read32(0x1800)? & 0xfffff,
-        dut.read32(0x2a00)?,
-        dut.read32(0x1884)?,
-        dut.rf_read(0x00)?
-    );
+    dut.write8(0x0522, 0x00)?; // REG_TXPAUSE: unpause all TX queues
     let rf18 = dut.rf_read(0x18)?;
-    let txpause = dut.read8(0x0522)?;
-    dut.write8(0x0522, 0x00)?; // REG_TXPAUSE: unpause ALL TX queues (cal leaves it set)
-    println!(
-        "8733b up on ch{ch} (RF18=0x{rf18:05x}, low byte={}, TXPAUSE was 0x{txpause:02x}→0); injecting at 1M CCK for 8s …",
-        rf18 & 0xff
-    );
+    println!("8733b up on ch{ch} (RF18=0x{rf18:05x}); injecting for 8s …");
 
     // Broadcast data frame carrying the marker payload.
     let mut frame = vec![0x08u8, 0x00, 0x00, 0x00];
@@ -93,11 +74,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     frame.extend_from_slice(&[0x00, 0x00]);
     frame.extend_from_slice(MARKER);
 
+    // 2.4 GHz → 1M CCK (0x00); 5 GHz → 6M OFDM (0x04), since CCK is 2.4-only.
+    let rate = if ch <= 14 { 0x00u8 } else { 0x04 };
     let hits0 = hits.load(Ordering::Relaxed);
     let mut sent = 0u16;
     let deadline = Instant::now() + Duration::from_secs(8);
     while Instant::now() < deadline {
-        if dut.inject_raw(&frame, 0x00, sent).is_ok() {
+        if dut.inject_raw(&frame, rate, sent).is_ok() {
             sent = sent.wrapping_add(1);
         }
         std::thread::sleep(Duration::from_millis(3));

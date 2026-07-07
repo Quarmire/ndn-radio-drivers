@@ -24,8 +24,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("after set_monitor: RF01=0x{:05x}", rf01(&d));
     d.enable_tx_path()?;
     println!("after enable_tx:   RF01=0x{:05x}", rf01(&d));
-    // Try a manual write here and see if it sticks at this point.
-    d.set_rf_txagc(0x1a)?;
-    println!("after set_rf_txagc(0x1a): RF01=0x{:05x}", rf01(&d));
+    // M9: TXGAPK — calibrate the PA gain LUT so the HW drives RF 0x01.
+    d.rfk_init()?; // NCTL/KIP microcode (the cal one-shots need it)
+    match d.phy_txgapk() {
+        Ok(v) => println!("after phy_txgapk:  RF01=0x{:05x}  RF56=0x{:05x}  (want RF01~0x1a)", v & 0xfffff, rf56(&d)),
+        Err(e) => println!("phy_txgapk FAILED: {e}"),
+    }
     Ok(())
 }

@@ -1041,7 +1041,9 @@ impl Rtl8733buBackend {
         self.bb_config()?;
         self.rf_config()?;
         self.init_trx()?;
+        self.rfk_init()?; // NCTL/KIP microcode (TXGAPK cal one-shots need it)
         self.tune_channel(channel)?;
+        let _ = self.phy_txgapk(); // TX Gain-K → RF gain LUT → drives RF 0x01 (TX AGC)
         self.set_monitor()?;
         self.enable_tx_path()?; // RF mode table → TX + BB CCK TX (normal-op TX enable)
         self.set_txagc_table(0x2d)?; // per-rate TX gain (0 by default → no output)
@@ -1134,6 +1136,13 @@ const DPK_BB_REGS: [u16; 15] = [
     0x1c68, 0x1864, 0x180c, 0x1880,
 ];
 const DPK_RF_REGS: [u32; 9] = [0x0, 0x5, 0x83, 0x8c, 0x8f, 0x9e, 0xde, 0xdf, 0xef];
+/// TXGAPK (TX Gain-K) register backup lists (halrf_txgapk_8733b).
+const GAPK_BB_REGS: [u16; 8] = [0x1b00, 0x1b14, 0x1b24, 0x1b38, 0x1b3c, 0x1bcc, 0x1d40, 0x09f0];
+const GAPK_RF_REGS: [u32; 8] = [0x00, 0x01, 0x83, 0x8c, 0x8f, 0x9e, 0xdf, 0x05];
+// enablek one-shot actions: index → 0x1bf0 bit.
+const GAPK_D_CLR: u8 = 0; // BIT21
+const GAPK_DIFFK: u8 = 1; // BIT23
+const GAPK_TAK: u8 = 2; // BIT31
 // DPK one-shot action tags (encode the shot_code in dpk_one_shot).
 const DPK_PAS: u8 = 0;
 const DO_DPK: u8 = 1;
@@ -1913,6 +1922,230 @@ impl Rtl8733buBackend {
         self.iqk_afe_setting(false)?;
         self.dpk_restore(&bb, &rf)?;
         Ok((agc_done, dpk_fail))
+    }
+
+    // ── M9: TXGAPK (TX Gain-K) — calibrates the PA gain curve → RF gain LUT ─────────
+
+    fn txgapk_backup(&self) -> Result<(Vec<u32>, Vec<u32>), FaceError> {
+        let mut bb = Vec::new();
+        for &r in &GAPK_BB_REGS {
+            bb.push(self.read32(r)?);
+        }
+        let mut rf = Vec::new();
+        for &r in &GAPK_RF_REGS {
+            rf.push(self.rf_get(0, r, RFREG_MASK)?);
+        }
+        Ok((bb, rf))
+    }
+    fn txgapk_restore(&self, bb: &[u32], rf: &[u32]) -> Result<(), FaceError> {
+        for (i, &r) in GAPK_BB_REGS.iter().enumerate() {
+            self.write32(r, bb[i])?;
+        }
+        for (i, &r) in GAPK_RF_REGS.iter().enumerate() {
+            self.rf_set(0, r, RFREG_MASK, rf[i])?;
+        }
+        Ok(())
+    }
+
+    /// Enablek one-shot (`_txgapk_enablek_one_shot`): pulse the K action bit in `0x1bf0`
+    /// gated by `0x1bb8[20]`. `sel`: D_CLR/DIFFK/TAK → bit21/23/31.
+    fn txgapk_enablek(&self, sel: u8) -> Result<(), FaceError> {
+        let action = [1u32 << 21, 1 << 23, 1 << 31][sel as usize];
+        self.bb_set(0x1bb8, 1 << 20, 1)?;
+        self.bb_set(0x1bf0, action, 1)?;
+        self.bb_set(0x1bf0, action, 0)?;
+        std::thread::sleep(Duration::from_micros(10));
+        self.bb_set(0x1bb8, 1 << 20, 0)?;
+        Ok(())
+    }
+
+    /// PSD one-shot (`_txgapk_psd_one_shot`): select point in `0x1bf0[30]`, pulse
+    /// `0x1b34[0]`.
+    fn txgapk_psd_one_shot(&self, point: u32) -> Result<(), FaceError> {
+        self.bb_set(0x1bf0, 1 << 30, point)?;
+        self.bb_set(0x1b34, 1 << 0, 1)?;
+        self.bb_set(0x1b34, 1 << 0, 0)?;
+        std::thread::sleep(Duration::from_micros(10));
+        Ok(())
+    }
+
+    /// PSD-power validity check (`_txgapk_dbg_psd_pwr`). First pass returns true (do the
+    /// DIFFK); the register touches prime the report path.
+    fn txgapk_psd_valid(&self) -> Result<bool, FaceError> {
+        self.bb_set(0x1bd4, 1 << 22, 0)?;
+        self.write8(0x1bd6, 0x2e)?;
+        self.bb_set(0x1bf4, 0x0000_0F00, 0x2)?;
+        let _p0 = self.bb_get(0x1bfc, 0x7f)?;
+        let _p1 = self.bb_get(0x1bfc, 0x007f_0000)?;
+        Ok(true)
+    }
+
+    /// Trigger the diff calculation (`_txgapk_dbg_diff_calculate`) before reading `ta`.
+    fn txgapk_diff_calc(&self) -> Result<(), FaceError> {
+        self.bb_set(0x1bd4, 1 << 22, 0)?;
+        self.write8(0x1bd6, 0x2e)?;
+        self.bb_set(0x1bf4, 0x0000_0F00, 0x3)?;
+        for i in 0..5 {
+            let _ = self.bb_get(0x1bfc, 0x3f << (i * 6))?;
+        }
+        self.bb_set(0x1bf4, 0x0000_0F00, 0x4)?;
+        for i in 0..5 {
+            let _ = self.bb_get(0x1bfc, 0x3f << (i * 6))?;
+        }
+        Ok(())
+    }
+
+    /// RF gain setup for the cal (`_txgapk_rf_gain_setting`, 2.4 GHz path A). Uses a
+    /// mid TX AGC (0x1a) as the measurement operating point.
+    fn txgapk_rf_gain_setting(&self, path: u8) -> Result<(), FaceError> {
+        self.rf_set(path, 0x5, 1 << 0, 0)?;
+        self.rf_set(path, 0x00, RFREG_MASK, 0x50000)?;
+        self.rf_set(path, 0x1, 0xff, 0x1a)?;
+        self.rf_set(path, 0x83, 0x00007, 0x0)?;
+        self.rf_set(path, 0x83, 0x000f0, 0x7)?;
+        self.rf_set(path, 0xdf, 1 << 12, 0x1)?;
+        self.rf_set(path, 0x9e, 1 << 8, 0x1)?;
+        self.rf_set(path, 0x8f, 1 << 1, 0x0)?;
+        self.rf_set(path, 0x8f, 0x0e000, 0x7)?;
+        // EN_PAD_GAPK + EN_PA_GAPK — without these the PAD/PA gain doesn't switch with
+        // the index, so the gap search measures nothing (g1==g2).
+        self.rf_set(path, 0x5c, 1 << 19, 0x1)?;
+        self.rf_set(path, 0x5e, 1 << 19, 0x1)?;
+        self.rf_set(path, 0x5e, 0x3f000, 0x00)?; // PA_GAPK_INDEX
+        Ok(())
+    }
+
+    /// Clear both gain LUTs to 0 (`_txgapk_clear_gain_table`).
+    fn txgapk_clear_gain_table(&self, path: u8) -> Result<(), FaceError> {
+        self.rf_set(path, 0xee, 1 << 15, 1)?;
+        for i in 0..10u32 {
+            self.rf_set(path, 0x5c, 0x3f800, 3 + i * 6)?;
+            self.rf_set(path, 0x3f, 0x0003f, 0)?;
+        }
+        self.rf_set(path, 0xee, 1 << 15, 0)?;
+        self.rf_set(path, 0xee, 1 << 18, 1)?;
+        for i in 0..10u32 {
+            self.rf_set(path, 0x5e, 0x3f000, 1 + i * 3)?;
+            self.rf_set(path, 0x3f, 0x0003f, 0)?;
+        }
+        self.rf_set(path, 0xee, 1 << 18, 0)?;
+        self.rf_set(path, 0x5e, 0x3f000, 0)?;
+        Ok(())
+    }
+
+    /// GAPK BB enable (`_txgapk_enable_gapk`).
+    fn txgapk_enable_gapk(&self, path: u8) -> Result<(), FaceError> {
+        self.bb_set(0x1b00, (1 << 2) | (1 << 1), path as u32)?;
+        self.bb_set(0x1bd8, (1 << 1) | (1 << 0), 2)?;
+        self.bb_set(0x1b0c, (1 << 11) | (1 << 10), 2)?;
+        let rf0 = self.rf_get(path, 0x0, RFREG_MASK)?;
+        self.bb_set(0x1b24, RFREG_MASK, rf0)?;
+        self.bb_set(0x1b1c, 0x0001_C000, 4)?;
+        self.bb_set(0x1b38, 0xFFFF_FF00, 0x200000)?;
+        self.bb_set(0x1b3c, 0xFFFF_FF00, 0x200000)?;
+        self.bb_set(0x1b18, 0x7000_0000, 4)?;
+        self.bb_set(0x1b14, 0xFFFF_FFFF, 0x0001_0100)?;
+        self.bb_set(0x1bcc, 1 << 31, 0)?;
+        self.bb_set(0x1b2c, 0x0fff_0000, 0x024)?;
+        self.write8(0x1bf4, 0x5c)?;
+        self.bb_set(0x1bf0, (1 << 1) | (1 << 0), 0x1)?; // [0]=Psd_Gapk_en
+        self.txgapk_enablek(GAPK_D_CLR)?;
+        Ok(())
+    }
+
+    /// One gap-search table (track: RF 0x5c / power: RF 0x5e). 10 points, PSD one-shots.
+    fn txgapk_gap_search(&self, path: u8, track: bool) -> Result<(), FaceError> {
+        let (reg, mask, gmask, step) = if track {
+            (0x5cu32, 0x3f800u32, 0x0ffe0u32, 6u32)
+        } else {
+            (0x5e, 0x3f000, 0x01c00, 3)
+        };
+        let base = if track { 3 } else { 1 };
+        for i in 0..10u32 {
+            let idx = base + i * step;
+            let itqt = if i > 3 { 0x2d } else { 0x1b };
+            self.rf_set(path, reg, mask, idx)?;
+            let g1 = self.rf_get(path, 0x56, gmask)?;
+            self.rf_set(path, reg, mask, idx + if track { 2 } else { 1 })?;
+            let g2 = self.rf_get(path, 0x56, gmask)?;
+            if std::env::var("IQKDBG").is_ok() {
+                eprintln!("  [gapk {}] D{i}: g1=0x{g1:x} g2=0x{g2:x} RF56=0x{:x}", if track {"trk"} else {"pwr"}, self.rf_get(path, 0x56, RFREG_MASK)?);
+            }
+            if g1 != g2 {
+                self.rf_set(path, reg, mask, idx)?;
+                self.rf_set(path, reg, 0x0003f, 0)?;
+                self.bb_set(0x1bf0, 0x1f00_0000, i)?;
+                self.bb_set(0x1bcc, 0x0000_003f, itqt)?;
+                self.txgapk_psd_one_shot(0)?;
+                self.rf_set(path, reg, mask, idx + if track { 2 } else { 1 })?;
+                self.txgapk_psd_one_shot(1)?;
+                if self.txgapk_psd_valid()? {
+                    self.txgapk_enablek(GAPK_DIFFK)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Read the computed `ta[10]` gaps and write them into the RF gain LUT
+    /// (`_txgapk_write_gain_table`).
+    fn txgapk_write_gain_table(&self, path: u8, track: bool) -> Result<(), FaceError> {
+        self.txgapk_enablek(GAPK_TAK)?;
+        self.txgapk_diff_calc()?;
+        let mut ta = [0u32; 10];
+        self.bb_set(0x1bf4, 0x0000_0F00, 0x8)?;
+        for i in 0..5 {
+            ta[i] = self.bb_get(0x1bfc, 0x3f << (i * 6))?;
+        }
+        self.bb_set(0x1bf4, 0x0000_0F00, 0x9)?;
+        for i in 0..5 {
+            ta[i + 5] = self.bb_get(0x1bfc, 0x3f << (i * 6))?;
+        }
+        if std::env::var("IQKDBG").is_ok() {
+            eprintln!("  [gapk {}] ta={ta:x?}", if track { "trk" } else { "pwr" });
+        }
+        if track {
+            self.rf_set(path, 0xee, 1 << 15, 1)?;
+            for i in 0..10usize {
+                self.rf_set(path, 0x5c, 0x3f800, 3 + i as u32 * 6)?;
+                self.rf_set(path, 0x3f, 0x0003f, ta[i])?;
+            }
+            self.rf_set(path, 0xee, 1 << 15, 0)?;
+        } else {
+            self.rf_set(path, 0xee, 1 << 18, 1)?;
+            for i in 0..10usize {
+                self.rf_set(path, 0x5e, 0x3f000, 1 + i as u32 * 3)?;
+                self.rf_set(path, 0x3f, 0x0003f, ta[i])?;
+            }
+            self.rf_set(path, 0xee, 1 << 18, 0)?;
+        }
+        Ok(())
+    }
+
+    /// **M9 TXGAPK (TX Gain-K)**: calibrate the PA gain curve and write the RF gain LUT
+    /// that the HW uses to drive RF 0x01 (the RF TX AGC). Without this RF 0x01 idles at
+    /// 0 and nothing radiates. path A (1×1). Returns RF 0x01 after (should be nonzero).
+    pub fn phy_txgapk(&self) -> Result<u32, FaceError> {
+        let path = 0u8;
+        let (bb, rf) = self.txgapk_backup()?;
+        self.iqk_afe_setting(true)?; // ≈ _txgapk_afe_setting(true)
+        // config_offset_table: rf setup → clear → enable → track → power.
+        self.txgapk_rf_gain_setting(path)?;
+        self.txgapk_clear_gain_table(path)?;
+        self.txgapk_enable_gapk(path)?;
+        self.txgapk_gap_search(path, true)?;
+        self.txgapk_write_gain_table(path, true)?;
+        // Power table: disable PAD GAPK first, D_CLR, then search.
+        self.rf_set(path, 0x5c, 1 << 19, 0)?;
+        std::thread::sleep(Duration::from_millis(1));
+        self.write8(0x1bf4, 0x5e)?;
+        self.txgapk_enablek(GAPK_D_CLR)?;
+        self.txgapk_gap_search(path, false)?;
+        self.txgapk_write_gain_table(path, false)?;
+        self.iqk_afe_setting(false)?;
+        self.txgapk_restore(&bb, &rf)?;
+        std::thread::sleep(Duration::from_millis(1));
+        self.rf_read(0x01)
     }
 
     /// NCTL diagnostic: set up a LOK-style one-shot and watch the mirror, the

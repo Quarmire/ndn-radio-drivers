@@ -12,6 +12,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let secs: u64 = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(25);
     let d = Rtl8733buBackend::open()?;
     d.bring_up_monitor(ch)?;
+    if std::env::var("CAL").is_ok() {
+        // The vendor runs the full RF cal suite during init (write-seq diff); test whether
+        // the cals I have enable the TX in the OPi's native single-context env.
+        let _ = d.rfk_init();
+        println!("dpk: {:?}", d.phy_dpk());
+        println!("txgapk RF01: {:?}", d.phy_txgapk());
+    }
     d.write8(0x0522, 0x00)?; // unpause TX
     println!(
         "8733b up ch{ch} RF18=0x{:05x} RF01=0x{:05x}; injecting {secs}s…",

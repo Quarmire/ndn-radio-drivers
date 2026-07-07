@@ -1515,6 +1515,10 @@ impl Rtl8733buBackend {
     /// DPK RF setup for 2.4 GHz path A (`_dpk_rf_setting_8733b`, G-band), using the
     /// current RF TXAGC. Returns the applied TXAGC.
     fn dpk_rf_setting(&self, path: u8) -> Result<u8, FaceError> {
+        // NOTE: the proper TX AGC comes from _dpk_get_tssi_mode_txagc via a live HW-TX
+        // TSSI measurement (needs the TX data path, M8). Here we use the current RF 0x1;
+        // the hardware keeps it at a low managed value without HW-TX, so the AGC search
+        // starves — this is the TX-path dependency on M8.
         let txagc = self.rf_get(path, 0x1, RFREG_MASK)? & 0x1f;
         self.rf_set(0, 0x5, 1 << 0, 0)?;
         self.rf_set(1, 0x5, 1 << 0, 0)?;
@@ -1531,26 +1535,184 @@ impl Rtl8733buBackend {
         Ok((self.rf_get(path, 0x1, 0x1f)?) as u8)
     }
 
-    /// **M7 DPK (part 1)**: infrastructure test — backup → shared BB setup → DPK RF
-    /// setup → run the PAS + DO_DPK one-shots on path A → report convergence →
-    /// restore. Validates the DPK NCTL path (coefficient extraction from the LMS/PAS
-    /// SRAM + the LUT application + DPK_ON land in part 2). Returns `(pas, do_dpk)`
-    /// fail reports (0 = converged/ok).
+    /// Read a DPK debug report (`_dpk_dbg_report_read_8733b`): select `index` into
+    /// `0x1bd6`, read the result from `0x1bfc`.
+    fn dpk_dbg_report(&self, index: u8) -> Result<u32, FaceError> {
+        self.write8(0x1bd6, index)?;
+        self.read32(0x1bfc)
+    }
+
+    /// Gain-loss / back-off read (`_dpk_gainloss_result_8733b`).
+    fn dpk_gainloss_result(&self, item: u8) -> Result<u32, FaceError> {
+        match item {
+            0 => {
+                // GL_BACK_VALUE
+                self.bb_set(0x1bcc, 1 << 26, 1)?;
+                self.bb_set(0x1b90, 0xFFFF_FFFF, 0x0105_e038)?;
+                self.dpk_dbg_report(0x06)
+            }
+            1 => {
+                // LOSS_CHK
+                self.bb_set(0x1bcc, 1 << 26, 0)?;
+                self.bb_set(0x1b90, 0xFFFF_FFFF, 0x0105_e038)?;
+                self.dpk_dbg_report(0x06)
+            }
+            _ => {
+                // GAIN_CHK
+                self.bb_set(0x1bcc, 1 << 26, 0)?;
+                self.bb_set(0x1b90, 0xFFFF_FFFF, 0x0105_e03f)?;
+                self.dpk_dbg_report(0x09)
+            }
+        }
+    }
+
+    /// One AGC-tune step (`_dpk_agc_tune_8733b`): read loss + back-off, adjust the RF
+    /// TXAGC toward back-off 0xA. Returns the next auto-AGC state (1/2/3/4).
+    fn dpk_agc_tune(&self, path: u8, ori_agc: u8) -> Result<u8, FaceError> {
+        let loss = self.dpk_gainloss_result(1)?;
+        if loss > 0x3FF_0000 {
+            if std::env::var("IQKDBG").is_ok() {
+                eprintln!("  [agc] loss=0x{loss:08x} OVERFLOW → fail");
+            }
+            return Ok(4); // gain-loss overflow
+        }
+        let backoff = self.dpk_gainloss_result(0)? as u8;
+        if std::env::var("IQKDBG").is_ok() {
+            eprintln!("  [agc] ori_agc=0x{ori_agc:x} loss=0x{loss:08x} backoff=0x{backoff:x}");
+        }
+        if backoff < 0x5 {
+            Ok(1)
+        } else if backoff == 0xA {
+            Ok(2)
+        } else if backoff > 0x4 && backoff < 0xA {
+            let new_agc = ori_agc.wrapping_sub(0xA - backoff);
+            self.rf_set(path, 0x1, 0x0001F, new_agc as u32)?;
+            std::thread::sleep(Duration::from_micros(10));
+            Ok(3)
+        } else {
+            Ok(4)
+        }
+    }
+
+    /// Auto-AGC loop (`_dpk_gainloss_auto_agc_8733b`): drive GAIN_LOSS/PAS one-shots
+    /// and step the RF TXAGC / PGA until the back-off lands in range. Returns
+    /// `agc_done` (1 = converged).
+    fn dpk_auto_agc(&self, path: u8, _ori_agc: u8) -> Result<u8, FaceError> {
+        let mut tmp_txagc = 0u8;
+        let mut auto_pga = 0u8;
+        let (mut i, mut agc_cnt, mut agc_done) = (0u8, 0u8, 0u8);
+        loop {
+            let mut goout = false;
+            match i {
+                0 => {
+                    tmp_txagc = (self.rf_get(path, 0x1, 0x0001f)?) as u8;
+                    self.dpk_one_shot(path, DPK_GAIN_LOSS)?;
+                    auto_pga = ((self.dpk_dbg_report(0x02)? >> 16) & 0x7) as u8;
+                    self.rf_set(0, 0x8f, 0x0e000, auto_pga as u32)?;
+                    std::thread::sleep(Duration::from_micros(10));
+                    self.dpk_one_shot(path, DPK_PAS)?;
+                    i = self.dpk_agc_tune(path, tmp_txagc)?;
+                    agc_cnt += 1;
+                }
+                1 => {
+                    if tmp_txagc < 0x5 {
+                        goout = true;
+                    } else {
+                        tmp_txagc -= 2;
+                        self.rf_set(path, 0x1, 0x0001f, tmp_txagc as u32)?;
+                        i = 0;
+                        agc_cnt += 1;
+                    }
+                }
+                2 => {
+                    if tmp_txagc == 0x1f {
+                        goout = true;
+                    } else {
+                        tmp_txagc += if tmp_txagc > 0x1c {
+                            1
+                        } else if tmp_txagc < 0x15 {
+                            3
+                        } else {
+                            2
+                        };
+                        self.rf_set(path, 0x1, 0x0001f, tmp_txagc as u32)?;
+                        i = 0;
+                        agc_cnt += 1;
+                    }
+                }
+                3 => {
+                    agc_done = 1;
+                    auto_pga += ((0xA - self.dpk_gainloss_result(0)? as u8) / 3).min(0x6);
+                    if auto_pga > 0x6 {
+                        auto_pga = 0x6;
+                    }
+                    self.rf_set(0, 0x8f, 0x0e000, auto_pga as u32)?;
+                    goout = true;
+                }
+                4 => {
+                    if auto_pga > 0 {
+                        self.rf_set(0, 0x8f, 0x0e000, 0)?;
+                        i = 0;
+                        agc_cnt += 2;
+                    } else {
+                        goout = true;
+                    }
+                }
+                _ => goout = true,
+            }
+            if goout || agc_cnt >= 6 {
+                break;
+            }
+        }
+        Ok(agc_done)
+    }
+
+    /// DPK gain-loss setup + auto-AGC (`_dpk_gainloss_8733b`): RF setup, TPG BW select,
+    /// RXIQC default, then run the auto-AGC to condition the TX level.
+    fn dpk_gainloss(&self, path: u8) -> Result<u8, FaceError> {
+        let ori_txagc = self.dpk_rf_setting(path)?;
+        self.write8(0x1b00, 0x08)?;
+        self.write8(0x1bd8, 0x00)?;
+        // TPG BW select (test-pattern generator) — the DPK measurement signal.
+        let dpk_bw = (self.rf_get(path, 0x18, RFREG_MASK)? >> 10) & 1;
+        let tpg = if dpk_bw == 1 { 0xd200_0065 } else { 0xd200_0068 };
+        self.bb_set(0x1bf8, 0xFFFF_FFFF, tpg)?;
+        self.bb_set(0x1b3c, 0xFFFF_FF00, 0x200000)?; // RXIQC default
+        self.bb_set(0x1b88, 0xFFFF_FFFF, 0x00b4_8000)?;
+        self.dpk_auto_agc(path, ori_txagc)
+    }
+
+    /// DPK per-path K (`_dpk_one_path_8733b`, non-TSSI): set PWSF, run PAS then DO_DPK,
+    /// verify via the gain-loss check. Returns the DPK fail report (0 = ok).
+    fn dpk_one_path(&self, path: u8) -> Result<u8, FaceError> {
+        let tx_agc = (self.rf_get(path, 0x1, RFREG_MASK)? & 0x1f) as i32;
+        self.bb_set(0x1bb8, 1 << 4, 0)?; // disable TSSI mode
+        let pwsf = ((((0x19 - tx_agc) << 3) + 0x50) & 0x1ff) as u32;
+        self.bb_set(0x1bd8, 0x001f_f000, pwsf)?; // path A
+        self.bb_set(0x1bec, 0x00e0_0000, 0x6)?; // LUT point 6
+        let mut result = 0u8;
+        if self.dpk_one_shot(path, DPK_PAS)? == 0 {
+            result = self.dpk_one_shot(path, DO_DPK)?;
+        }
+        if self.dpk_gainloss_result(1)? != 0x400_0000 {
+            result = 1;
+        }
+        Ok(result)
+    }
+
+    /// **M7 DPK**: full per-path calibration — backup → shared BB setup → gain-loss +
+    /// auto-AGC (conditions the TX level) → per-path DO_DPK → restore. 1x1 path A.
+    /// Returns `(agc_done, dpk_fail)` (agc_done 1 = AGC converged; dpk_fail 0 = ok).
     pub fn phy_dpk(&self) -> Result<(u8, u8), FaceError> {
         let path = 0u8;
         let (bb, rf) = self.dpk_backup()?;
         self.iqk_afe_setting(true)?; // ≈ _dpk_mac_bb_setting_8733b
         self.bb_set(0x1884, 1 << 20, path as u32)?; // one-path K
-        self.dpk_rf_setting(path)?;
-        let pas = self.dpk_one_shot(path, DPK_PAS)?;
-        let do_dpk = if pas == 0 {
-            self.dpk_one_shot(path, DO_DPK)?
-        } else {
-            1
-        };
+        let agc_done = self.dpk_gainloss(path)?;
+        let dpk_fail = self.dpk_one_path(path)?;
         self.iqk_afe_setting(false)?;
         self.dpk_restore(&bb, &rf)?;
-        Ok((pas, do_dpk))
+        Ok((agc_done, dpk_fail))
     }
 
     /// NCTL diagnostic: set up a LOK-style one-shot and watch the mirror, the

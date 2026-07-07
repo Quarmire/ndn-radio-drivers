@@ -119,10 +119,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         ),
                         Err(e) => println!("FAILED: {e}"),
                     }
-                    // M7 DPK (part 1): infrastructure + one-shot convergence.
+                    // M7 DPK: gain-loss/auto-AGC + per-path DO_DPK.
                     print!("M7 phy_dpk … ");
                     match dev.phy_dpk() {
-                        Ok((pas, do_dpk)) => println!("✓ PAS fail={pas} DO_DPK fail={do_dpk} (0=converged)"),
+                        Ok((agc, fail)) => println!("✓ agc_done={agc} dpk_fail={fail} (agc 1=ok, fail 0=ok)"),
                         Err(e) => println!("FAILED: {e}"),
                     }
                 }

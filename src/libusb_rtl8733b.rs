@@ -1039,6 +1039,9 @@ impl Rtl8733buBackend {
         self.init_trx()?;
         self.tune_channel(channel)?;
         self.set_monitor()?;
+        self.enable_tx_path()?; // RF mode table → TX + BB CCK TX (normal-op TX enable)
+        self.set_txagc_table(0x2d)?; // per-rate TX gain (0 by default → no output)
+        let _ = self.configure_trsw(true); // external TRSW antenna routing (best-effort)
         Ok(())
     }
 

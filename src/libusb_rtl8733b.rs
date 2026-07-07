@@ -194,7 +194,11 @@ const REG_RCR: u16 = 0x0608;
 const REG_RXFLTMAP0: u16 = 0x06A0; // mgmt
 const REG_RXFLTMAP1: u16 = 0x06A2; // ctrl
 const REG_RXFLTMAP2: u16 = 0x06A4; // data
-const DATA_TX_DESC_SIZE: usize = 48; // 8733b data-path TX descriptor
+// 8733b data-path TX descriptor. The LIVE vendor driver uses a 40-byte descriptor
+// (OFFSET=0x28) — confirmed by usbmon capture of its inject on the OPi — NOT the 48 the
+// halmac struct suggests. A 48-byte descriptor misplaces the frame by 8 bytes (the DMA
+// keys off the fixed 40) so the PHY transmits garbage: MAC accepts it, nothing radiates.
+const DATA_TX_DESC_SIZE: usize = 40;
 const IDDMA_SRC: u32 = 0x1878_0028; // OCPBASE_TXBUF + 40 (skip the txdesc); constant per capture
 const DDMA_OWN: u32 = 1 << 31; // BIT_DDMACH0_OWN (start / busy)
 const DDMA_CHKSUM_EN: u32 = 1 << 29; // BIT_DDMACH0_CHKSUM_EN

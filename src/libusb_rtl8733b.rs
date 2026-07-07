@@ -2042,6 +2042,16 @@ impl Rtl8733buBackend {
         Ok(())
     }
 
+    /// Set the **RF TX AGC** (RF register `0x01[4:0]`, both paths) — the RF-side TX
+    /// gain. The vendor holds this at ~`0x1a`; if it idles at 0 the PA input is zero
+    /// and nothing radiates (confirmed via the OPi vendor RF dump). This is the final
+    /// TX-enable the digital TXAGC path doesn't set on its own.
+    pub fn set_rf_txagc(&self, val: u8) -> Result<(), FaceError> {
+        self.rf_set(0, 0x01, 0x0001f, (val & 0x1f) as u32)?;
+        self.rf_set(1, 0x01, 0x0001f, (val & 0x1f) as u32)?;
+        Ok(())
+    }
+
     /// BB reset (`phydm_bb_reset_8733b`): toggle `SYS_FUNC_EN[0]` (FEN_BBRSTB, bit 16
     /// of the dword at MAC `0x0`) 1→0→1 so BB config changes latch.
     fn bb_reset(&self) -> Result<(), FaceError> {

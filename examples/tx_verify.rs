@@ -63,8 +63,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     dut.bring_up_monitor(ch)?;
     dut.set_tx_power_idx(0x7f)?; // max reference TX power
     dut.write8(0x0522, 0x00)?; // REG_TXPAUSE: unpause all TX queues
+    // Match the vendor's exact per-rate TXAGC — my uniform table was too low, leaving
+    // RF01 (the RF TX AGC) at 0 = zero TX gain = no RF output.
+    dut.write32(0x3a00, 0xc0c0_c0c0)?; // CCK 1/2/5.5/11M
+    dut.write32(0x3a04, 0x0808_0c0c)?; // OFDM 6/9/12/18M
+    dut.write32(0x4308, 0x5c54_5c50)?; // TXAGC ref
+    // Per-TX BB writes the vendor makes around each bulk-OUT (from the usbmon capture).
+    dut.write32(0x1c3c, 0x0105_1f43)?;
+    dut.write32(0x08a0, 0x9764_309f)?;
+    dut.write32(0x2a44, 0x8020_0311)?;
+    // THE fix: RF TX AGC (RF 0x01) — vendor holds 0x1a, mine idled at 0 = no TX gain.
+    dut.set_rf_txagc(0x1a)?;
     let rf18 = dut.rf_read(0x18)?;
-    println!("8733b up on ch{ch} (RF18=0x{rf18:05x}); injecting for 8s …");
+    println!(
+        "8733b up on ch{ch} (RF18=0x{rf18:05x}, RF01/TXAGC=0x{:05x}); injecting for 8s …",
+        dut.rf_read(0x01)?
+    );
 
     // Broadcast data frame carrying the marker payload.
     let mut frame = vec![0x08u8, 0x00, 0x00, 0x00];

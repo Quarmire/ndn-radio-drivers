@@ -238,7 +238,10 @@ const NETTYPE_AP: u32 = 0x2 << 16;
 /// **Monitor** receive config: accept all unicast/phys-match/multicast/broadcast,
 /// data + management frames, no BSSID filter, append PHY status (for RSSI), force
 /// ACK off-path. `AAP|APM|AM|AB|ADF|AMF|HTC_LOC_CTRL|APP_PHYST_RXFF|FORCEACK`.
-const MONITOR_RCR: u32 = 0x1 | 0x2 | 0x4 | 0x8 | (1 << 11) | (1 << 13) | (1 << 14) | (1 << 28) | (1 << 26);
+const MONITOR_RCR: u32 =
+    0x1 | 0x2 | 0x4 | 0x8 | (1 << 8) | (1 << 9) | (1 << 11) | (1 << 13) | (1 << 14) | (1 << 28) | (1 << 26);
+// bit8 ACRC32 + bit9 AICV: keep CRC/ICV-error frames too — a true monitor sees
+// marginal/corrupt frames (e.g. an uncalibrated peer's TX), not just clean ones.
 
 // ── Milestone 8: frame injection / capture (TX/RX descriptors) ──────────────
 /// 8812A TX descriptor size (`TXDESC_SIZE`): the WiFi-info header prepended to

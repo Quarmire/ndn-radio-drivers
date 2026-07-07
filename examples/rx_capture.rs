@@ -27,18 +27,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let deadline = Instant::now() + Duration::from_secs(20);
     let (mut total, mut hits) = (0u32, 0u32);
     while Instant::now() < deadline {
-        match tokio::time::timeout(Duration::from_millis(500), dev.recv_frame()).await {
-            Ok(Ok(f)) => {
-                total += 1;
-                let hit = f.payload.windows(mk.len()).any(|w| w == mk);
-                if hit {
-                    hits += 1;
-                    let txt: String = String::from_utf8_lossy(&f.payload).chars().take(40).collect();
-                    println!("  ✅ HIT #{hits}: {}B rssi={:?} src={:?} payload={txt:?}",
-                             f.payload.len(), f.rssi_dbm, f.addr);
-                }
+        if let Ok(Ok(f)) = tokio::time::timeout(Duration::from_millis(500), dev.recv_frame()).await {
+            total += 1;
+            let hit = f.payload.windows(mk.len()).any(|w| w == mk);
+            if hit {
+                hits += 1;
+                let txt: String = String::from_utf8_lossy(&f.payload).chars().take(40).collect();
+                println!("  ✅ HIT #{hits}: {}B rssi={:?} src={:?} payload={txt:?}",
+                         f.payload.len(), f.rssi_dbm, f.addr);
             }
-            _ => {}
         }
     }
     println!("captured {total} RawNdn frames, {hits} matched {marker:?}");

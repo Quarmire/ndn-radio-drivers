@@ -119,6 +119,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         ),
                         Err(e) => println!("FAILED: {e}"),
                     }
+                    // M7 DPK (part 1): infrastructure + one-shot convergence.
+                    print!("M7 phy_dpk … ");
+                    match dev.phy_dpk() {
+                        Ok((pas, do_dpk)) => println!("✓ PAS fail={pas} DO_DPK fail={do_dpk} (0=converged)"),
+                        Err(e) => println!("FAILED: {e}"),
+                    }
                 }
                 Err(e) => {
                     println!("FAILED: {e}");

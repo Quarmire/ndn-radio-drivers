@@ -961,6 +961,18 @@ const IQK_BB_REGS: [u16; 11] = [
 const IQK_RF_REGS: [u32; 5] = [0x05, 0xde, 0xdf, 0xef, 0x1f];
 const RFREG_MASK: u32 = 0x000F_FFFF; // RF registers are 20-bit
 
+/// DPK register backup lists (do_dpk_8733b).
+const DPK_BB_REGS: [u16; 15] = [
+    0x0522, 0x1884, 0x09f0, 0x2a24, 0x1830, 0x1d40, 0x1b38, 0x1b3c, 0x1bf8, 0x1e70, 0x1c38,
+    0x1c68, 0x1864, 0x180c, 0x1880,
+];
+const DPK_RF_REGS: [u32; 9] = [0x0, 0x5, 0x83, 0x8c, 0x8f, 0x9e, 0xde, 0xdf, 0xef];
+// DPK one-shot action tags (encode the shot_code in dpk_one_shot).
+const DPK_PAS: u8 = 0;
+const DO_DPK: u8 = 1;
+const DPK_ON: u8 = 2;
+const DPK_GAIN_LOSS: u8 = 3;
+
 /// Backed-up register state, restored after calibration.
 #[derive(Default)]
 struct IqkBackup {
@@ -1426,6 +1438,119 @@ impl Rtl8733buBackend {
         // Enable the RX-IQK correction if RXK succeeded (`_iqk_restore_mac_bb`).
         self.bb_set(0x180c, 1 << 31, u32::from(!info.rxk_ok))?;
         Ok(info)
+    }
+
+    // ── M7 DPK (digital pre-distortion) — part 1: infrastructure + one-shot ──
+
+    fn dpk_backup(&self) -> Result<(Vec<u32>, Vec<u32>), FaceError> {
+        let mut bb = Vec::new();
+        for &r in &DPK_BB_REGS {
+            bb.push(self.read32(r)?);
+        }
+        let mut rf = Vec::new();
+        for &r in &DPK_RF_REGS {
+            rf.push(self.rf_get(0, r, RFREG_MASK)?);
+        }
+        Ok((bb, rf))
+    }
+    fn dpk_restore(&self, bb: &[u32], rf: &[u32]) -> Result<(), FaceError> {
+        for (i, &r) in DPK_BB_REGS.iter().enumerate() {
+            self.write32(r, bb[i])?;
+        }
+        for (i, &r) in DPK_RF_REGS.iter().enumerate() {
+            self.rf_set(0, r, RFREG_MASK, rf[i])?;
+        }
+        Ok(())
+    }
+
+    /// DPK NCTL one-shot (`_dpk_one_shot_8733b`): write the `shot_code` (path + action
+    /// bits) to `0x1b00`, trigger with `+1`, then wait for the timing-sync report.
+    /// Returns the fail report (0 = ok); `DPK_ON` has no report.
+    fn dpk_one_shot(&self, path: u8, action: u8) -> Result<u8, FaceError> {
+        let mut shot: u16 = if path == 0 { 0x0018 } else { 0x002a };
+        match action {
+            DPK_GAIN_LOSS => {
+                self.write8(0x1bef, if path == 0 { 0xa2 } else { 0xaa })?;
+                shot |= 0x1100;
+            }
+            DPK_PAS => {
+                self.write8(0x1bef, 0x2a)?;
+                shot |= 0x1100;
+            }
+            DO_DPK => shot |= 0x1300,
+            DPK_ON => shot |= 0x1400,
+            _ => {}
+        }
+        self.write16(0x1b00, shot)?;
+        self.write16(0x1b00, shot + 1)?; // one-shot trigger
+        std::thread::sleep(Duration::from_micros(100));
+        if action == DPK_ON {
+            Ok(0)
+        } else {
+            self.dpk_timing_sync()
+        }
+    }
+
+    /// DPK timing-sync (`_dpk_timing_sync_report_8733b`): poll `0x2d9c==0x55` (done),
+    /// then wait for KFAIL (`0x1b08` BIT26) to clear; reset `0x1b10`. Returns fail.
+    fn dpk_timing_sync(&self) -> Result<u8, FaceError> {
+        let mut count = 0;
+        while self.bb_get(0x2d9c, 0xFF)? != 0x55 && count < 1000 {
+            std::thread::sleep(Duration::from_micros(20));
+            count += 1;
+        }
+        let mut fail = (self.bb_get(0x1b08, 1 << 26)? & 1) as u8;
+        if count < 1000 {
+            let mut c2 = 0;
+            while fail != 0 && c2 < 100 {
+                std::thread::sleep(Duration::from_micros(10));
+                fail = (self.bb_get(0x1b08, 1 << 26)? & 1) as u8;
+                c2 += 1;
+            }
+        }
+        self.write8(0x1b10, 0)?;
+        Ok(fail)
+    }
+
+    /// DPK RF setup for 2.4 GHz path A (`_dpk_rf_setting_8733b`, G-band), using the
+    /// current RF TXAGC. Returns the applied TXAGC.
+    fn dpk_rf_setting(&self, path: u8) -> Result<u8, FaceError> {
+        let txagc = self.rf_get(path, 0x1, RFREG_MASK)? & 0x1f;
+        self.rf_set(0, 0x5, 1 << 0, 0)?;
+        self.rf_set(1, 0x5, 1 << 0, 0)?;
+        self.rf_set(0, 0x00, RFREG_MASK, 0x50000)?;
+        self.rf_set(1, 0x00, RFREG_MASK, 0x50000)?;
+        // 2G path A gain chain.
+        self.rf_set(path, 0x1, 0xff, (txagc + 5) & 0xff)?;
+        self.rf_set(0, 0x83, 0x00007, 0x2)?;
+        self.rf_set(0, 0xdf, 1 << 12, 0x1)?;
+        self.rf_set(0, 0x9e, 1 << 8, 0x1)?;
+        self.rf_set(path, 0x83, 0x000f0, 0x3)?;
+        self.rf_set(0, 0x8f, 1 << 1, 0x0)?;
+        self.rf_set(0, 0x8f, 0x0e000, 0x3)?;
+        Ok((self.rf_get(path, 0x1, 0x1f)?) as u8)
+    }
+
+    /// **M7 DPK (part 1)**: infrastructure test — backup → shared BB setup → DPK RF
+    /// setup → run the PAS + DO_DPK one-shots on path A → report convergence →
+    /// restore. Validates the DPK NCTL path (coefficient extraction from the LMS/PAS
+    /// SRAM + the LUT application + DPK_ON land in part 2). Returns `(pas, do_dpk)`
+    /// fail reports (0 = converged/ok).
+    pub fn phy_dpk(&self) -> Result<(u8, u8), FaceError> {
+        let path = 0u8;
+        let (bb, rf) = self.dpk_backup()?;
+        self.iqk_afe_setting(true)?; // ≈ _dpk_mac_bb_setting_8733b
+        self.bb_set(0x1884, 1 << 20, path as u32)?; // one-path K
+        self.dpk_rf_setting(path)?;
+        let pas = self.dpk_one_shot(path, DPK_PAS)?;
+        let do_dpk = if pas == 0 {
+            self.dpk_one_shot(path, DO_DPK)?
+        } else {
+            1
+        };
+        self.iqk_afe_setting(false)?;
+        self.dpk_restore(&bb, &rf)?;
+        Ok((pas, do_dpk))
     }
 
     /// NCTL diagnostic: set up a LOK-style one-shot and watch the mirror, the

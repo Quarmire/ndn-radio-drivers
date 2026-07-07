@@ -1360,6 +1360,20 @@ impl Rtl8733buBackend {
         self.rf_set(0, 0x19, RFREG_MASK, rf19)?;
         self.rf_set(1, 0x19, RFREG_MASK, rf19)?;
         self.bb_set(0x1ea8, 1 << 7, is_2g as u32)?; // RX idle AGC table: 1=2.4G, 0=5G
+
+        // BB channel/bandwidth config (config_phydm_switch_channel_bw_8733b, 20 MHz
+        // common part) — the digital front-end setup the TX/RX path needs, which the
+        // RF writes alone don't do. Confirmed against the vendor's live procfs dump.
+        self.bb_set(0x0818, 1 << 11, 0)?;
+        self.bb_set(0x1940, 1 << 31, 0)?;
+        self.bb_set(0x1ce8, 1 << 28, 0)?;
+        self.bb_set(0x0db4, 1 << 0, 0)?;
+        self.bb_set(0x0c10, 1 << 9, 0)?;
+        self.bb_set(0x0c24, 0x0000_00FF, 0xFF)?;
+        self.bb_set(0x0c24, 0x0000_FF00, 0x00)?;
+        self.bb_set(0x0884, 0x0001_C000, 0x4)?;
+        self.bb_set(0x1900, 0x0000_000F, 6)?; // BW mode 20
+        self.bb_set(0x1908, 0x0000_00F0, 9)?;
         Ok(())
     }
 

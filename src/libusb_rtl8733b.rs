@@ -1224,7 +1224,7 @@ impl Rtl8733buBackend {
         self.bb_set(0x1b20, 0x000F_FFFF, tx_pi)?;
         self.bb_set(0x1b20, 0x0F00_0000, 0)?;
         self.bb_set(0x1bbc, 0x3000_0000, 0)?;
-        self.bb_set(0x1b1c, 0x0001_C000, 0)?;
+        self.bb_set(0x1b1c, 0x0001_C000, 0)?; // TX_P_Avg (vendor value; averaging didn't lift KFAIL)
         self.bb_set(0x1bb8, 1 << 20, 0)?;
         Ok(())
     }
@@ -1296,6 +1296,9 @@ impl Rtl8733buBackend {
         let r = self.read32(0x1bfc)?;
         let idac_if = ((r >> 26) & 0xF) + u32::from(r & (1 << 25) != 0);
         let idac_qf = ((r >> 6) & 0xF) + u32::from(r & (1 << 5) != 0);
+        if std::env::var("IQKDBG").is_ok() {
+            eprintln!("  [lok] idac ic={idac_ic:#x} qc={idac_qc:#x} if={idac_if:#x} qf={idac_qf:#x}");
+        }
         self.rf_set(path, 0x09, 0xF0000, idac_if)?;
         self.rf_set(path, 0x09, 0x003C0, idac_qf)?;
         self.rf_set(path, 0x08, 0xF8000, idac_ic)?; // re-apply coarse
@@ -1314,7 +1317,17 @@ impl Rtl8733buBackend {
         self.bb_set(0x1bcc, 0x3F, 0x09)?;
         self.bb_set(0x1b2c, 0xFFFF_FFFF, 0x0024_0024)?;
         self.bb_set(0x1b00, 0x0000_1FFF, if path == 0 { 0x218 } else { 0x228 })?;
-        if self.nctl_one_shot(1)? && self.bb_get(0x1b08, 1 << 26)? == 0 {
+        let conv = self.nctl_one_shot(1)?;
+        let kfail = self.bb_get(0x1b08, 1 << 26)?;
+        if std::env::var("IQKDBG").is_ok() {
+            eprintln!(
+                "  [txk] conv={conv} KFAIL={kfail} 0x1b38=0x{:08x} is_tssi(0x1e7c[30])={} rf0x56=0x{:05x}",
+                self.read32(0x1b38)?,
+                self.bb_get(0x1e7c, 1 << 30)?,
+                self.rf_get(0, 0x56, 0xFFFFF)?
+            );
+        }
+        if conv && kfail == 0 {
             info.txxy[p][0] = self.bb_get(0x1b38, 0x7FF0_0000)?;
             info.txxy[p][1] = self.bb_get(0x1b38, 0x0007_FF00)?;
         }

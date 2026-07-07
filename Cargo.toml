@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.90"
 license = "MPL-2.0"
-description = "Userspace USB Wi-Fi monitor-mode driver backends (RTL8812EU/8822E, RTL8821CU, MT7612U, RTL8812AU) over the ndn-radio-hal contract."
+description = "Userspace USB Wi-Fi monitor-mode driver backends (RTL8812EU/8822E, RTL8821CU, MT7612U, RTL8812AU, RTL8731BU/8733BU) over the ndn-radio-hal contract."
 
 [dependencies]
 ndn-radio-hal = { path = "../ndn-rs/crates/core/ndn-radio-hal" }
@@ -24,5 +24,23 @@ serialport = { version = "4", optional = true }
 default = []
 # The BW16 (RTL8720DN) serial-bridged monitor-mode backend.
 bw16 = ["dep:serialport"]
+
+# BW16 examples need the `bw16` backend — gate them so `cargo build --examples`
+# (default features) skips them instead of failing on the unresolved import.
+[[example]]
+name = "bw16_probe"
+required-features = ["bw16"]
+
+[[example]]
+name = "bw16_probe_rate"
+required-features = ["bw16"]
+
+[[example]]
+name = "bw16_txpower"
+required-features = ["bw16"]
+
+[[example]]
+name = "bw16_knobs"
+required-features = ["bw16"]
 
 [workspace]

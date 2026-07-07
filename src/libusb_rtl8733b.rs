@@ -1126,6 +1126,7 @@ impl Rtl8733buBackend {
         self.bb_config()?;
         self.rf_config()?;
         self.init_trx()?;
+        let _ = self.rfk_init(); // load cal (KIP) microcode — vendor does this during normal init
         self.tune_channel(channel)?;
         // NOTE: RF 0x01=0 at idle is NORMAL (the vendor reads 0 too when not actively
         // transmitting; the HW sets the TX AGC per-transmit). The earlier TXGAPK call

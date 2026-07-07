@@ -1024,6 +1024,24 @@ impl Rtl8733buBackend {
         Ok(())
     }
 
+    /// Full monitor-mode bring-up: power-on → firmware → MAC/BB/RF init → normal TRX →
+    /// tune `channel` → promiscuous RX. After this the backend injects and captures
+    /// (the [`FrameIo`] path). Calibration is optional and omitted here (TX radiates
+    /// without it). Note the chip wedges after repeated re-inits in a process — open
+    /// once per power-cycle.
+    pub fn bring_up_monitor(&self, channel: u8) -> Result<(), FaceError> {
+        self.power_on()?;
+        self.fw_dl_setup()?;
+        self.download_firmware()?;
+        self.mac_config()?;
+        self.bb_config()?;
+        self.rf_config()?;
+        self.init_trx()?;
+        self.tune_channel(channel)?;
+        self.set_monitor()?;
+        Ok(())
+    }
+
     /// **M8**: read one bulk-IN transfer and split out the 802.11 frames it packs.
     /// Each frame sits at `24 + drvinfo*8 + shift` after its 24-byte RX descriptor,
     /// and successive frames are 8-byte aligned; `DMA_AGG_NUM` counts them.

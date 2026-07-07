@@ -97,7 +97,7 @@ const REG_DDMA_CH0DA: u16 = 0x1204;
 const REG_DDMA_CH0CTRL: u16 = 0x1208;
 const REG_H2CQ_CSR: u16 = 0x1330;
 const REG_LTECOEX_ACCESS_CTRL: u16 = 0x1700; // REG_WL2LTECOEX_INDIRECT_ACCESS_CTRL_V1
-/// `REG_SYS_CFG1` — silicon config; byte 1 bits[7:4] = chip cut/version.
+/// `REG_SYS_CFG1` — silicon config; byte 1 bits\[7:4\] = chip cut/version.
 pub const REG_SYS_CFG: u16 = 0x00f0;
 const REG_SYS_STATUS1: u16 = 0x00f4;
 /// `REG_SYS_CFG2` — byte 0 is the hardware chip id (`0x17` = 8822E).
@@ -108,7 +108,7 @@ const REG_ANAPAR_MAC_0: u16 = 0x1018;
 const REG_CPU_DMEM_CON: u16 = 0x1080;
 const REG_CR_EXT: u16 = 0x1100;
 
-/// `CHIP_ID_HW_DEF_8822E` — what `REG_SYS_CFG2[7:0]` reads on this silicon.
+/// `CHIP_ID_HW_DEF_8822E` — what `REG_SYS_CFG2\[7:0\]` reads on this silicon.
 pub const CHIP_ID_8822E: u8 = 0x17;
 
 /// RX-path init — see [`LibUsbRtl88xxBackend::rx_path_init`]. `(addr, value)` in
@@ -273,7 +273,7 @@ pub struct LibUsbRtl88xxBackend {
     /// DATA_BW field follows it.
     cur_bw: std::sync::atomic::AtomicU8,
     /// Cyclic Shift Diversity for 1-stream OFDM frames. When set, the OFDM
-    /// 1-stream TX path is routed to **both** antennas (`0x820[1:0]=AB`) instead
+    /// 1-stream TX path is routed to **both** antennas (`0x820\[1:0\]=AB`) instead
     /// of A-only, so a single stream is transmitted from both antennas with the
     /// standard per-antenna cyclic shift the BB applies — decorrelating them to
     /// avoid line-of-sight nulls. Pure TX diversity for feedback-free broadcast,
@@ -380,7 +380,7 @@ impl LibUsbRtl88xxBackend {
     /// ~2 s it runs [`watchdog_tick`](Self::watchdog_tick) (thermal TX-power
     /// tracking + RX DIG) for the life of the backend. The thread holds a
     /// [`Weak`](std::sync::Weak) reference and exits on its own once the
-    /// `Arc<Self>` is dropped, so the returned [`JoinHandle`] can be ignored.
+    /// `Arc<Self>` is dropped, so the returned `JoinHandle` can be ignored.
     /// Call once after [`open_monitor`](Self::open_monitor) for a self-
     /// maintaining link.
     pub fn spawn_watchdog(self: &Arc<Self>) -> std::thread::JoinHandle<()> {
@@ -575,7 +575,7 @@ impl LibUsbRtl88xxBackend {
     }
 
     /// **Force the BT-coexistence grant to Wi-Fi** (`btc_set_gnt_wl_bt`): set
-    /// GNT_WL = 1, GNT_BT = 0 by writing BTC indirect register `0x38[15:8] =
+    /// GNT_WL = 1, GNT_BT = 0 by writing BTC indirect register `0x38\[15:8\] =
     /// 0x77`. **This is the on-air TX-power gate.** Without it the BT-coex
     /// arbiter throttles the Wi-Fi TX — every static TXAGC/BB/RF register
     /// matched the kernel yet the modulated output sat ~50 dB low. The kernel
@@ -585,8 +585,8 @@ impl LibUsbRtl88xxBackend {
     pub fn btc_grant_wl(&self) -> Result<(), FaceError> {
         // The kernel rtl88x2eu writes BTC 0x38 = 0xdd03 as a full 32-bit value
         // (golden usbmon 2026-06-14: read 0x800f0038, then 0x1704=0x0000dd03 /
-        // strobe 0xc00f0038) — [15:8]=0xdd, [7:0]=0x03 — whereas we historically
-        // forced only [15:8]=0x77. NDN_RADIO_BTC38=<hex> overrides for A/B
+        // strobe 0xc00f0038) — \[15:8\]=0xdd, \[7:0\]=0x03 — whereas we historically
+        // forced only \[15:8\]=0x77. NDN_RADIO_BTC38=<hex> overrides for A/B
         // testing (e.g. 0xdd03 = kernel-faithful full write).
         if let Ok(s) = std::env::var("NDN_RADIO_BTC38")
             && let Ok(v) = u32::from_str_radix(s.trim_start_matches("0x"), 16)
@@ -622,13 +622,13 @@ impl LibUsbRtl88xxBackend {
     /// Enable or disable Cyclic Shift Diversity for 1-stream OFDM frames (see
     /// [`tx_csd`](Self#structfield.tx_csd)). Stores the flag (so it survives a
     /// later [`set_channel_bw20`](Self::set_channel_bw20)) and applies it
-    /// immediately by rewriting the OFDM 1-stream TX-path nibble `0x820[1:0]`
+    /// immediately by rewriting the OFDM 1-stream TX-path nibble `0x820\[1:0\]`
     /// (AB = both antennas when on, A-only when off). Call after bring-up /
     /// channel setup. **Do not combine with per-frame STBC** — both use antenna
     /// B and the kernel treats `tx_npath` and STBC_TX as mutually exclusive.
     pub fn set_tx_csd(&self, enable: bool) -> Result<(), FaceError> {
         self.tx_csd.store(enable, Ordering::Relaxed);
-        // 0x820[1:0] = 1-stream OFDM TX path: AB (3) for CSD, A (1) otherwise.
+        // 0x820\[1:0\] = 1-stream OFDM TX path: AB (3) for CSD, A (1) otherwise.
         self.bb_write(0x820, 0x3, if enable { 0x3 } else { 0x1 })?;
         Ok(())
     }
@@ -682,8 +682,8 @@ impl LibUsbRtl88xxBackend {
     /// occupancy — including non-decodable interference that frame-counting
     /// misses — making it the spectrum-sensing primitive for frequency agility /
     /// cognitive radio. Faithful to `phydm_clm_*` (jaguar3): period
-    /// `0x1e40[15:0]` in 4 µs units, trigger `0x1e60[0]` 0→1, ready `0x2d88[16]`,
-    /// result `0x2d88[15:0]`; ratio = `(busy·100 + period/2) / period`.
+    /// `0x1e40\[15:0\]` in 4 µs units, trigger `0x1e60[0]` 0→1, ready `0x2d88[16]`,
+    /// result `0x2d88\[15:0\]`; ratio = `(busy·100 + period/2) / period`.
     /// `window_us` is the measurement window (period clamped to 4 µs · 65535 ≈
     /// 262 ms). Blocking; call from a scan loop, not the inject hot path. NB the
     /// period count assumes a 20 MHz sample clock.
@@ -766,7 +766,7 @@ impl LibUsbRtl88xxBackend {
         // Program the name-group hash into the BSSID match register (addr3).
         self.write32(REG_BSSID, lo)?;
         self.write16(REG_BSSID + 4, hi)?;
-        // Media status = AdHoc (`MSR` = REG_CR byte 0x102 bits[1:0], `_NETTYPE`).
+        // Media status = AdHoc (`MSR` = REG_CR byte 0x102 bits\[1:0\], `_NETTYPE`).
         // Without AAP the MAC gates *data*-frame RX on a connected media status;
         // the monitor default (NoLink) drops them even when the address matches.
         let msr = (self.read8(0x0102)? & !0x03) | 0x01; // MSR_ADHOC
@@ -1033,8 +1033,8 @@ impl LibUsbRtl88xxBackend {
         Ok(())
     }
 
-    /// `enable_bb_rf_88xx`: gate the BB (`REG_SYS_FUNC_EN[1:0]`), RF paths
-    /// (`REG_RF_CTRL[2:0]`), and WLRF analog enables (`REG_WLRF1[26:24]`).
+    /// `enable_bb_rf_88xx`: gate the BB (`REG_SYS_FUNC_EN\[1:0\]`), RF paths
+    /// (`REG_RF_CTRL\[2:0\]`), and WLRF analog enables (`REG_WLRF1\[26:24\]`).
     /// Pre-init disables them; the BB/RF bring-up stage re-enables them.
     pub fn enable_bb_rf(&self, enable: bool) -> Result<(), FaceError> {
         let fen = self.read8(REG_SYS_FUNC_EN)?;
@@ -1081,7 +1081,7 @@ impl LibUsbRtl88xxBackend {
         const BIT_WL_PLATFORM_RST: u32 = 1 << 16;
         const BIT_DDMA_EN: u32 = 1 << 8;
         const SYS_FUNC_EN_8822E: u8 = 0xd8; // written to REG_SYS_FUNC_EN+1
-        const WLAN_PHY_REQ_DELAY: u8 = 0x0c; // REG_CR_EXT+3 bits[3:0] (20 MHz BW)
+        const WLAN_PHY_REQ_DELAY: u8 = 0x0c; // REG_CR_EXT+3 bits\[3:0\] (20 MHz BW)
         const BIT_BOOT_FSPI_EN: u32 = 1 << 20;
         const BIT_FSPI_EN: u32 = 1 << 19;
         const BITS_LDO_VSEL: u8 = 0x03;
@@ -1164,7 +1164,7 @@ impl LibUsbRtl88xxBackend {
     /// `ISO_EB2CORE` isolation on `REG_SYS_ISO_CTRL` — without this the EFUSE
     /// block is isolated and never responds) and **OTP burst mode**
     /// (`REG_EFUSE_CTRL_1[19]`); the `REG_EFUSE_CTRL` field layout is the V1
-    /// one — address in bits[26:16], ready flag at bit 29, data in [15:0].
+    /// one — address in bits\[26:16\], ready flag at bit 29, data in \[15:0\].
     /// Requires [`power_on`](Self::power_on). Bank select is a no-op on 8822E.
     pub fn efuse_read(&self, offset: u16, buf: &mut [u8]) -> Result<(), FaceError> {
         const BIT_EF_RDY: u32 = 1 << 29;
@@ -1226,8 +1226,8 @@ impl LibUsbRtl88xxBackend {
     /// Decode a physical EFUSE map into the **logical** map (`EEPROM_SIZE_8822E`
     /// = 2048 bytes, unwritten cells `0xFF`) — a port of `eeprom_parser_8822e`
     /// (wifi flavour): content starts after the 4 security-control bytes; every
-    /// entry has a 2-byte header (`blk_idx = hdr2[7:4] | hdr[3:0] << 4`,
-    /// `word_en = hdr2[3:0]` active-low per 2-byte word), then the enabled
+    /// entry has a 2-byte header (`blk_idx = hdr2\[7:4\] | hdr\[3:0\] << 4`,
+    /// `word_en = hdr2\[3:0\]` active-low per 2-byte word), then the enabled
     /// words. A `0xFF` header terminates the map.
     pub fn efuse_decode_logical(physical: &[u8]) -> Result<Vec<u8>, FaceError> {
         const SEC_CTRL_EFUSE_SIZE: usize = 4;
@@ -1603,7 +1603,7 @@ impl LibUsbRtl88xxBackend {
         const ANT_AB: u32 = 0x3;
         let info = self.chip_info()?;
 
-        // general_info: FW_TX_BOUNDARY at 0x08[16:23] = fw-txbuf − rsvd boundary.
+        // general_info: FW_TX_BOUNDARY at 0x08\[16:23\] = fw-txbuf − rsvd boundary.
         let mut gi = [0u8; 32];
         h2c_hdr(&mut gi, SUB_GENERAL_INFO, 4, 0);
         let fw_tx_boundary = (Self::RSVD_CSIBUF_ADDR - 4) - Self::RSVD_BOUNDARY; // rsvd_fw_txbuf_addr − boundary
@@ -1660,7 +1660,7 @@ impl LibUsbRtl88xxBackend {
         txdesc_checksum(&mut buf);
         buf[TX_DESC_SIZE..].copy_from_slice(h2c);
         // Stamp the monotonic H2C sequence number into the offload header
-        // (dword 1 bits [16:31]); the fw echoes it in the C2H ack.
+        // (dword 1 bits \[16:31\]); the fw echoes it in the C2H ack.
         let seq = self.h2c_seq.fetch_add(1, Ordering::Relaxed);
         txdesc_set(&mut buf, TX_DESC_SIZE + 0x04, 16, 16, seq as u32);
         if buf.len().is_multiple_of(512) {
@@ -1771,7 +1771,7 @@ impl LibUsbRtl88xxBackend {
         const REG_FWFF_CTRL: u16 = 0x029c;
         const REG_FWFF_PKT_INFO: u16 = 0x02a0;
         // HALMAC_RQPN_3BULKOUT_8822E[NORMAL]: VO/VI→normal(2), BE/BK→low(1),
-        // MG/HI→high(3), packed into REG_TXDMA_PQ_MAP bits[15:4].
+        // MG/HI→high(3), packed into REG_TXDMA_PQ_MAP bits\[15:4\].
         const PQ_MAP: u16 = (3 << 14) | (3 << 12) | (1 << 10) | (1 << 8) | (2 << 6) | (2 << 4);
         const MAC_TRX_ENABLE: u8 = 0xff; // HCI TX/RX DMA, TX/RX DMA, protocol, schedule, MAC TX/RX
 
@@ -1997,7 +1997,7 @@ impl LibUsbRtl88xxBackend {
         let bft = self.read32(REG_BF_TIMEOUT_EN)? & !(1 << 0) & !(1 << 1);
         self.write32(REG_BF_TIMEOUT_EN, bft)?;
 
-        // Fix incorrect HW default of RRSR RSC (bits [22:21] on 8822E)
+        // Fix incorrect HW default of RRSR RSC (bits \[22:21\] on 8822E)
         let rrsr = self.read32(REG_RRSR)? & !(0x3 << 21);
         self.write32(REG_RRSR, rrsr)?;
 
@@ -2042,7 +2042,7 @@ impl LibUsbRtl88xxBackend {
         self.clr8(REG_TX_PTCL_CTRL + 1, 1 << 4)?;
         self.set8(REG_RD_CTRL + 1, 0x07)?;
 
-        // cfg_mac_clk_88xx: 80 MHz MAC clock (sel = 0 in bits [21:20])
+        // cfg_mac_clk_88xx: 80 MHz MAC clock (sel = 0 in bits \[21:20\])
         let afe = self.read32(REG_AFE_CTRL1)? & !((1 << 20) | (1 << 21));
         self.write32(REG_AFE_CTRL1, afe)?;
         self.write8(REG_USTIME_TSF, MAC_CLK_SPEED)?;
@@ -2191,7 +2191,7 @@ impl LibUsbRtl88xxBackend {
             s.bb_cfg_write(a, d)
         })?;
 
-        // Crystal cap from logical EFUSE 0x110 → 0x1040[23:10] = cap‖cap.
+        // Crystal cap from logical EFUSE 0x110 → 0x1040\[23:10\] = cap‖cap.
         let physical = self.efuse_dump_physical()?;
         let logical = Self::efuse_decode_logical(&physical)?;
         let cap = (logical[0x110] & 0x7f) as u32;
@@ -2297,7 +2297,7 @@ impl LibUsbRtl88xxBackend {
 
     /// `config_phydm_write_rf_reg_8822e`: direct memory-mapped RF write
     /// through the BB window, except RF reg 0 (indirect via 0x1808/0x4108
-    /// with addr[27:20] | data[19:0]). 20-bit registers; 1 µs settle.
+    /// with addr\[27:20\] | data\[19:0\]). 20-bit registers; 1 µs settle.
     fn rf_write(&self, path: RfPath, reg: u32, mask: u32, data: u32) -> Result<(), FaceError> {
         const RFREG_MASK: u32 = 0xfffff;
         let mask = mask & RFREG_MASK;
@@ -2482,10 +2482,10 @@ impl LibUsbRtl88xxBackend {
         self.bb_write(0x81c, 0x1f_c000, 0x4)?; // Tx scaling
 
         // 2-stream OFDM TX path (`phydm_config_ofdm_tx_path_8822e`, 2T2R): enable
-        // 2SS across both paths (0x820[7:0]=0x31 = 2SS-AB | 1ss-A), 0x1e2c[15:0]=
+        // 2SS across both paths (0x820\[7:0\]=0x31 = 2SS-AB | 1ss-A), 0x1e2c\[15:0\]=
         // 0x0400. Without this the BB only forms a single spatial stream, so HT
         // MCS8-15 / VHT-2SS frames are never modulated. The 1SS path nibble
-        // (0x820[1:0]) is A-only by default, or **AB** when CSD is enabled
+        // (0x820\[1:0\]) is A-only by default, or **AB** when CSD is enabled
         // (`tx_csd`) — Cyclic Shift Diversity sends the single stream from both
         // antennas (the kernel's `tx_npath`: 1ss `txpath` = `BB_PATH_AB`).
         let ofdm_path = if self.tx_csd.load(Ordering::Relaxed) {
@@ -3240,7 +3240,7 @@ impl LibUsbRtl88xxBackend {
         let p = self.efuse_dump_physical()?;
         let at = |a: usize| p.get(a).copied().unwrap_or(0xff);
 
-        // ── Thermal trim (RF 0x43[19:16]), gated on the path-A cell. ──
+        // ── Thermal trim (RF 0x43\[19:16\]), gated on the path-A cell. ──
         let therm_a = at(0x5df);
         if therm_a != 0xff {
             let pack = |t: u8| -> u32 {
@@ -3390,8 +3390,8 @@ impl LibUsbRtl88xxBackend {
         if self.bb_read(0x1c90, 1 << 15)? != 0 {
             self.bb_write(0x1c90, 1 << 15, 0)?; // unlock TXAGC table writes
         }
-        // References: OFDM (0x18e8/0x41e8, [16:10]) + CCK (0x18a0/0x41a0,
-        // [22:16]); both paths share the curve (per-device offset is in kfree).
+        // References: OFDM (0x18e8/0x41e8, \[16:10\]) + CCK (0x18a0/0x41a0,
+        // \[22:16\]); both paths share the curve (per-device offset is in kfree).
         self.bb_write(0x18e8, 0x0001_fc00, ref_idx as u32)?;
         self.bb_write(0x41e8, 0x0001_fc00, ref_idx as u32)?;
         self.bb_write(0x18a0, 0x007f_0000, ref_idx as u32)?;
@@ -3413,7 +3413,7 @@ impl LibUsbRtl88xxBackend {
 
     /// Read the RF thermal meter for `path` (`halrf_get_thermal_8822e`): pulse
     /// RF `0x42[19]` to latch a fresh sample, then read the 6-bit value at
-    /// `0x42[6:1]`. Higher = hotter; the PA's gain falls as it heats.
+    /// `0x42\[6:1\]`. Higher = hotter; the PA's gain falls as it heats.
     pub fn read_thermal(&self, path: RfPath) -> Result<u8, FaceError> {
         self.rf_write(path, 0x42, 1 << 19, 1)?;
         self.rf_write(path, 0x42, 1 << 19, 0)?;
@@ -3640,7 +3640,7 @@ impl LibUsbRtl88xxBackend {
 
     /// `halrf_txgapk_save_all_tx_gain_table_8822e`: read the factory TX gain
     /// table (RF 0x5f at gain indices 1,4,…,31) across the 5 bands and both
-    /// paths, and flag adjacent entries sharing bits [11:5].
+    /// paths, and flag adjacent entries sharing bits \[11:5\].
     #[allow(clippy::type_complexity)]
     fn txgapk_save_gain_table(
         &self,
@@ -3947,7 +3947,7 @@ impl LibUsbRtl88xxBackend {
     /// **Single-tone TX** (`phydm_mp_set_single_tone_jgr3`, 8822E branch) — a
     /// diagnostic that keys the PA to emit a continuous carrier at the current
     /// channel, bypassing the MAC entirely. Per path: put the RF in TX mode
-    /// (`RF 0x00[19:16] = 2`), set the lowest gain index (`RF 0x00[4:0] = 0` =
+    /// (`RF 0x00\[19:16\] = 2`), set the lowest gain index (`RF 0x00\[4:0\] = 0` =
     /// max power), and enable the RF LO (`RF 0x58[1] = 1`); plus disable OFDM
     /// CCA. If an SDR sees a tone, the RF/PA path works and any frame-TX gap is
     /// in the MAC; if not, the analog TX path itself is dead.
@@ -4008,8 +4008,8 @@ impl LibUsbRtl88xxBackend {
     }
 
     /// Identify the silicon the way halmac's `get_chip_info` does: the hardware
-    /// chip id from `REG_SYS_CFG2[7:0]` (`0x17` = 8822E) and the cut from
-    /// `REG_SYS_CFG1` byte 1 bits[7:4] (0 = A-cut, 1 = B-cut, …).
+    /// chip id from `REG_SYS_CFG2\[7:0\]` (`0x17` = 8822E) and the cut from
+    /// `REG_SYS_CFG1` byte 1 bits\[7:4\] (0 = A-cut, 1 = B-cut, …).
     pub fn chip_info(&self) -> Result<ChipInfo, FaceError> {
         Ok(ChipInfo {
             sys_cfg: self.read32(REG_SYS_CFG)?,
@@ -4139,7 +4139,7 @@ fn txdesc_set(desc: &mut [u8], dword_off: usize, bit: u32, len: u32, value: u32)
 
 /// `fill_txdesc_check_sum_8822e`: XOR of the descriptor's 16-bit LE words
 /// (covering the descriptor plus any packet-offset padding), stored in the
-/// checksum field at +0x1C bits[15:0]. The field is zeroed before summing.
+/// checksum field at +0x1C bits\[15:0\]. The field is zeroed before summing.
 fn txdesc_checksum(desc: &mut [u8]) {
     let pkt_offset = (u32::from_le_bytes(desc[4..8].try_into().unwrap()) >> 24) & 0x1f;
     txdesc_set(desc, 0x1c, 0, 16, 0);
@@ -4241,7 +4241,7 @@ impl RfPath {
 }
 
 /// phydm table headline selection (`halbb_sel_headline`): the table starts
-/// with (0xF-prefixed) variant descriptors {cut[27:24], rfe[7:0]}; pick by
+/// with (0xF-prefixed) variant descriptors {cut\[27:24\], rfe\[7:0\]}; pick by
 /// exact match → cut-don't-care → rfe-match/max-cut → rfe-don't-care/max-cut.
 #[derive(Clone, Copy)]
 struct HeadlineSel {
@@ -4532,7 +4532,7 @@ impl LibUsbRtl88xxBackend {
         // kernel driver sets it for every single-buffer frame; captured from a
         // live monitor-inject TX descriptor over usbmon (2026-06-13).
         txdesc_set(&mut buf, 0x00, 26, 1, 1); // LS
-        // G_ID = 63: the no-group / broadcast default the kernel uses (0x08[24:6]).
+        // G_ID = 63: the no-group / broadcast default the kernel uses (0x08\[24:6\]).
         txdesc_set(&mut buf, 0x08, 24, 6, 63); // G_ID
         txdesc_set(&mut buf, 0x0c, 8, 1, 1); // USE_RATE (driver-fixed rate)
         txdesc_set(&mut buf, 0x0c, 9, 1, 1); // DISRTSFB (no RTS rate fallback)
@@ -4568,7 +4568,7 @@ impl LibUsbRtl88xxBackend {
         if mcs.short_gi {
             txdesc_set(&mut buf, 0x14, 4, 1, 1); // DATA_SHORT (SGI)
         }
-        // DATA_BW (0x14[6:5]) = the channel bandwidth (20/40/80). The frame is
+        // DATA_BW (0x14\[6:5\]) = the channel bandwidth (20/40/80). The frame is
         // sent at the full channel width, so DATA_SC stays DONT_CARE (0). The
         // 5/10 MHz narrowband modes use code 0 (20 MHz format, BB down-clocked).
         let bw = match self.cur_bw.load(Ordering::Relaxed) {
@@ -4590,7 +4590,7 @@ impl LibUsbRtl88xxBackend {
         if ldpc {
             txdesc_set(&mut buf, 0x14, 7, 1, 1);
         }
-        // DATA_STBC (0x14[8:2]): Alamouti-encode ONE spatial stream across both
+        // DATA_STBC (0x14\[8:2\]): Alamouti-encode ONE spatial stream across both
         // TX antennas (A+B, enabled via `0x820=0x31`) — pure TX diversity for the
         // feedback-free broadcast case. Value 1 = one STBC stream. Only valid for
         // a 1-stream rate (HT MCS0–7, or VHT `nss == 1`): there is no 802.11 STBC
@@ -4935,7 +4935,7 @@ impl LibUsbRtl88xxBackend {
                         .collect();
                 }
             };
-            // Type must be Data (FC byte0 bits[3:2]); the QoS subtype (bit 7) adds
+            // Type must be Data (FC byte0 bits\[3:2\]); the QoS subtype (bit 7) adds
             // a 2-byte QoS Control field, so the MAC header is 26 not 24 bytes.
             if frame.len() < 24 || frame[0] & 0x0c != 0x08 {
                 return vec![];

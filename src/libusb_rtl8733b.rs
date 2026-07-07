@@ -926,7 +926,7 @@ impl Rtl8733buBackend {
 
     /// **M6b**: baseband init — apply the BB PHY-register table then the AGC table
     /// (`array_mp_8733b_phy_reg` + `array_mp_8733b_agc_tab`). The BB block is already
-    /// powered by [`mac_config`] (`0x002 = 0xC3`). Run after [`mac_config`].
+    /// powered by [`mac_config`](Self::mac_config) (`0x002 = 0xC3`). Run after [`mac_config`](Self::mac_config).
     pub fn bb_config(&self) -> Result<(), FaceError> {
         self.config_table_bin(PHY_REG_8733B, |s, a, d| s.bb_write(a, d))?;
         self.config_table_bin(AGC_TAB_8733B, |s, a, d| s.bb_write(a, d))?;
@@ -953,12 +953,12 @@ impl Rtl8733buBackend {
     }
 
     /// **M6c**: RF init — apply the radioA table (`array_mp_8733b_radioa`) through the
-    /// direct RF-write window. Run after [`bb_config`].
+    /// direct RF-write window. Run after [`bb_config`](Self::bb_config).
     pub fn rf_config(&self) -> Result<(), FaceError> {
         self.config_table_bin(RADIOA_8733B, |s, a, d| s.rf_write(a, d))
     }
 
-    /// Read a path-A RF register (for verifying [`rf_config`]) via the direct window.
+    /// Read a path-A RF register (for verifying [`rf_config`](Self::rf_config)) via the direct window.
     pub fn rf_read(&self, addr: u32) -> Result<u32, FaceError> {
         Ok(self.read32((0x3C00 + ((addr & 0xFF) << 2)) as u16)? & 0x000F_FFFF)
     }
@@ -968,7 +968,7 @@ impl Rtl8733buBackend {
     /// path can run: queue→DMA map, enable all TRX, normal RQPN + reserved-page
     /// boundary, then the hardware auto-LLT (poll `REG_AUTO_LLT` BIT16 until it
     /// clears). All values are the reference driver's, taken from its usbmon capture.
-    /// Run after the BB/RF tables ([`rf_config`]).
+    /// Run after the BB/RF tables ([`rf_config`](Self::rf_config)).
     pub fn init_trx(&self) -> Result<(), FaceError> {
         self.write16(REG_TXDMA_PQ_MAP, 0xF5A0)?; // queue → DMA mapping (normal)
         self.write8(REG_CR, 0x00)?;
@@ -1091,7 +1091,7 @@ impl Rtl8733buBackend {
     /// **M8**: inject a raw 802.11 frame at a fixed rate. Builds the 48-byte data TX
     /// descriptor (QSEL=MGT, USE_RATE + DISDATAFB fixed-rate, no encryption, SW seq)
     /// and sends `[desc][frame]` to the HIGH bulk-OUT endpoint (0x05). `rate` is a
-    /// HwRate code (0x00 = 1M CCK, 0x04 = 6M OFDM). Run after [`init_trx`].
+    /// HwRate code (0x00 = 1M CCK, 0x04 = 6M OFDM). Run after [`init_trx`](Self::init_trx).
     pub fn inject_raw(&self, frame: &[u8], rate: u8, seq: u16) -> Result<(), FaceError> {
         let bcast = frame.len() > 4 && frame[4] & 0x01 != 0; // 802.11 addr1[0] group bit
         let desc = build_data_txdesc(frame.len(), rate, seq, bcast, self.tx_flags.load(Ordering::Relaxed));
@@ -2330,7 +2330,7 @@ impl Rtl8733buBackend {
     /// keystone that makes the TX mixer emit a clean carrier. Coarse LOK, path A, 5 GHz
     /// A-mode (`is_5g`=true). Runs the NCTL one-shot (process 0x018), reads the IDAC I/Q
     /// from `0x1bfc`, and writes the LO-leakage cancellation into RF 0x08. Needs
-    /// [`rfk_init`] (KIP microcode) + a tuned channel first. Returns the raw `0x1bfc`.
+    /// [`rfk_init`](Self::rfk_init) (KIP microcode) + a tuned channel first. Returns the raw `0x1bfc`.
     pub fn phy_lok(&self, is_5g: bool) -> Result<u32, FaceError> {
         let dbg = std::env::var("IQKDBG").is_ok();
         let backup = self.iqk_backup()?;
@@ -2409,7 +2409,7 @@ impl Rtl8733buBackend {
 
     /// Set the TX PHY flags applied to every injected frame's descriptor: `ldpc`
     /// (LDPC coding), `stbc` (space-time block coding), `sgi` (short guard interval),
-    /// and `bw40` (mark the frame 40 MHz — pair with [`set_bandwidth`] `Bw40`). These
+    /// and `bw40` (mark the frame 40 MHz — pair with [`set_bandwidth`](Self::set_bandwidth) `Bw40`). These
     /// only affect HT (MCS) rates; a legacy CCK/OFDM frame ignores them.
     pub fn set_tx_flags(&self, ldpc: bool, stbc: bool, sgi: bool, bw40: bool) {
         let f = (ldpc as u8) | ((sgi as u8) << 1) | ((stbc as u8) << 2) | ((bw40 as u8) << 3);

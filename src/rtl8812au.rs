@@ -178,7 +178,7 @@ static MAC_REG: &[u8] = include_bytes!("../fw/rtl8812au/rtl8812au_mac_reg.bin");
 /// 8812A baseband (PHY) register table (`array_mp_8812a_phy_reg`) and AGC table
 /// (`array_mp_8812a_agc_tab`), extracted from the vendor phydm
 /// `halhwimg8812a_bb.c`. Same phydm conditional format as [`MAC_REG`], applied as
-/// 32-bit writes with delay opcodes (addr `0xfe..0xf9`). See [`bb_config`].
+/// 32-bit writes with delay opcodes (addr `0xfe..0xf9`). See [`bb_config`](Self::bb_config).
 static PHY_REG: &[u8] = include_bytes!("../fw/rtl8812au/rtl8812au_phy_reg.bin");
 static AGC_TAB: &[u8] = include_bytes!("../fw/rtl8812au/rtl8812au_agc_tab.bin");
 
@@ -747,7 +747,7 @@ impl Rtl8812auBackend {
         Ok(())
     }
 
-    /// Read a baseband register (32-bit) — for verifying [`bb_config`].
+    /// Read a baseband register (32-bit) — for verifying [`bb_config`](Self::bb_config).
     pub fn bb_read(&self, addr: u16) -> Result<u32, FaceError> {
         self.read32(addr)
     }
@@ -1463,7 +1463,7 @@ impl Rtl8812auBackend {
         Ok(())
     }
 
-    /// The current `REG_CR` value — read back after [`mac_init_queues`] to
+    /// The current `REG_CR` value — read back after [`mac_init_queues`](Self::mac_init_queues) to
     /// confirm the MAC TX/RX enable bits are set.
     pub fn read_cr(&self) -> Result<u16, FaceError> {
         self.read16(REG_CR)

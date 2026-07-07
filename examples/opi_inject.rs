@@ -25,7 +25,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         d.rf_read(0x18)?,
         d.rf_read(0x01)?
     );
-    let rate = if ch <= 14 { 0x00u8 } else { 0x04 }; // 1M CCK / 6M OFDM
+    let rate = std::env::var("RATE").ok().and_then(|v| u8::from_str_radix(&v,16).ok()).unwrap_or(if ch <= 14 { 0x00 } else { 0x04 });
     if std::env::var("TXDIAG").is_ok() {
         // Does the MAC transmit? Snapshot MAC status regs, inject a fast burst, re-read,
         // print deltas. A moving TX counter ⇒ frames hit the air (RF problem); nothing

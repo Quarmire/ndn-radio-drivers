@@ -125,6 +125,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         Ok((agc, fail)) => println!("✓ agc_done={agc} dpk_fail={fail} (agc 1=ok, fail 0=ok)"),
                         Err(e) => println!("FAILED: {e}"),
                     }
+                    // M8: monitor-mode RX capture (ambient frames) + TX inject.
+                    dev.set_channel(1)?;
+                    dev.set_monitor()?;
+                    print!("M8 capture (2s ambient, ch1) … ");
+                    let mut total = 0usize;
+                    let mut sample = String::new();
+                    for _ in 0..20 {
+                        for f in dev.capture(100)? {
+                            if total < 3 {
+                                sample.push_str(&format!(
+                                    " [{}B fc=0x{:04x}]",
+                                    f.len(),
+                                    u16::from_le_bytes([f[0], *f.get(1).unwrap_or(&0)])
+                                ));
+                            }
+                            total += 1;
+                        }
+                    }
+                    println!("captured {total} frames{sample}");
+                    // TX inject: a broadcast data frame with a recognizable payload.
+                    let mut frame = vec![0x08u8, 0x00, 0x00, 0x00];
+                    frame.extend_from_slice(&[0xff; 6]); // addr1 = broadcast
+                    frame.extend_from_slice(&[0x02, 0x11, 0x22, 0x33, 0x44, 0x55]); // addr2
+                    frame.extend_from_slice(&[0x02, 0x11, 0x22, 0x33, 0x44, 0x55]); // addr3
+                    frame.extend_from_slice(&[0x00, 0x00]); // seq
+                    frame.extend_from_slice(b"NDN8733B-TEST-INJECT");
+                    print!("M8 inject (1M CCK) … ");
+                    match dev.inject(&frame, 0x00, 1) {
+                        Ok(()) => println!("✓ sent {} bytes to air", frame.len()),
+                        Err(e) => println!("FAILED: {e}"),
+                    }
                 }
                 Err(e) => {
                     println!("FAILED: {e}");

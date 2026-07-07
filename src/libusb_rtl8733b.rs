@@ -185,6 +185,12 @@ const REG_BCNQ_BDNY: u16 = 0x0424;
 const REG_BCNQ2_BDNY: u16 = 0x0455;
 const REG_AUTO_LLT: u16 = 0x0224;
 const REG_TXDMA_OFFSET_CHK: u16 = 0x020C;
+// M8 — RX control / filter maps (monitor mode).
+const REG_RCR: u16 = 0x0608;
+const REG_RXFLTMAP0: u16 = 0x06A0; // mgmt
+const REG_RXFLTMAP1: u16 = 0x06A2; // ctrl
+const REG_RXFLTMAP2: u16 = 0x06A4; // data
+const DATA_TX_DESC_SIZE: usize = 48; // 8733b data-path TX descriptor
 const IDDMA_SRC: u32 = 0x1878_0028; // OCPBASE_TXBUF + 40 (skip the txdesc); constant per capture
 const DDMA_OWN: u32 = 1 << 31; // BIT_DDMACH0_OWN (start / busy)
 const DDMA_CHKSUM_EN: u32 = 1 << 29; // BIT_DDMACH0_CHKSUM_EN
@@ -214,6 +220,32 @@ fn download_txdesc(payload_len: usize) -> [u8; TX_DESC_SIZE] {
     // Checksum: field at 0x1C stays 0 while XORing the 20 little-endian u16 words.
     let mut ck: u16 = 0;
     for i in 0..TX_DESC_SIZE / 2 {
+        ck ^= u16::from_le_bytes([d[2 * i], d[2 * i + 1]]);
+    }
+    d[0x1C..0x1E].copy_from_slice(&(!ck).to_le_bytes());
+    d
+}
+
+/// Build the 48-byte data-path TX descriptor for a fixed-rate raw 802.11 inject:
+/// TXPKTSIZE + OFFSET=48, QSEL=MGT, disable-agg, USE_RATE + DISDATAFB/DISRTSFB (fixed
+/// rate), retry-limit-enable, SEC_TYPE=0 (raw), EN_HWSEQ=0 with a 12-bit SW sequence,
+/// and the TX-desc checksum (`~XOR` of the first 32 bytes' u16 words) at 0x1C.
+fn build_data_txdesc(frame_len: usize, rate: u8, seq: u16, bcast: bool) -> [u8; DATA_TX_DESC_SIZE] {
+    let mut d = [0u8; DATA_TX_DESC_SIZE];
+    let mut dw0 = (frame_len as u32 & 0xFFFF) | ((DATA_TX_DESC_SIZE as u32 & 0xFF) << 16);
+    if bcast {
+        dw0 |= 1 << 24; // BMC
+    }
+    d[0..4].copy_from_slice(&dw0.to_le_bytes());
+    d[4..8].copy_from_slice(&((0x12u32 & 0x1F) << 8).to_le_bytes()); // dw1: QSEL=MGT
+    d[8..12].copy_from_slice(&(1u32 << 16).to_le_bytes()); // dw2: BK (disable aggregation)
+    d[12..16].copy_from_slice(&((1u32 << 8) | (1 << 9) | (1 << 10)).to_le_bytes()); // dw3: USE_RATE|DISRTSFB|DISDATAFB
+    d[16..20].copy_from_slice(&((rate as u32 & 0x7F) | (1 << 17)).to_le_bytes()); // dw4: DATARATE|RTY_LMT_EN
+    d[36..40].copy_from_slice(&(((seq as u32) & 0xFFF) << 12).to_le_bytes()); // dw9: SW_SEQ
+    // Checksum over the FIRST 32 bytes (16 u16 words, dw0..dw7) with the field at 0x1C
+    // left zero — NOT the whole descriptor (dw8/dw9 hold the seq and are excluded).
+    let mut ck: u16 = 0;
+    for i in 0..16 {
         ck ^= u16::from_le_bytes([d[2 * i], d[2 * i + 1]]);
     }
     d[0x1C..0x1E].copy_from_slice(&(!ck).to_le_bytes());
@@ -912,6 +944,74 @@ impl Rtl8733buBackend {
         }
         self.write8(REG_CR + 3, 0x00)?; // transfer mode = normal
         Ok(())
+    }
+
+    // ── M8: TX/RX data path (monitor-mode inject/capture) ────────────────────
+
+    /// **M8**: inject a raw 802.11 frame at a fixed rate. Builds the 48-byte data TX
+    /// descriptor (QSEL=MGT, USE_RATE + DISDATAFB fixed-rate, no encryption, SW seq)
+    /// and sends `[desc][frame]` to the HIGH bulk-OUT endpoint (0x05). `rate` is a
+    /// HwRate code (0x00 = 1M CCK, 0x04 = 6M OFDM). Run after [`init_trx`].
+    pub fn inject(&self, frame: &[u8], rate: u8, seq: u16) -> Result<(), FaceError> {
+        let bcast = frame.len() > 4 && frame[4] & 0x01 != 0; // 802.11 addr1[0] group bit
+        let desc = build_data_txdesc(frame.len(), rate, seq, bcast);
+        let mut pkt = Vec::with_capacity(desc.len() + frame.len() + 1);
+        pkt.extend_from_slice(&desc);
+        pkt.extend_from_slice(frame);
+        if pkt.len() % 512 == 0 {
+            pkt.push(0); // avoid a bulk-max-multiple transfer (ZLP); TXPKTSIZE bounds the frame
+        }
+        let ep = *self.bulk_outs.first().unwrap_or(&self.bulk_out);
+        let wrote = self
+            .handle
+            .write_bulk(ep, &pkt, Duration::from_millis(500))
+            .map_err(usb_err)?;
+        if wrote != pkt.len() {
+            return Err(io_err(format!("inject: short bulk write {wrote}/{}", pkt.len())));
+        }
+        Ok(())
+    }
+
+    /// **M8**: put the receiver in monitor mode — accept every frame (incl. CRC/ICV
+    /// errors), append PHY status + FCS, and open all mgmt/ctrl/data filter maps.
+    pub fn set_monitor(&self) -> Result<(), FaceError> {
+        self.write32(REG_RCR, 0x9000_030F)?; // AAP|APM|AM|AB|ACRC32|AICV|APP_PHYSTS|APP_FCS
+        self.write16(REG_RXFLTMAP0, 0xFFFF)?; // mgmt
+        self.write16(REG_RXFLTMAP1, 0xFFFF)?; // ctrl
+        self.write16(REG_RXFLTMAP2, 0xFFFF)?; // data
+        Ok(())
+    }
+
+    /// **M8**: read one bulk-IN transfer and split out the 802.11 frames it packs.
+    /// Each frame sits at `24 + drvinfo*8 + shift` after its 24-byte RX descriptor,
+    /// and successive frames are 8-byte aligned; `DMA_AGG_NUM` counts them.
+    pub fn capture(&self, timeout_ms: u64) -> Result<Vec<Vec<u8>>, FaceError> {
+        let mut buf = vec![0u8; 16384];
+        let n = match self.handle.read_bulk(self.bulk_in, &mut buf, Duration::from_millis(timeout_ms)) {
+            Ok(n) => n,
+            Err(rusb::Error::Timeout) => return Ok(Vec::new()),
+            Err(e) => return Err(usb_err(e)),
+        };
+        let data = &buf[..n];
+        let mut frames = Vec::new();
+        let mut off = 0usize;
+        while off + 24 <= data.len() {
+            let dw0 = u32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]]);
+            let pkt_len = (dw0 & 0x3FFF) as usize;
+            if pkt_len == 0 {
+                break;
+            }
+            let drvinfo = ((dw0 >> 16) & 0xF) as usize * 8;
+            let shift = ((dw0 >> 24) & 0x3) as usize;
+            let dw2 = u32::from_le_bytes([data[off + 8], data[off + 9], data[off + 10], data[off + 11]]);
+            let is_c2h = dw2 & (1 << 28) != 0;
+            let fstart = off + 24 + drvinfo + shift;
+            if !is_c2h && fstart + pkt_len <= data.len() {
+                frames.push(data[fstart..fstart + pkt_len].to_vec());
+            }
+            off += ((24 + drvinfo + shift + pkt_len) + 7) & !7; // _RND8 to next
+        }
+        Ok(frames)
     }
 
     /// **M6a**: apply the 8733b MAC register table (`array_mp_8733b_mac_reg`) — a

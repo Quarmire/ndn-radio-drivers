@@ -10,11 +10,21 @@
 //! stream rate codes (HT MCS0–7 / VHT MCS0–8), no 2SS descriptor/TX-path setup,
 //! and a simpler IQK/calibration than the 2×2 chips.
 //!
-//! ## Milestones
-//! - **M1 (this file today): open + reg-I/O + chip-version identification.**
-//! - M2+: power-on, firmware download, MAC/BB/RF init, 1×1 calibration,
-//!   channel/TX-power, RX-DMA, TX inject, RX capture — implementing
-//!   [`FrameIo`](ndn_frame_io::FrameIo) + [`WifiRadio`](ndn_frame_io::WifiRadio).
+//! ## Status
+//! Working and verified on hardware (OPi, RTL8733BU on bus 5): open + reg-I/O + chip
+//! identification, power-on, firmware download, MAC/BB/RF init, channel/bandwidth tuning,
+//! monitor-mode **RX capture**, and **inject-to-MAC** — the full
+//! [`FrameIo`](ndn_frame_io::FrameIo) / [`WifiRadio`](ndn_frame_io::WifiRadio) /
+//! [`RadioKnobs`](ndn_radio_hal::RadioKnobs) contract for capture, injection, and control.
+//!
+//! One open item: **on-air TX radiation**. Injected frames reach and are accepted by the
+//! MAC, but the RF does not yet radiate. Every reproducible aspect of the vendor's
+//! transmit path was matched (bit-identical firmware, full ordered register replay, TX
+//! descriptor, H2C box commands, reserved-page download, endpoint) with no RF output — the
+//! residual gate is firmware-internal/analog and needs firmware-level tooling. The IQK /
+//! DPK / TXGAPK calibration scaffolding here (`phy_lok`, `phy_dpk`, `phy_txgapk`,
+//! `apply_efuse_trim`) is retained for that follow-on; it is not on the working RX/inject
+//! path and is not required for it.
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -1113,10 +1123,19 @@ impl Rtl8733buBackend {
     }
 
     /// Full monitor-mode bring-up: power-on → firmware → MAC/BB/RF init → normal TRX →
-    /// tune `channel` → promiscuous RX. After this the backend injects and captures
-    /// (the [`FrameIo`] path). Calibration is optional and omitted here (TX radiates
-    /// without it). Note the chip wedges after repeated re-inits in a process — open
-    /// once per power-cycle.
+    /// tune `channel` → promiscuous RX. After this the backend **captures** frames and
+    /// **injects to the MAC** (the [`FrameIo`] path) — both verified on the OPi.
+    ///
+    /// TX status: injected frames reach and are accepted by the MAC, but the RF does not
+    /// yet radiate on air. This was exhaustively reverse-engineered against the vendor
+    /// driver — firmware (bit-identical), all register writes (full ordered replay), the
+    /// TX descriptor, H2C box commands, and the reserved-page download all match the
+    /// radiating vendor, yet no RF output. The residual gate is firmware-internal /
+    /// analog and needs firmware-level tooling (see the port notes). On-air TX is the one
+    /// open item; everything else (RX/monitor, inject-to-MAC, knobs) works.
+    ///
+    /// Note the chip wedges after repeated re-inits in a process — open once per
+    /// power-cycle.
     pub fn bring_up_monitor(&self, channel: u8) -> Result<(), FaceError> {
         self.power_on()?;
         self.fw_dl_setup()?;

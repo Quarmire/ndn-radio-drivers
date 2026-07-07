@@ -17,12 +17,19 @@
 //! the 8812AU product ids ([`RTL8812AU_PIDS`]) — never `a81a` — and claims that
 //! one device, so bringing up the AU never detaches the EU sniffer.
 //!
-//! ## Status: bring-up in progress
+//! ## Status: full bring-up implemented, on-hardware validation pending
 //!
-//! Implemented: device-targeted USB open + the Realtek register-I/O protocol +
-//! chip-version identification ([`chip_info`](Rtl8812auBackend::chip_info)). The
-//! power-on sequence, firmware download, MAC/BB/RF init, and the `FrameIo`
-//! inject/capture path are the next milestones (ported from the C reference).
+//! Implemented (ported from the C reference): device-targeted USB open + the
+//! Realtek register-I/O protocol + chip-version identification
+//! ([`chip_info`](Rtl8812auBackend::chip_info)), the power-on sequence
+//! ([`power_on`](Rtl8812auBackend::power_on)), firmware download
+//! ([`download_firmware`](Rtl8812auBackend::download_firmware)), MAC/BB/RF init
+//! ([`mac_config`](Rtl8812auBackend::mac_config) /
+//! [`bb_config`](Rtl8812auBackend::bb_config) /
+//! [`rf_config`](Rtl8812auBackend::rf_config)), monitor bring-up
+//! ([`bring_up_monitor`](Rtl8812auBackend::bring_up_monitor)), and the
+//! [`FrameIo`] inject/capture path. On-hardware validation against the golden
+//! trace is the remaining step.
 
 use std::io;
 use std::sync::Arc;

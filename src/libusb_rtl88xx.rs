@@ -3,14 +3,14 @@
 //! runs on hosts without an `AF_PACKET` monitor interface (macOS, and Linux
 //! without the out-of-tree `rtl88x2eu` driver).
 //!
-//! **Status: bring-up complete through the PHY + TX/RX descriptors; on-air
-//! radiation pending RF calibration.** Hardware-verified against the golden
-//! kernel-driver state: power-on, the physical-EFUSE/MAC read, firmware
-//! download (fw alive, `REG_MCUFW_CTRL = 0xC078`), MAC init (449/512 registers
-//! match), and BB/RF init (`RF 0x18 = 0x531a1`, channel 161, 509/512 BB
-//! registers match). [`inject`](FrameIo::inject) builds the 48-byte TX
-//! descriptor + 802.11 frame and the chip accepts it on bulk-OUT;
-//! [`recv_frame`](FrameIo::recv_frame) parses the 24-byte RX descriptor.
+//! **Status: complete and on-air — RX capture + TX radiation both verified
+//! end-to-end.** Hardware-verified against the golden kernel-driver state:
+//! power-on, the physical-EFUSE/MAC read, firmware download (fw alive,
+//! `REG_MCUFW_CTRL = 0xC078`), MAC init (449/512 registers match), and BB/RF
+//! init (`RF 0x18 = 0x531a1`, channel 161, 509/512 BB registers match).
+//! [`inject`](FrameIo::inject) builds the 48-byte TX descriptor + 802.11 frame
+//! (radiated, decoded by a peer); [`recv_frame`](FrameIo::recv_frame) parses the
+//! 24-byte RX descriptor. See the on-air TX note below for the datapath gate.
 //!
 //! **On-air TX works.** The long-hunted gate was the BB transmit datapath:
 //! [`bb_tx_datapath_init`](Self::bb_tx_datapath_init) configures the

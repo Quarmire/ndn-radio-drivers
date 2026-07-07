@@ -67,6 +67,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     dut.set_tx_power_idx(0x7f)?; // max reference TX power
     let txagc0 = dut.read32(0x3a00)?;
     dut.set_txagc_table(0x3f)?; // per-rate TX AGC table — 0 without this = no RF
+    dut.configure_trsw(true)?; // route the external TRSW antenna switch (TX path)
     println!("  TXAGC table 0x3a00: 0x{txagc0:08x} -> 0x{:08x}", dut.read32(0x3a00)?);
     let rf18 = dut.rf_read(0x18)?;
     let txpause = dut.read8(0x0522)?;

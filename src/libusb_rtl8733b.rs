@@ -2021,6 +2021,26 @@ impl Rtl8733buBackend {
         Ok(())
     }
 
+    /// Route the TX/RX antenna-switch (TRSW) control GPIOs
+    /// (`phydm_init_hw_info_by_rfe_type_8733b`). `ext = true` is the external-TRSW
+    /// board config (rfe 1/3/4/5, "pin usecase E9") most USB dongles use; without it
+    /// the antenna stays on the RX path and TX never keys the air. `false` is the
+    /// internal/default (rfe 0) routing. GPIO_MUXCFG/LED_CFG/PAD_CTRL are MAC regs.
+    pub fn configure_trsw(&self, ext: bool) -> Result<(), FaceError> {
+        if ext {
+            let v40 = (self.read32(0x40)? & !0x0f00_0000) | (0x5 << 24);
+            self.write32(0x40, v40)?;
+            let v4c = (self.read32(0x4c)? & !0x0780_0000) | (0x2 << 23);
+            self.write32(0x4c, v4c)?;
+            let v64 = (self.read32(0x64)? & !0x3000_0000) | (0x3 << 28);
+            self.write32(0x64, v64)?;
+        } else {
+            self.write32(0x4c, self.read32(0x4c)? & !(1 << 24))?;
+            self.write32(0x64, self.read32(0x64)? & !0x3000_0000)?;
+        }
+        Ok(())
+    }
+
     /// Split a bulk-IN transfer into 802.11 frames and queue the parsed
     /// [`CapturedFrame`]s (used by [`FrameIo::recv_frame`]).
     fn parse_rx_into_pending(&self, data: &[u8]) {

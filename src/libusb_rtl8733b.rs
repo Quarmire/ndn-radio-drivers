@@ -1969,14 +1969,28 @@ impl Rtl8733buBackend {
         Ok(())
     }
 
-    /// PSD-power validity check (`_txgapk_dbg_psd_pwr`). First pass returns true (do the
-    /// DIFFK); the register touches prime the report path.
+    /// PSD-power validity check (`_txgapk_dbg_psd_pwr`): the two point measurements
+    /// (`psd_pwr[0]`/`[1]`, read from `0x1bfc`) must both be ≥ 0x1000 and within 2× of
+    /// each other, else the DIFFK is skipped (running it on garbage saturates the LUT).
     fn txgapk_psd_valid(&self) -> Result<bool, FaceError> {
         self.bb_set(0x1bd4, 1 << 22, 0)?;
         self.write8(0x1bd6, 0x2e)?;
-        self.bb_set(0x1bf4, 0x0000_0F00, 0x2)?;
-        let _p0 = self.bb_get(0x1bfc, 0x7f)?;
-        let _p1 = self.bb_get(0x1bfc, 0x007f_0000)?;
+        self.bb_set(0x1bf4, 0x0000_0F00, 0x0)?;
+        let p0 = self.read32(0x1bfc)?;
+        self.bb_set(0x1bf4, 0x0000_0F00, 0x1)?;
+        let p1 = self.read32(0x1bfc)?;
+        if std::env::var("IQKDBG").is_ok() {
+            eprintln!("    [psd] p0=0x{p0:x} p1=0x{p1:x}");
+        }
+        if p0 < 0x1000 && p1 < 0x1000 {
+            return Ok(false);
+        }
+        if p0 == 0 || p1 == 0 {
+            return Ok(false);
+        }
+        if p1 / p0 >= 2 || p0 / p1 >= 2 {
+            return Ok(false);
+        }
         Ok(true)
     }
 

@@ -13,11 +13,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let d = Rtl8733buBackend::open()?;
     d.bring_up_monitor(ch)?;
     if std::env::var("CAL").is_ok() {
-        // The vendor runs the full RF cal suite during init (write-seq diff); test whether
-        // the cals I have enable the TX in the OPi's native single-context env.
+        // M11: LOK — the TX-carrier keystone. rfk_init loads the KIP microcode the NCTL
+        // one-shot needs; phy_lok cals the LO leakage so the TX mixer emits a carrier.
         let _ = d.rfk_init();
-        println!("dpk: {:?}", d.phy_dpk());
-        println!("txgapk RF01: {:?}", d.phy_txgapk());
+        println!("lok: {:?}", d.phy_lok(ch > 14));
     }
     d.write8(0x0522, 0x00)?; // unpause TX
     println!(

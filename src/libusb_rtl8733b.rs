@@ -2248,6 +2248,77 @@ impl Rtl8733buBackend {
         self.iqk_restore(&backup)?;
         Ok((probe, self.read32(IQK_BB_REGS[0])?))
     }
+
+    /// **M11 — LOK** (LO-leakage / TX-carrier calibration, `_iqk_lok_by_path`): the
+    /// keystone that makes the TX mixer emit a clean carrier. Coarse LOK, path A, 5 GHz
+    /// A-mode (`is_5g`=true). Runs the NCTL one-shot (process 0x018), reads the IDAC I/Q
+    /// from `0x1bfc`, and writes the LO-leakage cancellation into RF 0x08. Needs
+    /// [`rfk_init`] (KIP microcode) + a tuned channel first. Returns the raw `0x1bfc`.
+    pub fn phy_lok(&self, is_5g: bool) -> Result<u32, FaceError> {
+        let dbg = std::env::var("IQKDBG").is_ok();
+        let backup = self.iqk_backup()?;
+        let rf_mode = self.rf_get(0, 0x00, 0xF0000)?;
+        self.iqk_afe_setting(true)?;
+        self.iqk_preset(true)?;
+        // txk_rf_setting (path A).
+        self.rf_set(0, 0xde, 0xFE000, 0x3f)?; // DEBUG_LUT_TX_TRACK/POWER
+        if is_5g {
+            self.rf_set(0, 0x60, 0x00007, 0x7)?; // A-mode Att_SMXR
+        } else {
+            self.rf_set(0, 0x51, 1 << 19, 0x0)?;
+            self.rf_set(0, 0x51, 1 << 11, 0x0)?;
+            self.rf_set(0, 0x52, 1 << 11, 0x0)?;
+        }
+        self.rf_set(0, 0x55, 1 << 0, 0x0)?; // EN_TXGAIN_FOR_LOK=0
+        self.rf_set(0, 0xef, 1 << 2, 0x1)?; // WE_LUT_TX_LOK=1
+        self.rf_set(0, 0xdf, 1 << 2, 0x0)?; // DEBUG_LUT_TX_LOK=0
+        self.rf_set(0, 0x33, 0x003FF, if is_5g { 0x100 } else { 0x000 })?;
+        // lok_by_path (coarse).
+        self.bb_set(0x1860, 1 << 30, 0x1)?; // DAC on (TX tone source for the cal)
+        self.rf_set(0, 0xf5, 1 << 17, 0x1)?; // clock gating
+        self.bb_set(0x1b10, 0x0000_00FF, 0x00)?;
+        self.bb_set(0x1b00, 0xFFFF_0000, 0x3c00)?; // rfc_base_address (path A)
+        self.bb_set(0x1880, 1 << 21, 0x1)?; // r_iqk_IO_RFC_en
+        self.bb_set(0x1bcc, 0x0000_003F, 0x9)?; // ItQt
+        self.bb_set(0x1b2c, 0xFFFF_FFFF, 0x0024_0024)?; // Tx_tone_idx
+        self.bb_set(0x1b00, 0x0000_1FFF, 0x018)?; // cal_path/process = LOK coarse
+        let mut ms = 0;
+        if self.read32(0x2d9c)? & 0xff == 0 {
+            self.bb_set(0x1b00, 1 << 0, 0x1)?; // one-shot
+            let deadline = Instant::now() + Duration::from_millis(20);
+            loop {
+                std::thread::sleep(Duration::from_millis(1));
+                ms += 1;
+                if self.read32(0x2d9c)? & 0xff == 0x55 || Instant::now() > deadline {
+                    break;
+                }
+            }
+        }
+        self.bb_set(0x1880, 1 << 21, 0x0)?;
+        self.bb_set(0x1bd4, 0xFFFF_FFFF, 0x002c_0001)?; // select IDAC readout
+        let reg = self.read32(0x1bfc)?;
+        let mut idac_ic = (reg >> 25) & 0x1F;
+        let mut idac_qc = (reg >> 5) & 0x1F;
+        if reg & (1 << 24) != 0 {
+            idac_ic += 1;
+        }
+        if reg & (1 << 4) != 0 {
+            idac_qc += 1;
+        }
+        self.rf_set(0, 0x08, 0xF8000, idac_ic)?; // apply LO-leakage I
+        self.rf_set(0, 0x08, 0x003E0, idac_qc)?; // apply LO-leakage Q
+        if dbg {
+            eprintln!(
+                "[lok] 0x2d9c={:#04x} after {ms}ms, 0x1bfc={reg:#010x}, idac_ic={idac_ic:#x} idac_qc={idac_qc:#x}",
+                self.read32(0x2d9c)? & 0xff
+            );
+        }
+        self.iqk_preset(false)?;
+        self.iqk_afe_setting(false)?;
+        self.iqk_restore(&backup)?;
+        self.rf_set(0, 0x00, 0xF0000, rf_mode)?; // restore RF mode
+        Ok(reg)
+    }
 }
 
 // ── M8 async FrameIo backend + the full radio-knob surface ───────────────────

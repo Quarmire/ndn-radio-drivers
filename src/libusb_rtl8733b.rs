@@ -139,6 +139,9 @@ const MAC_REG_8733B: &[u32] = &[
 const PHY_REG_8733B: &[u8] = include_bytes!("../fw/rtl8733b/rtl8733b_phy_reg.bin");
 const AGC_TAB_8733B: &[u8] = include_bytes!("../fw/rtl8733b/rtl8733b_agc_tab.bin");
 const RADIOA_8733B: &[u8] = include_bytes!("../fw/rtl8733b/rtl8733b_radioa.bin");
+/// Calibration-init table (`array_mp_8733b_cal_init`, halrf_rfk_init_8733b.c): enables
+/// the 0x1b register page and loads the NCTL (KIP) microcode — a prerequisite for IQK/DPK.
+const CAL_INIT_8733B: &[u8] = include_bytes!("../fw/rtl8733b/rtl8733b_cal_init.bin");
 
 // FW header field offsets (halmac_fw_info.h).
 const FW_HDR_SIZE: u32 = 64;
@@ -1113,6 +1116,32 @@ impl Rtl8733buBackend {
         Ok(())
     }
 
+    /// **RF-K init** (`odm_read_and_config_mp_8733b_cal_init`): apply the cal-init
+    /// table — enable the 0x1b register page and load the NCTL/KIP microcode. Must run
+    /// once (after M6 BB/RF init) before any IQK/DPK, or the NCTL engine has no routine
+    /// to execute (the one-shot trigger is never consumed).
+    pub fn rfk_init(&self) -> Result<(), FaceError> {
+        let words: Vec<u32> = CAL_INIT_8733B
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        let mut i = 0;
+        while i + 1 < words.len() {
+            if let Err(e) = self.bb_write(words[i], words[i + 1]) {
+                eprintln!(
+                    "  [rfk] FAILED at pair {}/{} addr=0x{:04x} val=0x{:08x}: {e}",
+                    i / 2,
+                    words.len() / 2,
+                    words[i],
+                    words[i + 1]
+                );
+                return Err(e);
+            }
+            i += 2;
+        }
+        Ok(())
+    }
+
     /// Tune the RF to a 2.4 GHz channel (`config_phydm_switch_channel_8733b`, G-band
     /// path): clear the band/channel bits of RF 0x18 and set the channel, write both
     /// paths with the cut-D settle loop (poll RF 0xc5 BIT15), restore RF 0x19, and
@@ -1358,18 +1387,16 @@ impl Rtl8733buBackend {
             band: 0,
             ..Default::default()
         };
+        // Identity defaults (_iq_calibrate_8733b_init): x=0x200, y=0 — applied if a K
+        // step fails so the correction is a no-op rather than a zeroing.
+        for p in 0..2 {
+            info.txxy[p] = [0x200, 0x000];
+            info.rxxy[p][0] = [0x200, 0x200]; // x (LNA small, large)
+            info.rxxy[p][1] = [0x000, 0x000]; // y (LNA small, large)
+        }
         let path = 0u8;
         let backup = self.iqk_backup()?;
         self.iqk_afe_setting(true)?;
-        if std::env::var("IQKDBG").is_ok() {
-            let v = (self.read32(0x1b10)? & !0xFF) | 0x33;
-            self.write32(0x1b10, v)?;
-            eprintln!(
-                "  [kip] after afe-on: 0x1b10 wrote 0x33 → rb=0x{:08x}, 0x1b08 rb=0x{:08x}",
-                self.read32(0x1b10)?,
-                self.read32(0x1b08)?
-            );
-        }
         // _iqk_start_iqk: backup RF mode → preset(true) → LOK/TXK/RXK → preset(false).
         let pa_mode = self.rf_get(0, 0x0, 0xF0000)?;
         self.iqk_preset(true)?;
@@ -1386,6 +1413,50 @@ impl Rtl8733buBackend {
         // Enable the RX-IQK correction if RXK succeeded (`_iqk_restore_mac_bb`).
         self.bb_set(0x180c, 1 << 31, u32::from(!info.rxk_ok))?;
         Ok(info)
+    }
+
+    /// NCTL diagnostic: set up a LOK-style one-shot and watch the mirror, the
+    /// trigger self-clear, `0x2d9c`, and the WLAN-CPU PC (`FW_DBG7`) — to tell whether
+    /// the read path, the trigger, or the KIP-kernel execution is the problem.
+    pub fn nctl_debug(&self) -> Result<(), FaceError> {
+        let backup = self.iqk_backup()?;
+        self.iqk_afe_setting(true)?;
+        self.iqk_preset(true)?;
+        // (a) mirror check: 0x1b10[7:0] should route to 0x2d9c[7:0].
+        self.write32(0x1b10, (self.read32(0x1b10)? & !0xFF) | 0x55)?;
+        eprintln!(
+            "[nctl] mirror: 0x1b10[7:0]=0x55 → 0x2d9c[7:0]=0x{:02x}",
+            self.read32(0x2d9c)? & 0xFF
+        );
+        // (b) LOK-style one-shot setup (path A).
+        self.iqk_txk_rf_setting(0, 0)?;
+        self.rf_set(0, 0xf5, 1 << 17, 1)?;
+        self.bb_set(0x1b10, 0xFF, 0)?;
+        self.bb_set(0x1b00, 0xFFFF_0000, 0x3c00)?;
+        self.bb_set(0x1880, 1 << 21, 1)?;
+        self.bb_set(0x1bcc, 0x3F, 0x9)?;
+        self.bb_set(0x1b2c, 0xFFFF_FFFF, 0x0024_0024)?;
+        self.bb_set(0x1b00, 0x0000_1FFF, 0x018)?;
+        eprintln!(
+            "[nctl] pre-trigger 0x1b00=0x{:08x} FW_DBG7=0x{:08x} 0x2d9c=0x{:02x}",
+            self.read32(0x1b00)?,
+            self.read32(0x10AC)?,
+            self.read32(0x2d9c)? & 0xFF
+        );
+        self.bb_set(0x1b00, 1 << 0, 1)?; // one-shot trigger
+        for i in 0..8 {
+            std::thread::sleep(Duration::from_millis(1));
+            eprintln!(
+                "[nctl] t={i}ms 0x2d9c=0x{:02x} 0x1b00[0]={} FW_DBG7=0x{:08x}",
+                self.read32(0x2d9c)? & 0xFF,
+                self.read32(0x1b00)? & 1,
+                self.read32(0x10AC)?
+            );
+        }
+        self.iqk_preset(false)?;
+        self.iqk_afe_setting(false)?;
+        self.iqk_restore(&backup)?;
+        Ok(())
     }
 
     /// **M7 (part 1) self-test**: exercise the IQK setup/teardown scaffold —

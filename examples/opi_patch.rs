@@ -10,13 +10,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ch: u8 = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(36);
     let d = Rtl8733buBackend::open()?;
     d.bring_up_monitor(ch)?;
-    // TX AGC to the vendor's values: 0x3a00 per-rate = 0xc0 (mine was 0x2d), 0x4308 ref.
-    let bb: [(u16, u32); 6] = [
+    // MAC EDCA / media-access timing to the vendor's values — if the CSMA/CA timing is
+    // wrong the MAC queues but never keys a TX. Plus the TX AGC.
+    let bb: [(u16, u32); 11] = [
+        (0x0500, 0x002f_a226), // EDCA VO
+        (0x0504, 0x005e_a328), // EDCA VI
+        (0x0508, 0x005e_a42b), // EDCA BE
+        (0x050c, 0x0000_a44f), // EDCA BK
+        (0x0514, 0x0e0a_0e0a), // SIFS
+        (0x0520, 0x8000_2f0f), // slot/timing
+        (0x0524, 0x0000_cf0f),
         (0x3a00, 0xc0c0_c0c0),
         (0x3a04, 0xc0c0_c0c0),
         (0x3a08, 0xc0c0_c0c0),
-        (0x3a0c, 0xc0c0_c0c0),
-        (0x3a10, 0xc0c0_c0c0),
         (0x4308, 0x5c54_5c50),
     ];
     for (a, v) in bb {

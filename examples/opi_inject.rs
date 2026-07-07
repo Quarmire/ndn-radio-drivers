@@ -26,6 +26,44 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         d.rf_read(0x01)?
     );
     let rate = if ch <= 14 { 0x00u8 } else { 0x04 }; // 1M CCK / 6M OFDM
+    if std::env::var("TXDIAG").is_ok() {
+        // Does the MAC transmit? Snapshot MAC status regs, inject a fast burst, re-read,
+        // print deltas. A moving TX counter ⇒ frames hit the air (RF problem); nothing
+        // moving ⇒ MAC accepts-and-drops (MAC-level TX enable missing).
+        // A minimal set of likely TX-status/counter registers (device is fragile).
+        let regs = [
+            0x0200u16, 0x0230, 0x0234, 0x02d0, 0x02d4, 0x0640, 0x0660, 0x0664, 0x0668, 0x066c,
+            0x01e0, 0x0210,
+        ];
+        let snap = |d: &Rtl8733buBackend| {
+            let mut v = std::collections::BTreeMap::new();
+            for a in regs {
+                if let Ok(x) = d.read32(a) {
+                    v.insert(a, x);
+                }
+            }
+            v
+        };
+        let mut f = vec![0x08u8, 0, 0, 0];
+        f.extend_from_slice(&[0xff; 6]);
+        f.extend_from_slice(&[0x02, 0x4d, 0x59, 0x44, 0x52, 0x56]);
+        f.extend_from_slice(&[0x02, 0x4d, 0x59, 0x44, 0x52, 0x56]);
+        f.extend_from_slice(&[0, 0]);
+        f.extend_from_slice(b"MYDRV8733-INJECT");
+        let before = snap(&d);
+        for s in 0..100u16 {
+            let _ = d.inject_raw(&f, rate, s);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let after = snap(&d);
+        println!("== MAC reg deltas after 100 injects (0=no change) ==");
+        for a in regs {
+            if let (Some(bv), Some(av)) = (before.get(&a), after.get(&a)) {
+                println!("  0x{a:04x}: {bv:08x} -> {av:08x}{}", if bv != av { "  *" } else { "" });
+            }
+        }
+        return Ok(());
+    }
     let mut frame = vec![0x08u8, 0x00, 0x00, 0x00];
     frame.extend_from_slice(&[0xff; 6]);
     frame.extend_from_slice(&[0x02, 0x4d, 0x59, 0x44, 0x52, 0x56]); // src

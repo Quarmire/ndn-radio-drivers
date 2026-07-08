@@ -43,4 +43,10 @@ required-features = ["bw16"]
 name = "bw16_knobs"
 required-features = ["bw16"]
 
+[dev-dependencies]
+# Cross-repo: the live named-time driver (wifi transport) for the on-air node example.
+ndn-time-driver = { path = "../ndn-ext/crates/time/ndn-time-driver", features = ["wifi"] }
+ndn-time-sources = { path = "../ndn-ext/crates/time/ndn-time-sources" }
+ndn-time = { path = "../ndn-rs/crates/core/ndn-time", default-features = false }
+
 [workspace]

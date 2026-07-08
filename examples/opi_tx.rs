@@ -8,8 +8,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let secs: u64 = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(10);
     let d = Rtl8733buBackend::open()?;
     d.bring_up_monitor(ch)?;
-    d.enable_tx(ch)?;
-    println!("enable_tx done: RF01=0x{:05x} 0x70=0x{:08x} 0x1e44=0x{:08x}",
+    let retry: u32 = std::env::var("RETRY").ok().and_then(|s| s.parse().ok()).unwrap_or(1);
+    for _ in 0..retry { d.enable_tx(ch)?; }
+    println!("enable_tx x{retry} done: RF01=0x{:05x} 0x70=0x{:08x} 0x1e44=0x{:08x}",
         d.rf_read(0x01)?, d.read32(0x70)?, d.read32(0x1e44)?);
     let mut f = vec![0x08u8, 0, 0, 0];
     f.extend_from_slice(&[0xff; 6]);

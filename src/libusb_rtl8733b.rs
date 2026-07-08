@@ -1058,6 +1058,56 @@ impl Rtl8733buBackend {
         Ok(())
     }
 
+    /// Read the 64-bit **port-0 beacon TSF** (`REG_TSFTR` 0x560 low / 0x564 high), microseconds.
+    /// Wrap-safe: the high dword is read either side of the low and the low re-read if it rolled
+    /// over between them.
+    ///
+    /// IMPORTANT — this is **not** the same clock as the per-frame RX [`stamp`](CapturedFrame).
+    /// The port TSF only advances when the beacon/port timer runs ([`set_tsf_run`](Self::set_tsf_run));
+    /// in bare passive monitor it is frozen (reads a constant), and once running it is periodically
+    /// re-synced by the beacon timer, so it is not a clean monotonic clock. The RX stamp instead
+    /// rides an always-on free-run RX TSF (a distinct counter, verified on this chip). Treat the
+    /// two as separate clocks; only the RX stamp is a reliable monitor-mode time source.
+    pub fn read_tsf(&self) -> Result<u64, FaceError> {
+        let hi1 = self.read32(0x0564)?;
+        let lo = self.read32(0x0560)?;
+        let hi2 = self.read32(0x0564)?;
+        let (hi, lo) = if hi1 == hi2 {
+            (hi1, lo)
+        } else {
+            (hi2, self.read32(0x0560)?) // low wrapped between the reads; re-read it
+        };
+        Ok((u64::from(hi) << 32) | u64::from(lo))
+    }
+
+    /// Start (`true`) or freeze (`false`) the port-0 TSF timer: `REG_BCN_CTRL` (0x550)
+    /// `EN_BCN_FUNCTION` (BIT3) on + `DIS_TSF_UDT` (BIT4) off makes [`read_tsf`](Self::read_tsf)
+    /// advance. Off restores the passive default. Note the beacon function periodically re-syncs
+    /// the TSF, so it is not a clean monotonic clock while running (see `read_tsf`).
+    pub fn set_tsf_run(&self, enable: bool) -> Result<(), FaceError> {
+        let v = self.read8(0x0550)?;
+        let v = if enable {
+            (v & !0x10) | 0x08
+        } else {
+            (v | 0x10) & !0x08
+        };
+        self.write8(0x0550, v)
+    }
+
+    /// Reset port-0's TSF counter to 0 (`REG_DUAL_TSF_RST` 0x553, `BIT_TSFTR_RST`) — the
+    /// zero-at-a-known-instant alignment primitive (the port TSF cannot be arbitrary-written).
+    /// Only meaningful while the port TSF is running ([`set_tsf_run`](Self::set_tsf_run)).
+    pub fn reset_tsf(&self) -> Result<(), FaceError> {
+        self.write8(0x0553, 0x01)
+    }
+
+    /// The [`ClockDomainId`] of this device's per-frame RX [`stamp`](CapturedFrame) clock (the
+    /// free-run RX TSF) — the key `ndn-time` uses for cross-domain mapping. (The port TSF read
+    /// by [`read_tsf`](Self::read_tsf) is a *separate* clock; see its docs.)
+    pub fn tsf_domain(&self) -> ClockDomainId {
+        self.tsf_domain
+    }
+
     /// **M6 tail**: normal-mode TRX/queue init (`init_trx_cfg_8733b`). Switches the
     /// download-mode page/RQPN config over to the normal-operation layout so the data
     /// path can run: queue→DMA map, enable all TRX, normal RQPN + reserved-page

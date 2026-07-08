@@ -31,7 +31,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use ndn_frame_io::{frame, CapturedFrame, FrameFormat, FrameIo, InjectFrame};
+use ndn_frame_io::{
+    frame, CapturedFrame, ClockDomainId, FrameFormat, FrameIo, InjectFrame, LatchPoint, LinkStamp,
+};
 use ndn_radio_hal::{Bandwidth, McsDescriptor, RadioKnobs, WifiRadio};
 use ndn_transport::FaceError;
 use rusb::{Context, Device, DeviceHandle, Direction, TransferType, UsbContext};
@@ -403,6 +405,9 @@ pub struct Rtl8733buBackend {
     tx_flags: std::sync::atomic::AtomicU8,
     /// Parsed RX frames buffered between bulk-IN reads (one read yields many).
     rx_pending: std::sync::Mutex<std::collections::VecDeque<CapturedFrame>>,
+    /// Clock domain of this device's TSF counter (unique per physical device, from the USB
+    /// bus/address) — the identity every RX hardware stamp is keyed on.
+    tsf_domain: ClockDomainId,
 }
 
 /// Guard for the background TX power-tracking thread started by
@@ -457,6 +462,9 @@ impl Rtl8733buBackend {
     }
 
     fn claim(device: Device<Context>) -> Result<Self, FaceError> {
+        // Per-device TSF clock domain (bus<<8 | address) — read before the device is opened.
+        let tsf_domain =
+            ClockDomainId((u32::from(device.bus_number()) << 8) | u32::from(device.address()));
         let handle = Arc::new(device.open().map_err(usb_err)?);
         // Detach any kernel driver (Linux); a no-op where none is bound (macOS).
         let _ = handle.set_auto_detach_kernel_driver(true);
@@ -494,6 +502,7 @@ impl Rtl8733buBackend {
             tx_seq: std::sync::atomic::AtomicU16::new(0),
             tx_flags: std::sync::atomic::AtomicU8::new(0),
             rx_pending: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            tsf_domain,
         })
     }
 
@@ -2958,9 +2967,24 @@ impl Rtl8733buBackend {
                 } else {
                     None
                 };
+                // Per-frame hardware RX timestamp: RX descriptor dword5 (bytes 20-23) is the
+                // TSF-low latched when the MAC finished the frame (RXTSFL, µs). Wraps every
+                // ~71 min; comparable within this device's TSF clock domain.
+                let rxtsfl = u32::from_le_bytes([
+                    data[off + 20],
+                    data[off + 21],
+                    data[off + 22],
+                    data[off + 23],
+                ]);
+                let stamp = Some(LinkStamp::new(
+                    u64::from(rxtsfl),
+                    self.tsf_domain,
+                    LatchPoint::MacDone.precision_floor_ns(),
+                    LatchPoint::MacDone,
+                ));
                 if std::env::var("NDN_RX_META_DBG").is_ok() {
                     eprintln!(
-                        "RX len={pkt_len} drvinfo={drvinfo} rate=0x{rx_rate:02x} rssi={rssi:?} mcs={mcs:?}"
+                        "RX len={pkt_len} drvinfo={drvinfo} rate=0x{rx_rate:02x} rssi={rssi:?} mcs={mcs:?} tsfl={rxtsfl}"
                     );
                 }
                 if let Some(cap) = frame::parse_dot11(
@@ -2968,7 +2992,7 @@ impl Rtl8733buBackend {
                     &data[fstart..fstart + pkt_len],
                     rssi,
                     mcs,
-                    None,
+                    stamp,
                 ) {
                     q.push_back(cap);
                 }

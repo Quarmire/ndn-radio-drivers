@@ -1,9 +1,14 @@
 //! A live named-time node on a real monitor-wifi radio (the doc's "runs on hardware" seam).
-//! Opens the RTL8812EU, pipelines RX with the async-URB pump (the better USB data path), wraps it
-//! as a FrameIoTransport, and runs a TimeService (OS-clock source) that ingests peer beacons and
-//! broadcasts its own. Proves the ndn-time pipeline stands up on-air.
+//! Opens a Realtek USB radio, pipelines RX with the async-URB pump (the better USB data path),
+//! wraps it as a FrameIoTransport, and runs a TimeService (OS-clock source) that ingests peer
+//! beacons and broadcasts its own. Two instances (distinct node ids) on radios in RF range are an
+//! on-air 2-node convergence: watch `peer_beacons_heard` climb.
+//!
+//! Args: `<node_id> <chip> [channel] [secs] [pid_hex]`
+//!   chip = `8733` (RTL8731BU/8733BU, the *radiating* transmitter) or `8812` (RTL8812EU/8822E).
+//!   pid_hex pins a specific 8812-class dongle when several are attached (e.g. `a81a`).
 use ndn_frame_io::FrameIo;
-use ndn_radio_drivers::LibUsbRtl88xxBackend;
+use ndn_radio_drivers::{LibUsbRtl88xxBackend, PowerTracker, Rtl8733buBackend};
 use ndn_time::{ClockCapability, KeyId, TimePolicy};
 use ndn_time_driver::wifi::FrameIoTransport;
 use ndn_time_driver::{ClockSink, DevAuth, TimeService};
@@ -19,29 +24,37 @@ impl ClockSink for PrintClock {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Args: <node_id> [channel] [secs]. Give each of the two nodes a distinct id so their beacons
-    // are attributed to different peers (0 on one machine, 1 on the other).
     let id: u64 = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(0);
-    let ch: u8 = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(36);
-    let secs: u64 = std::env::args().nth(3).and_then(|s| s.parse().ok()).unwrap_or(20);
-    // Optional 4th arg: a specific radio's product id (hex, e.g. a81a / 881a) when several are
-    // attached — the two nodes of an on-air test each pin their own dongle.
+    let chip: String = std::env::args().nth(2).unwrap_or_else(|| "8812".into());
+    let ch: u8 = std::env::args().nth(3).and_then(|s| s.parse().ok()).unwrap_or(36);
+    let secs: u64 = std::env::args().nth(4).and_then(|s| s.parse().ok()).unwrap_or(20);
     let pid: Option<u16> = std::env::args()
-        .nth(4)
+        .nth(5)
         .and_then(|s| u16::from_str_radix(&s, 16).ok());
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
     rt.block_on(async move {
-        // Open + pipeline RX: spawn_rx_pump keeps 4 bulk-IN transfers in flight (async-URB path),
-        // so a busy channel isn't dropped between reads and each frame's stamp is taken promptly.
-        let radio = Arc::new(match pid {
-            Some(p) => LibUsbRtl88xxBackend::open_monitor_pid(p, ch)?,
-            None => LibUsbRtl88xxBackend::open_monitor(ch)?,
-        });
-        let _pump = radio.spawn_rx_pump(4);
-        println!("named-time node {id} up: 8812EU ch{ch}, RX pump depth 4");
+        // Open + bring up the radio, then pipeline RX with the shared async-URB pump (depth 4) so a
+        // busy channel isn't dropped between reads. The 8733b brings up a *radiating* TX with
+        // thermal power-tracking (kept alive for the run); the 8812-class is RX-capable monitor.
+        let mut _tracker: Option<PowerTracker> = None;
+        let radio: Arc<dyn FrameIo> = if chip == "8733" {
+            let r = Arc::new(Rtl8733buBackend::open()?);
+            _tracker = Some(r.bring_up_tx_tracked(ch)?);
+            r.spawn_rx_pump(4);
+            println!("named-time node {id} up: 8733b ch{ch} (radiating TX), RX pump depth 4");
+            r
+        } else {
+            let r = Arc::new(match pid {
+                Some(p) => LibUsbRtl88xxBackend::open_monitor_pid(p, ch)?,
+                None => LibUsbRtl88xxBackend::open_monitor(ch)?,
+            });
+            r.spawn_rx_pump(4);
+            println!("named-time node {id} up: 8812-class ch{ch}, RX pump depth 4");
+            r
+        };
 
         let clock = Arc::new(PrintClock(Mutex::new(None)));
-        let transport = Arc::new(FrameIoTransport::new(radio as Arc<dyn FrameIo>));
+        let transport = Arc::new(FrameIoTransport::new(radio));
         let svc = Arc::new(TimeService::new(
             id,
             KeyId(id),
@@ -59,7 +72,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             clock.clone(),
         ));
         // Run the live loop (RX-ingest task + cadence tick/beacon) and report status each second:
-        // clock_ms is the disciplined estimate, peer_ingests counts beacons heard over the air.
+        // clock_ms is the disciplined estimate, peer_beacons_heard counts beacons heard over the air.
         let runner = svc.clone();
         tokio::spawn(async move { runner.run(Duration::from_millis(500)).await });
         for t in 0..secs {

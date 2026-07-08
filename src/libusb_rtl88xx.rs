@@ -59,6 +59,8 @@ use ndn_transport::FaceError;
 use crate::McsDescriptor;
 use crate::frame::LLC_SNAP_PREFIX;
 use crate::{CapturedFrame, FrameFormat, InjectFrame, FrameIo};
+use ndn_frame_io::ClockDomainId;
+use ndn_radio_hal::{RadioTime, RadioTimeSource};
 
 /// Realtek USB vendor request: `bRequest` for register I/O, and the IN/OUT
 /// `bmRequestType`s (vendor, device). The register address rides in `wValue`,
@@ -295,6 +297,9 @@ pub struct LibUsbRtl88xxBackend {
     rx_pumped: std::sync::atomic::AtomicBool,
     /// Wakes `recv_frame` when a pump thread pushes into `rx_pending`.
     rx_notify: tokio::sync::Notify,
+    /// Clock domain of this device's free-run RX-stamp TSF (unique per physical device, from the
+    /// USB bus/address) — the identity every RX [`LinkStamp`](ndn_frame_io::LinkStamp) is keyed on.
+    tsf_domain: ClockDomainId,
 }
 
 impl LibUsbRtl88xxBackend {
@@ -316,6 +321,9 @@ impl LibUsbRtl88xxBackend {
     }
 
     fn claim(device: Device<Context>) -> Result<Self, FaceError> {
+        // Per-device RX-stamp clock domain (bus<<8 | address) — read before the device is opened.
+        let tsf_domain =
+            ClockDomainId((u32::from(device.bus_number()) << 8) | u32::from(device.address()));
         let handle = Arc::new(device.open().map_err(usb_err)?);
         // Take the device from any kernel driver (Linux); harmless elsewhere.
         let _ = handle.set_auto_detach_kernel_driver(true);
@@ -361,6 +369,7 @@ impl LibUsbRtl88xxBackend {
             rx_pending: std::sync::Mutex::new(std::collections::VecDeque::new()),
             rx_pumped: std::sync::atomic::AtomicBool::new(false),
             rx_notify: tokio::sync::Notify::new(),
+            tsf_domain,
         })
     }
 
@@ -4905,6 +4914,10 @@ impl LibUsbRtl88xxBackend {
             None
         };
         let mcs_index = crate::realtek_rx::mcs_from_desc_rate(data_rate);
+        // Per-frame hardware RX timestamp: RX descriptor dword5 (offset 0x14) is the free-run
+        // TSF-low (µs) the MAC latched at receive — the FreeRunRxStamp clock (realtek_rx). LinkStamp
+        // is Copy, so it rides all decode paths below.
+        let stamp = Some(crate::realtek_rx::rx_stamp(dw(0x14), self.tsf_domain));
         // Decode the 802.11 data frame into one CapturedFrame, or — for a QoS
         // A-MSDU — several (the link-layer bundle de-aggregated back into the
         // independent NDN packets it carried; see `build_amsdu_body`).
@@ -4925,7 +4938,7 @@ impl LibUsbRtl88xxBackend {
             let ethertype = match self.format {
                 FrameFormat::RawNdn { ethertype } => ethertype,
                 other => {
-                    return crate::frame::parse_dot11(other, frame, rssi_dbm, mcs_index, None)
+                    return crate::frame::parse_dot11(other, frame, rssi_dbm, mcs_index, stamp)
                         .into_iter()
                         .collect();
                 }
@@ -4972,7 +4985,7 @@ impl LibUsbRtl88xxBackend {
                             group: Some(da),
                             rssi_dbm,
                             mcs_index,
-                            stamp: None,
+                            stamp,
                         });
                     }
                     p += (14 + len + 3) & !3; // next subframe (4-byte aligned)
@@ -4994,7 +5007,7 @@ impl LibUsbRtl88xxBackend {
                 group: Some(addr1),
                 rssi_dbm,
                 mcs_index,
-                stamp: None,
+                stamp,
             }]
         })();
         Some((decoded, advance))
@@ -5077,6 +5090,15 @@ impl FrameIo for LibUsbRtl88xxBackend {
                 }
             }
         }
+    }
+}
+
+/// This backend exposes only the always-on free-run per-frame RX-stamp clock (RXTSFL). It does
+/// not surface the port/beacon TSF (no read-now clock here), so `read_clock` stays the default
+/// `None` — honestly reporting a single, latch-only link clock.
+impl RadioTime for LibUsbRtl88xxBackend {
+    fn time_sources(&self) -> Vec<RadioTimeSource> {
+        vec![RadioTimeSource::free_run_rx_stamp(self.tsf_domain, 1_000)]
     }
 }
 

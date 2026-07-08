@@ -32,9 +32,10 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use ndn_frame_io::{
-    frame, CapturedFrame, ClockDomainId, FrameFormat, FrameIo, InjectFrame, LatchPoint, LinkStamp,
+    frame, CapturedFrame, ClockDomainId, FrameFormat, FrameIo, InjectFrame,
 };
-use ndn_radio_hal::{Bandwidth, McsDescriptor, RadioKnobs, WifiRadio};
+use crate::realtek_rx;
+use ndn_radio_hal::{Bandwidth, McsDescriptor, RadioKnobs, RadioTime, RadioTimeSource, WifiRadio};
 use ndn_transport::FaceError;
 use rusb::{Context, Device, DeviceHandle, Direction, TransferType, UsbContext};
 
@@ -2999,24 +3000,13 @@ impl Rtl8733buBackend {
             let is_c2h = dw2 & (1 << 28) != 0;
             let fstart = off + 24 + drvinfo + shift;
             if !is_c2h && fstart + pkt_len <= data.len() {
-                // RX HwRate -> MCS index: HT MCS0-15 (DESC_RATEMCS0=0x0c), VHT (0x2c);
-                // legacy CCK/OFDM carry no MCS (None).
-                let mcs = if (0x0c..=0x1b).contains(&rx_rate) {
-                    Some(rx_rate - 0x0c)
-                } else if rx_rate >= 0x2c {
-                    Some((rx_rate - 0x2c) % 10)
-                } else {
-                    None
-                };
-                // RSSI from the jaguar3 type1 phystatus (drvinfo block): path-A power `pwdb_a`
-                // at byte 1, rx_pwr_dbm = pwdb_a - 110 (per phydm_phystatus.c). Only OFDM+
-                // rates report a type1 status; CCK (0x00-0x03) uses a different type0 layout,
-                // so leave RSSI unset there for now. off+25 < fstart <= data.len() here.
-                let rssi = if drvinfo >= 8 && rx_rate >= 0x04 {
-                    Some(((i16::from(data[off + 24 + 1])) - 110).clamp(-110, 20) as i8)
-                } else {
-                    None
-                };
+                // Field interpretation is shared across the Realtek USB backends (realtek_rx):
+                // MCS from the RX HwRate; RSSI from the jaguar3 type1 phystatus path-A power
+                // `pwdb_a` (drvinfo byte 1). CCK (rate 0x00-0x03) uses a different type0 layout,
+                // so RSSI is left unset there. off+25 < fstart <= data.len() here.
+                let mcs = realtek_rx::mcs_from_desc_rate(rx_rate);
+                let rssi = (drvinfo >= 8 && rx_rate >= 0x04)
+                    .then(|| realtek_rx::rssi_dbm(data[off + 24 + 1]));
                 // Per-frame hardware RX timestamp: RX descriptor dword5 (bytes 20-23) is the
                 // TSF-low latched when the MAC finished the frame (RXTSFL, µs). Wraps every
                 // ~71 min; comparable within this device's TSF clock domain.
@@ -3026,12 +3016,7 @@ impl Rtl8733buBackend {
                     data[off + 22],
                     data[off + 23],
                 ]);
-                let stamp = Some(LinkStamp::new(
-                    u64::from(rxtsfl),
-                    self.tsf_domain,
-                    LatchPoint::MacDone.precision_floor_ns(),
-                    LatchPoint::MacDone,
-                ));
+                let stamp = Some(realtek_rx::rx_stamp(rxtsfl, self.tsf_domain));
                 if std::env::var("NDN_RX_META_DBG").is_ok() {
                     eprintln!(
                         "RX len={pkt_len} drvinfo={drvinfo} rate=0x{rx_rate:02x} rssi={rssi:?} mcs={mcs:?} tsfl={rxtsfl}"
@@ -3126,6 +3111,38 @@ impl RadioKnobs for Rtl8733buBackend {
         let (l2h, h2l): (u32, u32) = if on { (0xff, 0xff) } else { (0x77, 0x6f) };
         let v = (self.read32(0x84c)? & 0x0000_FFFF) | (l2h << 16) | (h2l << 24);
         self.write32(0x84c, v)
+    }
+}
+
+impl Rtl8733buBackend {
+    /// Distinct clock domain for the port-0 beacon TSF (a *different* physical counter from the
+    /// free-run RX-stamp clock `tsf_domain`) — the RX-stamp domain with the top bit set.
+    fn port_tsf_domain(&self) -> ClockDomainId {
+        ClockDomainId(self.tsf_domain.0 | 0x8000_0000)
+    }
+}
+
+/// Reference [`RadioTime`] implementation: this chip exposes the two link clocks the abstraction
+/// was designed around — an always-on free-run per-frame RX stamp (RXTSFL) and the gated,
+/// beacon-resynced, read-on-demand port TSF.
+impl RadioTime for Rtl8733buBackend {
+    fn time_sources(&self) -> Vec<RadioTimeSource> {
+        vec![
+            // The per-frame RX stamp every CapturedFrame is latched from — µs ticks, always on.
+            RadioTimeSource::free_run_rx_stamp(self.tsf_domain, 1_000),
+            // The port-0 beacon TSF: readable via read_clock, but only advances under
+            // set_tsf_run and is beacon-resynced (not monotonic) — its own domain.
+            RadioTimeSource::port_tsf(self.port_tsf_domain()),
+        ]
+    }
+
+    fn read_clock(&self, domain: ClockDomainId) -> Result<Option<u64>, FaceError> {
+        // Only the port TSF is readable on demand; the free-run RX stamp is latch-only.
+        if domain == self.port_tsf_domain() {
+            Ok(Some(self.read_tsf()?))
+        } else {
+            Ok(None)
+        }
     }
 }
 

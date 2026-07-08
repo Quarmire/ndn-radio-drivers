@@ -4896,20 +4896,15 @@ impl LibUsbRtl88xxBackend {
         // conversion is dBm ≈ pwdb - 110. CCK (page_num 0, 2.4 GHz only) uses a
         // different layout — skipped. This is the first cross-layer signal the
         // userspace driver surfaces (feeds adaptive MCS + measured strategy).
+        // Field interpretation is shared with the other Realtek USB backends (realtek_rx):
+        // path-A power pwdb_a at drvinfo byte 1 -> dBm; RX HwRate -> MCS index.
         let rssi_dbm = if drvinfo_sz >= 2 && at + RX_DESC_SIZE + 2 <= buf.len() {
             let page_num = buf[at + RX_DESC_SIZE] & 0x0f;
-            (page_num != 0).then(|| {
-                let pwdb_a = buf[at + RX_DESC_SIZE + 1] as i16;
-                (pwdb_a - 110).clamp(-128, 0) as i8
-            })
+            (page_num != 0).then(|| crate::realtek_rx::rssi_dbm(buf[at + RX_DESC_SIZE + 1]))
         } else {
             None
         };
-
-        // DESC_RATEMCS0..=MCS31 → 11n MCS index for the upward hint.
-        let mcs_index = (DESC_RATE_MCS0..=DESC_RATE_MCS0 + 31)
-            .contains(&data_rate)
-            .then(|| data_rate - DESC_RATE_MCS0);
+        let mcs_index = crate::realtek_rx::mcs_from_desc_rate(data_rate);
         // Decode the 802.11 data frame into one CapturedFrame, or — for a QoS
         // A-MSDU — several (the link-layer bundle de-aggregated back into the
         // independent NDN packets it carried; see `build_amsdu_body`).

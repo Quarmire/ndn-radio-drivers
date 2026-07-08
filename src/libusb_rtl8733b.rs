@@ -1033,6 +1033,22 @@ impl Rtl8733buBackend {
         self.rf_set(0, addr, 0x000F_FFFF, val)
     }
 
+    /// Send a register-based HMEBOX H2C command (`REG_HMEBOX0` 0x1d0 + ext box `REG_HMEBOX_E0`
+    /// 0x1f0). `content` is up to 7 bytes: bytes 0-2 ride in the main box after the 1-byte
+    /// `cmd` id; bytes 3-6 go in the ext box (written first). Writing the main box triggers the
+    /// firmware to consume it. (Box 0 only; adequate for the low H2C rate we need.)
+    pub fn send_h2c_box(&self, cmd: u8, content: &[u8]) -> Result<(), FaceError> {
+        let mut c = [0u8; 7];
+        let n = content.len().min(7);
+        c[..n].copy_from_slice(&content[..n]);
+        if n > 3 {
+            self.write32(0x01f0, u32::from_le_bytes([c[3], c[4], c[5], c[6]]))?;
+        }
+        self.write32(0x01d0, u32::from_le_bytes([cmd, c[0], c[1], c[2]]))?;
+        std::thread::sleep(Duration::from_millis(5));
+        Ok(())
+    }
+
     /// **M6 tail**: normal-mode TRX/queue init (`init_trx_cfg_8733b`). Switches the
     /// download-mode page/RQPN config over to the normal-operation layout so the data
     /// path can run: queue→DMA map, enable all TRX, normal RQPN + reserved-page

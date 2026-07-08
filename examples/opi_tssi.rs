@@ -12,8 +12,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     d.bring_up_monitor(ch)?;
     d.tssi_setup(ch)?;
     d.write8(0x0522, 0x00)?;
-    println!("TSSI: 0x4318=0x{:08x} (bits30:28 should be 7), 0x4384=0x{:08x}, RF01=0x{:05x}",
-        d.read32(0x4318)?, d.read32(0x4384)?, d.rf_read(0x01)?);
+    println!("TSSI: 0x4318=0x{:08x} (30:28=7), DE 0x4334=0x{:08x} 0x43b0=0x{:08x}, RF01=0x{:05x}",
+        d.read32(0x4318)?, d.read32(0x4334)?, d.read32(0x43b0)?, d.rf_read(0x01)?);
     let mut f = vec![0x08u8, 0, 0, 0];
     f.extend_from_slice(&[0xff; 6]);
     f.extend_from_slice(&[0x02, 0x4d, 0x59, 0x44, 0x52, 0x56]);

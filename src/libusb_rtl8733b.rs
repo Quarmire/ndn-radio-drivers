@@ -1448,6 +1448,23 @@ impl Rtl8733buBackend {
     /// after [`bring_up_monitor`](Self::bring_up_monitor) / [`tune_channel`](Self::tune_channel).
     pub fn tssi_setup(&self, ch: u8) -> Result<(), FaceError> {
         let band_5g = ch > 14;
+        // ── efuse-DE prep: per-channel TSSI power offsets + thermal reference ──
+        // (halrf_tssi_get_efuse: tssi_efuse[A] = logical 0x10-0x1a ++ 0x22-0x2f; thermal 0xBA).
+        let logi = Self::decode_efuse(&self.read_efuse(512)?);
+        let thermal = if logi[0xBA] == 0xff { 0x20u32 } else { logi[0xBA] as u32 };
+        // OFDM offset index (_halrf_get_efuse_tssi_offset) → logical efuse byte.
+        let ofdm_idx: usize = match ch {
+            1..=2 => 6, 3..=5 => 7, 6..=8 => 8, 9..=11 => 9, 12..=14 => 10,
+            16..=40 => 11, 42..=48 => 12, 50..=58 => 13, 60..=64 => 14,
+            100..=104 => 15, 106..=112 => 16, 114..=120 => 17, 122..=128 => 18,
+            130..=136 => 19, 138..=144 => 20, 149..=153 => 21, 155..=161 => 22,
+            163..=169 => 23, _ => 24,
+        };
+        let ofdm_byte = if ofdm_idx < 11 { 0x10 + ofdm_idx } else { 0x22 + (ofdm_idx - 11) };
+        let cck_idx: usize = match ch { 3..=5 => 1, 6..=8 => 2, 9..=11 => 3, 12..=13 => 4, 14 => 5, _ => 0 };
+        let ofdm_off = logi[ofdm_byte] as i8 as i32;
+        let cck_off = logi[0x10 + cck_idx] as i8 as i32;
+        let clamp8 = |v: i32| (v.clamp(-128, 127) & 0xff) as u32;
         self.bb_set(0x4318, 0x7000_0000, 0x0)?; // disable tssi first
         // ── anapar (00_set_tssi_sys) ──
         self.bb_set(0x1860, 1 << 30, 0)?;
@@ -1488,6 +1505,12 @@ impl Rtl8733buBackend {
             (0x4364, 0), (0x4368, 0), (0x436c, 0), (0x4374, 0), (0x4378, 0), (0x437c, 0), (0x4380, 0x00000002),
             (0x4384, 0x100000ff), (0x4388, 0), (0x43a0, 0),
         ] { self.write32(a, v)?; }
+        // ── tmeter table (03): thermal reference + zeroed compensation LUT (cal temp) ──
+        self.bb_set(0x4380, 0x0000_0007, 0x3)?;
+        self.bb_set(0x4380, 0x0000_0FF0, thermal)?;
+        self.bb_set(0x4380, 0x000F_F000, 0x0)?;
+        self.bb_set(0x4380, 0xFFF0_0000, 0x0)?;
+        for i in (0..64u16).step_by(4) { self.write32(0x4200 + i, 0)?; }
         // ── DCK (05, auto) ──
         self.bb_set(0x4328, 1 << 24, 0x1)?;
         self.bb_set(0x4328, 1 << 25, 0x1)?;
@@ -1509,6 +1532,17 @@ impl Rtl8733buBackend {
         self.write32(0x4390, 0x8080_8080)?;
         self.write32(0x4398, 0x8080_8080)?;
         self.bb_set(0x439c, 1 << 0, 0x1)?;
+        // ── efuse-DE (halrf_tssi_set_efuse_de, path A): the calibrated TX-power offset ──
+        let diff = 2i32;
+        let tmp_ofdm = clamp8(ofdm_off);
+        let tmp_ofdm_d = ((tmp_ofdm as i32 - diff) & 0xff) as u32;
+        let tmp_cck = clamp8(cck_off);
+        self.bb_set(0x4334, 0x0FF0_0000, tmp_ofdm)?; // HT40
+        self.bb_set(0x43b0, 0x0000_00FF, tmp_ofdm_d)?; // OFDM (tmp-diff)
+        self.bb_set(0x43b0, 0xFF00_0000, tmp_ofdm_d)?; // HT20 (tmp-diff)
+        self.bb_set(0x43b0, 0x0000_FF00, tmp_ofdm)?; // RF40M OFDM 6M
+        self.bb_set(0x43b0, 0x00FF_0000, tmp_ofdm)?; // RF40M OFDM 6M
+        self.bb_set(0x433c, 0x0FF0_0000, tmp_cck)?; // CCK
         // ── track (08) + ENABLE (0x4318[30:28]=7) + un-pause TSSI ──
         self.bb_set(0x4320, 1 << 24, 0x0)?;
         self.bb_set(0x439c, 0x0FFF_FFF0, 0x080080)?;

@@ -44,7 +44,7 @@ use rusb::{Context, Device, DeviceHandle, Direction, TransferType, UsbContext};
 
 use crate::realtek_rx;
 use ndn_frame_io::{CapturedFrame, ClockDomainId, FrameIo, InjectFrame};
-use ndn_radio_hal::{RadioCapability, RadioProfile, RadioTime, RadioTimeSource};
+use ndn_radio_hal::{Band, RadioCapability, RadioProfile, RadioTime, RadioTimeSource};
 use ndn_transport::FaceError;
 
 // The RF-path enum is shared with the 8822E backend (an A/B selector).
@@ -1776,8 +1776,11 @@ impl RadioTime for Rtl8812auBackend {
 
 impl RadioProfile for Rtl8812auBackend {
     fn capability(&self) -> RadioCapability {
-        // RTL8812AU: 2-stream dual-band 11ac, used here for NAN management frames on the 5 GHz
-        // social channels. Reports the hardware profile (the NAN-only usage is a driver policy).
-        RadioCapability::wifi_monitor_5ghz(vec![44, 149])
+        // RTL8812AU: 2-stream dual-band 11ac, used here for NAN management frames on the social
+        // channels (2.4 ch6 + 5 GHz ch44/149). Reports the hardware profile (NAN-only is policy).
+        RadioCapability {
+            bands: vec![Band::Band2_4GHz, Band::Band5GHz],
+            ..RadioCapability::wifi_monitor_5ghz(vec![6, 44, 149])
+        }
     }
 }

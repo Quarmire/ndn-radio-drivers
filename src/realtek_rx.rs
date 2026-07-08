@@ -41,10 +41,14 @@ pub fn rx_stamp(rxtsfl: u32, domain: ClockDomainId) -> LinkStamp {
     )
 }
 
-// CSI (channel state information): future seam. Realtek phydm can emit a per-subcarrier CSI
-// report (H-matrix) over a C2H/BB path not yet parsed by any backend. When added it would
-// decode here into a shared `RadioCsi` and attach to `CapturedFrame`, so every Realtek backend
-// gains it uniformly rather than re-deriving. Absent today (no CSI field on CapturedFrame).
+// CSI (channel state information): ASSESSED — not available on these Realtek parts. The vendor
+// phydm's only CSI is compressed 802.11 *beamforming* feedback (angles for TxBF/MU-MIMO, set up
+// in phydm_direct_bf.c via BB 0x72c / 0x19b8[6]); it is computed on-chip and never handed to the
+// host as a per-subcarrier H-matrix, and it is N/A on the 1x1 8733b (beamforming needs >=2
+// chains). So these backends report `CsiSupport::None`. A host-visible per-subcarrier estimate
+// would need a CSI-tool NIC (Atheros/Intel) or an SDR (`CsiSupport::PerSubcarrier`); the coarse
+// per-path RSSI/CFO/EVM in the phystatus is the most a Realtek part could offer (`Coarse`), and
+// is not decoded here yet. If a future backend gains CSI, it decodes into a shared type here.
 
 #[cfg(test)]
 mod tests {

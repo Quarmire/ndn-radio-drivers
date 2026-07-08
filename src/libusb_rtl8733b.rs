@@ -1205,6 +1205,18 @@ impl Rtl8733buBackend {
         Ok(())
     }
 
+    /// Read the RF thermal meter (`RF_T_METER` = RF 0x42). Triggers a measurement (toggle
+    /// RF `0x42` BIT19) then reads the 6-bit value at `[6:1]`. Compare against the cal
+    /// reference (efuse `0xBA`, ~0x20 from [`apply_efuse_trim`](Self::apply_efuse_trim)):
+    /// a rising delta = the PA heating, which drops TX power without power-tracking.
+    pub fn read_thermal(&self) -> Result<u8, FaceError> {
+        self.rf_set(0, 0x42, 1 << 19, 1)?;
+        self.rf_set(0, 0x42, 1 << 19, 0)?;
+        self.rf_set(0, 0x42, 1 << 19, 1)?;
+        std::thread::sleep(Duration::from_millis(1));
+        Ok((self.rf_get(0, 0x42, 0x7e)? & 0x3f) as u8)
+    }
+
     /// One-shot TX bring-up: [`bring_up_monitor`](Self::bring_up_monitor) (self-resets the
     /// chip via card-disable) then [`enable_tx`](Self::enable_tx) (cal + datapath + grant).
     /// After this, injected frames radiate — on ~62% of boots (the per-boot analog TX-path

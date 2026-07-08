@@ -2934,14 +2934,45 @@ impl Rtl8733buBackend {
             let shift = ((dw0 >> 24) & 0x3) as usize;
             let dw2 =
                 u32::from_le_bytes([data[off + 8], data[off + 9], data[off + 10], data[off + 11]]);
+            let dw3 =
+                u32::from_le_bytes([data[off + 12], data[off + 13], data[off + 14], data[off + 15]]);
+            let rx_rate = (dw3 & 0x7f) as u8; // RX HwRate (DESC_RATE code)
             let is_c2h = dw2 & (1 << 28) != 0;
             let fstart = off + 24 + drvinfo + shift;
-            if !is_c2h && fstart + pkt_len <= data.len()
-                && let Some(cap) =
-                    frame::parse_dot11(self.format, &data[fstart..fstart + pkt_len], None, None, None)
-                {
+            if !is_c2h && fstart + pkt_len <= data.len() {
+                // RX HwRate -> MCS index: HT MCS0-15 (DESC_RATEMCS0=0x0c), VHT (0x2c);
+                // legacy CCK/OFDM carry no MCS (None).
+                let mcs = if (0x0c..=0x1b).contains(&rx_rate) {
+                    Some(rx_rate - 0x0c)
+                } else if rx_rate >= 0x2c {
+                    Some((rx_rate - 0x2c) % 10)
+                } else {
+                    None
+                };
+                // RSSI from the jaguar3 type1 phystatus (drvinfo block): path-A power `pwdb_a`
+                // at byte 1, rx_pwr_dbm = pwdb_a - 110 (per phydm_phystatus.c). Only OFDM+
+                // rates report a type1 status; CCK (0x00-0x03) uses a different type0 layout,
+                // so leave RSSI unset there for now. off+25 < fstart <= data.len() here.
+                let rssi = if drvinfo >= 8 && rx_rate >= 0x04 {
+                    Some(((i16::from(data[off + 24 + 1])) - 110).clamp(-110, 20) as i8)
+                } else {
+                    None
+                };
+                if std::env::var("NDN_RX_META_DBG").is_ok() {
+                    eprintln!(
+                        "RX len={pkt_len} drvinfo={drvinfo} rate=0x{rx_rate:02x} rssi={rssi:?} mcs={mcs:?}"
+                    );
+                }
+                if let Some(cap) = frame::parse_dot11(
+                    self.format,
+                    &data[fstart..fstart + pkt_len],
+                    rssi,
+                    mcs,
+                    None,
+                ) {
                     q.push_back(cap);
                 }
+            }
             off += (24 + drvinfo + shift + pkt_len + 7) & !7;
         }
     }

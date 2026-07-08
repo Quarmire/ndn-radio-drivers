@@ -377,6 +377,30 @@ impl LibUsbRtl88xxBackend {
         Ok(backend)
     }
 
+    /// Open a *specific* RTL88xx dongle by product id — for a host with more than one attached
+    /// (e.g. an on-air 2-node test with two radios inches apart). Claims the first device whose
+    /// `product_id` equals `want_pid`.
+    pub fn open_pid(want_pid: u16) -> Result<Self, FaceError> {
+        let context = Context::new().map_err(usb_err)?;
+        for device in context.devices().map_err(usb_err)?.iter() {
+            let desc = device.device_descriptor().map_err(usb_err)?;
+            if desc.vendor_id() == REALTEK_VID && desc.product_id() == want_pid {
+                return Self::claim(device);
+            }
+        }
+        Err(FaceError::Io(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("no Realtek 0bda:{want_pid:04x} found"),
+        )))
+    }
+
+    /// [`open_pid`](Self::open_pid) + bring up 5 GHz monitor mode on `channel`.
+    pub fn open_monitor_pid(want_pid: u16, channel: u8) -> Result<Self, FaceError> {
+        let backend = Self::open_pid(want_pid)?;
+        backend.bring_up(channel)?;
+        Ok(backend)
+    }
+
     /// Spawn the **dynamic-mechanism watchdog** on a background thread: every
     /// ~2 s it runs [`watchdog_tick`](Self::watchdog_tick) (thermal TX-power
     /// tracking + RX DIG) for the life of the backend. The thread holds a

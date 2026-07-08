@@ -1024,6 +1024,11 @@ impl Rtl8733buBackend {
         Ok(self.read32((0x3C00 + ((addr & 0xFF) << 2)) as u16)? & 0x000F_FFFF)
     }
 
+    /// Write a path-A RF register (full 20-bit value via the LSSI/3-wire).
+    pub fn rf_write_full(&self, addr: u32, val: u32) -> Result<(), FaceError> {
+        self.rf_set(0, addr, 0x000F_FFFF, val)
+    }
+
     /// **M6 tail**: normal-mode TRX/queue init (`init_trx_cfg_8733b`). Switches the
     /// download-mode page/RQPN config over to the normal-operation layout so the data
     /// path can run: queue→DMA map, enable all TRX, normal RQPN + reserved-page

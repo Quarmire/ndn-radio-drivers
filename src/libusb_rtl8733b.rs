@@ -1217,6 +1217,15 @@ impl Rtl8733buBackend {
         Ok((self.rf_get(0, 0x42, 0x7e)? & 0x3f) as u8)
     }
 
+    /// USB-level port reset (`libusb reset_device`) — a far deeper reset than the register
+    /// power_off/card-disable; re-establishes the device the way a kernel-driver bind/unbind
+    /// does. In-process register resets do NOT re-randomize the per-boot analog TX state
+    /// (retry stays stuck), but only a fresh process — which involves a kernel USB cycle —
+    /// does; this exposes that cycle in-process. Re-run [`bring_up_monitor`] after it.
+    pub fn usb_reset(&self) -> Result<(), FaceError> {
+        self.handle.reset().map_err(usb_err)
+    }
+
     /// One-shot TX bring-up: [`bring_up_monitor`](Self::bring_up_monitor) (self-resets the
     /// chip via card-disable) then [`enable_tx`](Self::enable_tx) (cal + datapath + grant).
     /// After this, injected frames radiate — on ~62% of boots (the per-boot analog TX-path

@@ -1246,6 +1246,22 @@ impl Rtl8733buBackend {
         Ok(())
     }
 
+    /// Reliable-TX bring-up (the productized "approach B" path): monitor bring-up +
+    /// [`enable_tx`](Self::enable_tx) + a background [`spawn_power_tracking`](Self::spawn_power_tracking)
+    /// loop that sustains TX with no thermal fade. Returns the [`PowerTracker`] guard — keep it
+    /// alive for as long as you transmit; drop it to stop tracking.
+    ///
+    /// This gives **sustained** reliable TX once a boot radiates. The residual ~50% per-boot
+    /// cold-start variance (whether a fresh bring-up radiates at all — an analog TX-power-path
+    /// variance the vendor's full init avoids) is handled at the process/supervisor layer:
+    /// relaunch the process until protocol-level delivery is confirmed (see
+    /// `scripts/supervise_tx.sh`). Descriptor / firmware-MACID paths were ruled out as levers.
+    pub fn bring_up_tx_tracked(self: &Arc<Self>, ch: u8) -> Result<PowerTracker, FaceError> {
+        self.bring_up_monitor(ch)?;
+        self.enable_tx(ch)?;
+        Ok(self.spawn_power_tracking())
+    }
+
     /// Start a background TX **power-tracking** loop — the driver-side stand-in for the
     /// vendor's power-tracking DM (which is a `//[TBD]` stub on the 8733b). Every ~400 ms it
     /// reads the die thermal ([`read_thermal`](Self::read_thermal)) and sets the OFDM swing

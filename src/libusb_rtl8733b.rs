@@ -2773,6 +2773,33 @@ impl Rtl8733buBackend {
         self.tx_flags.store(f, Ordering::Relaxed);
     }
 
+    /// Build + send one 802.11 frame at an explicit `rate` (HwRate) and descriptor `flags`,
+    /// without touching the shared [`set_tx_rate`](Self::set_tx_rate)/[`set_tx_flags`](Self::set_tx_flags)
+    /// state — the common core of `FrameIo::inject` (fixed rate) and `WifiRadio::inject_at`
+    /// (per-frame MCS), so per-frame rate control is race-free.
+    async fn tx_dot11(&self, frame_in: InjectFrame, rate: u8, flags: u8) -> Result<(), FaceError> {
+        let dot11 = frame::build_dot11(self.format, &frame_in)?;
+        let seq = self.tx_seq.fetch_add(1, Ordering::Relaxed) & 0xFFF;
+        let bcast = dot11.len() > 4 && dot11[4] & 0x01 != 0;
+        let desc = build_data_txdesc(dot11.len(), rate, seq, bcast, flags);
+        let mut buf = Vec::with_capacity(desc.len() + dot11.len() + 1);
+        buf.extend_from_slice(&desc);
+        buf.extend_from_slice(&dot11);
+        if buf.len() % 512 == 0 {
+            buf.push(0);
+        }
+        let handle = self.handle.clone();
+        let ep = self.bulk_out;
+        tokio::task::spawn_blocking(move || {
+            handle
+                .write_bulk(ep, &buf, Duration::from_millis(500))
+                .map(|_| ())
+                .map_err(usb_err)
+        })
+        .await
+        .map_err(|e| io_err(format!("inject join: {e}")))?
+    }
+
     /// Set bandwidth / narrowband. 5 & 10 MHz narrowband (the vendor `narrowband`
     /// knob) are `0x9b0[7:6] = 1/2` on top of a 20 MHz channel; 20 vs 40 MHz is the
     /// BB path-width mode (`0x1900[3:0]` = 6/7 + the 40 MHz enables).
@@ -2926,27 +2953,9 @@ impl Rtl8733buBackend {
 #[async_trait]
 impl FrameIo for Rtl8733buBackend {
     async fn inject(&self, frame_in: InjectFrame) -> Result<(), FaceError> {
-        let dot11 = frame::build_dot11(self.format, &frame_in)?;
         let rate = self.tx_rate.load(Ordering::Relaxed);
-        let seq = self.tx_seq.fetch_add(1, Ordering::Relaxed) & 0xFFF;
-        let bcast = dot11.len() > 4 && dot11[4] & 0x01 != 0;
-        let desc = build_data_txdesc(dot11.len(), rate, seq, bcast, self.tx_flags.load(Ordering::Relaxed));
-        let mut buf = Vec::with_capacity(desc.len() + dot11.len() + 1);
-        buf.extend_from_slice(&desc);
-        buf.extend_from_slice(&dot11);
-        if buf.len() % 512 == 0 {
-            buf.push(0);
-        }
-        let handle = self.handle.clone();
-        let ep = self.bulk_out;
-        tokio::task::spawn_blocking(move || {
-            handle
-                .write_bulk(ep, &buf, Duration::from_millis(500))
-                .map(|_| ())
-                .map_err(usb_err)
-        })
-        .await
-        .map_err(|e| io_err(format!("inject join: {e}")))?
+        let flags = self.tx_flags.load(Ordering::Relaxed);
+        self.tx_dot11(frame_in, rate, flags).await
     }
 
     async fn recv_frame(&self) -> Result<CapturedFrame, FaceError> {
@@ -2975,10 +2984,21 @@ impl FrameIo for Rtl8733buBackend {
 
 #[async_trait]
 impl WifiRadio for Rtl8733buBackend {
-    async fn inject_at(&self, frame_in: InjectFrame, _mcs: McsDescriptor) -> Result<(), FaceError> {
-        // The current fixed rate (set_tx_rate) applies; per-frame rate control is via
-        // set_tx_rate before inject.
-        self.inject(frame_in).await
+    async fn inject_at(&self, frame_in: InjectFrame, mcs: McsDescriptor) -> Result<(), FaceError> {
+        // Map the MCS to a Realtek HwRate + per-frame descriptor flags. The 8731bu is 1x1
+        // (single chain), so only single-stream rates apply: HT MCS0-7 (DESC_RATEMCS0=0x0c)
+        // or VHT-1SS MCS0-9 (DESC_RATEVHTSS1MCS0=0x2c). STBC and 2-stream (nss=2) rates are
+        // suppressed — they need a second TX chain this part doesn't have. SGI and LDPC are
+        // single-chain-safe and honoured. 40 MHz is carried by set_bandwidth, so preserve the
+        // current bw40 flag rather than deriving it here.
+        let hw_rate = if mcs.vht {
+            0x2c + (mcs.index & 0x0f).min(9) // VHT 1SS MCS0-9
+        } else {
+            0x0c + (mcs.index & 0x0f).min(7) // HT MCS0-7 (1 stream)
+        };
+        let bw40 = (self.tx_flags.load(Ordering::Relaxed) >> 3) & 1;
+        let flags = (mcs.ldpc as u8) | ((mcs.short_gi as u8) << 1) | (bw40 << 3); // STBC omitted (1x1)
+        self.tx_dot11(frame_in, hw_rate, flags).await
     }
 }
 

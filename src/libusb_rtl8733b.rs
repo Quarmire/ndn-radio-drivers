@@ -2990,6 +2990,18 @@ impl RadioKnobs for Rtl8733buBackend {
     fn set_tx_power(&self, idx: u32) -> Result<(), FaceError> {
         self.set_tx_power_idx(idx.min(0x7f) as u8)
     }
+    // set_tx_csd stays the default no-op: the 8731bu is 1x1 (single chain), so there is no
+    // second chain to apply cyclic-shift diversity to.
+    fn set_edcca_ignore(&self, on: bool) -> Result<(), FaceError> {
+        // EDCCA low-to-high / high-to-low thresholds live in BB reg 0x84c: L2H at [23:16],
+        // H2L at [31:24], offset-binary (0x80 = 0 dBm). To ignore EDCCA, raise both to the
+        // maximum so measured channel energy never crosses them and TX never defers under
+        // contention; to restore, set an FCC-ish threshold (L2H ~= -9 dBm, H2L ~= -17 dBm with
+        // hysteresis). Mirrors phydm_adaptivity's odm_set_bb_reg(0x84c, MASKBYTE2/3, L2H/H2L).
+        let (l2h, h2l): (u32, u32) = if on { (0xff, 0xff) } else { (0x77, 0x6f) };
+        let v = (self.read32(0x84c)? & 0x0000_FFFF) | (l2h << 16) | (h2l << 24);
+        self.write32(0x84c, v)
+    }
 }
 
 #[cfg(test)]

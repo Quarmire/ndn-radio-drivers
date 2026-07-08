@@ -15,6 +15,8 @@ pub use ndn_frame_io::{
 mod libusb_rtl88xx;
 /// Shared Realtek RX-descriptor field decode (RSSI/MCS/timestamp) used by the USB backends.
 mod realtek_rx;
+/// Shared async-URB RX pump (bulk-IN pipelining) used by the USB backends.
+pub mod rx_pump;
 pub use libusb_rtl88xx::{
     CHIP_ID_8822E, ChannelBw, FwVersion, LibUsbRtl88xxBackend, REALTEK_VID, REG_SYS_CFG,
     RTL88XX_PIDS, RfPath,

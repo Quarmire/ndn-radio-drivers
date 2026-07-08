@@ -407,8 +407,10 @@ pub struct Rtl8733buBackend {
     /// TX PHY flags for the descriptor: bit0 LDPC, bit1 short-GI, bit2 STBC,
     /// bit3 40 MHz (see [`set_tx_flags`](Rtl8733buBackend::set_tx_flags)).
     tx_flags: std::sync::atomic::AtomicU8,
-    /// Parsed RX frames buffered between bulk-IN reads (one read yields many).
-    rx_pending: std::sync::Mutex<std::collections::VecDeque<CapturedFrame>>,
+    /// Shared async-URB RX pipeline: the queue background pump threads fill and `recv_frame`
+    /// drains, its wake signal, and the pumped flag (one bulk-IN read yields many frames). See
+    /// [`crate::rx_pump`].
+    rx_pump: crate::rx_pump::RxPumpState,
     /// Clock domain of this device's TSF counter (unique per physical device, from the USB
     /// bus/address) — the identity every RX hardware stamp is keyed on.
     tsf_domain: ClockDomainId,
@@ -505,7 +507,7 @@ impl Rtl8733buBackend {
             tx_rate: std::sync::atomic::AtomicU8::new(0x04), // 6 Mbps OFDM
             tx_seq: std::sync::atomic::AtomicU16::new(0),
             tx_flags: std::sync::atomic::AtomicU8::new(0),
-            rx_pending: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            rx_pump: crate::rx_pump::RxPumpState::new(),
             tsf_domain,
         })
     }
@@ -2982,10 +2984,10 @@ impl Rtl8733buBackend {
         Ok(())
     }
 
-    /// Split a bulk-IN transfer into 802.11 frames and queue the parsed
-    /// [`CapturedFrame`]s (used by [`FrameIo::recv_frame`]).
-    fn parse_rx_into_pending(&self, data: &[u8]) {
-        let mut q = self.rx_pending.lock().unwrap();
+    /// Split a bulk-IN transfer into the 802.11 frames it carried (the RX pump's per-transfer
+    /// parse; used by both the pumped and one-shot [`FrameIo::recv_frame`] paths).
+    fn parse_rx_transfer(&self, data: &[u8]) -> Vec<CapturedFrame> {
+        let mut q: Vec<CapturedFrame> = Vec::new();
         let mut off = 0usize;
         while off + 24 <= data.len() {
             let dw0 = u32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]]);
@@ -3032,11 +3034,37 @@ impl Rtl8733buBackend {
                     mcs,
                     stamp,
                 ) {
-                    q.push_back(cap);
+                    q.push(cap);
                 }
             }
             off += (24 + drvinfo + shift + pkt_len + 7) & !7;
         }
+        q
+    }
+
+    /// Start `depth` background reader threads — **USB RX pipelining** via the shared
+    /// [`crate::rx_pump`] (the async-URB path). Several bulk-IN transfers stay in flight so the RX
+    /// FIFO isn't left unattended between `recv_frame` calls; afterwards `recv_frame` just drains
+    /// the queue. Threads exit when the backend is dropped. `depth` 2–4 is plenty over USB.
+    pub fn spawn_rx_pump(self: &Arc<Self>, depth: usize) -> Vec<std::thread::JoinHandle<()>> {
+        crate::rx_pump::spawn_rx_pump(self, depth)
+    }
+}
+
+/// The RX pump's per-transfer parse for the 8733b — the async-URB pipelining named-time §3c calls
+/// for, now shared with the 88xx via one [`crate::rx_pump`] implementation.
+impl crate::rx_pump::Pumpable for Rtl8733buBackend {
+    fn pump_handle(&self) -> Arc<DeviceHandle<Context>> {
+        self.handle.clone()
+    }
+    fn pump_bulk_in(&self) -> u8 {
+        self.bulk_in
+    }
+    fn pump_state(&self) -> &crate::rx_pump::RxPumpState {
+        &self.rx_pump
+    }
+    fn parse_transfer(&self, buf: &[u8]) -> Vec<CapturedFrame> {
+        self.parse_rx_transfer(buf)
     }
 }
 
@@ -3052,8 +3080,13 @@ impl FrameIo for Rtl8733buBackend {
     }
 
     async fn recv_frame(&self) -> Result<CapturedFrame, FaceError> {
+        // Pumped mode: background reader threads keep several bulk-IN transfers in flight and fill
+        // the shared queue; just drain it (waking on the notify).
+        if self.rx_pump.is_pumped() {
+            return Ok(self.rx_pump.recv().await);
+        }
         loop {
-            if let Some(f) = self.rx_pending.lock().unwrap().pop_front() {
+            if let Some(f) = self.rx_pump.try_pop() {
                 return Ok(f);
             }
             let handle = self.handle.clone();
@@ -3069,7 +3102,8 @@ impl FrameIo for Rtl8733buBackend {
             .await
             .map_err(|e| io_err(format!("recv join: {e}")))??;
             if n > 0 {
-                self.parse_rx_into_pending(&buf[..n]);
+                self.rx_pump
+                    .push(crate::rx_pump::Pumpable::parse_transfer(self, &buf[..n]));
             }
         }
     }

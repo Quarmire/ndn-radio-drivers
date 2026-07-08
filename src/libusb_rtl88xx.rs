@@ -286,17 +286,11 @@ pub struct LibUsbRtl88xxBackend {
     /// Subscribed name-groups for multi-prefix DCNLA (software set-membership
     /// over the hardware multicast-narrowed RX stream). Empty ⇒ no SW filter.
     mcast_groups: std::sync::Mutex<Vec<[u8; 6]>>,
-    /// Decoded frames pending from the last bulk-IN read. The chip aggregates
-    /// several RX units into one USB transfer, so `recv_frame` parses the whole
-    /// buffer and drains them one at a time. Single consumer (the face reader).
-    rx_pending: std::sync::Mutex<std::collections::VecDeque<CapturedFrame>>,
-    /// Set once an RX pump ([`spawn_rx_pump`](Self::spawn_rx_pump)) is running:
-    /// background reader threads keep several bulk-IN transfers in flight and fill
-    /// `rx_pending`, so `recv_frame` just drains the queue instead of doing its own
-    /// blocking read (which left the RX FIFO unattended between calls).
-    rx_pumped: std::sync::atomic::AtomicBool,
-    /// Wakes `recv_frame` when a pump thread pushes into `rx_pending`.
-    rx_notify: tokio::sync::Notify,
+    /// Shared async-URB RX pipeline: the queue background pump threads fill and `recv_frame`
+    /// drains, its wake signal, and the pumped flag. The chip aggregates several RX units into one
+    /// USB transfer, so a transfer parses into many frames drained one at a time. See
+    /// [`crate::rx_pump`].
+    rx_pump: crate::rx_pump::RxPumpState,
     /// Clock domain of this device's free-run RX-stamp TSF (unique per physical device, from the
     /// USB bus/address) — the identity every RX [`LinkStamp`](ndn_frame_io::LinkStamp) is keyed on.
     tsf_domain: ClockDomainId,
@@ -366,9 +360,7 @@ impl LibUsbRtl88xxBackend {
             cur_bw: std::sync::atomic::AtomicU8::new(ChannelBw::Bw20 as u8),
             tx_csd: std::sync::atomic::AtomicBool::new(false),
             mcast_groups: std::sync::Mutex::new(Vec::new()),
-            rx_pending: std::sync::Mutex::new(std::collections::VecDeque::new()),
-            rx_pumped: std::sync::atomic::AtomicBool::new(false),
-            rx_notify: tokio::sync::Notify::new(),
+            rx_pump: crate::rx_pump::RxPumpState::new(),
             tsf_domain,
         })
     }
@@ -405,52 +397,13 @@ impl LibUsbRtl88xxBackend {
         })
     }
 
-    /// Start `depth` background reader threads — **USB RX pipelining**. Each loops
-    /// a blocking bulk-IN read, parses the transfer into `rx_pending`, and wakes
-    /// `recv_frame`. With several reads always outstanding the chip always has a
-    /// buffer to DMA into, so the RX FIFO doesn't overflow between `recv_frame`
-    /// calls (the userspace-RX throughput ceiling). After this, `recv_frame` just
-    /// drains the queue. Threads hold a `Weak<Self>` and exit when the backend is
-    /// dropped (within one ~200 ms read timeout). `depth` 2–4 is plenty over USB.
+    /// Start `depth` background reader threads — **USB RX pipelining** via the shared
+    /// [`crate::rx_pump`]. With several reads always outstanding the chip always has a buffer to
+    /// DMA into, so the RX FIFO doesn't overflow between `recv_frame` calls; after this
+    /// `recv_frame` just drains the queue. Threads exit when the backend is dropped. `depth` 2–4
+    /// is plenty over USB.
     pub fn spawn_rx_pump(self: &Arc<Self>, depth: usize) -> Vec<std::thread::JoinHandle<()>> {
-        self.rx_pumped
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-        (0..depth.max(1))
-            .map(|_| {
-                let weak = Arc::downgrade(self);
-                std::thread::spawn(move || {
-                    let mut buf = vec![0u8; 16384];
-                    loop {
-                        let Some(dev) = weak.upgrade() else { break };
-                        match dev.handle.read_bulk(
-                            dev.bulk_in,
-                            &mut buf,
-                            Duration::from_millis(200),
-                        ) {
-                            Ok(n) if n > 0 => {
-                                {
-                                    let mut off = 0;
-                                    let mut q = dev.rx_pending.lock().unwrap();
-                                    while let Some((decoded, advance)) =
-                                        dev.parse_rx_at(&buf[..n], off)
-                                    {
-                                        for f in decoded {
-                                            q.push_back(f);
-                                        }
-                                        off += advance;
-                                        if off + 24 > n {
-                                            break;
-                                        }
-                                    }
-                                }
-                                dev.rx_notify.notify_one();
-                            }
-                            _ => {} // timeout / empty / error: re-submit the read
-                        }
-                    }
-                })
-            })
-            .collect()
+        crate::rx_pump::spawn_rx_pump(self, depth)
     }
 
     /// Run the full monitor-mode bring-up on an already-[`open`](Self::open)ed
@@ -5043,21 +4996,14 @@ impl FrameIo for LibUsbRtl88xxBackend {
     // (IQK/LCK/DPK/TSSI — the unported `halrf_8822e` subsystem); see the module
     // header. `recv_frame` is fully functional once a peer is transmitting.
     async fn recv_frame(&self) -> Result<CapturedFrame, FaceError> {
-        // Pumped mode: background reader threads keep several bulk-IN transfers in
-        // flight and fill `rx_pending`; just drain it (waking on the notify).
-        if self.rx_pumped.load(Ordering::Relaxed) {
-            loop {
-                let notified = self.rx_notify.notified();
-                if let Some(f) = self.rx_pending.lock().unwrap().pop_front() {
-                    return Ok(f);
-                }
-                // Re-poll on a timeout in case a notify was missed.
-                let _ = tokio::time::timeout(Duration::from_millis(200), notified).await;
-            }
+        // Pumped mode: background reader threads keep several bulk-IN transfers in flight and fill
+        // the shared queue; just drain it (waking on the notify).
+        if self.rx_pump.is_pumped() {
+            return Ok(self.rx_pump.recv().await);
         }
         loop {
             // Drain frames already de-aggregated from the previous transfer.
-            if let Some(f) = self.rx_pending.lock().unwrap().pop_front() {
+            if let Some(f) = self.rx_pump.try_pop() {
                 return Ok(f);
             }
             let handle = self.handle.clone();
@@ -5076,23 +5022,39 @@ impl FrameIo for LibUsbRtl88xxBackend {
             .await
             .map_err(|e| init_err(format!("rtl88xx recv: join {e}")))??;
 
-            // Walk every aggregated RX unit in the transfer, queueing the
-            // decodable data frames (the OPi's Data may sit behind ambient
-            // beacons in the same buffer).
+            // De-aggregate the transfer (the OPi's Data may sit behind ambient beacons in the same
+            // buffer) and queue every decodable frame — the same parse the pump uses.
             if let Some(buf) = buf {
-                let mut off = 0;
-                let mut q = self.rx_pending.lock().unwrap();
-                while let Some((decoded, advance)) = self.parse_rx_at(&buf, off) {
-                    for f in decoded {
-                        q.push_back(f);
-                    }
-                    off += advance;
-                    if off + 24 > buf.len() {
-                        break;
-                    }
-                }
+                self.rx_pump
+                    .push(crate::rx_pump::Pumpable::parse_transfer(self, &buf));
             }
         }
+    }
+}
+
+/// The RX pump's per-transfer parse (named-time §3c): de-aggregate every RX unit the chip packed
+/// into one bulk-IN transfer into decodable frames, each carrying its free-run RXTSFL stamp.
+impl crate::rx_pump::Pumpable for LibUsbRtl88xxBackend {
+    fn pump_handle(&self) -> Arc<DeviceHandle<Context>> {
+        self.handle.clone()
+    }
+    fn pump_bulk_in(&self) -> u8 {
+        self.bulk_in
+    }
+    fn pump_state(&self) -> &crate::rx_pump::RxPumpState {
+        &self.rx_pump
+    }
+    fn parse_transfer(&self, buf: &[u8]) -> Vec<CapturedFrame> {
+        let mut out = Vec::new();
+        let mut off = 0;
+        while let Some((decoded, advance)) = self.parse_rx_at(buf, off) {
+            out.extend(decoded);
+            off += advance;
+            if off + 24 > buf.len() {
+                break;
+            }
+        }
+        out
     }
 }
 

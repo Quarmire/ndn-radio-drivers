@@ -42,7 +42,9 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use rusb::{Context, Device, DeviceHandle, Direction, TransferType, UsbContext};
 
-use ndn_frame_io::{CapturedFrame, FrameIo, InjectFrame};
+use crate::realtek_rx;
+use ndn_frame_io::{CapturedFrame, ClockDomainId, FrameIo, InjectFrame};
+use ndn_radio_hal::{RadioTime, RadioTimeSource};
 use ndn_transport::FaceError;
 
 // The RF-path enum is shared with the 8822E backend (an A/B selector).
@@ -311,6 +313,8 @@ pub struct Rtl8812auBackend {
     /// RX frames de-aggregated from one bulk-IN URB (the 8812A stacks several
     /// 802.11 packets per USB transfer); drained one per `recv_frame` call.
     rx_pending: Mutex<VecDeque<CapturedFrame>>,
+    /// Clock domain of this device's free-run RX-stamp TSF (per-device, from the USB bus/address).
+    tsf_domain: ClockDomainId,
 }
 
 impl Rtl8812auBackend {
@@ -332,6 +336,9 @@ impl Rtl8812auBackend {
     }
 
     fn claim(device: Device<Context>, pid: u16) -> Result<Self, FaceError> {
+        // Per-device RX-stamp clock domain (bus<<8 | address) — read before opening the device.
+        let tsf_domain =
+            ClockDomainId((u32::from(device.bus_number()) << 8) | u32::from(device.address()));
         let handle = Arc::new(device.open().map_err(usb_err)?);
         // Detach only THIS device's kernel driver (Linux); leaves other adapters
         // (e.g. the 8812EU sniffer) bound to their drivers.
@@ -369,6 +376,7 @@ impl Rtl8812auBackend {
             bulk_in: bulk_in.ok_or_else(no_ep)?,
             pid,
             rx_pending: Mutex::new(VecDeque::new()),
+            tsf_domain,
         })
     }
 
@@ -1658,13 +1666,25 @@ impl Rtl8812auBackend {
                 ta.copy_from_slice(&body[10..16]);
                 let mut group = [0u8; 6];
                 group.copy_from_slice(&body[4..10]);
+                // Same Realtek RX-descriptor field interpretation as the sibling backends
+                // (realtek_rx): RX HwRate (dword3) -> MCS; path-A power pwdb_a (phystatus byte 1)
+                // -> RSSI; RXTSFL (dword5) -> free-run per-frame hardware stamp. Useful for NAN
+                // neighbor ranking + named-time even though this backend is management-frame only.
+                let rate = (u32::from_le_bytes([d[12], d[13], d[14], d[15]]) & 0x7f) as u8;
+                let mcs_index = realtek_rx::mcs_from_desc_rate(rate);
+                let rssi_dbm = (drvinfo >= 1 && rate >= 0x04)
+                    .then(|| realtek_rx::rssi_dbm(d[RXDESC_SIZE + 1]));
+                let stamp = Some(realtek_rx::rx_stamp(
+                    u32::from_le_bytes([d[20], d[21], d[22], d[23]]),
+                    self.tsf_domain,
+                ));
                 q.push_back(CapturedFrame {
                     payload: Bytes::copy_from_slice(body),
                     addr: Some(ta),
                     group: Some(group),
-                    rssi_dbm: None,
-                    mcs_index: None,
-                    stamp: None,
+                    rssi_dbm,
+                    mcs_index,
+                    stamp,
                 });
             }
             off += (start + pkt_len + 7) & !7; // next subframe, 8-byte aligned
@@ -1743,5 +1763,13 @@ impl crate::WifiRadio for Rtl8812auBackend {
         // Whole-frame legacy 6 Mbps injection (NAN management frames); the exact
         // HT/VHT rate does not apply, so it is ignored — same as `inject`.
         self.inject(frame).await
+    }
+}
+
+/// Exposes the always-on free-run per-frame RX-stamp clock (RXTSFL) now latched onto every
+/// received management frame. No read-now port TSF here, so `read_clock` stays the default `None`.
+impl RadioTime for Rtl8812auBackend {
+    fn time_sources(&self) -> Vec<RadioTimeSource> {
+        vec![RadioTimeSource::free_run_rx_stamp(self.tsf_domain, 1_000)]
     }
 }

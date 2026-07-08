@@ -297,7 +297,11 @@ fn build_data_txdesc(
         dw0 |= 1 << 24; // BMC
     }
     d[0..4].copy_from_slice(&dw0.to_le_bytes());
-    d[4..8].copy_from_slice(&((0x12u32 & 0x1F) << 8).to_le_bytes()); // dw1: QSEL=MGT
+    // dw1: QSEL=MGT (0x12) + RATE_ID=RATEID_IDX_G(7) at [20:16]. The vendor fill_fake_txdesc
+    // sets RATE_ID; leaving it 0 selects a 2-stream rate/power group on this 1x1 part, which
+    // steers the MAC to the wrong rate/power table.
+    const RATEID_IDX_G: u32 = 7;
+    d[4..8].copy_from_slice(&(((0x12u32 & 0x1F) << 8) | (RATEID_IDX_G << 16)).to_le_bytes());
     d[8..12].copy_from_slice(&(1u32 << 16).to_le_bytes()); // dw2: BK (disable aggregation)
     d[12..16].copy_from_slice(&((1u32 << 8) | (1 << 9) | (1 << 10)).to_le_bytes()); // dw3: USE_RATE|DISRTSFB|DISDATAFB
     d[16..20].copy_from_slice(&((rate as u32 & 0x7F) | (1 << 17)).to_le_bytes()); // dw4: DATARATE|RTY_LMT_EN

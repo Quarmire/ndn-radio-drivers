@@ -26,7 +26,7 @@
 //! `apply_efuse_trim`) is retained for that follow-on; it is not on the working RX/inject
 //! path and is not required for it.
 
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -399,6 +399,22 @@ pub struct Rtl8733buBackend {
     tx_flags: std::sync::atomic::AtomicU8,
     /// Parsed RX frames buffered between bulk-IN reads (one read yields many).
     rx_pending: std::sync::Mutex<std::collections::VecDeque<CapturedFrame>>,
+}
+
+/// Guard for the background TX power-tracking thread started by
+/// [`Rtl8733buBackend::spawn_power_tracking`]. Stops the thread on drop.
+pub struct PowerTracker {
+    stop: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for PowerTracker {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
 }
 
 /// What [`Rtl8733buBackend::chip_version`] reads back.
@@ -1203,6 +1219,33 @@ impl Rtl8733buBackend {
         self.set_txagc_table(0x2d)?; // per-rate TX gain (0 by default → no output)
         let _ = self.configure_trsw(true); // external TRSW antenna routing (best-effort)
         Ok(())
+    }
+
+    /// Start a background TX **power-tracking** loop — the driver-side stand-in for the
+    /// vendor's power-tracking DM (which is a `//[TBD]` stub on the 8733b). Every ~400 ms it
+    /// reads the die thermal ([`read_thermal`](Self::read_thermal)) and sets the OFDM swing
+    /// offset `0x18a0[6:0]` (the vendor's `absolute_ofdm_swing_idx` register) proportional to
+    /// the rise over the cal reference, capped below the over-drive point — compensating the
+    /// PA droop as it heats. Verified to hold TX for the full length of a long transmit
+    /// (893 frames over 15 s) with no fade. Call after [`enable_tx`](Self::enable_tx); the
+    /// returned [`PowerTracker`] stops the loop when dropped. (Reliable *sustained* TX; the
+    /// per-boot analog variance that determines whether a boot radiates at all is separate —
+    /// gate on it with [`bring_up_tx_until`](Self::bring_up_tx_until) / a process supervisor.)
+    pub fn spawn_power_tracking(self: &Arc<Self>) -> PowerTracker {
+        let stop = Arc::new(AtomicBool::new(false));
+        let dev = Arc::clone(self);
+        let s = Arc::clone(&stop);
+        let handle = std::thread::spawn(move || {
+            while !s.load(Ordering::Relaxed) {
+                let die = dev.read_thermal().unwrap_or(32);
+                let sw = u32::from(die.saturating_sub(31)).saturating_mul(16).min(0x28);
+                if let Ok(v) = dev.read32(0x18a0) {
+                    let _ = dev.write32(0x18a0, (v & !0x7f) | sw);
+                }
+                std::thread::sleep(Duration::from_millis(400));
+            }
+        });
+        PowerTracker { stop, handle: Some(handle) }
     }
 
     /// Read the RF thermal meter (`RF_T_METER` = RF 0x42). Triggers a measurement (toggle

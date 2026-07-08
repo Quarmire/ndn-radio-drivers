@@ -26,7 +26,9 @@ pub use rtl8812au::{ChipInfo, IqkResult, RTL8812AU_PIDS, Rtl8812auBackend};
 // RTL8731BU / RTL8733BU (halmac_87xx, 1x1 11ac) — ground-up port, M1 (open +
 // reg-I/O + chip-version). REALTEK_VID is already re-exported above.
 mod libusb_rtl8733b;
-pub use libusb_rtl8733b::{ChipVersion, FW_NIC_8733B, FwHeader, RTL8733B_PIDS, Rtl8733buBackend};
+pub use libusb_rtl8733b::{
+    ChipVersion, FW_NIC_8733B, FwHeader, PowerTracker, RTL8733B_PIDS, Rtl8733buBackend,
+};
 
 // BW16 (RTL8720DN) serial-bridged backend — a dual-band 802.11 injector/capturer
 // driven over USB-serial (firmware/bw16-ndn-bridge), implementing the same

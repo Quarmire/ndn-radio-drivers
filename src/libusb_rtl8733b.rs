@@ -122,6 +122,42 @@ const fn step(cmd: PwrCmd, offset: u16, msk: u8, val: u8) -> PwrStep {
     }
 }
 
+/// Full card-disable / power-down sequence — captured verbatim from the vendor driver's
+/// `rtl8733b_power_off` (`rtw_halmac_poweroff`) via usbmon during `rmmod`. Run before
+/// [`power_on`](Rtl8733buBackend::power_on) to force the chip to a clean state each bring-up:
+/// the key steps are `0x0005=0x02` (APS_FSMCO APFM_OFFMAC — power off the MAC FSM) and
+/// `0x0005=0x08` (PDN). Without this a re-init inherits residual analog/FSM state, which is
+/// what left on-air TX firing on only a minority of boots.
+const POWER_OFF_8733B: &[PwrStep] = &[
+    step(W, 0x00cd, 0xff, 0x00),
+    step(W, 0x001f, 0xff, 0x00),
+    step(W, 0x0077, 0xff, 0x00),
+    step(W, 0x001f, 0xff, 0x87),
+    step(W, 0x0077, 0xff, 0x87),
+    step(W, 0x001f, 0xff, 0x00),
+    step(W, 0x0077, 0xff, 0x00),
+    step(W, 0x001f, 0xff, 0x87),
+    step(W, 0x0077, 0xff, 0x87),
+    step(W, 0x001f, 0xff, 0x00),
+    step(W, 0x0077, 0xff, 0x00),
+    step(W, 0x0002, 0xff, 0xdc),
+    step(W, 0x0002, 0xff, 0xdf),
+    step(W, 0x0002, 0xff, 0xdc),
+    step(W, 0x0002, 0xff, 0xdf),
+    step(W, 0x0002, 0xff, 0xdc),
+    step(W, 0x0049, 0xff, 0x00),
+    step(W, 0x0006, 0xff, 0x03),
+    step(W, 0x0091, 0xff, 0x86),
+    step(W, 0x0005, 0xff, 0x02), // APS_FSMCO APFM_OFFMAC — power off MAC
+    step(W, 0x0005, 0xff, 0x08), // PDN / card-disable
+    step(W, 0x0006, 0xff, 0x03),
+    step(W, 0x0007, 0xff, 0x10),
+    step(W, 0x0024, 0xff, 0x50),
+    step(W, 0x0025, 0xff, 0x11),
+    step(W, 0x0021, 0xff, 0x79),
+    step(W, 0x004a, 0xff, 0x11),
+];
+
 /// The MAC control register — non-zero once the MAC is active.
 const REG_CR: u16 = 0x0100;
 /// SYS_FUNC_EN — after power-on its low two bits (BB/RF enable) read back set.
@@ -514,7 +550,19 @@ impl Rtl8733buBackend {
     /// card-disable/emulation to the active state (BB/RF out of reset, RF path
     /// up). Errors if any poll step times out (~200 ms budget each).
     pub fn power_on(&self) -> Result<(), FaceError> {
-        for s in POWER_ON_8733B {
+        self.run_pwr_seq(POWER_ON_8733B, "power-on")
+    }
+
+    /// Full card-disable power-down ([`POWER_OFF_8733B`], captured from the vendor `rmmod`).
+    /// Run before [`power_on`](Self::power_on) to clear residual analog/FSM state between
+    /// bring-ups — the key to reliable on-air TX (a stale FSM leaves the synth locking on
+    /// only a minority of boots).
+    pub fn power_off(&self) -> Result<(), FaceError> {
+        self.run_pwr_seq(POWER_OFF_8733B, "power-off")
+    }
+
+    fn run_pwr_seq(&self, seq: &[PwrStep], what: &str) -> Result<(), FaceError> {
+        for s in seq {
             match s.cmd {
                 PwrCmd::Write => {
                     let cur = self.read8(s.offset)?;
@@ -529,11 +577,8 @@ impl Rtl8733buBackend {
                         }
                         if Instant::now() >= deadline {
                             return Err(io_err(format!(
-                                "8733b power-on: poll timeout at 0x{:04x} (msk 0x{:02x}, want 0x{:02x}, got 0x{:02x})",
-                                s.offset,
-                                s.msk,
-                                s.val & s.msk,
-                                got
+                                "8733b {what}: poll timeout at 0x{:04x} (msk 0x{:02x}, want 0x{:02x}, got 0x{:02x})",
+                                s.offset, s.msk, s.val & s.msk, got
                             )));
                         }
                     }
@@ -1137,6 +1182,10 @@ impl Rtl8733buBackend {
     /// Note the chip wedges after repeated re-inits in a process — open once per
     /// power-cycle.
     pub fn bring_up_monitor(&self, channel: u8) -> Result<(), FaceError> {
+        // Full card-disable first so every bring-up starts from a clean analog/FSM state
+        // (best-effort: the chip may already be off on a fresh enumeration).
+        let _ = self.power_off();
+        std::thread::sleep(Duration::from_millis(10));
         self.power_on()?;
         self.fw_dl_setup()?;
         self.download_firmware()?;

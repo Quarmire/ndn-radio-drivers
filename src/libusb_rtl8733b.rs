@@ -37,7 +37,7 @@ use ndn_frame_io::{
 use crate::realtek_rx;
 use ndn_radio_hal::{
     Band, Bandwidth, McsDescriptor, RadioCapability, RadioKnobs, RadioProfile, RadioTime,
-    RadioTimeSource, WifiRadio,
+    RadioTimeSource, TxDiscipline, WifiRadio,
 };
 use ndn_transport::FaceError;
 use rusb::{Context, Device, DeviceHandle, Direction, TransferType, UsbContext};
@@ -3114,6 +3114,12 @@ impl RadioKnobs for Rtl8733buBackend {
         let (l2h, h2l): (u32, u32) = if on { (0xff, 0xff) } else { (0x77, 0x6f) };
         let v = (self.read32(0x84c)? & 0x0000_FFFF) | (l2h << 16) | (h2l << 24);
         self.write32(0x84c, v)
+    }
+    fn tx_discipline(&self) -> TxDiscipline {
+        // On owned spectrum with EDCCA-ignore + single-frame userspace injection this part
+        // delivers a bounded transmit delay (no CSMA backoff); the ~1 ms bound covers the USB
+        // inject + queue + airtime of one 6 Mbps MPDU.
+        TxDiscipline::PromptBounded { max_delay_ns: 1_000_000 }
     }
 }
 

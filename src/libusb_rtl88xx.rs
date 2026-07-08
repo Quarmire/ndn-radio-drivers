@@ -4918,6 +4918,9 @@ impl LibUsbRtl88xxBackend {
         // TSF-low (µs) the MAC latched at receive — the FreeRunRxStamp clock (realtek_rx). LinkStamp
         // is Copy, so it rides all decode paths below.
         let stamp = Some(crate::realtek_rx::rx_stamp(dw(0x14), self.tsf_domain));
+        if std::env::var("NDN_RX_META_DBG").is_ok() {
+            eprintln!("RX88 rate=0x{data_rate:02x} rssi={rssi_dbm:?} tsfl={}", dw(0x14));
+        }
         // Decode the 802.11 data frame into one CapturedFrame, or — for a QoS
         // A-MSDU — several (the link-layer bundle de-aggregated back into the
         // independent NDN packets it carried; see `build_amsdu_body`).

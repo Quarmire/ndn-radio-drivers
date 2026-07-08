@@ -1205,6 +1205,37 @@ impl Rtl8733buBackend {
         Ok(())
     }
 
+    /// One-shot TX bring-up: [`bring_up_monitor`](Self::bring_up_monitor) (self-resets the
+    /// chip via card-disable) then [`enable_tx`](Self::enable_tx) (cal + datapath + grant).
+    /// After this, injected frames radiate — on ~62% of boots (the per-boot analog TX-path
+    /// variance). For reliable delivery, drive [`bring_up_tx_until`](Self::bring_up_tx_until)
+    /// with a caller-side verify, or just retransmit at the protocol layer across re-inits.
+    pub fn bring_up_tx(&self, ch: u8) -> Result<(), FaceError> {
+        self.bring_up_monitor(ch)?;
+        self.enable_tx(ch)
+    }
+
+    /// Reliable TX bring-up: re-run [`bring_up_tx`](Self::bring_up_tx) (full clean re-init,
+    /// ~62%/boot) until `verify(self)` returns `true` or `max_attempts` is reached. Returns
+    /// `Ok(true)` once verified, `Ok(false)` if exhausted.
+    ///
+    /// There is **no on-chip signal** that distinguishes a radiating boot from a dead one
+    /// (RX, self-reception, cal result, and registers are all identical) — so `verify` must
+    /// use **external feedback**: transmit a probe and confirm a response (an ACK, an NDN Data
+    /// for an Interest, a peer echo). At ~62%/boot this reaches ~99% within 5 attempts.
+    pub fn bring_up_tx_until<F>(&self, ch: u8, max_attempts: u32, mut verify: F) -> Result<bool, FaceError>
+    where
+        F: FnMut(&Self) -> bool,
+    {
+        for _ in 0..max_attempts.max(1) {
+            self.bring_up_tx(ch)?;
+            if verify(self) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// Enable on-air TX (call after [`bring_up_monitor`](Self::bring_up_monitor)). Runs the
     /// full RF calibration — IQK ([`phy_iq_calibrate`](Self::phy_iq_calibrate)), TXGAPK
     /// ([`phy_txgapk`](Self::phy_txgapk)), DPK ([`phy_dpk`](Self::phy_dpk)) — which converges

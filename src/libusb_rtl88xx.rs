@@ -60,7 +60,7 @@ use crate::McsDescriptor;
 use crate::frame::LLC_SNAP_PREFIX;
 use crate::{CapturedFrame, FrameFormat, InjectFrame, FrameIo};
 use ndn_frame_io::ClockDomainId;
-use ndn_radio_hal::{RadioTime, RadioTimeSource};
+use ndn_radio_hal::{RadioCapability, RadioProfile, RadioTime, RadioTimeSource};
 
 /// Realtek USB vendor request: `bRequest` for register I/O, and the IN/OUT
 /// `bmRequestType`s (vendor, device). The register address rides in `wValue`,
@@ -5099,6 +5099,13 @@ impl FrameIo for LibUsbRtl88xxBackend {
 impl RadioTime for LibUsbRtl88xxBackend {
     fn time_sources(&self) -> Vec<RadioTimeSource> {
         vec![RadioTimeSource::free_run_rx_stamp(self.tsf_domain, 1_000)]
+    }
+}
+
+impl RadioProfile for LibUsbRtl88xxBackend {
+    fn capability(&self) -> RadioCapability {
+        // RTL8812EU / RTL8822E: 2-stream 5 GHz 11ac (our data radio).
+        RadioCapability::wifi_monitor_5ghz(vec![36, 40, 44, 48, 149, 153, 157, 161])
     }
 }
 

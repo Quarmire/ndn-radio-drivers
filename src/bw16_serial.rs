@@ -16,7 +16,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use ndn_frame_io::{
     CapturedFrame, ClockDomainId, FrameFormat, FrameIo, InjectFrame, LatchPoint, LinkStamp,
-    McsDescriptor, RadioTime, RadioTimeSource, WifiRadio, frame,
+    McsDescriptor, RadioCapability, RadioProfile, RadioTime, RadioTimeSource, WifiRadio, frame,
 };
 
 /// Host monotonic clock domain — shared by every host-stamped frame in this process (the serial
@@ -260,6 +260,13 @@ impl RadioTime for Bw16SerialBackend {
 
     fn read_clock(&self, domain: ClockDomainId) -> Result<Option<u64>, FaceError> {
         Ok((domain == HOST_CLOCK_DOMAIN).then(|| host_stamp().raw))
+    }
+}
+
+impl RadioProfile for Bw16SerialBackend {
+    fn capability(&self) -> RadioCapability {
+        // RTL8720DN (BW16): single-chain 2.4 GHz 11n over the serial bridge.
+        RadioCapability::wifi_monitor_2ghz_1ss(vec![1, 6, 11])
     }
 }
 

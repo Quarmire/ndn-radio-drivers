@@ -35,7 +35,10 @@ use ndn_frame_io::{
     frame, CapturedFrame, ClockDomainId, FrameFormat, FrameIo, InjectFrame,
 };
 use crate::realtek_rx;
-use ndn_radio_hal::{Bandwidth, McsDescriptor, RadioKnobs, RadioTime, RadioTimeSource, WifiRadio};
+use ndn_radio_hal::{
+    Bandwidth, McsDescriptor, RadioCapability, RadioKnobs, RadioProfile, RadioTime, RadioTimeSource,
+    WifiRadio,
+};
 use ndn_transport::FaceError;
 use rusb::{Context, Device, DeviceHandle, Direction, TransferType, UsbContext};
 
@@ -3143,6 +3146,13 @@ impl RadioTime for Rtl8733buBackend {
         } else {
             Ok(None)
         }
+    }
+}
+
+impl RadioProfile for Rtl8733buBackend {
+    fn capability(&self) -> RadioCapability {
+        // RTL8731BU: single-chain (1x1) 11ac. Dual-band, but reported on its primary 5 GHz use.
+        RadioCapability::wifi_monitor_5ghz_1ss(vec![36, 40, 44, 48, 149, 153, 157, 161])
     }
 }
 

@@ -1156,6 +1156,47 @@ impl Rtl8733buBackend {
         Ok(())
     }
 
+    /// Enable on-air TX (call after [`bring_up_monitor`](Self::bring_up_monitor)). Runs the
+    /// full RF calibration — IQK ([`phy_iq_calibrate`](Self::phy_iq_calibrate)), TXGAPK
+    /// ([`phy_txgapk`](Self::phy_txgapk)), DPK ([`phy_dpk`](Self::phy_dpk)) — which converges
+    /// once [`phy_lok`](Self::phy_lok)'s loopback gains are set; then applies the datapath
+    /// TXAGC block (`0x1e40-0x1e60`, the per-rate TX power the cal leaves zeroed) and grants
+    /// the shared RF front-end to WiFi (`GNT_WL=1`). Frames injected after this **radiate**
+    /// (verified against a witness radio: full/near-full capture of the injected stream).
+    ///
+    /// Do NOT run [`tssi_setup`](Self::tssi_setup) after this — TSSI overwrites the datapath
+    /// TXAGC with an uncalibrated DE and kills output. TX is currently keyed on the synth
+    /// locking on that boot (a per-boot analog variance; not every bring-up radiates yet).
+    pub fn enable_tx(&self, ch: u8) -> Result<(), FaceError> {
+        // Vendor final values for the TXAGC/datapath regs the cal leaves zeroed/un-restored
+        // (from a post-cal-vs-vendor BB diff). 0x1e40-0x1e60 is the per-rate TX power table.
+        const DP: &[(u16, u32)] = &[
+            (0x180c, 0x17f43863), (0x18ac, 0x00065a60), (0x1968, 0x36632640),
+            (0x1c38, 0xffb5005e), (0x1c3c, 0x01051f43), (0x1c80, 0x0f38e000), (0x1c84, 0x24512054),
+            (0x1ca4, 0xe0000000), (0x1d70, 0x2020201c), (0x1e1c, 0x8400b000),
+            (0x1e40, 0xfffeffff), (0x1e44, 0x2824201c), (0x1e48, 0x3834302c), (0x1e50, 0x2824201c),
+            (0x1e54, 0x3834302c), (0x1e58, 0xfe44403c), (0x1e5c, 0xc13c00ff), (0x1e60, 0x4440413f),
+            (0x1e88, 0x0000fc1c), (0x1e8c, 0x00007000), (0x1eb8, 0x00000b00),
+            (0x1ed4, 0x800c0040), (0x1ed8, 0x8005000c), (0x1edc, 0x80020005), (0x1ee0, 0x80000002),
+            (0x1ee4, 0xf0000000), (0x1ef0, 0x30000a80), (0x1ef4, 0x40001266), (0x1ef8, 0x3b000100),
+        ];
+        self.apply_efuse_trim()?;
+        self.rfk_init()?; // KIP microcode (prereq for IQK/DPK)
+        let _ = self.phy_iq_calibrate()?; // IQK (incl. LOK) — converges after the txk gain fix
+        let _ = self.phy_txgapk()?; // TX gain-index cal
+        let _ = self.phy_dpk()?; // digital pre-distortion
+        // The cal zeroes the per-rate TXAGC + leaves datapath regs un-restored; apply the
+        // vendor final values, re-tune (needed to re-lock RF/BB), then re-assert.
+        for &(a, v) in DP { self.write32(a, v)?; }
+        self.tune_channel(ch)?;
+        for &(a, v) in DP { self.write32(a, v)?; }
+        // Grant the shared RF front-end to WiFi (phy_set_rf_path_switch: GNT_WL=1, GNT_BT=0).
+        let g = self.read32(0x70)?;
+        self.write32(0x70, (g & !0xF000_0000) | (1 << 26) | (0x9 << 28))?;
+        self.write8(0x0522, 0x00)?; // unpause TX
+        Ok(())
+    }
+
     /// **M8**: read one bulk-IN transfer and split out the 802.11 frames it packs.
     /// Each frame sits at `24 + drvinfo*8 + shift` after its 24-byte RX descriptor,
     /// and successive frames are 8-byte aligned; `DMA_AGG_NUM` counts them.

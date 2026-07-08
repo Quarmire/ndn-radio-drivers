@@ -2463,8 +2463,21 @@ impl Rtl8733buBackend {
         self.rf_set(0, 0xef, 1 << 2, 0x1)?; // WE_LUT_TX_LOK=1
         self.rf_set(0, 0xdf, 1 << 2, 0x0)?; // DEBUG_LUT_TX_LOK=0
         self.rf_set(0, 0x33, 0x003FF, if is_5g { 0x100 } else { 0x000 })?;
+        // txk_rf_setting continued — the gain writes that set the loopback level. Without
+        // these the feedback ADC saturates (0x1bfc rails to 0x3ff) and the IDAC search slams
+        // to the extremes instead of converging (_iqk_txk_rf_setting_8733b tail).
+        self.rf_set(0, 0x00, 0xFFFF0, 0x403E)?; // RFmode[19:16] + RXBB[9:5] — RX feedback gain
+        self.rf_set(0, 0x56, 0x0FFFF, 0xe0e4)?; // Tx gain MOD/PA/PAD/TxBB — LOK tone level
+        let tx_pi_data = self.rf_get(0, 0x00, 0xFFFFF)?;
+        self.bb_set(0x1b20, 0x000F_FFFF, tx_pi_data)?; // TX_PI_DATA = RF0x00
+        self.bb_set(0x1b20, 0x0F00_0000, 0x0)?; // disable DPD
+        self.bb_set(0x1bbc, 0x3000_0000, 0x0)?; // disable DPD
+        self.bb_set(0x1b1c, 0x0001_C000, 0x0)?; // TX_P_Avg
+        self.bb_set(0x1bb8, 1 << 20, 0x0)?; // r_tst_iqk2set
         // lok_by_path (coarse).
-        self.bb_set(0x1860, 1 << 30, 0x1)?; // DAC on (TX tone source for the cal)
+        if std::env::var("NOLOKDAC").is_err() {
+            self.bb_set(0x1860, 1 << 30, 0x1)?; // DAC on (TX tone source for the cal)
+        }
         self.rf_set(0, 0xf5, 1 << 17, 0x1)?; // clock gating
         self.bb_set(0x1b10, 0x0000_00FF, 0x00)?;
         self.bb_set(0x1b00, 0xFFFF_0000, 0x3c00)?; // rfc_base_address (path A)
@@ -2490,7 +2503,12 @@ impl Rtl8733buBackend {
         }
         self.bb_set(0x1880, 1 << 21, 0x0)?;
         self.bb_set(0x1bd4, 0xFFFF_FFFF, 0x002c_0001)?; // select IDAC readout
+        std::thread::sleep(Duration::from_millis(1)); // let the readout latch settle
         let reg = self.read32(0x1bfc)?;
+        if dbg {
+            let (r2, r3) = (self.read32(0x1bfc)?, self.read32(0x1bfc)?);
+            eprintln!("[lok-rb] 0x1bfc x3 = {reg:#010x} {r2:#010x} {r3:#010x}");
+        }
         let mut idac_ic = ((reg >> 25) & 0x1F) + ((reg >> 24) & 1);
         let mut idac_qc = ((reg >> 5) & 0x1F) + ((reg >> 4) & 1);
         idac_ic = idac_ic.min(0x1f); // clamp — the 5-bit RF 0x08 field wraps at 0x20

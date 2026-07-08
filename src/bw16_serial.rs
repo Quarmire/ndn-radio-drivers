@@ -14,7 +14,27 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use ndn_frame_io::{CapturedFrame, FrameFormat, FrameIo, InjectFrame, McsDescriptor, WifiRadio, frame};
+use ndn_frame_io::{
+    CapturedFrame, ClockDomainId, FrameFormat, FrameIo, InjectFrame, LatchPoint, LinkStamp,
+    McsDescriptor, RadioTime, RadioTimeSource, WifiRadio, frame,
+};
+
+/// Host monotonic clock domain — shared by every host-stamped frame in this process (the serial
+/// board has no hardware TSF, so its stamps are host-side). Distinct from per-device TSF domains.
+const HOST_CLOCK_DOMAIN: ClockDomainId = ClockDomainId(0x484F_5354); // "HOST"
+
+/// A HostRecv [`LinkStamp`]: nanoseconds since process start (monotonic), latched when the serial
+/// line delivered the frame — the coarsest but honest time a serial board can offer.
+fn host_stamp() -> LinkStamp {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let start = START.get_or_init(std::time::Instant::now);
+    LinkStamp::new(
+        start.elapsed().as_nanos() as u64,
+        HOST_CLOCK_DOMAIN,
+        LatchPoint::HostRecv.precision_floor_ns(),
+        LatchPoint::HostRecv,
+    )
+}
 use ndn_radio_hal::{Bandwidth, RadioKnobs};
 use ndn_transport::FaceError;
 use tokio::sync::{Mutex as AsyncMutex, mpsc};
@@ -153,7 +173,11 @@ fn reader_loop(
                 while let Some((ty, payload, consumed)) = deframe(&acc) {
                     if ty == T_RX && !payload.is_empty() {
                         let rssi = payload[0] as i8;
-                        if let Some(cap) = frame::parse_dot11(format, &payload[1..], Some(rssi), None, None) {
+                        // The board carries RSSI but no hardware timestamp, so stamp HostRecv
+                        // when the serial line delivered the frame (see RadioTime impl).
+                        if let Some(cap) =
+                            frame::parse_dot11(format, &payload[1..], Some(rssi), None, Some(host_stamp()))
+                        {
                             if tx.send(cap).is_err() {
                                 return; // backend dropped
                             }
@@ -223,6 +247,19 @@ impl RadioKnobs for Bw16SerialBackend {
         // Reachable on the Rust firmware (reimplemented txpower). Index is clamped
         // into a byte for the wext command.
         self.set_txpower(idx.min(u8::MAX as u32) as u8)
+    }
+}
+
+/// Reference [`RadioTime`] for the `HostRecv` clock kind: the serial board reports no hardware
+/// timestamp, so its only honest link clock is the host monotonic clock read when the serial
+/// line delivered the frame. It is readable on demand, so `read_clock` returns it.
+impl RadioTime for Bw16SerialBackend {
+    fn time_sources(&self) -> Vec<RadioTimeSource> {
+        vec![RadioTimeSource::host_recv(HOST_CLOCK_DOMAIN)]
+    }
+
+    fn read_clock(&self, domain: ClockDomainId) -> Result<Option<u64>, FaceError> {
+        Ok((domain == HOST_CLOCK_DOMAIN).then(|| host_stamp().raw))
     }
 }
 

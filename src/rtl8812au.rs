@@ -1615,6 +1615,11 @@ impl Rtl8812auBackend {
         self.bb_config()?;
         self.rf_config()?;
         self.set_channel(channel)?;
+        // TXAGC: without this the TXAGC registers sit at their reset default (~0), so injected
+        // frames leave the PA at essentially zero power — the frame is built + queued but never
+        // radiates decodably (SDR-confirmed: no on-air energy until this is set). A mid-high
+        // uniform index gives real range for a monitor/broadcast face.
+        self.set_tx_power(0x3f)?;
         let _ = self.iq_calibrate(); // best-effort; tunes RX EVM, not the on-air gate
         let _ = self.lc_calibrate();
         self.start_rx_dma()?;

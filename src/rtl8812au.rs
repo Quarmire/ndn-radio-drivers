@@ -402,6 +402,153 @@ static CH36_5G_PROGRAM: &[(u16, u8, u32)] = &[
     (0x0e50, 4, 0x00000024),
     (0x08b0, 4, 0x00000642),
 ];
+/// The RTL8812AU **5 GHz ch149** channel program (golden/rtw88-8812au-ch149-5g), same capture
+/// method as ch36 — the per-channel fc_area + TXAGC + RF writes differ; band-switch writes match.
+static CH149_5G_PROGRAM: &[(u16, u8, u32)] = &[
+    (0x0860, 4, 0x72d5c321),
+    (0x08b0, 4, 0x00000618),
+    (0x0c90, 4, 0x0180702a),
+    (0x08ac, 4, 0x0ff0fa0a),
+    (0x08ac, 4, 0x0ff0fa0a),
+    (0x08c4, 4, 0x00000000),
+    (0x08b0, 4, 0x00000618),
+    (0x0c90, 4, 0x01807001),
+    (0x08b0, 4, 0x00000618),
+    (0x0e90, 4, 0x0180702a),
+    (0x08ac, 4, 0x0ff0fa0a),
+    (0x08ac, 4, 0x0ff0fa0a),
+    (0x08c4, 4, 0x00000000),
+    (0x08b0, 4, 0x00000618),
+    (0x0e90, 4, 0x01807001),
+    (0x0668, 2, 0x00001000),
+    (0x08ac, 4, 0x0ff0fa08),
+    (0x08c4, 4, 0x00000000),
+    (0x0848, 4, 0x61d0ff8b),
+    (0x08ac, 4, 0x0ff0fa08),
+    (0x08ac, 4, 0x0ff0fa08),
+    (0x08c4, 4, 0x00000000),
+    (0x08b0, 4, 0x00000618),
+    (0x0c90, 4, 0x01807c01),
+    (0x08b0, 4, 0x00000618),
+    (0x0e90, 4, 0x01807c01),
+    (0x0c20, 4, 0x13131313),
+    (0x0c24, 4, 0x20202020),
+    (0x0c28, 4, 0x1c1e2020),
+    (0x0c2c, 4, 0x20202020),
+    (0x0c30, 4, 0x1c1e2020),
+    (0x0c34, 4, 0x20202020),
+    (0x0c38, 4, 0x1a1c1e20),
+    (0x0c3c, 4, 0x20202020),
+    (0x0c40, 4, 0x1c1e2020),
+    (0x0c44, 4, 0x1e1e181a),
+    (0x0c48, 4, 0x1e1e1e1e),
+    (0x0c4c, 4, 0x16181a1c),
+    (0x0c54, 4, 0x00040a12),
+    (0x0e20, 4, 0x14141414),
+    (0x0e24, 4, 0x1d1d1d1d),
+    (0x0e28, 4, 0x191b1d1d),
+    (0x0e2c, 4, 0x1f1f1f1f),
+    (0x0e30, 4, 0x1b1d1f1f),
+    (0x0e34, 4, 0x1f1f1f1f),
+    (0x0e38, 4, 0x191b1d1f),
+    (0x0e3c, 4, 0x1f1f1f1f),
+    (0x0e40, 4, 0x1b1d1f1f),
+    (0x0e44, 4, 0x1d1d1719),
+    (0x0e48, 4, 0x1d1d1d1d),
+    (0x0e4c, 4, 0x1517191b),
+    (0x0e54, 4, 0x00030911),
+    (0x0454, 1, 0x00000080),
+    (0x0808, 4, 0x3e028233),
+    (0x0834, 4, 0x0037a706),
+    (0x0830, 4, 0x2eaaaeb8),
+    (0x0830, 4, 0x2eaaaeb8),
+    (0x082c, 4, 0x002083dd),
+    (0x0cb0, 4, 0x54337717),
+    (0x0eb0, 4, 0x54337717),
+    (0x0cb4, 4, 0x01000077),
+    (0x0eb4, 4, 0x01000077),
+    (0x0900, 4, 0x00000401),
+    (0x080c, 4, 0x12131103),
+    (0x0a04, 4, 0x0fff000c),
+    (0x0c1c, 4, 0x2d400003),
+    (0x0e1c, 4, 0x2d400003),
+    (0x0860, 4, 0x6825c321),
+    (0x08b0, 4, 0x00000618),
+    (0x0c90, 4, 0x01857d01),
+    (0x08ac, 4, 0x0ff0fa08),
+    (0x08ac, 4, 0x0ff0fa08),
+    (0x08c4, 4, 0x00000000),
+    (0x08b0, 4, 0x00000618),
+    (0x0c90, 4, 0x01817d95),
+    (0x08b0, 4, 0x00000618),
+    (0x0e90, 4, 0x01857d01),
+    (0x08ac, 4, 0x0ff0fa08),
+    (0x08ac, 4, 0x0ff0fa08),
+    (0x08c4, 4, 0x00000000),
+    (0x08b0, 4, 0x00000618),
+    (0x0e90, 4, 0x01817d95),
+    (0x0668, 2, 0x00001000),
+    (0x08ac, 4, 0x0ff0fa08),
+    (0x08c4, 4, 0x00000000),
+    (0x0848, 4, 0x61d0ff8b),
+    (0x08ac, 4, 0x0ff0fa08),
+    (0x08ac, 4, 0x0ff0fa08),
+    (0x08c4, 4, 0x00000000),
+    (0x08b0, 4, 0x00000618),
+    (0x0c90, 4, 0x01857d95),
+    (0x08b0, 4, 0x00000618),
+    (0x0e90, 4, 0x01857d95),
+    (0x0c24, 4, 0x30303030),
+    (0x0c28, 4, 0x2c2e3030),
+    (0x0c2c, 4, 0x35353535),
+    (0x0c30, 4, 0x2d2f3133),
+    (0x0c34, 4, 0x31313131),
+    (0x0c38, 4, 0x2b2d2f31),
+    (0x0c3c, 4, 0x35353535),
+    (0x0c40, 4, 0x2d2f3133),
+    (0x0c44, 4, 0x31312b2b),
+    (0x0c48, 4, 0x2f313131),
+    (0x0c4c, 4, 0x29292b2d),
+    (0x0c54, 4, 0x00151b23),
+    (0x0e24, 4, 0x1e1e1e1e),
+    (0x0e28, 4, 0x1a1c1e1e),
+    (0x0e2c, 4, 0x23232323),
+    (0x0e30, 4, 0x1b1d1f21),
+    (0x0e34, 4, 0x1f1f1f1f),
+    (0x0e38, 4, 0x191b1d1f),
+    (0x0e3c, 4, 0x23232323),
+    (0x0e40, 4, 0x1b1d1f21),
+    (0x0e44, 4, 0x1f1f1919),
+    (0x0e48, 4, 0x1d1f1f1f),
+    (0x0e4c, 4, 0x1717191b),
+    (0x0e54, 4, 0x00030911),
+    (0x09a4, 4, 0x000a0080),
+    (0x09a4, 4, 0x00080080),
+    (0x0a2c, 4, 0x00900000),
+    (0x0a2c, 4, 0x00908000),
+    (0x0b58, 4, 0x00000001),
+    (0x0b58, 4, 0x00000000),
+    (0x0c50, 4, 0x00000022),
+    (0x0e50, 4, 0x00000022),
+    (0x08b0, 4, 0x00000642),
+    (0x0c90, 4, 0x04238910),
+    (0x09a4, 4, 0x000a0080),
+    (0x09a4, 4, 0x00080080),
+    (0x0a2c, 4, 0x00900000),
+    (0x0a2c, 4, 0x00908000),
+    (0x0b58, 4, 0x00000001),
+    (0x0b58, 4, 0x00000000),
+    (0x0c50, 4, 0x00000020),
+    (0x0e50, 4, 0x00000020),
+    (0x08b0, 4, 0x00000642),
+    (0x0c1c, 4, 0x39000003),
+    (0x0e1c, 4, 0x32e00003),
+];
+
+/// Per-channel 5 GHz programs, keyed by channel. Extend by capturing a usbmon golden trace on a
+/// new 5 GHz channel (see golden/). ch36 = UNII-1, ch149 = UNII-3 (both sub-bands covered).
+static PROGS_5G: &[(u8, &[(u16, u8, u32)])] = &[(36, CH36_5G_PROGRAM), (149, CH149_5G_PROGRAM)];
+
 
 /// Management-queue select (`QSLT_MGNT`) + its rate-adaptation group
 /// (`RATEID_IDX_G`, the OFDM/11g table).
@@ -972,14 +1119,20 @@ impl Rtl8812auBackend {
     /// ([`rf_config`](Self::rf_config)). Verify by reading RF `0x18` back (byte 0
     /// = channel).  Assumes `rfe_type == 0` (the common generic-dongle RFE).
     pub fn set_channel(&self, channel: u8) -> Result<(), FaceError> {
-        // 5 GHz: replay the kernel rtw88 driver's exact ch36 channel program verbatim (from the
-        // usbmon golden trace, golden/rtw88-8812au-ch36-5g). The band switch (BB + RFE), the RF
-        // `0x18`/LSSI channel writes, and the 5 GHz TXAGC tables are a single interdependent
-        // sequence — piecemeal deltas onto the 2.4 path did not work, so we apply the whole thing.
-        // ch36-specific for now (the RF + fc_area writes are per-channel; other 5 GHz channels need
-        // their own trace).
+        // 5 GHz: replay the kernel rtw88 driver's exact per-channel program (usbmon golden traces
+        // in golden/). The band switch (BB + RFE), the RF `0x18`/LSSI channel writes, and the 5 GHz
+        // TXAGC tables are a single interdependent sequence — piecemeal deltas onto the 2.4 path did
+        // not work, so the whole thing is applied. The band-switch writes are channel-constant; the
+        // RF, fc_area, and TXAGC writes are per-channel, so each channel has its own traced program
+        // ([`PROGS_5G`]). Untraced 5 GHz channels error (capture a trace to add one).
         if channel > 14 {
-            return self.apply_reg_program(CH36_5G_PROGRAM);
+            return match PROGS_5G.iter().find(|(ch, _)| *ch == channel) {
+                Some((_, prog)) => self.apply_reg_program(prog),
+                None => Err(init_err(format!(
+                    "rtl8812au: 5 GHz ch{channel} not traced (have {:?}); capture a golden trace",
+                    PROGS_5G.iter().map(|(c, _)| *c).collect::<Vec<_>>()
+                ))),
+            };
         }
 
         // ── 2.4 GHz band switch (BB) — production two-way named-time on-air ──

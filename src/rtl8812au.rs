@@ -1677,6 +1677,16 @@ impl Rtl8812auBackend {
                     u32::from_le_bytes([d[20], d[21], d[22], d[23]]),
                     self.tsf_domain,
                 ));
+                // Raw capture debug (pre-parse): shows every 802.11 frame the chip delivered,
+                // independent of whether parse_dot11 accepts it — isolates RX-capture vs RX-parse.
+                // First 2 header bytes (frame-control) + first payload byte after the 24-B hdr.
+                if std::env::var("NDN_RX_META_DBG").is_ok() {
+                    let fc = if body.len() >= 2 { (body[0], body[1]) } else { (0, 0) };
+                    eprintln!(
+                        "RX8812AU len={pkt_len} rate=0x{rate:02x} rssi={rssi_dbm:?} fc={:02x}{:02x}",
+                        fc.0, fc.1
+                    );
+                }
                 match self.format {
                     // named-time: extract the NDN payload from the 802.11 data frame.
                     FrameFormat::RawNdn { .. } => {

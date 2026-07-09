@@ -5355,7 +5355,13 @@ impl FrameIo for Rtl8812auBackend {
         let handle = self.handle.clone();
         let ep = self.bulk_out;
         let dot11 = frame::build_dot11(self.format, &frame)?;
-        let buf = Self::tx_buffer(&dot11, DESC_RATE_6M);
+        // Default legacy 6 Mbps; NDN_RADIO_TX_RATE=<dec> forces a DESC_RATE code for diagnostics
+        // (e.g. 12 = HT-MCS0, 44 = VHT-1SS-MCS0 — to test a peer's 1SS/20 MHz HT/VHT RX).
+        let rate = std::env::var("NDN_RADIO_TX_RATE")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(DESC_RATE_6M);
+        let buf = Self::tx_buffer(&dot11, rate);
         tokio::task::spawn_blocking(move || {
             handle
                 .write_bulk(ep, &buf, TX_TIMEOUT)

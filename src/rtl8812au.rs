@@ -260,11 +260,14 @@ const RXDESC_SIZE: usize = 24;
 /// OFDM, the rate real NAN devices emit beacons/SDFs at.
 const DESC_RATE_6M: u32 = 0x04;
 
+/// A captured register program: `(addr, width-in-bytes, value)` writes applied in order.
+type RegProgram = &'static [(u16, u8, u32)];
+
 /// The RTL8812AU **5 GHz ch36** channel program — the BB/RFE/RF/TXAGC band-switch writes
 /// captured from the kernel `rtw88_8812au` driver via usbmon (golden/rtw88-8812au-ch36-5g).
 /// MAC/sys-control writes are filtered out (they reset the device out of kernel context).
 /// `(addr, width_bytes, value)`, applied in order by [`Rtl8812auBackend::set_channel`].
-static CH36_5G_PROGRAM: &[(u16, u8, u32)] = &[
+static CH36_5G_PROGRAM: RegProgram = &[
     (0x0860, 4, 0x72d5c321),
     (0x08b0, 4, 0x00000618),
     (0x0c90, 4, 0x0180702a),
@@ -404,7 +407,7 @@ static CH36_5G_PROGRAM: &[(u16, u8, u32)] = &[
 ];
 /// The RTL8812AU **5 GHz ch149** channel program (golden/rtw88-8812au-ch149-5g), same capture
 /// method as ch36 — the per-channel fc_area + TXAGC + RF writes differ; band-switch writes match.
-static CH149_5G_PROGRAM: &[(u16, u8, u32)] = &[
+static CH149_5G_PROGRAM: RegProgram = &[
     (0x0860, 4, 0x72d5c321),
     (0x08b0, 4, 0x00000618),
     (0x0c90, 4, 0x0180702a),
@@ -547,7 +550,7 @@ static CH149_5G_PROGRAM: &[(u16, u8, u32)] = &[
 
 /// Per-channel 5 GHz programs, keyed by channel. Extend by capturing a usbmon golden trace on a
 /// new 5 GHz channel (see golden/). ch36 = UNII-1, ch149 = UNII-3 (both sub-bands covered).
-static PROGS_5G: &[(u8, &[(u16, u8, u32)])] = &[(36, CH36_5G_PROGRAM), (149, CH149_5G_PROGRAM)];
+static PROGS_5G: &[(u8, RegProgram)] = &[(36, CH36_5G_PROGRAM), (149, CH149_5G_PROGRAM)];
 
 
 /// Management-queue select (`QSLT_MGNT`) + its rate-adaptation group

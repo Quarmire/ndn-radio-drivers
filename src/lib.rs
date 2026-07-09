@@ -42,6 +42,14 @@ mod bw16_serial;
 #[cfg(feature = "bw16")]
 pub use bw16_serial::{BW16_BAUD, Bw16SerialBackend};
 
+// Waveshare USB-TO-LoRa (SX1262) serial-bridged sub-GHz backend: a transparent-mode byte pipe with
+// host-supplied framing and AT-programmed radio params, implementing the same FrameIo/RadioTime/
+// RadioProfile contract as the USB drivers (see src/lora_serial.rs).
+#[cfg(feature = "lora")]
+mod lora_serial;
+#[cfg(feature = "lora")]
+pub use lora_serial::{LORA_BAUD, LoraParams, LoraSerialBackend, MAX_LORA_PAYLOAD};
+
 // The control-plane `RadioKnobs` impls for the driver backends. These live with
 // the driver types (the trait is from `ndn-radio-hal`, the types are declared
 // here) — the orphan rule requires the impl travel with the local type. The

@@ -24,6 +24,8 @@ serialport = { version = "4", optional = true }
 default = []
 # The BW16 (RTL8720DN) serial-bridged monitor-mode backend.
 bw16 = ["dep:serialport"]
+# The Waveshare USB-TO-LoRa (SX1262) serial-bridged sub-GHz backend.
+lora = ["dep:serialport"]
 
 # BW16 examples need the `bw16` backend — gate them so `cargo build --examples`
 # (default features) skips them instead of failing on the unresolved import.
@@ -42,6 +44,10 @@ required-features = ["bw16"]
 [[example]]
 name = "bw16_knobs"
 required-features = ["bw16"]
+
+[[example]]
+name = "lora_link"
+required-features = ["lora"]
 
 [dev-dependencies]
 # Cross-repo: the live named-time driver (wifi transport) for the on-air node example.

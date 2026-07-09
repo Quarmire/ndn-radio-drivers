@@ -828,30 +828,62 @@ impl Rtl8812auBackend {
     /// ([`rf_config`](Self::rf_config)). Verify by reading RF `0x18` back (byte 0
     /// = channel).  Assumes `rfe_type == 0` (the common generic-dongle RFE).
     pub fn set_channel(&self, channel: u8) -> Result<(), FaceError> {
-        // ── 2.4 GHz band switch (BB) ──
-        self.bb_set(0x0808, 0x3000_0000, 0x03)?; // OFDM + CCK enable (0x808)
+        // Band switch (`PHY_SwitchWirelessBand8812`): 2.4 GHz (ch 1–14) or 5 GHz (ch ≥ 36). The RF
+        // tables from `rf_config` are full-band; here we set the BB band mode + the RF `0x18`
+        // channel/band. 2.4 GHz is production (two-way named-time on-air).
+        //
+        // **5 GHz is SCAFFOLDING, not yet functional.** The deltas below mirror the shared Jaguar
+        // path (8822E `set_channel_bw20`): OFDM-only, 5 GHz AGC table, RF `0x18` band markers +
+        // sub-band. On-air this gets the synthesiser roughly on-band (ambient RX rose from 0 to a
+        // couple of frames on ch36/149) but the 5 GHz RX sensitivity + TX are NOT working — the
+        // pair does not converge on 5 GHz. The exact 8812A 5 GHz tuning (fc_area, the 5 GHz AGC
+        // table, PD_TH, the RFE pinmux, and the 5 GHz TXAGC) needs the vendor
+        // `phy_SwitchWirelessBand8812` source or a usbmon golden trace of the kernel driver on a
+        // 5 GHz channel. Until then, use 2.4 GHz for the 8812AU.
+        let is_5g = channel > 14;
+
+        // ── band switch (BB) ──
+        // 0x808[29:28]: 2.4 GHz = OFDM+CCK (0x3); 5 GHz = OFDM only (0x2 — no CCK PHY on 5 GHz).
+        self.bb_set(0x0808, 0x3000_0000, if is_5g { 0x02 } else { 0x03 })?;
         self.bb_set(0x0834, 0x3, 0x1)?; // BW indication
         self.bb_set(0x0830, 0x3_E000, 0x17)?; // PD_TH 0x830[17:13]
         self.bb_set(0x0830, 0xE, 0x04)?; // 0x830[3:1] = 100 (2T)
-        self.bb_set(0x082C, 0x3, 0x0)?; // AGC table select 2.4 G
-        // RFE (rfe_type 0): pinmux 0x77777777, inv 0.
+        // AGC table select: 2.4 GHz = 0; 5 GHz = 1.
+        self.bb_set(0x082C, 0x3, if is_5g { 0x1 } else { 0x0 })?;
+        // RFE (rfe_type 0): pinmux 0x77777777, inv 0 (generic dongle, both bands).
         self.write32(0x0CB0, 0x7777_7777)?;
         self.write32(0x0EB0, 0x7777_7777)?;
         self.bb_set(0x0CB4, 0x3FF0_0000, 0x000)?;
         self.bb_set(0x0EB4, 0x3FF0_0000, 0x000)?;
-        // CCK FA / scan workaround + CCK check (clear 0x454[7] for 2.4 G).
-        self.bb_set(0x080C, 0xF0, 0x1)?;
-        self.bb_set(0x0A04, 0x0F00_0000, 0x1)?;
+        // CCK FA / scan workaround (2.4 GHz only).
+        if !is_5g {
+            self.bb_set(0x080C, 0xF0, 0x1)?;
+            self.bb_set(0x0A04, 0x0F00_0000, 0x1)?;
+        }
+        // CCK check 0x454[7]: clear for 2.4 GHz (CCK present), set for 5 GHz (none).
         let cck = self.read8(0x0454)?;
-        self.write8(0x0454, cck & !0x80)?;
+        self.write8(0x0454, if is_5g { cck | 0x80 } else { cck & !0x80 })?;
 
-        // fc_area (channel < 36).
-        self.bb_set(0x0860, 0x1FFE_0000, 0x96A)?;
+        // fc_area 0x860[28:17]: band-dependent RX AGC frequency area (5G? value).
+        self.bb_set(0x0860, 0x1FFE_0000, if is_5g { 0x484 } else { 0x96A })?;
 
         // ── RF channel + band/mode + bandwidth, both paths ──
         for path in [RfPath::A, RfPath::B] {
-            // RF_MOD_AG: 2.4 G band/mode (bits 18,17,16,9,8 = 0).
-            self.rf_set(path, 0x18, 0x7_0300, 0x000)?;
+            // RF_MOD_AG 0x18: 2.4 GHz clears band bits (18,17,16,9,8); 5 GHz sets band (BIT16|BIT8)
+            // + sub-band (BIT17 for ch ≥ 80, BIT18 for ch > 144), like the 8822E path.
+            let band = if is_5g {
+                let sub = if channel > 144 {
+                    1 << 18
+                } else if channel >= 80 {
+                    1 << 17
+                } else {
+                    0
+                };
+                (1 << 16) | (1 << 8) | sub
+            } else {
+                0
+            };
+            self.rf_set(path, 0x18, 0x7_0300, band)?;
             // Bandwidth bits [11:10] = 20 MHz.
             self.rf_set(path, 0x18, 0xC00, 0x3)?;
             // Channel number (byte 0).
@@ -860,7 +892,9 @@ impl Rtl8812auBackend {
 
         // ── 20 MHz bandwidth (BB + MAC) ──
         self.bb_set(0x08AC, 0x0030_03C3, 0x0030_0200)?; // rRFMOD 20 MHz
-        self.bb_set(0x08AC, 0x300, 0x2)?; // spur workaround, ch ≤ 14
+        if !is_5g {
+            self.bb_set(0x08AC, 0x300, 0x2)?; // spur workaround, ch ≤ 14
+        }
         let trx = self.read16(0x0668)?;
         self.write16(0x0668, trx & 0xFE7F)?; // WMAC TRXPTCL: 20 MHz (BIT7=BIT8=0)
         Ok(())

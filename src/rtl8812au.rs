@@ -35,15 +35,13 @@ use std::io;
 use std::sync::Arc;
 use std::time::Duration;
 
-use std::collections::VecDeque;
-use std::sync::Mutex;
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use rusb::{Context, Device, DeviceHandle, Direction, TransferType, UsbContext};
 
 use crate::realtek_rx;
-use ndn_frame_io::{CapturedFrame, ClockDomainId, FrameIo, InjectFrame};
+use ndn_frame_io::{frame, CapturedFrame, ClockDomainId, FrameFormat, FrameIo, InjectFrame};
 use ndn_radio_hal::{Band, RadioCapability, RadioProfile, RadioTime, RadioTimeSource};
 use ndn_transport::FaceError;
 
@@ -310,9 +308,13 @@ pub struct Rtl8812auBackend {
     bulk_in: u8,
     /// The product id we matched (diagnostics).
     pid: u16,
-    /// RX frames de-aggregated from one bulk-IN URB (the 8812A stacks several
-    /// 802.11 packets per USB transfer); drained one per `recv_frame` call.
-    rx_pending: Mutex<VecDeque<CapturedFrame>>,
+    /// On-air frame format: `Raw80211` (NAN — the payload is a complete 802.11 frame) or a
+    /// `RawNdn { ethertype }` (named-time — wrap/extract the NDN payload). Set via
+    /// [`with_format`](Self::with_format); defaults to `Raw80211` for the NAN path.
+    format: FrameFormat,
+    /// Shared async-URB RX pipeline: the queue background pump threads fill and `recv_frame`
+    /// drains (the 8812A stacks several 802.11 packets per USB transfer). See [`crate::rx_pump`].
+    rx_pump: crate::rx_pump::RxPumpState,
     /// Clock domain of this device's free-run RX-stamp TSF (per-device, from the USB bus/address).
     tsf_domain: ClockDomainId,
 }
@@ -375,7 +377,8 @@ impl Rtl8812auBackend {
             bulk_out: bulk_out.ok_or_else(no_ep)?,
             bulk_in: bulk_in.ok_or_else(no_ep)?,
             pid,
-            rx_pending: Mutex::new(VecDeque::new()),
+            format: FrameFormat::Raw80211,
+            rx_pump: crate::rx_pump::RxPumpState::new(),
             tsf_domain,
         })
     }
@@ -1640,9 +1643,10 @@ impl Rtl8812auBackend {
     /// queued on `rx_pending`. The 8812A stacks `RXDESC ++ drvinfo ++ shift ++
     /// frame` per packet, each 8-byte aligned (`recvbuf2recvframe`); CRC-error
     /// and firmware-report (C2H) packets are dropped.
-    fn parse_rx_buffer(&self, buf: &[u8], n: usize) {
+    fn parse_rx_transfer(&self, buf: &[u8]) -> Vec<CapturedFrame> {
+        let n = buf.len();
         let mut off = 0;
-        let mut q = self.rx_pending.lock().unwrap();
+        let mut q: Vec<CapturedFrame> = Vec::new();
         while off + RXDESC_SIZE <= n {
             let d = &buf[off..];
             let w0 = u32::from_le_bytes([d[0], d[1], d[2], d[3]]);
@@ -1662,14 +1666,9 @@ impl Rtl8812auBackend {
             }
             if !crc_err && !rpt_sel && pkt_len >= DOT11_HDR_LEN {
                 let body = &d[start..end];
-                let mut ta = [0u8; 6];
-                ta.copy_from_slice(&body[10..16]);
-                let mut group = [0u8; 6];
-                group.copy_from_slice(&body[4..10]);
                 // Same Realtek RX-descriptor field interpretation as the sibling backends
                 // (realtek_rx): RX HwRate (dword3) -> MCS; path-A power pwdb_a (phystatus byte 1)
-                // -> RSSI; RXTSFL (dword5) -> free-run per-frame hardware stamp. Useful for NAN
-                // neighbor ranking + named-time even though this backend is management-frame only.
+                // -> RSSI; RXTSFL (dword5) -> free-run per-frame hardware stamp.
                 let rate = (u32::from_le_bytes([d[12], d[13], d[14], d[15]]) & 0x7f) as u8;
                 let mcs_index = realtek_rx::mcs_from_desc_rate(rate);
                 let rssi_dbm = (drvinfo >= 1 && rate >= 0x04)
@@ -1678,32 +1677,80 @@ impl Rtl8812auBackend {
                     u32::from_le_bytes([d[20], d[21], d[22], d[23]]),
                     self.tsf_domain,
                 ));
-                q.push_back(CapturedFrame {
-                    payload: Bytes::copy_from_slice(body),
-                    addr: Some(ta),
-                    group: Some(group),
-                    rssi_dbm,
-                    mcs_index,
-                    stamp,
-                });
+                match self.format {
+                    // named-time: extract the NDN payload from the 802.11 data frame.
+                    FrameFormat::RawNdn { .. } => {
+                        if let Some(cap) =
+                            frame::parse_dot11(self.format, body, rssi_dbm, mcs_index, stamp)
+                        {
+                            q.push(cap);
+                        }
+                    }
+                    // NAN / Raw80211: capture the raw 802.11 body, source/group MACs preserved.
+                    _ => {
+                        let mut ta = [0u8; 6];
+                        ta.copy_from_slice(&body[10..16]);
+                        let mut group = [0u8; 6];
+                        group.copy_from_slice(&body[4..10]);
+                        q.push(CapturedFrame {
+                            payload: Bytes::copy_from_slice(body),
+                            addr: Some(ta),
+                            group: Some(group),
+                            rssi_dbm,
+                            mcs_index,
+                            stamp,
+                        });
+                    }
+                }
             }
             off += (start + pkt_len + 7) & !7; // next subframe, 8-byte aligned
         }
+        q
+    }
+
+    /// Set the on-air frame format — `RawNdn { ethertype }` for named-time (wrap/extract the NDN
+    /// payload), leaving the NAN default `Raw80211` otherwise. Consumes/returns `self` (builder).
+    pub fn with_format(mut self, format: FrameFormat) -> Self {
+        self.format = format;
+        self
+    }
+
+    /// Start `depth` background reader threads — USB RX pipelining via the shared [`crate::rx_pump`]
+    /// (the async-URB path). Afterwards `recv_frame` drains the shared queue.
+    pub fn spawn_rx_pump(self: &Arc<Self>, depth: usize) -> Vec<std::thread::JoinHandle<()>> {
+        crate::rx_pump::spawn_rx_pump(self, depth)
     }
 
     /// Synchronously poll for one captured 802.11 frame: drain the de-aggregation
     /// queue, else do one bulk-IN read (returns `None` on timeout / no frame).
     pub fn poll_frame(&self) -> Result<Option<CapturedFrame>, FaceError> {
-        if let Some(f) = self.rx_pending.lock().unwrap().pop_front() {
+        if let Some(f) = self.rx_pump.try_pop() {
             return Ok(Some(f));
         }
         let mut buf = vec![0u8; 16384];
         match self.handle.read_bulk(self.bulk_in, &mut buf, RX_TIMEOUT) {
-            Ok(n) => self.parse_rx_buffer(&buf, n),
+            Ok(n) => self.rx_pump.push(self.parse_rx_transfer(&buf[..n])),
             Err(rusb::Error::Timeout) => return Ok(None),
             Err(e) => return Err(usb_err(e)),
         }
-        Ok(self.rx_pending.lock().unwrap().pop_front())
+        Ok(self.rx_pump.try_pop())
+    }
+}
+
+/// The RX pump's per-transfer parse for the 8812AU — shares the async-URB pipeline with the other
+/// Realtek USB backends via one [`crate::rx_pump`] implementation.
+impl crate::rx_pump::Pumpable for Rtl8812auBackend {
+    fn pump_handle(&self) -> Arc<DeviceHandle<Context>> {
+        self.handle.clone()
+    }
+    fn pump_bulk_in(&self) -> u8 {
+        self.bulk_in
+    }
+    fn pump_state(&self) -> &crate::rx_pump::RxPumpState {
+        &self.rx_pump
+    }
+    fn parse_transfer(&self, buf: &[u8]) -> Vec<CapturedFrame> {
+        self.parse_rx_transfer(buf)
     }
 }
 
@@ -1713,12 +1760,14 @@ impl Rtl8812auBackend {
 #[async_trait]
 impl FrameIo for Rtl8812auBackend {
     async fn inject(&self, frame: InjectFrame) -> Result<(), FaceError> {
-        // `payload` is the whole 802.11 frame; inject verbatim at legacy 6 Mbps
-        // OFDM (what real NAN devices emit). The HT/VHT `mcs` does not apply to a
-        // legacy management frame, so it is intentionally ignored here.
+        // Build the on-air 802.11 frame under the configured format (Raw80211 = the payload IS the
+        // frame, verbatim, the NAN path; RawNdn = wrap the NDN payload in an 802.11 data frame),
+        // then inject at legacy 6 Mbps OFDM — universally decodable (real NAN + a legacy-only 8733b
+        // RX alike). The HT/VHT `mcs` does not apply to a legacy frame, so it is ignored here.
         let handle = self.handle.clone();
         let ep = self.bulk_out;
-        let buf = Self::tx_buffer(&frame.payload, DESC_RATE_6M);
+        let dot11 = frame::build_dot11(self.format, &frame)?;
+        let buf = Self::tx_buffer(&dot11, DESC_RATE_6M);
         tokio::task::spawn_blocking(move || {
             handle
                 .write_bulk(ep, &buf, TX_TIMEOUT)
@@ -1730,8 +1779,12 @@ impl FrameIo for Rtl8812auBackend {
     }
 
     async fn recv_frame(&self) -> Result<CapturedFrame, FaceError> {
+        // Pumped mode: background reader threads fill the shared queue; just drain it.
+        if self.rx_pump.is_pumped() {
+            return Ok(self.rx_pump.recv().await);
+        }
         loop {
-            if let Some(f) = self.rx_pending.lock().unwrap().pop_front() {
+            if let Some(f) = self.rx_pump.try_pop() {
                 return Ok(f);
             }
             let handle = self.handle.clone();
@@ -1747,7 +1800,7 @@ impl FrameIo for Rtl8812auBackend {
             .await
             .map_err(|e| init_err(format!("recv join: {e}")))??;
             if n > 0 {
-                self.parse_rx_buffer(&buf, n);
+                self.rx_pump.push(self.parse_rx_transfer(&buf[..n]));
             }
         }
     }

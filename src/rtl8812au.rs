@@ -850,11 +850,21 @@ impl Rtl8812auBackend {
         self.bb_set(0x0830, 0xE, 0x04)?; // 0x830[3:1] = 100 (2T)
         // AGC table select: 2.4 GHz = 0; 5 GHz = 1.
         self.bb_set(0x082C, 0x3, if is_5g { 0x1 } else { 0x0 })?;
-        // RFE (rfe_type 0): pinmux 0x77777777, inv 0 (generic dongle, both bands).
-        self.write32(0x0CB0, 0x7777_7777)?;
-        self.write32(0x0EB0, 0x7777_7777)?;
-        self.bb_set(0x0CB4, 0x3FF0_0000, 0x000)?;
-        self.bb_set(0x0EB4, 0x3FF0_0000, 0x000)?;
+        // RFE pinmux — the RF front-end band routing. 2.4 GHz = generic 0x77777777; 5 GHz =
+        // 0x17773354 (+ 0xCB4/0xEB4 = 0x77000001), from the rtw88 kernel-driver usbmon golden trace
+        // (golden/rtw88-8812au-ch36-5g.*). Using the 2.4 pinmux on 5 GHz leaves the antenna path
+        // off-band — the reason the first-cut 5 GHz was deaf.
+        if is_5g {
+            self.write32(0x0CB0, 0x1777_3354)?;
+            self.write32(0x0EB0, 0x1777_3354)?;
+            self.write32(0x0CB4, 0x7700_0001)?;
+            self.write32(0x0EB4, 0x7700_0001)?;
+        } else {
+            self.write32(0x0CB0, 0x7777_7777)?;
+            self.write32(0x0EB0, 0x7777_7777)?;
+            self.bb_set(0x0CB4, 0x3FF0_0000, 0x000)?;
+            self.bb_set(0x0EB4, 0x3FF0_0000, 0x000)?;
+        }
         // CCK FA / scan workaround (2.4 GHz only).
         if !is_5g {
             self.bb_set(0x080C, 0xF0, 0x1)?;
@@ -864,8 +874,10 @@ impl Rtl8812auBackend {
         let cck = self.read8(0x0454)?;
         self.write8(0x0454, if is_5g { cck | 0x80 } else { cck & !0x80 })?;
 
-        // fc_area 0x860[28:17]: band-dependent RX AGC frequency area (5G? value).
-        self.bb_set(0x0860, 0x1FFE_0000, if is_5g { 0x484 } else { 0x96A })?;
+        // fc_area 0x860[28:17]: band/channel RX AGC frequency area. 2.4 GHz = 0x96A; 5 GHz ch36 =
+        // 0x0E1 (from the golden trace's final 0x860 = 0x21c32969). NOTE: channel-specific — this
+        // is the ch36 value; other 5 GHz channels need their own (a small per-channel table).
+        self.bb_set(0x0860, 0x1FFE_0000, if is_5g { 0x0E1 } else { 0x96A })?;
 
         // ── RF channel + band/mode + bandwidth, both paths ──
         for path in [RfPath::A, RfPath::B] {

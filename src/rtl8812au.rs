@@ -259,6 +259,150 @@ const RXDESC_SIZE: usize = 24;
 /// Hardware rate code (`DESC_RATE6M`) for the `TX_RATE` field — legacy 6 Mbps
 /// OFDM, the rate real NAN devices emit beacons/SDFs at.
 const DESC_RATE_6M: u32 = 0x04;
+
+/// The RTL8812AU **5 GHz ch36** channel program — the BB/RFE/RF/TXAGC band-switch writes
+/// captured from the kernel `rtw88_8812au` driver via usbmon (golden/rtw88-8812au-ch36-5g).
+/// MAC/sys-control writes are filtered out (they reset the device out of kernel context).
+/// `(addr, width_bytes, value)`, applied in order by [`Rtl8812auBackend::set_channel`].
+static CH36_5G_PROGRAM: &[(u16, u8, u32)] = &[
+    (0x0860, 4, 0x72d5c321),
+    (0x08b0, 4, 0x00000618),
+    (0x0c90, 4, 0x0180702a),
+    (0x08ac, 4, 0x0ff0fa0a),
+    (0x08ac, 4, 0x0ff0fa0a),
+    (0x08c4, 4, 0x00000000),
+    (0x08b0, 4, 0x00000618),
+    (0x0c90, 4, 0x01807001),
+    (0x08b0, 4, 0x00000618),
+    (0x0e90, 4, 0x0180702a),
+    (0x08ac, 4, 0x0ff0fa0a),
+    (0x08ac, 4, 0x0ff0fa0a),
+    (0x08c4, 4, 0x00000000),
+    (0x08b0, 4, 0x00000618),
+    (0x0e90, 4, 0x01807001),
+    (0x0668, 2, 0x00001000),
+    (0x08ac, 4, 0x0ff0fa08),
+    (0x08c4, 4, 0x00000000),
+    (0x0848, 4, 0x61d0ff8b),
+    (0x08ac, 4, 0x0ff0fa08),
+    (0x08ac, 4, 0x0ff0fa08),
+    (0x08c4, 4, 0x00000000),
+    (0x08b0, 4, 0x00000618),
+    (0x0c90, 4, 0x01807c01),
+    (0x08b0, 4, 0x00000618),
+    (0x0e90, 4, 0x01807c01),
+    (0x0c20, 4, 0x13131313),
+    (0x0c24, 4, 0x20202020),
+    (0x0c28, 4, 0x1c1e2020),
+    (0x0c2c, 4, 0x20202020),
+    (0x0c30, 4, 0x1c1e2020),
+    (0x0c34, 4, 0x20202020),
+    (0x0c38, 4, 0x1a1c1e20),
+    (0x0c3c, 4, 0x20202020),
+    (0x0c40, 4, 0x1c1e2020),
+    (0x0c44, 4, 0x1e1e181a),
+    (0x0c48, 4, 0x1e1e1e1e),
+    (0x0c4c, 4, 0x16181a1c),
+    (0x0c54, 4, 0x00040a12),
+    (0x0e20, 4, 0x14141414),
+    (0x0e24, 4, 0x1d1d1d1d),
+    (0x0e28, 4, 0x191b1d1d),
+    (0x0e2c, 4, 0x1f1f1f1f),
+    (0x0e30, 4, 0x1b1d1f1f),
+    (0x0e34, 4, 0x1f1f1f1f),
+    (0x0e38, 4, 0x191b1d1f),
+    (0x0e3c, 4, 0x1f1f1f1f),
+    (0x0e40, 4, 0x1b1d1f1f),
+    (0x0e44, 4, 0x1d1d1719),
+    (0x0e48, 4, 0x1d1d1d1d),
+    (0x0e4c, 4, 0x1517191b),
+    (0x0e54, 4, 0x00030911),
+    (0x0454, 1, 0x00000080),
+    (0x0808, 4, 0x3e028233),
+    (0x0834, 4, 0x0037a706),
+    (0x0830, 4, 0x2eaaaeb8),
+    (0x0830, 4, 0x2eaaaeb8),
+    (0x082c, 4, 0x002083dd),
+    (0x0cb0, 4, 0x54337717),
+    (0x0eb0, 4, 0x54337717),
+    (0x0cb4, 4, 0x01000077),
+    (0x0eb4, 4, 0x01000077),
+    (0x0900, 4, 0x00000401),
+    (0x080c, 4, 0x12131103),
+    (0x0a04, 4, 0x0fff000c),
+    (0x0c1c, 4, 0x2d400003),
+    (0x0e1c, 4, 0x2d400003),
+    (0x0860, 4, 0x6929c321),
+    (0x08b0, 4, 0x00000618),
+    (0x0c90, 4, 0x01817d01),
+    (0x08ac, 4, 0x0ff0fa08),
+    (0x08ac, 4, 0x0ff0fa08),
+    (0x08c4, 4, 0x00000000),
+    (0x08b0, 4, 0x00000618),
+    (0x0c90, 4, 0x01817d24),
+    (0x08b0, 4, 0x00000618),
+    (0x0e90, 4, 0x01817d01),
+    (0x08ac, 4, 0x0ff0fa08),
+    (0x08ac, 4, 0x0ff0fa08),
+    (0x08c4, 4, 0x00000000),
+    (0x08b0, 4, 0x00000618),
+    (0x0e90, 4, 0x01817d24),
+    (0x0668, 2, 0x00001000),
+    (0x08ac, 4, 0x0ff0fa08),
+    (0x08c4, 4, 0x00000000),
+    (0x0848, 4, 0x61d0ff8b),
+    (0x08ac, 4, 0x0ff0fa08),
+    (0x08ac, 4, 0x0ff0fa08),
+    (0x08c4, 4, 0x00000000),
+    (0x08b0, 4, 0x00000618),
+    (0x0c90, 4, 0x01817d24),
+    (0x08b0, 4, 0x00000618),
+    (0x0e90, 4, 0x01817d24),
+    (0x0c24, 4, 0x27272727),
+    (0x0c28, 4, 0x25272727),
+    (0x0c2c, 4, 0x2c2c2c2c),
+    (0x0c30, 4, 0x26282a2c),
+    (0x0c34, 4, 0x28282828),
+    (0x0c38, 4, 0x24262828),
+    (0x0c3c, 4, 0x2c2c2c2c),
+    (0x0c40, 4, 0x26282a2c),
+    (0x0c44, 4, 0x28282424),
+    (0x0c48, 4, 0x28282828),
+    (0x0c4c, 4, 0x22222426),
+    (0x0c54, 4, 0x000e141c),
+    (0x0e24, 4, 0x23232323),
+    (0x0e28, 4, 0x21232323),
+    (0x0e2c, 4, 0x28282828),
+    (0x0e30, 4, 0x22242628),
+    (0x0e34, 4, 0x24242424),
+    (0x0e38, 4, 0x20222424),
+    (0x0e3c, 4, 0x28282828),
+    (0x0e40, 4, 0x22242628),
+    (0x0e44, 4, 0x24242020),
+    (0x0e48, 4, 0x24242424),
+    (0x0e4c, 4, 0x1e1e2022),
+    (0x0e54, 4, 0x000a1018),
+    (0x09a4, 4, 0x000a0080),
+    (0x09a4, 4, 0x00080080),
+    (0x0a2c, 4, 0x00900000),
+    (0x0a2c, 4, 0x00908000),
+    (0x0b58, 4, 0x00000001),
+    (0x0b58, 4, 0x00000000),
+    (0x0c50, 4, 0x00000022),
+    (0x0e50, 4, 0x00000022),
+    (0x08b0, 4, 0x00000642),
+    (0x0c90, 4, 0x042378f0),
+    (0x09a4, 4, 0x000a0080),
+    (0x09a4, 4, 0x00080080),
+    (0x0a2c, 4, 0x00900000),
+    (0x0a2c, 4, 0x00908000),
+    (0x0b58, 4, 0x00000001),
+    (0x0b58, 4, 0x00000000),
+    (0x0c50, 4, 0x00000024),
+    (0x0e50, 4, 0x00000024),
+    (0x08b0, 4, 0x00000642),
+];
+
 /// Management-queue select (`QSLT_MGNT`) + its rate-adaptation group
 /// (`RATEID_IDX_G`, the OFDM/11g table).
 const QSLT_MGNT: u32 = 0x12;
@@ -828,87 +972,57 @@ impl Rtl8812auBackend {
     /// ([`rf_config`](Self::rf_config)). Verify by reading RF `0x18` back (byte 0
     /// = channel).  Assumes `rfe_type == 0` (the common generic-dongle RFE).
     pub fn set_channel(&self, channel: u8) -> Result<(), FaceError> {
-        // Band switch (`PHY_SwitchWirelessBand8812`): 2.4 GHz (ch 1–14) or 5 GHz (ch ≥ 36). The RF
-        // tables from `rf_config` are full-band; here we set the BB band mode + the RF `0x18`
-        // channel/band. 2.4 GHz is production (two-way named-time on-air).
-        //
-        // **5 GHz is SCAFFOLDING, not yet functional.** The deltas below mirror the shared Jaguar
-        // path (8822E `set_channel_bw20`): OFDM-only, 5 GHz AGC table, RF `0x18` band markers +
-        // sub-band. On-air this gets the synthesiser roughly on-band (ambient RX rose from 0 to a
-        // couple of frames on ch36/149) but the 5 GHz RX sensitivity + TX are NOT working — the
-        // pair does not converge on 5 GHz. The exact 8812A 5 GHz tuning (fc_area, the 5 GHz AGC
-        // table, PD_TH, the RFE pinmux, and the 5 GHz TXAGC) needs the vendor
-        // `phy_SwitchWirelessBand8812` source or a usbmon golden trace of the kernel driver on a
-        // 5 GHz channel. Until then, use 2.4 GHz for the 8812AU.
-        let is_5g = channel > 14;
+        // 5 GHz: replay the kernel rtw88 driver's exact ch36 channel program verbatim (from the
+        // usbmon golden trace, golden/rtw88-8812au-ch36-5g). The band switch (BB + RFE), the RF
+        // `0x18`/LSSI channel writes, and the 5 GHz TXAGC tables are a single interdependent
+        // sequence — piecemeal deltas onto the 2.4 path did not work, so we apply the whole thing.
+        // ch36-specific for now (the RF + fc_area writes are per-channel; other 5 GHz channels need
+        // their own trace).
+        if channel > 14 {
+            return self.apply_reg_program(CH36_5G_PROGRAM);
+        }
 
-        // ── band switch (BB) ──
-        // 0x808[29:28]: 2.4 GHz = OFDM+CCK (0x3); 5 GHz = OFDM only (0x2 — no CCK PHY on 5 GHz).
-        self.bb_set(0x0808, 0x3000_0000, if is_5g { 0x02 } else { 0x03 })?;
+        // ── 2.4 GHz band switch (BB) — production two-way named-time on-air ──
+        self.bb_set(0x0808, 0x3000_0000, 0x03)?; // OFDM + CCK enable (0x808)
         self.bb_set(0x0834, 0x3, 0x1)?; // BW indication
         self.bb_set(0x0830, 0x3_E000, 0x17)?; // PD_TH 0x830[17:13]
         self.bb_set(0x0830, 0xE, 0x04)?; // 0x830[3:1] = 100 (2T)
-        // AGC table select: 2.4 GHz = 0; 5 GHz = 1.
-        self.bb_set(0x082C, 0x3, if is_5g { 0x1 } else { 0x0 })?;
-        // RFE pinmux — the RF front-end band routing. 2.4 GHz = generic 0x77777777; 5 GHz =
-        // 0x17773354 (+ 0xCB4/0xEB4 = 0x77000001), from the rtw88 kernel-driver usbmon golden trace
-        // (golden/rtw88-8812au-ch36-5g.*). Using the 2.4 pinmux on 5 GHz leaves the antenna path
-        // off-band — the reason the first-cut 5 GHz was deaf.
-        if is_5g {
-            self.write32(0x0CB0, 0x1777_3354)?;
-            self.write32(0x0EB0, 0x1777_3354)?;
-            self.write32(0x0CB4, 0x7700_0001)?;
-            self.write32(0x0EB4, 0x7700_0001)?;
-        } else {
-            self.write32(0x0CB0, 0x7777_7777)?;
-            self.write32(0x0EB0, 0x7777_7777)?;
-            self.bb_set(0x0CB4, 0x3FF0_0000, 0x000)?;
-            self.bb_set(0x0EB4, 0x3FF0_0000, 0x000)?;
-        }
-        // CCK FA / scan workaround (2.4 GHz only).
-        if !is_5g {
-            self.bb_set(0x080C, 0xF0, 0x1)?;
-            self.bb_set(0x0A04, 0x0F00_0000, 0x1)?;
-        }
-        // CCK check 0x454[7]: clear for 2.4 GHz (CCK present), set for 5 GHz (none).
+        self.bb_set(0x082C, 0x3, 0x0)?; // AGC table select 2.4 G
+        // RFE (rfe_type 0): pinmux 0x77777777, inv 0.
+        self.write32(0x0CB0, 0x7777_7777)?;
+        self.write32(0x0EB0, 0x7777_7777)?;
+        self.bb_set(0x0CB4, 0x3FF0_0000, 0x000)?;
+        self.bb_set(0x0EB4, 0x3FF0_0000, 0x000)?;
+        // CCK FA / scan workaround + CCK check (clear 0x454[7] for 2.4 G).
+        self.bb_set(0x080C, 0xF0, 0x1)?;
+        self.bb_set(0x0A04, 0x0F00_0000, 0x1)?;
         let cck = self.read8(0x0454)?;
-        self.write8(0x0454, if is_5g { cck | 0x80 } else { cck & !0x80 })?;
-
-        // fc_area 0x860[28:17]: band/channel RX AGC frequency area. 2.4 GHz = 0x96A; 5 GHz ch36 =
-        // 0x0E1 (from the golden trace's final 0x860 = 0x21c32969). NOTE: channel-specific — this
-        // is the ch36 value; other 5 GHz channels need their own (a small per-channel table).
-        self.bb_set(0x0860, 0x1FFE_0000, if is_5g { 0x0E1 } else { 0x96A })?;
-
-        // ── RF channel + band/mode + bandwidth, both paths ──
+        self.write8(0x0454, cck & !0x80)?;
+        // fc_area (channel < 36).
+        self.bb_set(0x0860, 0x1FFE_0000, 0x96A)?;
+        // RF channel + 2.4 G band/mode + 20 MHz, both paths.
         for path in [RfPath::A, RfPath::B] {
-            // RF_MOD_AG 0x18: 2.4 GHz clears band bits (18,17,16,9,8); 5 GHz sets band (BIT16|BIT8)
-            // + sub-band (BIT17 for ch ≥ 80, BIT18 for ch > 144), like the 8822E path.
-            let band = if is_5g {
-                let sub = if channel > 144 {
-                    1 << 18
-                } else if channel >= 80 {
-                    1 << 17
-                } else {
-                    0
-                };
-                (1 << 16) | (1 << 8) | sub
-            } else {
-                0
-            };
-            self.rf_set(path, 0x18, 0x7_0300, band)?;
-            // Bandwidth bits [11:10] = 20 MHz.
-            self.rf_set(path, 0x18, 0xC00, 0x3)?;
-            // Channel number (byte 0).
-            self.rf_set(path, 0x18, 0xFF, channel as u32)?;
+            self.rf_set(path, 0x18, 0x7_0300, 0x000)?; // 2.4 G band/mode (bits 18,17,16,9,8 = 0)
+            self.rf_set(path, 0x18, 0xC00, 0x3)?; // BW 20 MHz
+            self.rf_set(path, 0x18, 0xFF, channel as u32)?; // channel byte
         }
-
-        // ── 20 MHz bandwidth (BB + MAC) ──
+        // 20 MHz bandwidth (BB + MAC).
         self.bb_set(0x08AC, 0x0030_03C3, 0x0030_0200)?; // rRFMOD 20 MHz
-        if !is_5g {
-            self.bb_set(0x08AC, 0x300, 0x2)?; // spur workaround, ch ≤ 14
-        }
+        self.bb_set(0x08AC, 0x300, 0x2)?; // spur workaround, ch ≤ 14
         let trx = self.read16(0x0668)?;
-        self.write16(0x0668, trx & 0xFE7F)?; // WMAC TRXPTCL: 20 MHz (BIT7=BIT8=0)
+        self.write16(0x0668, trx & 0xFE7F)?; // WMAC TRXPTCL: 20 MHz
+        Ok(())
+    }
+
+    /// Apply a captured register program — `(addr, width-in-bytes, value)` writes, in order.
+    fn apply_reg_program(&self, prog: &[(u16, u8, u32)]) -> Result<(), FaceError> {
+        for &(addr, width, val) in prog {
+            match width {
+                1 => self.write8(addr, val as u8)?,
+                2 => self.write16(addr, val as u16)?,
+                _ => self.write32(addr, val)?,
+            }
+        }
         Ok(())
     }
 

@@ -283,6 +283,9 @@ pub struct LibUsbRtl88xxBackend {
     /// [`set_channel_bw20`](Self::set_channel_bw20) so it survives bandwidth
     /// changes. Mutually exclusive with per-frame STBC (both claim antenna B).
     tx_csd: std::sync::atomic::AtomicBool,
+    /// Forced TX DESC_RATE code, or `0xFF` for "use the resolved MCS". Set to a legacy OFDM code
+    /// (0x04 = 6 Mbps) so broadcast frames are decodable by a legacy-only receiver like the 8733b.
+    fixed_desc_rate: std::sync::atomic::AtomicU8,
     /// Subscribed name-groups for multi-prefix DCNLA (software set-membership
     /// over the hardware multicast-narrowed RX stream). Empty ⇒ no SW filter.
     mcast_groups: std::sync::Mutex<Vec<[u8; 6]>>,
@@ -359,6 +362,7 @@ impl LibUsbRtl88xxBackend {
             tx_ref_base: std::sync::atomic::AtomicU8::new(0),
             cur_bw: std::sync::atomic::AtomicU8::new(ChannelBw::Bw20 as u8),
             tx_csd: std::sync::atomic::AtomicBool::new(false),
+            fixed_desc_rate: std::sync::atomic::AtomicU8::new(0xFF),
             mcast_groups: std::sync::Mutex::new(Vec::new()),
             rx_pump: crate::rx_pump::RxPumpState::new(),
             tsf_domain,
@@ -428,6 +432,16 @@ impl LibUsbRtl88xxBackend {
     /// is plenty over USB.
     pub fn spawn_rx_pump(self: &Arc<Self>, depth: usize) -> Vec<std::thread::JoinHandle<()>> {
         crate::rx_pump::spawn_rx_pump(self, depth)
+    }
+
+    /// Force every injected frame to a fixed DESC_RATE code, or `None` to use the intent-resolved
+    /// HT/VHT MCS. Pass a legacy OFDM code (`0x04` = 6 Mbps) for broadcast frames that a legacy-only
+    /// receiver must decode: the 88xx `inject` path otherwise always emits HT/VHT (`0x0c+`), which
+    /// a legacy-only RX (e.g. the 8733b, whose BB never got HT/VHT demod) cannot receive. Real
+    /// 802.11 beacons/management use the lowest basic rate for exactly this universal reach.
+    pub fn set_fixed_desc_rate(&self, code: Option<u8>) {
+        self.fixed_desc_rate
+            .store(code.unwrap_or(0xFF), Ordering::Relaxed);
     }
 
     /// Run the full monitor-mode bring-up on an already-[`open`](Self::open)ed
@@ -4539,15 +4553,18 @@ impl LibUsbRtl88xxBackend {
         } else {
             DESC_RATE_MCS0 + mcs.index
         };
-        // NDN_RADIO_TX_RATE=<dec> overrides the DESC_RATE code for A/B testing the
-        // modulation. The kernel's monitor-inject golden descriptor uses 0x04 =
-        // 6 Mbps OFDM legacy (DESC codes: 0x00-0x03 CCK, 0x04-0x0b OFDM legacy,
-        // 0x0c+ HT MCS, 0x2c+ VHT). Our default is HT — this lets us test whether
-        // a legacy rate is decodable at the OPi RX when HT isn't.
-        let rate_code = std::env::var("NDN_RADIO_TX_RATE")
-            .ok()
-            .and_then(|s| s.parse::<u8>().ok())
-            .unwrap_or(rate_code);
+        // Rate override, in precedence order: an explicit programmatic fixed DESC_RATE
+        // ([`set_fixed_desc_rate`](Self::set_fixed_desc_rate), `0xFF` = unset) — used to force a
+        // robust *legacy* rate (0x04 = 6 Mbps OFDM) for broadcast frames a legacy-only receiver
+        // (e.g. the 8733b) must decode — then the `NDN_RADIO_TX_RATE=<dec>` env (A/B testing), else
+        // the MCS resolved above. DESC codes: 0x00-0x03 CCK, 0x04-0x0b OFDM legacy, 0x0c+ HT, 0x2c+ VHT.
+        let rate_code = match self.fixed_desc_rate.load(Ordering::Relaxed) {
+            0xFF => std::env::var("NDN_RADIO_TX_RATE")
+                .ok()
+                .and_then(|s| s.parse::<u8>().ok())
+                .unwrap_or(rate_code),
+            forced => forced,
+        };
         txdesc_set(&mut buf, 0x10, 0, 7, rate_code as u32);
         txdesc_set(&mut buf, 0x10, 17, 1, 1); // RTY_LMT_EN (use the limit below)
         txdesc_set(&mut buf, 0x10, 18, 6, 6); // RTS_DATA_RTY_LMT = 6 (kernel default)

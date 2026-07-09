@@ -48,8 +48,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Some(p) => LibUsbRtl88xxBackend::open_monitor_pid(p, ch)?,
                 None => LibUsbRtl88xxBackend::open_monitor(ch)?,
             });
+            // Beacon at robust legacy 6 Mbps (0x04), like real 802.11 beacons — so a legacy-only
+            // receiver (the 8733b, no HT/VHT demod) can decode us. Default HT/VHT would be deaf to it.
+            r.set_fixed_desc_rate(Some(0x04));
             r.spawn_rx_pump(4);
-            println!("named-time node {id} up: 8812-class ch{ch}, RX pump depth 4");
+            println!("named-time node {id} up: 8812-class ch{ch} (legacy 6M beacons), RX pump depth 4");
             r
         };
 

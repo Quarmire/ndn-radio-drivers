@@ -18,7 +18,7 @@ rusb = "0.9"
 libc = "0.2"
 libusb1-sys = "0.7"
 # BW16 (RTL8720DN) serial-bridged backend — optional (host<->board over USB-serial).
-serialport = { version = "4", optional = true }
+serialport = { version = "4", optional = true, default-features = false }
 
 [features]
 default = []

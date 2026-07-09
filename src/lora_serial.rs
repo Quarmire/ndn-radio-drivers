@@ -160,8 +160,11 @@ fn checksum(payload: &[u8]) -> u8 {
 /// from data mode, and merely errors (harmlessly) if already there, so after it we are always in
 /// AT mode; `AT+EXIT` then drops back to transparent data mode for the payload stream.
 fn configure(port: &mut Box<dyn serialport::SerialPort>, p: &LoraParams) -> Result<(), FaceError> {
+    // Opening the port pulses DTR, which resets the GD32 MCU; the module ignores `+++` within 3 s
+    // of power-on (datasheet), so settle past that window before entering command mode.
     let _ = port.clear(serialport::ClearBuffer::Input);
-    std::thread::sleep(Duration::from_millis(100));
+    std::thread::sleep(Duration::from_millis(3500));
+    let _ = port.clear(serialport::ClearBuffer::Input);
     at(port, "+++");
     at(port, "AT+MODE=1");
     at(port, &format!("AT+SF={}", p.sf));
@@ -199,6 +202,13 @@ fn at(port: &mut Box<dyn serialport::SerialPort>, cmd: &str) {
             Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => {}
             Err(_) => break,
         }
+    }
+    if std::env::var_os("LORA_AT_DEBUG").is_some() {
+        let printable: String = resp
+            .iter()
+            .map(|&b| if (0x20..0x7f).contains(&b) { b as char } else { '.' })
+            .collect();
+        eprintln!("AT[{cmd}] <- {} bytes [{printable}]", resp.len());
     }
 }
 

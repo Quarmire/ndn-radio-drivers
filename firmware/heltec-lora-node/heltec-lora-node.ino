@@ -31,13 +31,13 @@
 #define VEXT 21
 
 // --- Air parameters: match the peer to interoperate ---
-#define FREQ_MHZ 868.0    // tweak to the peer's channel frequency
+#define FREQ_MHZ 915.0    // US ISM band (Waveshare channel 65 = 850+65)
 #define BW_KHZ 125.0      // Waveshare BW=0
 #define SF 7              // Waveshare SF=7
 #define CR_DENOM 5        // Waveshare CR=1 → coding rate 4/5
 #define SYNC_WORD 0x12    // LoRa private sync word (RadioLib default)
 #define TX_POWER_DBM 17
-#define PREAMBLE_LEN 12
+#define PREAMBLE_LEN 8   // match the Waveshare (measured 8-symbol preamble on air)
 #define TX_CRC true // match the Waveshare (its frames carry a CRC), else its RX drops ours
 #define BEACON_MS 3000
 

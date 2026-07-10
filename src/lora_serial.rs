@@ -14,6 +14,7 @@
 //! frame (see [`RadioTime`]).
 
 use std::os::unix::io::RawFd;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -22,6 +23,7 @@ use ndn_frame_io::{
     CapturedFrame, ClockDomainId, FrameIo, InjectFrame, LatchPoint, LinkStamp, RadioCapability,
     RadioProfile, RadioTime, RadioTimeSource,
 };
+use ndn_radio_hal::{Bandwidth, RadioKnobs, TxDiscipline};
 use ndn_transport::FaceError;
 use tokio::sync::{Mutex as AsyncMutex, mpsc};
 
@@ -215,7 +217,12 @@ impl Drop for SerialFd {
 pub struct LoraSerialBackend {
     tx: Arc<Mutex<SerialFd>>,
     rx: AsyncMutex<mpsc::UnboundedReceiver<CapturedFrame>>,
-    params: LoraParams,
+    /// Behind a mutex because [`RadioKnobs`] retunes the module at runtime; `capability()` and
+    /// `params()` reflect the live values.
+    params: Arc<Mutex<LoraParams>>,
+    /// Set while a knob change is re-entering AT command mode, so the reader thread parks instead
+    /// of swallowing the AT responses off the shared tty.
+    reconfiguring: Arc<AtomicBool>,
 }
 
 impl LoraSerialBackend {
@@ -234,17 +241,40 @@ impl LoraSerialBackend {
             .try_clone()
             .map_err(|e| io_err(format!("lora clone: {e}")))?;
         let (txch, rxch) = mpsc::unbounded_channel();
-        std::thread::spawn(move || reader_loop(reader, txch));
+        let reconfiguring = Arc::new(AtomicBool::new(false));
+        let rflag = reconfiguring.clone();
+        std::thread::spawn(move || reader_loop(reader, txch, rflag));
         Ok(Self {
             tx: Arc::new(Mutex::new(port)),
             rx: AsyncMutex::new(rxch),
-            params,
+            params: Arc::new(Mutex::new(params)),
+            reconfiguring,
         })
     }
 
-    /// The radio parameters this backend programmed at open.
+    /// The radio parameters currently programmed (reflects runtime [`RadioKnobs`] changes).
     pub fn params(&self) -> LoraParams {
-        self.params
+        *self.params.lock().unwrap()
+    }
+
+    /// Re-enter AT command mode, apply `setters`, and drop back to transparent data mode — with the
+    /// reader parked so it does not consume the AT responses. Each knob change costs one such cycle
+    /// (a brief, ~1 s data-path interruption), so cognition should retune sparingly.
+    fn at_reconfigure(&self, setters: &[String]) -> Result<(), FaceError> {
+        self.reconfiguring.store(true, Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(300)); // let the reader notice and park
+        {
+            let port = self.tx.lock().unwrap();
+            port.flush_input();
+            at(&port, "+++");
+            for s in setters {
+                at(&port, s);
+            }
+            at(&port, "AT+EXIT");
+            port.flush_input();
+        }
+        self.reconfiguring.store(false, Ordering::SeqCst);
+        Ok(())
     }
 
     /// Frame and write one NDN payload as a single LoRa air frame.
@@ -388,10 +418,20 @@ fn at(port: &SerialFd, cmd: &str) {
 /// Background reader: accumulate serial bytes, deframe `[SYNC0 SYNC1 len16 payload cksum]` packets,
 /// verify the checksum, and hand each recovered NDN payload up as a `CapturedFrame` stamped
 /// `HostRecv` at delivery. A checksum miss (partial air loss) is dropped and resynced.
-fn reader_loop(port: SerialFd, tx: mpsc::UnboundedSender<CapturedFrame>) {
+fn reader_loop(
+    port: SerialFd,
+    tx: mpsc::UnboundedSender<CapturedFrame>,
+    reconfiguring: Arc<AtomicBool>,
+) {
     let mut acc: Vec<u8> = Vec::new();
     let mut tmp = [0u8; 512];
     loop {
+        if reconfiguring.load(Ordering::SeqCst) {
+            // A knob change owns the tty — don't read, or we'd eat its AT responses.
+            acc.clear();
+            std::thread::sleep(Duration::from_millis(50));
+            continue;
+        }
         match port.read(&mut tmp) {
             Ok(n) if n > 0 => {
                 acc.extend_from_slice(&tmp[..n]);
@@ -511,7 +551,64 @@ impl RadioTime for LoraSerialBackend {
 impl RadioProfile for LoraSerialBackend {
     fn capability(&self) -> RadioCapability {
         // Sub-GHz LoRa: the channel the module is tuned to, duty-cycled, half-duplex, ~256 B frames.
-        RadioCapability::lora(vec![self.params.tx_ch])
+        RadioCapability::lora(vec![self.params.lock().unwrap().tx_ch])
+    }
+}
+
+/// Control plane: LoRa's dials, actuated at runtime over the `AT` interface. `set_spreading_factor`
+/// is the reach/rate knob cognition drives (down for close/bulk, up for far/urgent); the rest tune
+/// channel, coding rate, bandwidth, power, and listen-before-talk. Each call briefly re-enters
+/// command mode, so cognition retunes only on a real decision change.
+impl RadioKnobs for LoraSerialBackend {
+    fn set_channel(&self, channel: u8, _bw: Bandwidth) -> Result<(), FaceError> {
+        // LoRa is half-duplex on a single channel: point TX and RX at it together.
+        self.at_reconfigure(&[format!("AT+TXCH={channel}"), format!("AT+RXCH={channel}")])?;
+        let mut p = self.params.lock().unwrap();
+        p.tx_ch = channel;
+        p.rx_ch = channel;
+        Ok(())
+    }
+
+    fn set_tx_power(&self, idx: u32) -> Result<(), FaceError> {
+        let dbm = idx.clamp(10, 22) as u8; // AT+PWR range
+        self.at_reconfigure(&[format!("AT+PWR={dbm}")])?;
+        self.params.lock().unwrap().pwr = dbm;
+        Ok(())
+    }
+
+    fn set_edcca_ignore(&self, on: bool) -> Result<(), FaceError> {
+        // LBT off ⇒ transmit without listening (EDCCA-ignore); LBT on ⇒ back off under contention.
+        self.at_reconfigure(&[format!("AT+LBT={}", if on { 0 } else { 1 })])
+    }
+
+    fn set_spreading_factor(&self, sf: u8) -> Result<(), FaceError> {
+        let sf = sf.clamp(7, 12);
+        self.at_reconfigure(&[format!("AT+SF={sf}")])?;
+        self.params.lock().unwrap().sf = sf;
+        Ok(())
+    }
+
+    fn set_coding_rate(&self, cr: u8) -> Result<(), FaceError> {
+        let cr = cr.clamp(1, 4);
+        self.at_reconfigure(&[format!("AT+CR={cr}")])?;
+        self.params.lock().unwrap().cr = cr;
+        Ok(())
+    }
+
+    fn set_bandwidth_khz(&self, khz: u32) -> Result<(), FaceError> {
+        let bw = match khz {
+            0..=180 => 0, // 125 kHz
+            181..=360 => 1, // 250 kHz
+            _ => 2,        // 500 kHz
+        };
+        self.at_reconfigure(&[format!("AT+BW={bw}")])?;
+        self.params.lock().unwrap().bw = bw;
+        Ok(())
+    }
+
+    fn tx_discipline(&self) -> TxDiscipline {
+        // The serial bridge + duty-cycle limit make the on-air instant loose; honest floor.
+        TxDiscipline::BestEffort
     }
 }
 

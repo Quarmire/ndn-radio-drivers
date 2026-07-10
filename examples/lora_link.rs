@@ -31,9 +31,22 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let role = args.next().unwrap_or_else(|| "both".into());
     let node = args.next().unwrap_or_else(|| "A".into());
 
+    // Optional 4th arg `sf=N`: retune the spreading factor at runtime through the RadioKnobs seam
+    // (proves cognition's LoRa reach/rate dial actuates the live radio).
+    let sf: Option<u8> = args
+        .next()
+        .and_then(|a| a.strip_prefix("sf=").and_then(|s| s.parse().ok()));
+
     println!("opening LoRa dongle at {path} (role={role}, node={node})…");
     let dev = std::sync::Arc::new(LoraSerialBackend::open(&path)?);
     println!("open OK, params = {:?}", dev.params());
+    if let Some(sf) = sf {
+        use ndn_radio_hal::RadioKnobs;
+        println!("retuning spreading factor -> SF{sf} via RadioKnobs…");
+        dev.set_spreading_factor(sf)
+            .map_err(|e| format!("set_spreading_factor: {e:?}"))?;
+        println!("retuned; live params = {:?}", dev.params());
+    }
 
     if role != "tx" {
         let rx = dev.clone();

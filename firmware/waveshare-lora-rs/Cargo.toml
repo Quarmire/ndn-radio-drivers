@@ -1,0 +1,29 @@
+# Standalone no_std firmware for the Waveshare USB-LoRa dongle (GD32F103C8 + SX1262).
+# Replaces the closed Waveshare stream firmware with open Rust: standard LoRa + the named-radio
+# serial bridge protocol + full SX1262 knob exposure. Flashed whole via ST-Link/openocd at 0x08000000
+# (no bootloader — SWD reflashes). Target thumbv7m-none-eabi (Cortex-M3). Not in the host workspace.
+[workspace]
+
+[package]
+name = "waveshare-lora-rs"
+version = "0.1.0"
+edition = "2021"
+description = "Open Rust firmware for the Waveshare USB-LoRa dongle (GD32F103C8 + SX1262)"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+cortex-m = "0.7"
+cortex-m-rt = "0.7"
+panic-halt = "0.2"
+embedded-hal = "0.2"
+nb = "1"
+
+[dependencies.stm32f1xx-hal]
+version = "0.10"
+features = ["stm32f103", "rt", "medium"]
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+debug = true

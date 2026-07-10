@@ -38,6 +38,7 @@
 #define SYNC_WORD 0x12    // LoRa private sync word (RadioLib default)
 #define TX_POWER_DBM 17
 #define PREAMBLE_LEN 12
+#define TX_CRC true // match the Waveshare (its frames carry a CRC), else its RX drops ours
 #define BEACON_MS 3000
 
 SX1276 radio = new Module(LORA_CS, LORA_DIO0, LORA_RST, LORA_DIO1);
@@ -90,6 +91,8 @@ void setup() {
     oled_render();
     while (true) delay(1000);
   }
+  int cst = radio.setCRC(TX_CRC); // payload CRC on TX (and require it on RX)
+  Serial.printf("setCRC(%d) -> %d\n", (int)TX_CRC, cst);
   radio.setDio0Action(on_dio0, RISING);
   radio.startReceive();
   phase = "listening";

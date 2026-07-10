@@ -1,21 +1,22 @@
 /*
  * esp32-cyd-radio — ESP32 "Cheap Yellow Display" (ESP32-2432S028R, ILI9341 320x240)
- * as a serial-bridged named-radio FrameIo node with a live on-screen dashboard.
+ * as a serial-bridged named-radio FrameIo node with a live on-screen radio HUD,
+ * including a Channel State Information (CSI) subcarrier plot.
  *
  * Same wire protocol and 802.11 inject/capture behaviour as esp32-ndn-bridge (so
- * ndn-radio-drivers::Bw16SerialBackend drives it too), but the CYD's TFT shows a
- * radio HUD: channel, TX/RX frame counts, last RSSI, and a scrolling list of the
- * most-recently-heard NDN frames (source MAC + RSSI). Put this and the Heltec node
- * on the same channel and each screen shows the other's traffic — a 2-node ESP32
- * mesh you can watch.
+ * ndn-radio-drivers::Bw16SerialBackend drives it too). Additionally it enables the
+ * ESP32's native CSI: every received frame yields per-subcarrier amplitude/phase,
+ * which the TFT plots live. Point the Heltec node (self-beaconing on the same
+ * channel) at it and the CSI plot updates continuously — waving a hand near the
+ * antennas visibly perturbs it (CSI = motion/presence sensing, not just a link).
  *
- * Build: arduino-cli, esp32:esp32 core + LovyanGFX. Flash to the CYD.
- *
- * Wire protocol: see esp32-ndn-bridge.ino (identical).
+ * Build: arduino-cli, esp32:esp32 core + LovyanGFX. Flash at UploadSpeed=115200
+ * (the CYD's CH340 drops the default 921600 mid-write).
  */
 
 #define LGFX_USE_V1
 #include <LovyanGFX.hpp>
+#include <math.h>
 #include "WiFi.h"
 #include "esp_wifi.h"
 
@@ -45,19 +46,19 @@ public:
 static LGFX tft;
 
 static const uint8_t SYNC0 = 0x4E, SYNC1 = 0x44;
-enum { T_INJECT = 0x01, T_CHANNEL = 0x02, T_TXPOWER = 0x03, T_RX = 0x81, T_LOG = 0x82 };
+enum { T_INJECT = 0x01, T_CHANNEL = 0x02, T_TXPOWER = 0x03, T_RX = 0x81, T_LOG = 0x82, T_CSI = 0x83 };
 static const size_t MAX_FRAME = 1600;
 
 static volatile uint32_t tx_count = 0, rx_count = 0;
-static volatile int8_t last_rssi = 0;
+static volatile int8_t last_rssi = 0, last_noise = 0;
 static volatile uint8_t cur_channel = 6;
 static const char *phase = "boot";
 
-// Ring buffer of recently-heard frames (src MAC + RSSI), rendered as a scrolling list.
-struct RxLog { uint8_t src[6]; int8_t rssi; };
-static const int LOG_N = 8;
-static RxLog rxlog[LOG_N];      // written in the WiFi task, read in loop(); a torn read is cosmetic
-static int rxlog_head = 0;
+// CSI: per-subcarrier amplitude of the most recent frame (int8 I/Q -> magnitude).
+static const int CSI_MAX = 128;
+static uint8_t csi_amp[CSI_MAX];
+static volatile int csi_n = 0;
+static volatile uint32_t csi_count = 0;
 static volatile bool dirty = true;
 
 static void send_framed(uint8_t type, const uint8_t *payload, uint16_t len) {
@@ -67,39 +68,38 @@ static void send_framed(uint8_t type, const uint8_t *payload, uint16_t len) {
 }
 static void logmsg(const char *s) { send_framed(T_LOG, (const uint8_t *)s, strlen(s)); }
 
-static void tft_render() {
-  char l[40];
-  tft.startWrite();
-  tft.fillScreen(TFT_BLACK);
-  tft.setTextColor(TFT_YELLOW, TFT_BLACK);
-  tft.setTextSize(2);
-  tft.setCursor(6, 6);
-  tft.print("NDN Radio Node");
+static void hud_render() {
+  char l[48];
+  // Header block — text with black background so fields overwrite cleanly (no full clear/flicker).
+  tft.setTextColor(TFT_YELLOW, TFT_BLACK); tft.setTextSize(2);
+  tft.setCursor(6, 6); tft.print("NDN Radio + CSI ");
   tft.setTextColor(TFT_CYAN, TFT_BLACK);
-  tft.setTextSize(2);
-  snprintf(l, sizeof l, "ch %-3d  %s", cur_channel, phase);
-  tft.setCursor(6, 34); tft.print(l);
+  snprintf(l, sizeof l, "ch %-3d  %-8s", cur_channel, phase);
+  tft.setCursor(6, 32); tft.print(l);
   tft.setTextColor(TFT_GREEN, TFT_BLACK);
-  snprintf(l, sizeof l, "TX %-6lu RX %-6lu", (unsigned long)tx_count, (unsigned long)rx_count);
-  tft.setCursor(6, 60); tft.print(l);
+  snprintf(l, sizeof l, "TX %-7lu RX %-7lu", (unsigned long)tx_count, (unsigned long)rx_count);
+  tft.setCursor(6, 58); tft.print(l);
   tft.setTextColor(TFT_ORANGE, TFT_BLACK);
-  snprintf(l, sizeof l, "last RSSI %d dBm", (int)last_rssi);
-  tft.setCursor(6, 86); tft.print(l);
-  tft.drawFastHLine(0, 110, 320, TFT_DARKGREY);
-  tft.setTextSize(1);
-  tft.setTextColor(TFT_WHITE, TFT_BLACK);
-  tft.setCursor(6, 116); tft.print("recent frames (src / rssi)");
-  for (int i = 0; i < LOG_N; i++) {
-    int idx = (rxlog_head - 1 - i + LOG_N * 2) % LOG_N;
-    RxLog e = rxlog[idx];
-    if (e.src[0] == 0 && e.src[1] == 0 && e.src[5] == 0 && e.rssi == 0) continue;
-    snprintf(l, sizeof l, "%02x:%02x:%02x:%02x:%02x:%02x  %d dBm",
-             e.src[0], e.src[1], e.src[2], e.src[3], e.src[4], e.src[5], (int)e.rssi);
-    tft.setCursor(10, 132 + i * 12); tft.print(l);
+  snprintf(l, sizeof l, "RSSI %-4d noise %-4d   ", (int)last_rssi, (int)last_noise);
+  tft.setCursor(6, 84); tft.print(l);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK); tft.setTextSize(1);
+  int n = csi_n; if (n > CSI_MAX) n = CSI_MAX;
+  snprintf(l, sizeof l, "CSI %-3d subcarriers  frames %-8lu", n, (unsigned long)csi_count);
+  tft.setCursor(6, 108); tft.print(l);
+  // CSI subcarrier bar plot, drawn directly (no sprite): clear the plot band, draw bars.
+  const int y0 = 232, H = 108;
+  tft.fillRect(0, 120, 320, 120, TFT_BLACK);
+  tft.drawFastHLine(0, 120, 320, TFT_DARKGREY);
+  if (n > 0) {
+    for (int i = 0; i < n; i++) {
+      int x = (i * 319) / (n - 1 > 0 ? n - 1 : 1);
+      int h = (csi_amp[i] * H) / 127;
+      if (h > 0) tft.drawFastVLine(x, y0 - h, h, TFT_MAGENTA);
+    }
   }
-  tft.endWrite();
 }
 
+// Promiscuous RX: forward NDN DATA frames to the host + count them.
 static void promisc_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
   if (type != WIFI_PKT_DATA) return;
   const wifi_promiscuous_pkt_t *p = (const wifi_promiscuous_pkt_t *)buf;
@@ -108,37 +108,73 @@ static void promisc_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
   if (flen < 32 || flen > (int)MAX_FRAME - 1) return;
   if ((frame[0] & 0x0C) != 0x08) return;
   if (frame[30] != 0x86 || frame[31] != 0x24) return;
-  last_rssi = p->rx_ctrl.rssi;
   rx_count++;
-  RxLog e;
-  memcpy(e.src, frame + 10, 6); // addr2 = source
-  e.rssi = p->rx_ctrl.rssi;
-  rxlog[rxlog_head] = e;
-  rxlog_head = (rxlog_head + 1) % LOG_N;
-  dirty = true;
   static uint8_t out[MAX_FRAME];
   out[0] = (uint8_t)p->rx_ctrl.rssi;
   memcpy(out + 1, frame, flen);
   send_framed(T_RX, out, (uint16_t)(flen + 1));
 }
 
+// CSI: per-frame channel state — magnitude of each subcarrier's I/Q pair.
+static void csi_cb(void *ctx, wifi_csi_info_t *info) {
+  if (!info || !info->buf) return;
+  int n = info->len / 2;
+  if (n > CSI_MAX) n = CSI_MAX;
+  for (int i = 0; i < n; i++) {
+    int im = info->buf[2 * i];
+    int re = info->buf[2 * i + 1];
+    int a = (int)sqrtf((float)(im * im + re * re));
+    csi_amp[i] = a > 127 ? 127 : (uint8_t)a;
+  }
+  csi_n = n;
+  csi_count++;
+  last_rssi = info->rx_ctrl.rssi;
+  last_noise = info->rx_ctrl.noise_floor;
+  dirty = true;
+  // Forward a throttled CSI summary to the host: [rssi:i8][n:u8][amp:n] — real subcarrier
+  // magnitudes, so CSI-based sensing can run host-side too (a named-radio capability, not just a
+  // local plot). ~4/s keeps the 115200 link clear.
+  static unsigned long last_csi_tx = 0;
+  if (millis() - last_csi_tx > 250) {
+    last_csi_tx = millis();
+    static uint8_t buf[2 + CSI_MAX];
+    buf[0] = (uint8_t)info->rx_ctrl.rssi;
+    buf[1] = (uint8_t)n;
+    memcpy(buf + 2, csi_amp, n);
+    send_framed(T_CSI, buf, (uint16_t)(2 + n));
+  }
+}
+
 void setup() {
   Serial.begin(115200);
   delay(200);
   tft.init();
-  tft.setRotation(1); // landscape 320x240
+  tft.setRotation(1);
   tft.fillScreen(TFT_BLACK);
-  tft_render();
   logmsg("boot");
   WiFi.mode(WIFI_MODE_STA);
   esp_wifi_start();
   phase = "wifi_on"; logmsg("wifi_on");
   esp_wifi_set_channel(cur_channel, WIFI_SECOND_CHAN_NONE);
-  logmsg("ch6");
   wifi_promiscuous_filter_t filt = {.filter_mask = WIFI_PROMIS_FILTER_MASK_DATA};
   esp_wifi_set_promiscuous_filter(&filt);
   esp_wifi_set_promiscuous_rx_cb(&promisc_cb);
   esp_wifi_set_promiscuous(true);
+  // Enable native CSI: legacy + HT long training fields, channel-filtered, merged.
+  wifi_csi_config_t csi_cfg = {};
+  csi_cfg.lltf_en = true;
+  csi_cfg.htltf_en = true;
+  csi_cfg.stbc_htltf2_en = true;
+  csi_cfg.ltf_merge_en = true;
+  csi_cfg.channel_filter_en = true;
+  csi_cfg.manu_scale = false;
+  csi_cfg.shift = 0;
+  char m[48];
+  esp_err_t e1 = esp_wifi_set_csi_config(&csi_cfg);
+  esp_err_t e2 = esp_wifi_set_csi_rx_cb(&csi_cb, NULL);
+  esp_err_t e3 = esp_wifi_set_csi(true);
+  snprintf(m, sizeof m, "csi cfg=%d cb=%d en=%d", (int)e1, (int)e2, (int)e3);
+  logmsg(m);
   phase = "ready"; logmsg("ready");
   dirty = true;
 }
@@ -146,9 +182,9 @@ void setup() {
 static uint8_t rxbuf[MAX_FRAME];
 void loop() {
   static unsigned long last_render = 0;
-  if (dirty && millis() - last_render > 150) {
+  if (millis() - last_render > 150) { // always refresh, independent of RX activity
     last_render = millis(); dirty = false;
-    tft_render();
+    hud_render();
   }
   if (Serial.read() != SYNC0) return;
   while (Serial.available() < 1) {}

@@ -121,6 +121,10 @@ void setup() {
   phase = "wifi_on";
   logmsg("wifi_on");
   esp_wifi_set_channel(cur_channel, WIFI_SECOND_CHAN_NONE);
+  // Transmit at an OFDM rate (802.11g 6 Mbps), not the default 1 Mbps CCK: only OFDM frames carry
+  // the L-LTF/HT-LTF training fields a receiver needs to compute CSI. Without this, peers get RSSI
+  // but no channel state.
+  esp_wifi_config_80211_tx_rate(WIFI_IF_STA, WIFI_PHY_RATE_6M);
   logmsg("ch6");
   wifi_promiscuous_filter_t filt = {.filter_mask = WIFI_PROMIS_FILTER_MASK_DATA};
   esp_wifi_set_promiscuous_filter(&filt);
@@ -133,6 +137,18 @@ void setup() {
 #endif
 }
 
+// Self-beacon: periodically inject a small NDN frame so nearby nodes always have a reference
+// signal to measure CSI / RSSI against (a continuous sounding tone for the sensing receivers).
+#define SELF_BEACON_MS 80
+static const uint8_t beacon_frame[] = {
+    0x08, 0x00, 0x00, 0x00,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff,       // addr1 broadcast
+    0x02, 0x00, 0x00, 0x00, 0x00, 0x02,       // addr2 src = this node
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff,       // addr3
+    0x00, 0x00,                               // seq
+    0xAA, 0xAA, 0x03, 0x00, 0x00, 0x00, 0x86, 0x24, // LLC/SNAP + NDN ethertype
+    'C', 'S', 'I', '-', 'B', 'E', 'A', 'C', 'O', 'N'};
+
 /* Read one framed command from the host; inject or retune. Refresh the OLED on a timer. */
 static uint8_t rxbuf[MAX_FRAME];
 void loop() {
@@ -141,6 +157,14 @@ void loop() {
   if (millis() - last_render > 250) {
     last_render = millis();
     oled_render();
+  }
+#endif
+#ifdef SELF_BEACON_MS
+  static unsigned long last_beacon = 0;
+  if (millis() - last_beacon > SELF_BEACON_MS) {
+    last_beacon = millis();
+    esp_wifi_80211_tx(WIFI_IF_STA, beacon_frame, sizeof(beacon_frame), true);
+    tx_count++;
   }
 #endif
   if (Serial.read() != SYNC0) return;

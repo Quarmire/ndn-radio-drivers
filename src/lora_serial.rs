@@ -13,7 +13,7 @@
 //! floor: no hardware timestamp, only a `HostRecv` stamp latched when the serial line delivers the
 //! frame (see [`RadioTime`]).
 
-use std::io::{Read, Write};
+use std::os::unix::io::RawFd;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -91,9 +91,129 @@ impl Default for LoraParams {
     }
 }
 
+/// A raw serial tty opened with libc termios — a `cfmakeraw` / `CLOCAL` / `8N1` port, exactly what
+/// `stty raw clocal` gives. The `serialport` crate does not exchange bytes with the CH340 bridge
+/// on aarch64-musl (the OPi target), so we own the termios setup ourselves; this also drops the
+/// `serialport` dependency for the LoRa backend and cross-compiles cleanly.
+struct SerialFd {
+    fd: RawFd,
+}
+
+impl SerialFd {
+    fn open(path: &str, baud: u32) -> std::io::Result<Self> {
+        let cpath = std::ffi::CString::new(path)
+            .map_err(|_| std::io::Error::other("path has a NUL byte"))?;
+        // O_NONBLOCK during open avoids blocking on carrier-detect; cleared right after so reads
+        // then block under VMIN/VTIME control.
+        let fd = unsafe {
+            libc::open(
+                cpath.as_ptr(),
+                libc::O_RDWR | libc::O_NOCTTY | libc::O_NONBLOCK,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        unsafe {
+            let fl = libc::fcntl(fd, libc::F_GETFL);
+            libc::fcntl(fd, libc::F_SETFL, fl & !libc::O_NONBLOCK);
+        }
+        let me = SerialFd { fd };
+        me.set_termios(baud)?;
+        Ok(me)
+    }
+
+    fn set_termios(&self, baud: u32) -> std::io::Result<()> {
+        let speed: libc::speed_t = match baud {
+            9600 => libc::B9600,
+            19200 => libc::B19200,
+            38400 => libc::B38400,
+            57600 => libc::B57600,
+            _ => libc::B115200,
+        };
+        unsafe {
+            let mut t: libc::termios = std::mem::zeroed();
+            if libc::tcgetattr(self.fd, &mut t) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            libc::cfmakeraw(&mut t); // 8N1, no echo, no canon, no flow xlate
+            libc::cfsetispeed(&mut t, speed);
+            libc::cfsetospeed(&mut t, speed);
+            t.c_cflag |= libc::CLOCAL | libc::CREAD; // ignore modem lines, enable receiver
+            t.c_cflag &= !libc::CRTSCTS; // no hardware flow control
+            t.c_cc[libc::VMIN] = 0; // read returns after VTIME even with no data…
+            t.c_cc[libc::VTIME] = 2; // …a 0.2 s inter-read timeout
+            if libc::tcsetattr(self.fd, libc::TCSANOW, &t) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            libc::tcflush(self.fd, libc::TCIOFLUSH);
+        }
+        Ok(())
+    }
+
+    fn flush_input(&self) {
+        unsafe {
+            libc::tcflush(self.fd, libc::TCIFLUSH);
+        }
+    }
+
+    fn read(&self, buf: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            let n = unsafe { libc::read(self.fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+            if n < 0 {
+                let e = std::io::Error::last_os_error();
+                if e.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(e);
+            }
+            return Ok(n as usize);
+        }
+    }
+
+    fn write_all(&self, mut buf: &[u8]) -> std::io::Result<()> {
+        while !buf.is_empty() {
+            let n = unsafe { libc::write(self.fd, buf.as_ptr() as *const libc::c_void, buf.len()) };
+            if n < 0 {
+                let e = std::io::Error::last_os_error();
+                if e.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(e);
+            }
+            buf = &buf[n as usize..];
+        }
+        Ok(())
+    }
+
+    fn flush(&self) -> std::io::Result<()> {
+        unsafe {
+            libc::tcdrain(self.fd);
+        }
+        Ok(())
+    }
+
+    fn try_clone(&self) -> std::io::Result<SerialFd> {
+        let fd = unsafe { libc::dup(self.fd) };
+        if fd < 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(SerialFd { fd })
+        }
+    }
+}
+
+impl Drop for SerialFd {
+    fn drop(&mut self) {
+        unsafe {
+            libc::close(self.fd);
+        }
+    }
+}
+
 /// A Waveshare USB-TO-LoRa dongle reached over its `/dev/ttyACM*` serial port.
 pub struct LoraSerialBackend {
-    tx: Arc<Mutex<Box<dyn serialport::SerialPort>>>,
+    tx: Arc<Mutex<SerialFd>>,
     rx: AsyncMutex<mpsc::UnboundedReceiver<CapturedFrame>>,
     params: LoraParams,
 }
@@ -107,11 +227,9 @@ impl LoraSerialBackend {
     /// Open the dongle at `path`, program `params` over the `AT` interface, leave it in transparent
     /// data mode, and spawn the reader that deframes received NDN packets off the byte stream.
     pub fn open_with(path: &str, params: LoraParams) -> Result<Self, FaceError> {
-        let mut port = serialport::new(path, LORA_BAUD)
-            .timeout(Duration::from_millis(200))
-            .open()
-            .map_err(|e| io_err(format!("lora open {path}: {e}")))?;
-        configure(&mut port, &params)?;
+        let port =
+            SerialFd::open(path, LORA_BAUD).map_err(|e| io_err(format!("lora open {path}: {e}")))?;
+        configure(&port, &params)?;
         let reader = port
             .try_clone()
             .map_err(|e| io_err(format!("lora clone: {e}")))?;
@@ -137,19 +255,74 @@ impl LoraSerialBackend {
                 payload.len()
             )));
         }
-        let len = payload.len() as u16;
-        let cksum = checksum(payload);
-        let hdr = [SYNC0, SYNC1, (len & 0xff) as u8, (len >> 8) as u8];
-        let mut port = self.tx.lock().unwrap();
-        port.write_all(&hdr)
-            .and_then(|_| port.write_all(payload))
-            .and_then(|_| port.write_all(&[cksum]))
+        // The transparent module truncates a transmission at the first `0x00` byte, so the whole
+        // wire frame must be zero-free. COBS-encode `payload || checksum` (which removes every
+        // `0x00`) and prefix a zero-free header `[SYNC0 SYNC1 encoded_len]` — SYNC is 0x4E/0x44 and
+        // a COBS length is always ≥ 1. One contiguous write so the module (which else packetizes by
+        // a UART idle timeout) sends it as exactly one air frame.
+        let mut body = Vec::with_capacity(payload.len() + 1);
+        body.extend_from_slice(payload);
+        body.push(checksum(payload));
+        let enc = cobs_encode(&body); // zero-free; ≤ body + 2 bytes, still one LoRa frame
+        let mut frame = Vec::with_capacity(3 + enc.len());
+        frame.extend_from_slice(&[SYNC0, SYNC1, enc.len() as u8]);
+        frame.extend_from_slice(&enc);
+        let port = self.tx.lock().unwrap();
+        port.write_all(&frame)
             .map_err(|e| io_err(format!("lora write: {e}")))
     }
 }
 
-/// Sum-of-bytes checksum (mod 256) over a framed payload — lets the reader drop a frame corrupted
-/// by a partial on-air loss and resync on the next sync word rather than emit garbage.
+/// COBS-encode `data` into a `0x00`-free byte sequence (no trailing delimiter). One overhead byte
+/// per ≤254-byte run; the transparent LoRa module truncates at `0x00`, so this keeps binary NDN
+/// payloads (which contain zeros) intact on the wire.
+fn cobs_encode(data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(data.len() + data.len() / 254 + 2);
+    let mut code_at = 0usize; // index of the current code byte in `out`
+    out.push(0); // placeholder
+    let mut count: u8 = 1;
+    for &b in data {
+        if b == 0 {
+            out[code_at] = count;
+            code_at = out.len();
+            out.push(0);
+            count = 1;
+        } else {
+            out.push(b);
+            count += 1;
+            if count == 0xFF {
+                out[code_at] = count;
+                code_at = out.len();
+                out.push(0);
+                count = 1;
+            }
+        }
+    }
+    out[code_at] = count;
+    out
+}
+
+/// Inverse of [`cobs_encode`] (input has no trailing delimiter). `None` on a malformed sequence
+/// (an embedded `0x00`, or a code that overruns the buffer).
+fn cobs_decode(data: &[u8]) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(data.len());
+    let mut i = 0usize;
+    while i < data.len() {
+        let code = data[i] as usize;
+        if code == 0 || i + code > data.len() {
+            return None;
+        }
+        out.extend_from_slice(&data[i + 1..i + code]);
+        i += code;
+        if code < 0xFF && i < data.len() {
+            out.push(0);
+        }
+    }
+    Some(out)
+}
+
+/// Sum-of-bytes checksum (mod 256) over a payload — lets the reader drop a frame corrupted by a
+/// partial on-air loss and resync on the next sync word rather than emit garbage.
 fn checksum(payload: &[u8]) -> u8 {
     payload.iter().fold(0u8, |a, &b| a.wrapping_add(b))
 }
@@ -159,12 +332,12 @@ fn checksum(payload: &[u8]) -> u8 {
 /// Robust to the module's persisted mode (open does not reset the MCU): `+++\r\n` enters AT mode
 /// from data mode, and merely errors (harmlessly) if already there, so after it we are always in
 /// AT mode; `AT+EXIT` then drops back to transparent data mode for the payload stream.
-fn configure(port: &mut Box<dyn serialport::SerialPort>, p: &LoraParams) -> Result<(), FaceError> {
+fn configure(port: &SerialFd, p: &LoraParams) -> Result<(), FaceError> {
     // Opening the port pulses DTR, which resets the GD32 MCU; the module ignores `+++` within 3 s
     // of power-on (datasheet), so settle past that window before entering command mode.
-    let _ = port.clear(serialport::ClearBuffer::Input);
+    port.flush_input();
     std::thread::sleep(Duration::from_millis(3500));
-    let _ = port.clear(serialport::ClearBuffer::Input);
+    port.flush_input();
     at(port, "+++");
     at(port, "AT+MODE=1");
     at(port, &format!("AT+SF={}", p.sf));
@@ -176,14 +349,14 @@ fn configure(port: &mut Box<dyn serialport::SerialPort>, p: &LoraParams) -> Resu
     at(port, &format!("AT+ADDR={}", p.addr));
     at(port, &format!("AT+PWR={}", p.pwr));
     at(port, "AT+EXIT");
-    let _ = port.clear(serialport::ClearBuffer::Input);
+    port.flush_input();
     Ok(())
 }
 
 /// Send one `AT` command (CRLF-terminated) and drain its response until `OK`/`ERROR` or a short
 /// deadline. Best-effort: a non-`OK` reply (e.g. `+++` returning `ERROR` when already in AT mode)
 /// is not fatal — the sequence in [`configure`] converges regardless.
-fn at(port: &mut Box<dyn serialport::SerialPort>, cmd: &str) {
+fn at(port: &SerialFd, cmd: &str) {
     let _ = port.write_all(cmd.as_bytes());
     let _ = port.write_all(b"\r\n");
     let _ = port.flush();
@@ -215,7 +388,7 @@ fn at(port: &mut Box<dyn serialport::SerialPort>, cmd: &str) {
 /// Background reader: accumulate serial bytes, deframe `[SYNC0 SYNC1 len16 payload cksum]` packets,
 /// verify the checksum, and hand each recovered NDN payload up as a `CapturedFrame` stamped
 /// `HostRecv` at delivery. A checksum miss (partial air loss) is dropped and resynced.
-fn reader_loop(mut port: Box<dyn serialport::SerialPort>, tx: mpsc::UnboundedSender<CapturedFrame>) {
+fn reader_loop(port: SerialFd, tx: mpsc::UnboundedSender<CapturedFrame>) {
     let mut acc: Vec<u8> = Vec::new();
     let mut tmp = [0u8; 512];
     loop {
@@ -281,20 +454,25 @@ fn deframe(buf: &[u8]) -> Deframe {
     if start > 0 {
         return Deframe::Drop { consumed: start }; // discard leading garbage
     }
-    if buf.len() < 4 {
+    if buf.len() < 3 {
         return Deframe::Need;
     }
-    let len = (buf[2] as usize) | ((buf[3] as usize) << 8);
-    let total = 4 + len + 1; // sync(2) + len(2) + payload + cksum(1)
-    if len > MAX_LORA_PAYLOAD {
+    let enc_len = buf[2] as usize; // length of the COBS-encoded body
+    let total = 3 + enc_len; // sync(2) + len(1) + cobs(payload||cksum)
+    if enc_len == 0 || enc_len > MAX_LORA_PAYLOAD + 2 {
         return Deframe::Drop { consumed: 2 }; // implausible length — skip this sync word
     }
     if buf.len() < total {
         return Deframe::Need;
     }
-    let payload = &buf[4..4 + len];
-    if checksum(payload) != buf[4 + len] {
-        return Deframe::Drop { consumed: 2 }; // corrupt — skip past this sync word and resync
+    let Some(body) = cobs_decode(&buf[3..total]) else {
+        return Deframe::Drop { consumed: 2 }; // corrupt COBS — skip past this sync word and resync
+    };
+    let Some((&cksum, payload)) = body.split_last() else {
+        return Deframe::Drop { consumed: 2 };
+    };
+    if checksum(payload) != cksum {
+        return Deframe::Drop { consumed: 2 }; // corrupt — resync
     }
     Deframe::Frame {
         payload: payload.to_vec(),
@@ -346,10 +524,11 @@ mod tests {
     use super::*;
 
     fn frame_bytes(payload: &[u8]) -> Vec<u8> {
-        let len = payload.len() as u16;
-        let mut v = vec![SYNC0, SYNC1, (len & 0xff) as u8, (len >> 8) as u8];
-        v.extend_from_slice(payload);
-        v.push(checksum(payload));
+        let mut body = payload.to_vec();
+        body.push(checksum(payload));
+        let enc = cobs_encode(&body);
+        let mut v = vec![SYNC0, SYNC1, enc.len() as u8];
+        v.extend_from_slice(&enc);
         v
     }
 
@@ -421,5 +600,40 @@ mod tests {
     fn checksum_round_trips() {
         assert_eq!(checksum(&[1, 2, 3]), 6);
         assert_eq!(checksum(&[0xff, 0x01]), 0x00);
+    }
+
+    #[test]
+    fn cobs_round_trips_and_removes_zeros() {
+        let cases: &[&[u8]] = &[
+            &[],
+            &[0],
+            &[0, 0, 0],
+            &[1, 0, 2, 0, 0, 3],
+            &[0x4e, 0x44, 0x00, 0xff],
+            &[0xab; 300],
+        ];
+        for c in cases {
+            let enc = cobs_encode(c);
+            assert!(!enc.contains(&0), "COBS output must be zero-free: {c:?}");
+            assert_eq!(&cobs_decode(&enc).unwrap(), c, "round-trip: {c:?}");
+        }
+    }
+
+    #[test]
+    fn deframes_a_binary_payload_with_zeros() {
+        // A payload full of the bytes the raw module would choke on (0x00) and the sync bytes.
+        let payload = [0x00u8, 0x4e, 0x00, 0x44, 0xff, 0x00, 0x00];
+        let buf = frame_bytes(&payload);
+        assert!(
+            !buf.contains(&0),
+            "the whole wire frame must be zero-free for the transparent LoRa module"
+        );
+        match deframe(&buf) {
+            Deframe::Frame { payload: got, consumed } => {
+                assert_eq!(got, payload);
+                assert_eq!(consumed, buf.len());
+            }
+            _ => panic!("expected a frame"),
+        }
     }
 }

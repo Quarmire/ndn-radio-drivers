@@ -24,8 +24,8 @@ serialport = { version = "4", optional = true, default-features = false }
 default = []
 # The BW16 (RTL8720DN) serial-bridged monitor-mode backend.
 bw16 = ["dep:serialport"]
-# The Waveshare USB-TO-LoRa (SX1262) serial-bridged sub-GHz backend.
-lora = ["dep:serialport"]
+# The Waveshare USB-TO-LoRa (SX1262) serial-bridged sub-GHz backend (raw libc termios, no serialport).
+lora = []
 
 # BW16 examples need the `bw16` backend — gate them so `cargo build --examples`
 # (default features) skips them instead of failing on the unresolved import.

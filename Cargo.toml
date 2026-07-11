@@ -49,10 +49,16 @@ required-features = ["bw16"]
 name = "lora_link"
 required-features = ["lora"]
 
+[[example]]
+name = "lora_cognition"
+required-features = ["lora"]
+
 [dev-dependencies]
 # Cross-repo: the live named-time driver (wifi transport) for the on-air node example.
 ndn-time-driver = { path = "../ndn-ext/crates/time/ndn-time-driver", features = ["wifi"] }
 ndn-time-sources = { path = "../ndn-ext/crates/time/ndn-time-sources" }
 ndn-time = { path = "../ndn-rs/crates/core/ndn-time", default-features = false }
+# The cognitive control plane — drives the live LoRa radio from real RSSI in lora_cognition.
+ndn-radio-cognition = { path = "../ndn-ext/crates/faces/ndn-radio-cognition" }
 
 [workspace]

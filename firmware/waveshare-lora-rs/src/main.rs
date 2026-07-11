@@ -50,8 +50,8 @@ const EVT_INFO: u8 = 0x83; //  payload = [status, sync(2), errors(2), freq(4), s
 const EVT_LOG: u8 = 0x84; //   payload = ascii
 
 // Heartbeat-beacon base period in main-loop iterations (~seconds; the loop is SPI-poll bound).
-// The beacon is runtime-toggleable via CMD_SET_BEACON and defaults on, so a dongle proves itself
-// on-air without a host; a host that drives its own traffic silences it at open.
+// The beacon is runtime-toggleable via CMD_SET_BEACON and defaults OFF, so a fresh/reset dongle stays
+// quiet; enable on-air discovery explicitly with CMD_SET_BEACON[1].
 const BEACON_BASE_PERIOD: u32 = 250_000;
 
 /// Formats into a fixed stack buffer so we can build payloads/logs with `write!`.
@@ -222,7 +222,9 @@ fn main() -> ! {
 
     let mut parser = Parser::new();
     let mut rxbuf = [0u8; 64];
-    let mut beacon_enabled = true;
+    // Default OFF: a fresh/reset dongle stays quiet (no stray beacon before a host attaches). Opt in
+    // on-air discovery with CMD_SET_BEACON[1] (or the host's LoraParams.beacon = true).
+    let mut beacon_enabled = false;
     let mut beacon_period = BEACON_BASE_PERIOD;
     let mut beacon_ctr: u32 = 0;
     let mut beacon_seq: u32 = 0;

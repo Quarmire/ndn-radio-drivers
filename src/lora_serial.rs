@@ -332,11 +332,13 @@ fn configure(port: &SerialFd, p: &LoraParams) -> Result<(), FaceError> {
     port.flush_input();
     std::thread::sleep(Duration::from_millis(200));
     let mkerr = |e: std::io::Error| io_err(format!("lora configure: {e}"));
+    // Beacon state first: a host silencing it must not be beaten by a stray beacon that would fire
+    // during the slower radio reconfiguration below (SET_FREQ runs image calibration).
+    send_cmd(port, CMD_SET_BEACON, &[p.beacon as u8]).map_err(mkerr)?;
     send_cmd(port, CMD_SET_FREQ, &channel_to_hz(p.tx_ch).to_be_bytes()).map_err(mkerr)?;
     send_cmd(port, CMD_SET_MOD, &[p.sf, bw_to_fw(p.bw), p.cr]).map_err(mkerr)?;
     send_cmd(port, CMD_SET_PWR, &[p.pwr]).map_err(mkerr)?;
     send_cmd(port, CMD_SET_SYNC, &[p.sync]).map_err(mkerr)?;
-    send_cmd(port, CMD_SET_BEACON, &[p.beacon as u8]).map_err(mkerr)?;
     port.flush_input();
     Ok(())
 }

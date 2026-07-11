@@ -56,7 +56,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     Ok(f) => {
                         let body = String::from_utf8_lossy(&f.payload);
                         let age = f.stamp.map(|s| s.raw).unwrap_or(0);
-                        println!("RX [{} B, host_ns={age}] {body}", f.payload.len());
+                        let rssi = f.rssi_dbm.map(|r| format!("{r} dBm")).unwrap_or_else(|| "?".into());
+                        println!("RX [{} B, {rssi}, host_ns={age}] {body}", f.payload.len());
                     }
                     Err(e) => {
                         eprintln!("recv ended: {e:?}");

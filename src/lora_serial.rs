@@ -1,20 +1,25 @@
 //! Waveshare USB-TO-LoRa (SX1262) serial-bridged [`FrameIo`] backend.
 //!
 //! The dongle is a GD32F103 MCU + Semtech SX1262 behind a CH343 USB-UART, presenting
-//! `/dev/ttyACM*` at 115200 8N1. In its default **transparent mode** (`AT+MODE=1`) it is a plain
-//! byte pipe: bytes written to the UART are sent as a LoRa frame, and a received LoRa frame's
-//! payload comes back out the UART. There is no board-side packet protocol (unlike the BW16
-//! bridge, which speaks a typed frame), so this backend supplies its own length-delimited framing
-//! to recover NDN packet boundaries from the byte stream, and configures the radio parameters
-//! (spreading factor, bandwidth, channel, …) once at open via the module's `+++`/`AT` interface.
+//! `/dev/ttyACM*` (Linux) / `/dev/cu.usbmodem*` (macOS) at 115200 8N1. It runs our **open Rust
+//! firmware** (`firmware/waveshare-lora-rs`), which replaced the closed factory firmware: the air
+//! side is now plain **standard LoRa** (no proprietary header — interoperates with any SX127x/
+//! SX126x peer), and the host link is a small **binary protocol** — `7E A5 | type | len | payload |
+//! xor-crc` — carrying commands (transmit a frame; set frequency / SF-BW-CR / power / sync word;
+//! query info) and events (received frame **with RSSI + SNR**; TX-done; info; ascii log).
 //!
-//! This makes a long-range, low-rate, duty-cycled sub-GHz radio just another `FrameIo` — the same
-//! seam the USB Wi-Fi drivers and the BW16 board sit behind. Its named-time surface is the honest
-//! floor: no hardware timestamp, only a `HostRecv` stamp latched when the serial line delivers the
-//! frame (see [`RadioTime`]).
+//! Because the board now does its own LoRa framing, this backend no longer needs the transparent-
+//! mode workarounds the closed firmware forced (COBS to survive a `0x00`-truncating byte pipe, an
+//! `AT`/`+++` command mode, a DTR-reset settle): it just frames commands and parses events. Knobs
+//! are binary commands the firmware applies live, so there is no command-mode/data-mode switch and
+//! the reader never has to park. RX frames arrive with a real `rssi_dbm` (the closed path had none).
+//!
+//! This keeps a long-range, low-rate, duty-cycled sub-GHz radio as just another `FrameIo` — the
+//! same seam the USB Wi-Fi drivers and the BW16 board sit behind. Its named-time surface is the
+//! honest floor: no hardware timestamp, only a `HostRecv` stamp latched when the serial line
+//! delivers the frame (see [`RadioTime`]).
 
 use std::os::unix::io::RawFd;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -27,20 +32,48 @@ use ndn_radio_hal::{Bandwidth, RadioKnobs, TxDiscipline};
 use ndn_transport::FaceError;
 use tokio::sync::{Mutex as AsyncMutex, mpsc};
 
-/// Baud the CH343↔GD32 link (and thus the host) runs at — the module's factory default.
+/// Baud the CH343↔GD32 link (and thus the host) runs at.
 pub const LORA_BAUD: u32 = 115_200;
 
 /// Host clock domain for LoRa `HostRecv` stamps ("LORA"); the module exposes no hardware counter.
 const HOST_CLOCK_DOMAIN: ClockDomainId = ClockDomainId(0x4C4F_5241);
 
-/// Framing sync word ("ND") prefixing every host↔host NDN packet on the transparent byte stream.
-const SYNC0: u8 = 0x4E;
-const SYNC1: u8 = 0x44;
+// --- Host ⇄ firmware binary protocol (mirrors firmware/waveshare-lora-rs) ---
+const SYNC0: u8 = 0x7E;
+const SYNC1: u8 = 0xA5;
+// Host -> firmware commands.
+const CMD_TX: u8 = 0x01; //       payload = LoRa frame bytes
+const CMD_SET_FREQ: u8 = 0x02; //  payload = u32 BE Hz
+const CMD_SET_MOD: u8 = 0x03; //   payload = [sf, bw_code, cr_code]
+const CMD_SET_PWR: u8 = 0x04; //   payload = [i8 dBm]
+const CMD_SET_SYNC: u8 = 0x05; //  payload = [sx127x sync byte]
+#[allow(dead_code)]
+const CMD_GET_INFO: u8 = 0x06; //  payload = []
+// Firmware -> host events.
+const EVT_RX: u8 = 0x81; //     payload = [rssi i16 BE, snr i16 BE, LoRa bytes]
+const EVT_TXDONE: u8 = 0x82; // payload = [ok]
+const EVT_INFO: u8 = 0x83; //   payload = [status, sync(2), errors(2), freq(4), sf, bw, cr, pwr]
+const EVT_LOG: u8 = 0x84; //    payload = ascii
 
 /// Largest NDN payload carried in one LoRa frame. The SX1262 LoRa PHY caps a frame near 255 bytes;
-/// our 5-byte framing overhead (sync+len+cksum) leaves this so one framed packet is exactly one
-/// air frame — keeping loss atomic (a dropped frame loses one packet, never desyncs a larger one).
+/// keeping a margin means one NDN packet is exactly one air frame — loss stays atomic (a dropped
+/// frame loses one packet, never desyncs a larger one).
 pub const MAX_LORA_PAYLOAD: usize = 240;
+
+/// The Waveshare/firmware channel convention: channel index → carrier = `(850 + ch)` MHz
+/// (ch 18 = 868 EU, ch 65 = 915 US). Kept so cognition can keep thinking in channels.
+fn channel_to_hz(ch: u8) -> u32 {
+    (850 + ch as u32) * 1_000_000
+}
+
+/// Host bandwidth code (0/1/2 = 125/250/500 kHz) → SX1262 modulation bandwidth code.
+fn bw_to_fw(bw: u8) -> u8 {
+    match bw {
+        0 => 0x04, // 125 kHz
+        1 => 0x05, // 250 kHz
+        _ => 0x06, // 500 kHz
+    }
+}
 
 /// A `HostRecv` [`LinkStamp`]: nanoseconds since process start (monotonic), latched when the serial
 /// line delivered the frame — the coarsest but honest time a serial LoRa bridge can offer.
@@ -55,27 +88,25 @@ fn host_stamp() -> LinkStamp {
     )
 }
 
-/// Radio parameters programmed over the `AT` interface at open. Two modules must agree on all of
-/// these to hear each other; [`Default`] is the dongle's factory pairing (SF7, 125 kHz, 4/5,
-/// channel 18, network 0, 22 dBm), which two units share out of the box.
+/// Radio parameters programmed over the binary protocol at open. Two dongles must agree on
+/// frequency, SF, BW, CR and sync word to hear each other; [`Default`] is 915 MHz (US) / SF7 /
+/// 125 kHz / 4-5 / private sync — matching the firmware defaults and the Heltec interop node.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LoraParams {
-    /// Spreading factor 7–12 (`AT+SF`). Higher = longer range, exponentially slower.
+    /// Spreading factor 7–12. Higher = longer range, exponentially slower.
     pub sf: u8,
-    /// Bandwidth code (`AT+BW`): 0 = 125 kHz, 1 = 250 kHz, 2 = 500 kHz.
+    /// Bandwidth code: 0 = 125 kHz, 1 = 250 kHz, 2 = 500 kHz.
     pub bw: u8,
-    /// Coding-rate code (`AT+CR`): 1 = 4/5 … 4 = 4/8.
+    /// Coding-rate code: 1 = 4/5 … 4 = 4/8.
     pub cr: u8,
-    /// TX channel index (`AT+TXCH`).
+    /// TX channel index; carrier = `(850 + tx_ch)` MHz.
     pub tx_ch: u8,
-    /// RX channel index (`AT+RXCH`).
+    /// RX channel index; LoRa is half-duplex so this tracks `tx_ch`.
     pub rx_ch: u8,
-    /// Network id (`AT+NETID`) — only same-netid modules pair.
-    pub netid: u16,
-    /// Module address (`AT+ADDR`).
-    pub addr: u16,
-    /// TX power, dBm (`AT+PWR`), 10–22.
+    /// TX power, dBm, 10–22.
     pub pwr: u8,
+    /// LoRa sync word in the SX127x single-byte convention: 0x12 private / 0x34 public.
+    pub sync: u8,
 }
 
 impl Default for LoraParams {
@@ -84,11 +115,10 @@ impl Default for LoraParams {
             sf: 7,
             bw: 0,
             cr: 1,
-            tx_ch: 18,
-            rx_ch: 18,
-            netid: 0,
-            addr: 0,
+            tx_ch: 65, // 915 MHz (US ISM)
+            rx_ch: 65,
             pwr: 22,
+            sync: 0x12,
         }
     }
 }
@@ -213,26 +243,23 @@ impl Drop for SerialFd {
     }
 }
 
-/// A Waveshare USB-TO-LoRa dongle reached over its `/dev/ttyACM*` serial port.
+/// A Waveshare USB-TO-LoRa dongle (open firmware) reached over its serial port.
 pub struct LoraSerialBackend {
     tx: Arc<Mutex<SerialFd>>,
     rx: AsyncMutex<mpsc::UnboundedReceiver<CapturedFrame>>,
     /// Behind a mutex because [`RadioKnobs`] retunes the module at runtime; `capability()` and
     /// `params()` reflect the live values.
     params: Arc<Mutex<LoraParams>>,
-    /// Set while a knob change is re-entering AT command mode, so the reader thread parks instead
-    /// of swallowing the AT responses off the shared tty.
-    reconfiguring: Arc<AtomicBool>,
 }
 
 impl LoraSerialBackend {
-    /// Open the dongle at `path` with the factory-default (paired) parameters.
+    /// Open the dongle at `path` with the default (915 MHz / SF7) parameters.
     pub fn open(path: &str) -> Result<Self, FaceError> {
         Self::open_with(path, LoraParams::default())
     }
 
-    /// Open the dongle at `path`, program `params` over the `AT` interface, leave it in transparent
-    /// data mode, and spawn the reader that deframes received NDN packets off the byte stream.
+    /// Open the dongle at `path`, program `params` over the binary protocol, and spawn the reader
+    /// that parses events and hands received NDN frames (with RSSI/SNR) up as [`CapturedFrame`]s.
     pub fn open_with(path: &str, params: LoraParams) -> Result<Self, FaceError> {
         let port =
             SerialFd::open(path, LORA_BAUD).map_err(|e| io_err(format!("lora open {path}: {e}")))?;
@@ -241,14 +268,11 @@ impl LoraSerialBackend {
             .try_clone()
             .map_err(|e| io_err(format!("lora clone: {e}")))?;
         let (txch, rxch) = mpsc::unbounded_channel();
-        let reconfiguring = Arc::new(AtomicBool::new(false));
-        let rflag = reconfiguring.clone();
-        std::thread::spawn(move || reader_loop(reader, txch, rflag));
+        std::thread::spawn(move || reader_loop(reader, txch));
         Ok(Self {
             tx: Arc::new(Mutex::new(port)),
             rx: AsyncMutex::new(rxch),
             params: Arc::new(Mutex::new(params)),
-            reconfiguring,
         })
     }
 
@@ -257,204 +281,77 @@ impl LoraSerialBackend {
         *self.params.lock().unwrap()
     }
 
-    /// Re-enter AT command mode, apply `setters`, and drop back to transparent data mode — with the
-    /// reader parked so it does not consume the AT responses. Each knob change costs one such cycle
-    /// (a brief, ~1 s data-path interruption), so cognition should retune sparingly.
-    fn at_reconfigure(&self, setters: &[String]) -> Result<(), FaceError> {
-        self.reconfiguring.store(true, Ordering::SeqCst);
-        std::thread::sleep(Duration::from_millis(300)); // let the reader notice and park
-        {
-            let port = self.tx.lock().unwrap();
-            port.flush_input();
-            at(&port, "+++");
-            for s in setters {
-                at(&port, s);
-            }
-            at(&port, "AT+EXIT");
-            port.flush_input();
-        }
-        self.reconfiguring.store(false, Ordering::SeqCst);
-        Ok(())
-    }
-
-    /// Frame and write one NDN payload as a single LoRa air frame.
-    fn write_framed(&self, payload: &[u8]) -> Result<(), FaceError> {
-        if payload.len() > MAX_LORA_PAYLOAD {
-            return Err(io_err(format!(
-                "lora payload {} > {MAX_LORA_PAYLOAD} (one frame)",
-                payload.len()
-            )));
-        }
-        // The transparent module truncates a transmission at the first `0x00` byte, so the whole
-        // wire frame must be zero-free. COBS-encode `payload || checksum` (which removes every
-        // `0x00`) and prefix a zero-free header `[SYNC0 SYNC1 encoded_len]` — SYNC is 0x4E/0x44 and
-        // a COBS length is always ≥ 1. One contiguous write so the module (which else packetizes by
-        // a UART idle timeout) sends it as exactly one air frame.
-        let mut body = Vec::with_capacity(payload.len() + 1);
-        body.extend_from_slice(payload);
-        body.push(checksum(payload));
-        let enc = cobs_encode(&body); // zero-free; ≤ body + 2 bytes, still one LoRa frame
-        let mut frame = Vec::with_capacity(3 + enc.len());
-        frame.extend_from_slice(&[SYNC0, SYNC1, enc.len() as u8]);
-        frame.extend_from_slice(&enc);
+    /// Frame and write one protocol command to the dongle.
+    fn send(&self, typ: u8, payload: &[u8]) -> Result<(), FaceError> {
         let port = self.tx.lock().unwrap();
-        port.write_all(&frame)
-            .map_err(|e| io_err(format!("lora write: {e}")))
+        send_cmd(&port, typ, payload).map_err(|e| io_err(format!("lora cmd {typ:#04x}: {e}")))
+    }
+
+    /// Push the current SF/BW/CR triple to the firmware (any of them changing needs the full set).
+    fn send_mod(&self) -> Result<(), FaceError> {
+        let (sf, bw, cr) = {
+            let p = self.params.lock().unwrap();
+            (p.sf, bw_to_fw(p.bw), p.cr)
+        };
+        self.send(CMD_SET_MOD, &[sf, bw, cr])
     }
 }
 
-/// COBS-encode `data` into a `0x00`-free byte sequence (no trailing delimiter). One overhead byte
-/// per ≤254-byte run; the transparent LoRa module truncates at `0x00`, so this keeps binary NDN
-/// payloads (which contain zeros) intact on the wire.
-fn cobs_encode(data: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(data.len() + data.len() / 254 + 2);
-    let mut code_at = 0usize; // index of the current code byte in `out`
-    out.push(0); // placeholder
-    let mut count: u8 = 1;
-    for &b in data {
-        if b == 0 {
-            out[code_at] = count;
-            code_at = out.len();
-            out.push(0);
-            count = 1;
-        } else {
-            out.push(b);
-            count += 1;
-            if count == 0xFF {
-                out[code_at] = count;
-                code_at = out.len();
-                out.push(0);
-                count = 1;
-            }
-        }
+/// Frame one command/event as `7E A5 | type | len | payload | xor-crc` and write it in one call.
+fn send_cmd(port: &SerialFd, typ: u8, payload: &[u8]) -> std::io::Result<()> {
+    let mut f = Vec::with_capacity(5 + payload.len());
+    f.push(SYNC0);
+    f.push(SYNC1);
+    f.push(typ);
+    f.push(payload.len() as u8);
+    let mut crc = typ ^ (payload.len() as u8);
+    for &b in payload {
+        f.push(b);
+        crc ^= b;
     }
-    out[code_at] = count;
-    out
+    f.push(crc);
+    port.write_all(&f)?;
+    port.flush()
 }
 
-/// Inverse of [`cobs_encode`] (input has no trailing delimiter). `None` on a malformed sequence
-/// (an embedded `0x00`, or a code that overruns the buffer).
-fn cobs_decode(data: &[u8]) -> Option<Vec<u8>> {
-    let mut out = Vec::with_capacity(data.len());
-    let mut i = 0usize;
-    while i < data.len() {
-        let code = data[i] as usize;
-        if code == 0 || i + code > data.len() {
-            return None;
-        }
-        out.extend_from_slice(&data[i + 1..i + code]);
-        i += code;
-        if code < 0xFF && i < data.len() {
-            out.push(0);
-        }
-    }
-    Some(out)
-}
-
-/// Sum-of-bytes checksum (mod 256) over a payload — lets the reader drop a frame corrupted by a
-/// partial on-air loss and resync on the next sync word rather than emit garbage.
-fn checksum(payload: &[u8]) -> u8 {
-    payload.iter().fold(0u8, |a, &b| a.wrapping_add(b))
-}
-
-/// Enter AT command mode, program the radio parameters, and return to transparent data mode.
-///
-/// Robust to the module's persisted mode (open does not reset the MCU): `+++\r\n` enters AT mode
-/// from data mode, and merely errors (harmlessly) if already there, so after it we are always in
-/// AT mode; `AT+EXIT` then drops back to transparent data mode for the payload stream.
+/// Program frequency, modulation, power and sync word at open. The firmware applies each live; the
+/// port open does not reset the MCU (DTR is not wired to nRST), so a short settle + flush suffices.
 fn configure(port: &SerialFd, p: &LoraParams) -> Result<(), FaceError> {
-    // Opening the port pulses DTR, which resets the GD32 MCU; the module ignores `+++` within 3 s
-    // of power-on (datasheet), so settle past that window before entering command mode.
     port.flush_input();
-    std::thread::sleep(Duration::from_millis(3500));
-    port.flush_input();
-    at(port, "+++");
-    at(port, "AT+MODE=1");
-    at(port, &format!("AT+SF={}", p.sf));
-    at(port, &format!("AT+BW={}", p.bw));
-    at(port, &format!("AT+CR={}", p.cr));
-    at(port, &format!("AT+TXCH={}", p.tx_ch));
-    at(port, &format!("AT+RXCH={}", p.rx_ch));
-    at(port, &format!("AT+NETID={}", p.netid));
-    at(port, &format!("AT+ADDR={}", p.addr));
-    at(port, &format!("AT+PWR={}", p.pwr));
-    at(port, "AT+EXIT");
+    std::thread::sleep(Duration::from_millis(200));
+    let mkerr = |e: std::io::Error| io_err(format!("lora configure: {e}"));
+    send_cmd(port, CMD_SET_FREQ, &channel_to_hz(p.tx_ch).to_be_bytes()).map_err(mkerr)?;
+    send_cmd(port, CMD_SET_MOD, &[p.sf, bw_to_fw(p.bw), p.cr]).map_err(mkerr)?;
+    send_cmd(port, CMD_SET_PWR, &[p.pwr]).map_err(mkerr)?;
+    send_cmd(port, CMD_SET_SYNC, &[p.sync]).map_err(mkerr)?;
     port.flush_input();
     Ok(())
 }
 
-/// Send one `AT` command (CRLF-terminated) and drain its response until `OK`/`ERROR` or a short
-/// deadline. Best-effort: a non-`OK` reply (e.g. `+++` returning `ERROR` when already in AT mode)
-/// is not fatal — the sequence in [`configure`] converges regardless.
-fn at(port: &SerialFd, cmd: &str) {
-    let _ = port.write_all(cmd.as_bytes());
-    let _ = port.write_all(b"\r\n");
-    let _ = port.flush();
-    let deadline = Instant::now() + Duration::from_millis(800);
-    let mut resp = Vec::new();
-    let mut tmp = [0u8; 256];
-    while Instant::now() < deadline {
-        match port.read(&mut tmp) {
-            Ok(n) if n > 0 => {
-                resp.extend_from_slice(&tmp[..n]);
-                if resp.windows(2).any(|w| w == b"OK" || w == b"OR") {
-                    break; // "OK" or the tail of "ERROR"
-                }
-            }
-            Ok(_) => {}
-            Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => {}
-            Err(_) => break,
-        }
-    }
-    if std::env::var_os("LORA_AT_DEBUG").is_some() {
-        let printable: String = resp
-            .iter()
-            .map(|&b| if (0x20..0x7f).contains(&b) { b as char } else { '.' })
-            .collect();
-        eprintln!("AT[{cmd}] <- {} bytes [{printable}]", resp.len());
-    }
-}
-
-/// Background reader: accumulate serial bytes, deframe `[SYNC0 SYNC1 len16 payload cksum]` packets,
-/// verify the checksum, and hand each recovered NDN payload up as a `CapturedFrame` stamped
-/// `HostRecv` at delivery. A checksum miss (partial air loss) is dropped and resynced.
-fn reader_loop(
-    port: SerialFd,
-    tx: mpsc::UnboundedSender<CapturedFrame>,
-    reconfiguring: Arc<AtomicBool>,
-) {
+/// Background reader: accumulate serial bytes, parse protocol frames, and hand each received LoRa
+/// frame up as a `CapturedFrame` stamped `HostRecv` with its RSSI. Non-RX events are logged under
+/// `LORA_DEBUG` and otherwise ignored; a crc miss resyncs on the next sync word.
+fn reader_loop(port: SerialFd, tx: mpsc::UnboundedSender<CapturedFrame>) {
+    let debug = std::env::var_os("LORA_DEBUG").is_some();
     let mut acc: Vec<u8> = Vec::new();
     let mut tmp = [0u8; 512];
     loop {
-        if reconfiguring.load(Ordering::SeqCst) {
-            // A knob change owns the tty — don't read, or we'd eat its AT responses.
-            acc.clear();
-            std::thread::sleep(Duration::from_millis(50));
-            continue;
-        }
         match port.read(&mut tmp) {
             Ok(n) if n > 0 => {
                 acc.extend_from_slice(&tmp[..n]);
                 loop {
-                    match deframe(&acc) {
-                        Deframe::Frame { payload, consumed } => {
-                            let cap = CapturedFrame {
-                                payload: payload.into(),
-                                addr: None,
-                                group: None,
-                                rssi_dbm: None,
-                                mcs_index: None,
-                                stamp: Some(host_stamp()),
-                            };
+                    match next_event(&acc) {
+                        EvParse::Event { typ, payload, consumed } => {
+                            handle_event(typ, &payload, &tx, debug);
                             acc.drain(..consumed);
-                            if tx.send(cap).is_err() {
-                                return; // backend dropped
+                            if tx.is_closed() {
+                                return;
                             }
                         }
-                        Deframe::Drop { consumed } => {
+                        EvParse::Drop { consumed } => {
                             acc.drain(..consumed);
                         }
-                        Deframe::Need => break,
+                        EvParse::Need => break,
                     }
                 }
                 if acc.len() > 8192 {
@@ -468,64 +365,93 @@ fn reader_loop(
     }
 }
 
-/// Outcome of trying to deframe the front of the accumulator.
-enum Deframe {
-    /// A whole, checksum-valid packet; `consumed` bytes cover the sync word through the checksum.
-    Frame { payload: Vec<u8>, consumed: usize },
-    /// Bytes to discard (leading garbage before a sync word, or a checksum-failed frame).
+/// Dispatch one decoded event: an `EVT_RX` becomes a `CapturedFrame`; others are optional debug.
+fn handle_event(typ: u8, payload: &[u8], tx: &mpsc::UnboundedSender<CapturedFrame>, debug: bool) {
+    match typ {
+        EVT_RX if payload.len() >= 4 => {
+            let rssi = i16::from_be_bytes([payload[0], payload[1]]);
+            let snr = i16::from_be_bytes([payload[2], payload[3]]);
+            let ndn = &payload[4..];
+            if debug {
+                eprintln!("lora RX [{rssi} dBm, SNR {snr}] {} bytes", ndn.len());
+            }
+            let cap = CapturedFrame {
+                payload: ndn.to_vec().into(),
+                addr: None,
+                group: None,
+                rssi_dbm: Some(rssi.clamp(i8::MIN as i16, i8::MAX as i16) as i8),
+                mcs_index: None,
+                stamp: Some(host_stamp()),
+            };
+            let _ = tx.send(cap);
+        }
+        _ if debug => match typ {
+            EVT_TXDONE => eprintln!("lora TXDONE ok={}", payload.first().copied().unwrap_or(0)),
+            EVT_INFO => eprintln!("lora INFO {}", hex(payload)),
+            EVT_LOG => eprintln!("lora LOG: {}", String::from_utf8_lossy(payload)),
+            other => eprintln!("lora EVT {other:#04x} {}", hex(payload)),
+        },
+        _ => {}
+    }
+}
+
+fn hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+/// Outcome of trying to parse one event from the front of the accumulator.
+enum EvParse {
+    Event { typ: u8, payload: Vec<u8>, consumed: usize },
     Drop { consumed: usize },
-    /// Not enough bytes yet — read more.
     Need,
 }
 
-/// Parse one framed packet from the front of `buf`.
-fn deframe(buf: &[u8]) -> Deframe {
+/// Parse one `7E A5 | type | len | payload | crc` frame from the front of `buf`.
+fn next_event(buf: &[u8]) -> EvParse {
     let Some(start) = buf.windows(2).position(|w| w == [SYNC0, SYNC1]) else {
         // No sync word; keep only a possible trailing lone SYNC0 for the next read.
         let keep = if buf.last() == Some(&SYNC0) { 1 } else { 0 };
         return if buf.len() > keep {
-            Deframe::Drop {
-                consumed: buf.len() - keep,
-            }
+            EvParse::Drop { consumed: buf.len() - keep }
         } else {
-            Deframe::Need
+            EvParse::Need
         };
     };
     if start > 0 {
-        return Deframe::Drop { consumed: start }; // discard leading garbage
+        return EvParse::Drop { consumed: start }; // discard leading garbage
     }
-    if buf.len() < 3 {
-        return Deframe::Need;
+    if buf.len() < 4 {
+        return EvParse::Need; // sync(2) + type + len
     }
-    let enc_len = buf[2] as usize; // length of the COBS-encoded body
-    let total = 3 + enc_len; // sync(2) + len(1) + cobs(payload||cksum)
-    if enc_len == 0 || enc_len > MAX_LORA_PAYLOAD + 2 {
-        return Deframe::Drop { consumed: 2 }; // implausible length — skip this sync word
-    }
+    let typ = buf[2];
+    let len = buf[3] as usize;
+    let total = 4 + len + 1; // + crc
     if buf.len() < total {
-        return Deframe::Need;
+        return EvParse::Need;
     }
-    let Some(body) = cobs_decode(&buf[3..total]) else {
-        return Deframe::Drop { consumed: 2 }; // corrupt COBS — skip past this sync word and resync
-    };
-    let Some((&cksum, payload)) = body.split_last() else {
-        return Deframe::Drop { consumed: 2 };
-    };
-    if checksum(payload) != cksum {
-        return Deframe::Drop { consumed: 2 }; // corrupt — resync
+    let payload = &buf[4..4 + len];
+    let mut crc = typ ^ (len as u8);
+    for &b in payload {
+        crc ^= b;
     }
-    Deframe::Frame {
-        payload: payload.to_vec(),
-        consumed: total,
+    if crc != buf[4 + len] {
+        return EvParse::Drop { consumed: 2 }; // crc miss — skip past this sync word and resync
     }
+    EvParse::Event { typ, payload: payload.to_vec(), consumed: total }
 }
 
 #[async_trait]
 impl FrameIo for LoraSerialBackend {
     async fn inject(&self, frame_in: InjectFrame) -> Result<(), FaceError> {
-        // The payload is the NDN packet itself — LoRa carries no link addressing here, so `dst`/
-        // `src`/`tx` are advisory only. Transparent mode sends it as one air frame.
-        self.write_framed(&frame_in.payload)
+        // The payload is the NDN packet itself; the firmware LoRa-frames it. `dst`/`src`/`tx` carry
+        // no link addressing on standard LoRa here, so they are advisory only.
+        if frame_in.payload.len() > MAX_LORA_PAYLOAD {
+            return Err(io_err(format!(
+                "lora payload {} > {MAX_LORA_PAYLOAD} (one frame)",
+                frame_in.payload.len()
+            )));
+        }
+        self.send(CMD_TX, &frame_in.payload)
     }
 
     async fn recv_frame(&self) -> Result<CapturedFrame, FaceError> {
@@ -555,14 +481,14 @@ impl RadioProfile for LoraSerialBackend {
     }
 }
 
-/// Control plane: LoRa's dials, actuated at runtime over the `AT` interface. `set_spreading_factor`
-/// is the reach/rate knob cognition drives (down for close/bulk, up for far/urgent); the rest tune
-/// channel, coding rate, bandwidth, power, and listen-before-talk. Each call briefly re-enters
-/// command mode, so cognition retunes only on a real decision change.
+/// Control plane: LoRa's dials, actuated at runtime as binary commands the firmware applies live
+/// (no command-mode switch, no reader parking). `set_spreading_factor` is the reach/rate knob
+/// cognition drives (down for close/bulk, up for far/urgent); the rest tune channel, coding rate,
+/// bandwidth, and power.
 impl RadioKnobs for LoraSerialBackend {
     fn set_channel(&self, channel: u8, _bw: Bandwidth) -> Result<(), FaceError> {
-        // LoRa is half-duplex on a single channel: point TX and RX at it together.
-        self.at_reconfigure(&[format!("AT+TXCH={channel}"), format!("AT+RXCH={channel}")])?;
+        // LoRa is half-duplex on a single carrier: point TX and RX at it together.
+        self.send(CMD_SET_FREQ, &channel_to_hz(channel).to_be_bytes())?;
         let mut p = self.params.lock().unwrap();
         p.tx_ch = channel;
         p.rx_ch = channel;
@@ -570,40 +496,38 @@ impl RadioKnobs for LoraSerialBackend {
     }
 
     fn set_tx_power(&self, idx: u32) -> Result<(), FaceError> {
-        let dbm = idx.clamp(10, 22) as u8; // AT+PWR range
-        self.at_reconfigure(&[format!("AT+PWR={dbm}")])?;
+        let dbm = idx.clamp(10, 22) as u8;
+        self.send(CMD_SET_PWR, &[dbm])?;
         self.params.lock().unwrap().pwr = dbm;
         Ok(())
     }
 
-    fn set_edcca_ignore(&self, on: bool) -> Result<(), FaceError> {
-        // LBT off ⇒ transmit without listening (EDCCA-ignore); LBT on ⇒ back off under contention.
-        self.at_reconfigure(&[format!("AT+LBT={}", if on { 0 } else { 1 })])
+    fn set_edcca_ignore(&self, _on: bool) -> Result<(), FaceError> {
+        // The open firmware transmits without listen-before-talk (standard LoRa TX), so EDCCA is
+        // effectively always ignored; nothing to actuate.
+        Ok(())
     }
 
     fn set_spreading_factor(&self, sf: u8) -> Result<(), FaceError> {
         let sf = sf.clamp(7, 12);
-        self.at_reconfigure(&[format!("AT+SF={sf}")])?;
         self.params.lock().unwrap().sf = sf;
-        Ok(())
+        self.send_mod()
     }
 
     fn set_coding_rate(&self, cr: u8) -> Result<(), FaceError> {
         let cr = cr.clamp(1, 4);
-        self.at_reconfigure(&[format!("AT+CR={cr}")])?;
         self.params.lock().unwrap().cr = cr;
-        Ok(())
+        self.send_mod()
     }
 
     fn set_bandwidth_khz(&self, khz: u32) -> Result<(), FaceError> {
         let bw = match khz {
-            0..=180 => 0, // 125 kHz
+            0..=180 => 0,   // 125 kHz
             181..=360 => 1, // 250 kHz
-            _ => 2,        // 500 kHz
+            _ => 2,         // 500 kHz
         };
-        self.at_reconfigure(&[format!("AT+BW={bw}")])?;
         self.params.lock().unwrap().bw = bw;
-        Ok(())
+        self.send_mod()
     }
 
     fn tx_discipline(&self) -> TxDiscipline {
@@ -620,117 +544,105 @@ fn io_err(msg: String) -> FaceError {
 mod tests {
     use super::*;
 
-    fn frame_bytes(payload: &[u8]) -> Vec<u8> {
-        let mut body = payload.to_vec();
-        body.push(checksum(payload));
-        let enc = cobs_encode(&body);
-        let mut v = vec![SYNC0, SYNC1, enc.len() as u8];
-        v.extend_from_slice(&enc);
+    /// Build a wire frame the way the firmware would emit an event.
+    fn wire(typ: u8, payload: &[u8]) -> Vec<u8> {
+        let mut v = vec![SYNC0, SYNC1, typ, payload.len() as u8];
+        v.extend_from_slice(payload);
+        let mut crc = typ ^ (payload.len() as u8);
+        for &b in payload {
+            crc ^= b;
+        }
+        v.push(crc);
         v
     }
 
     #[test]
-    fn deframes_a_clean_packet() {
-        let buf = frame_bytes(b"hello-ndn");
-        match deframe(&buf) {
-            Deframe::Frame { payload, consumed } => {
-                assert_eq!(payload, b"hello-ndn");
+    fn parses_a_clean_rx_event() {
+        // rssi = -31, snr = 9, payload "hi"
+        let mut p = Vec::new();
+        p.extend_from_slice(&(-31i16).to_be_bytes());
+        p.extend_from_slice(&9i16.to_be_bytes());
+        p.extend_from_slice(b"hi");
+        let buf = wire(EVT_RX, &p);
+        match next_event(&buf) {
+            EvParse::Event { typ, payload, consumed } => {
+                assert_eq!(typ, EVT_RX);
                 assert_eq!(consumed, buf.len());
+                assert_eq!(i16::from_be_bytes([payload[0], payload[1]]), -31);
+                assert_eq!(&payload[4..], b"hi");
             }
-            _ => panic!("expected a frame"),
+            _ => panic!("expected an event"),
         }
     }
 
     #[test]
-    fn skips_leading_garbage_then_frames() {
+    fn skips_leading_garbage_then_parses() {
         let mut buf = vec![0x00, 0x11, 0x22];
-        buf.extend_from_slice(&frame_bytes(b"abc"));
-        // First: drop the 3 garbage bytes.
-        match deframe(&buf) {
-            Deframe::Drop { consumed } => buf.drain(..consumed),
+        buf.extend_from_slice(&wire(EVT_TXDONE, &[1]));
+        match next_event(&buf) {
+            EvParse::Drop { consumed } => buf.drain(..consumed),
             _ => panic!("expected drop of garbage"),
         };
-        match deframe(&buf) {
-            Deframe::Frame { payload, .. } => assert_eq!(payload, b"abc"),
-            _ => panic!("expected frame after garbage"),
+        match next_event(&buf) {
+            EvParse::Event { typ, payload, .. } => {
+                assert_eq!(typ, EVT_TXDONE);
+                assert_eq!(payload, vec![1]);
+            }
+            _ => panic!("expected event after garbage"),
         }
     }
 
     #[test]
     fn partial_frame_needs_more() {
-        let full = frame_bytes(b"waiting");
-        assert!(matches!(deframe(&full[..6]), Deframe::Need));
+        let full = wire(EVT_RX, &[0, 0, 0, 0, b'x']);
+        assert!(matches!(next_event(&full[..6]), EvParse::Need));
     }
 
     #[test]
-    fn corrupt_checksum_is_dropped_and_resyncs() {
-        let mut buf = frame_bytes(b"payload");
+    fn crc_miss_is_dropped_and_resyncs() {
+        let mut buf = wire(EVT_RX, &[0, 0, 0, 0, b'a']);
         let last = buf.len() - 1;
-        buf[last] ^= 0xff; // wreck the checksum
-        // Append a good frame after the corrupt one.
-        let good = frame_bytes(b"ok");
+        buf[last] ^= 0xff; // wreck the crc
+        let good = wire(EVT_TXDONE, &[1]);
         buf.extend_from_slice(&good);
-        // Corrupt frame → drop past its sync word (2 bytes).
-        match deframe(&buf) {
-            Deframe::Drop { consumed } => {
+        match next_event(&buf) {
+            EvParse::Drop { consumed } => {
                 assert_eq!(consumed, 2);
                 buf.drain(..consumed);
             }
             _ => panic!("expected drop of corrupt frame"),
         }
-        // Resync: find the good frame.
         loop {
-            match deframe(&buf) {
-                Deframe::Frame { payload, .. } => {
-                    assert_eq!(payload, b"ok");
+            match next_event(&buf) {
+                EvParse::Event { typ, .. } => {
+                    assert_eq!(typ, EVT_TXDONE);
                     break;
                 }
-                Deframe::Drop { consumed } => {
+                EvParse::Drop { consumed } => {
                     buf.drain(..consumed);
                 }
-                Deframe::Need => panic!("lost the good frame"),
+                EvParse::Need => panic!("lost the good frame"),
             }
         }
     }
 
     #[test]
-    fn checksum_round_trips() {
-        assert_eq!(checksum(&[1, 2, 3]), 6);
-        assert_eq!(checksum(&[0xff, 0x01]), 0x00);
-    }
-
-    #[test]
-    fn cobs_round_trips_and_removes_zeros() {
-        let cases: &[&[u8]] = &[
-            &[],
-            &[0],
-            &[0, 0, 0],
-            &[1, 0, 2, 0, 0, 3],
-            &[0x4e, 0x44, 0x00, 0xff],
-            &[0xab; 300],
-        ];
-        for c in cases {
-            let enc = cobs_encode(c);
-            assert!(!enc.contains(&0), "COBS output must be zero-free: {c:?}");
-            assert_eq!(&cobs_decode(&enc).unwrap(), c, "round-trip: {c:?}");
-        }
-    }
-
-    #[test]
-    fn deframes_a_binary_payload_with_zeros() {
-        // A payload full of the bytes the raw module would choke on (0x00) and the sync bytes.
-        let payload = [0x00u8, 0x4e, 0x00, 0x44, 0xff, 0x00, 0x00];
-        let buf = frame_bytes(&payload);
-        assert!(
-            !buf.contains(&0),
-            "the whole wire frame must be zero-free for the transparent LoRa module"
-        );
-        match deframe(&buf) {
-            Deframe::Frame { payload: got, consumed } => {
-                assert_eq!(got, payload);
-                assert_eq!(consumed, buf.len());
+    fn command_frame_round_trips_through_parser() {
+        // A command we send should parse back with the same type/payload (same framing both ways).
+        let payload = 915_000_000u32.to_be_bytes();
+        let buf = wire(CMD_SET_FREQ, &payload);
+        match next_event(&buf) {
+            EvParse::Event { typ, payload: got, .. } => {
+                assert_eq!(typ, CMD_SET_FREQ);
+                assert_eq!(u32::from_be_bytes([got[0], got[1], got[2], got[3]]), 915_000_000);
             }
-            _ => panic!("expected a frame"),
+            _ => panic!("expected event"),
         }
+    }
+
+    #[test]
+    fn channel_maps_to_us_and_eu() {
+        assert_eq!(channel_to_hz(65), 915_000_000);
+        assert_eq!(channel_to_hz(18), 868_000_000);
     }
 }

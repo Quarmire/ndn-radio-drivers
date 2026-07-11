@@ -36,6 +36,7 @@ Host → firmware:
 | 0x04 | SET_PWR | `[i8 dBm]` (≤ +22) |
 | 0x05 | SET_SYNC | `[sx127x sync byte]` (0x12 private / 0x34 public) |
 | 0x06 | GET_INFO | *(empty)* |
+| 0x07 | SET_BEACON | `[enabled(0/1)]` (opt `[enabled, period_mult]`) — toggle the on-air heartbeat |
 
 Firmware → host:
 

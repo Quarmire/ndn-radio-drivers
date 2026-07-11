@@ -42,15 +42,17 @@ const CMD_SET_MOD: u8 = 0x03; //  payload = [sf, bw_code, cr_code]
 const CMD_SET_PWR: u8 = 0x04; //  payload = [i8 dBm]
 const CMD_SET_SYNC: u8 = 0x05; // payload = [sx127x sync byte]
 const CMD_GET_INFO: u8 = 0x06; // payload = []
+const CMD_SET_BEACON: u8 = 0x07; // payload = [enabled(0/1)] or [enabled, period_mult]
 // Firmware -> host events.
 const EVT_RX: u8 = 0x81; //    payload = [rssi i16 BE, snr i16 BE, LoRa bytes]
 const EVT_TXDONE: u8 = 0x82; //payload = [ok]
 const EVT_INFO: u8 = 0x83; //  payload = [status, sync(2), errors(2), freq(4), sf, bw, cr, pwr]
 const EVT_LOG: u8 = 0x84; //   payload = ascii
 
-// Emit a heartbeat beacon roughly every few seconds so the radio proves itself without a host.
-const AUTO_BEACON: bool = true;
-const BEACON_EVERY: u32 = 250_000; // loop iterations (~seconds; loop is SPI-poll bound)
+// Heartbeat-beacon base period in main-loop iterations (~seconds; the loop is SPI-poll bound).
+// The beacon is runtime-toggleable via CMD_SET_BEACON and defaults on, so a dongle proves itself
+// on-air without a host; a host that drives its own traffic silences it at open.
+const BEACON_BASE_PERIOD: u32 = 250_000;
 
 /// Formats into a fixed stack buffer so we can build payloads/logs with `write!`.
 struct BufWriter {
@@ -220,6 +222,8 @@ fn main() -> ! {
 
     let mut parser = Parser::new();
     let mut rxbuf = [0u8; 64];
+    let mut beacon_enabled = true;
+    let mut beacon_period = BEACON_BASE_PERIOD;
     let mut beacon_ctr: u32 = 0;
     let mut beacon_seq: u32 = 0;
 
@@ -238,6 +242,8 @@ fn main() -> ! {
                     &mut bw,
                     &mut cr,
                     &mut pwr,
+                    &mut beacon_enabled,
+                    &mut beacon_period,
                 );
             }
         }
@@ -252,18 +258,21 @@ fn main() -> ! {
             send_frame(|b| { let _ = block!(tx.write(b)); }, EVT_RX, &ev[..4 + n]);
         }
 
-        // 3) Optional heartbeat beacon so TX is exercised without a host.
-        if AUTO_BEACON {
+        // 3) Optional heartbeat beacon (host-toggleable via CMD_SET_BEACON) so TX is exercised and
+        //    the node is discoverable on-air without a host driving it.
+        if beacon_enabled {
             beacon_ctr += 1;
-            if beacon_ctr >= BEACON_EVERY {
+            if beacon_ctr >= beacon_period {
                 beacon_ctr = 0;
                 let mut msg = BufWriter::new();
-                let _ = write!(msg, "WAVESHARE-RS seq={}", beacon_seq);
+                let _ = write!(msg, "LORA-BEACON seq={}", beacon_seq);
                 let ok = radio.transmit(msg.as_slice());
                 radio.start_rx();
                 send_frame(|b| { let _ = block!(tx.write(b)); }, EVT_TXDONE, &[ok as u8]);
                 beacon_seq = beacon_seq.wrapping_add(1);
             }
+        } else {
+            beacon_ctr = 0;
         }
     }
 }
@@ -281,6 +290,8 @@ fn handle_cmd<SPI, NSS, RST, BSY, DIO1, RFSW, E, TX>(
     bw: &mut u8,
     cr: &mut u8,
     pwr: &mut i8,
+    beacon_enabled: &mut bool,
+    beacon_period: &mut u32,
 ) where
     SPI: embedded_hal::blocking::spi::Transfer<u8, Error = E>
         + embedded_hal::blocking::spi::Write<u8, Error = E>,
@@ -327,6 +338,14 @@ fn handle_cmd<SPI, NSS, RST, BSY, DIO1, RFSW, E, TX>(
             radio.standby();
             radio.set_sync(buf[0]);
             radio.start_rx();
+            send_info(&mut put, radio, *freq, *sf, *bw, *cr, *pwr);
+        }
+        CMD_SET_BEACON if len >= 1 => {
+            *beacon_enabled = buf[0] != 0;
+            if len >= 2 {
+                // Optional second byte scales the base period (min ×1).
+                *beacon_period = BEACON_BASE_PERIOD.saturating_mul(buf[1].max(1) as u32);
+            }
             send_info(&mut put, radio, *freq, *sf, *bw, *cr, *pwr);
         }
         CMD_GET_INFO => {

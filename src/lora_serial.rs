@@ -49,6 +49,7 @@ const CMD_SET_PWR: u8 = 0x04; //   payload = [i8 dBm]
 const CMD_SET_SYNC: u8 = 0x05; //  payload = [sx127x sync byte]
 #[allow(dead_code)]
 const CMD_GET_INFO: u8 = 0x06; //  payload = []
+const CMD_SET_BEACON: u8 = 0x07; // payload = [enabled(0/1)] (opt [enabled, period_mult])
 // Firmware -> host events.
 const EVT_RX: u8 = 0x81; //     payload = [rssi i16 BE, snr i16 BE, LoRa bytes]
 const EVT_TXDONE: u8 = 0x82; // payload = [ok]
@@ -107,6 +108,9 @@ pub struct LoraParams {
     pub pwr: u8,
     /// LoRa sync word in the SX127x single-byte convention: 0x12 private / 0x34 public.
     pub sync: u8,
+    /// Emit the firmware's on-air heartbeat beacon. Off by default when a host drives the dongle
+    /// (its own traffic is liveness enough); set true to keep the node discoverable on-air.
+    pub beacon: bool,
 }
 
 impl Default for LoraParams {
@@ -119,6 +123,7 @@ impl Default for LoraParams {
             rx_ch: 65,
             pwr: 22,
             sync: 0x12,
+            beacon: false, // host-driven: silence the firmware beacon at open
         }
     }
 }
@@ -281,6 +286,13 @@ impl LoraSerialBackend {
         *self.params.lock().unwrap()
     }
 
+    /// Toggle the firmware's on-air heartbeat beacon at runtime (off by default under host control).
+    pub fn set_beacon(&self, on: bool) -> Result<(), FaceError> {
+        self.send(CMD_SET_BEACON, &[on as u8])?;
+        self.params.lock().unwrap().beacon = on;
+        Ok(())
+    }
+
     /// Frame and write one protocol command to the dongle.
     fn send(&self, typ: u8, payload: &[u8]) -> Result<(), FaceError> {
         let port = self.tx.lock().unwrap();
@@ -324,6 +336,7 @@ fn configure(port: &SerialFd, p: &LoraParams) -> Result<(), FaceError> {
     send_cmd(port, CMD_SET_MOD, &[p.sf, bw_to_fw(p.bw), p.cr]).map_err(mkerr)?;
     send_cmd(port, CMD_SET_PWR, &[p.pwr]).map_err(mkerr)?;
     send_cmd(port, CMD_SET_SYNC, &[p.sync]).map_err(mkerr)?;
+    send_cmd(port, CMD_SET_BEACON, &[p.beacon as u8]).map_err(mkerr)?;
     port.flush_input();
     Ok(())
 }

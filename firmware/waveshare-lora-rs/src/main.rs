@@ -18,19 +18,109 @@
 
 mod sx1262;
 
+use core::cell::UnsafeCell;
 use core::fmt::Write as FmtWrite;
+use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use cortex_m_rt::entry;
 use embedded_hal::spi::MODE_0;
 use nb::block;
 use panic_halt as _;
 use stm32f1xx_hal::{
     pac,
+    pac::interrupt,
     prelude::*,
     serial::{Config, Serial},
     spi::Spi,
 };
 
 use sx1262::Sx1262;
+
+/// Host-byte ring, filled by the USART1 interrupt and drained by the main loop.
+///
+/// **This is what makes the host link reliable.** The USART has no FIFO and holds exactly one byte:
+/// at 115200 a new byte lands every ~87 µs, which is far shorter than a `poll_rx` SPI transaction, a
+/// command handler, or a transmission (up to 2 s). Polling `rx.read()` from the main loop therefore
+/// *destroys* any command that arrives while the firmware is busy — measured on hardware at ~50% loss
+/// for a 37-byte `CMD_TX`. An interrupt is the only way to take the byte within its 87 µs window, so
+/// the ISR captures it here and the main loop drains at its leisure.
+///
+/// Single-producer (ISR) / single-consumer (main loop), so the two indices need no lock: each side
+/// only writes its own, and Acquire/Release pairs order the data against them.
+const RING_SZ: usize = 512;
+
+struct Ring {
+    buf: UnsafeCell<[u8; RING_SZ]>,
+    /// Written only by the ISR.
+    head: AtomicUsize,
+    /// Written only by the main loop.
+    tail: AtomicUsize,
+    /// Bytes dropped because the ring was full, or overruns the ISR saw — reported via GET_INFO so
+    /// a lossy link is visible instead of silent.
+    lost: AtomicU32,
+}
+
+// SAFETY: the indices are atomic and each side writes only its own; `buf` is only touched at the
+// slot the owning side's index points to, which the other side never reads until the index moves.
+unsafe impl Sync for Ring {}
+
+impl Ring {
+    const fn new() -> Self {
+        Self {
+            buf: UnsafeCell::new([0; RING_SZ]),
+            head: AtomicUsize::new(0),
+            tail: AtomicUsize::new(0),
+            lost: AtomicU32::new(0),
+        }
+    }
+
+    /// ISR side: take one byte. Drops (and counts) it if the consumer has fallen behind.
+    fn push(&self, b: u8) {
+        let h = self.head.load(Ordering::Relaxed);
+        let next = (h + 1) % RING_SZ;
+        if next == self.tail.load(Ordering::Acquire) {
+            self.lost.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        unsafe { (*self.buf.get())[h] = b };
+        self.head.store(next, Ordering::Release);
+    }
+
+    /// Main-loop side: take one byte if the ISR has left us any.
+    fn pop(&self) -> Option<u8> {
+        let t = self.tail.load(Ordering::Relaxed);
+        if t == self.head.load(Ordering::Acquire) {
+            return None;
+        }
+        let b = unsafe { (*self.buf.get())[t] };
+        self.tail.store((t + 1) % RING_SZ, Ordering::Release);
+        Some(b)
+    }
+
+    fn lost(&self) -> u32 {
+        self.lost.load(Ordering::Relaxed)
+    }
+}
+
+static RING: Ring = Ring::new();
+
+/// USART1 RX: take the byte out of the one-byte data register before the next one overwrites it.
+///
+/// Reading DR *after* SR is also what clears an overrun (ORE). That matters: a latched ORE stops the
+/// peripheral delivering anything further, so missing this would take the host link down for good
+/// rather than costing a single byte.
+#[interrupt]
+fn USART1() {
+    // SAFETY: after init, this ISR is the only code that touches USART1's SR/DR.
+    let usart = unsafe { &*pac::USART1::ptr() };
+    let sr = usart.sr.read();
+    if sr.ore().bit_is_set() {
+        RING.lost.fetch_add(1, Ordering::Relaxed);
+    }
+    if sr.rxne().bit_is_set() || sr.ore().bit_is_set() {
+        let b = usart.dr.read().dr().bits() as u8;
+        RING.push(b);
+    }
+}
 
 // --- Wire protocol tags ---
 const SYNC0: u8 = 0x7E;
@@ -46,7 +136,7 @@ const CMD_SET_BEACON: u8 = 0x07; // payload = [enabled(0/1)] or [enabled, period
 // Firmware -> host events.
 const EVT_RX: u8 = 0x81; //    payload = [rssi i16 BE, snr i16 BE, LoRa bytes]
 const EVT_TXDONE: u8 = 0x82; //payload = [ok]
-const EVT_INFO: u8 = 0x83; //  payload = [status, sync(2), errors(2), freq(4), sf, bw, cr, pwr]
+const EVT_INFO: u8 = 0x83; //  payload = [status, sync(2), errors(2), freq(4), sf, bw, cr, pwr, lost(2)]
 const EVT_LOG: u8 = 0x84; //   payload = ascii
 
 // Heartbeat-beacon base period in main-loop iterations (~seconds; the loop is SPI-poll bound).
@@ -183,6 +273,10 @@ fn main() -> ! {
         &clocks,
     );
     let (mut tx, mut rx) = serial.split();
+    // Take host bytes in an ISR, not from the main loop — see [`Ring`]. From here on nothing calls
+    // `rx.read()`; the ISR owns the data register and the main loop drains RING.
+    rx.listen();
+    unsafe { pac::NVIC::unmask(pac::Interrupt::USART1) };
 
     // SPI2: SCK=PB13, MISO=PB14, MOSI=PB15; NSS=PB12 by hand.
     let sck = gpiob.pb13.into_alternate_push_pull(&mut gpiob.crh);
@@ -230,8 +324,8 @@ fn main() -> ! {
     let mut beacon_seq: u32 = 0;
 
     loop {
-        // 1) Drain all pending host bytes (no delay: the F1 USART has no FIFO).
-        while let Ok(b) = rx.read() {
+        // 1) Drain host bytes the ISR has buffered. Nothing is lost while we are busy below.
+        while let Some(b) = RING.pop() {
             if let Some((typ, len)) = parser.push(b) {
                 handle_cmd(
                     typ,
@@ -318,7 +412,7 @@ fn handle_cmd<SPI, NSS, RST, BSY, DIO1, RFSW, E, TX>(
             radio.standby();
             radio.set_frequency(*freq);
             radio.start_rx();
-            send_info(&mut put, radio, *freq, *sf, *bw, *cr, *pwr);
+            send_info(&mut put, radio, *freq, *sf, *bw, *cr, *pwr, RING.lost().min(u16::MAX as u32) as u16);
         }
         CMD_SET_MOD if len >= 3 => {
             *sf = buf[0];
@@ -327,20 +421,20 @@ fn handle_cmd<SPI, NSS, RST, BSY, DIO1, RFSW, E, TX>(
             radio.standby();
             radio.set_modulation(*sf, *bw, *cr);
             radio.start_rx();
-            send_info(&mut put, radio, *freq, *sf, *bw, *cr, *pwr);
+            send_info(&mut put, radio, *freq, *sf, *bw, *cr, *pwr, RING.lost().min(u16::MAX as u32) as u16);
         }
         CMD_SET_PWR if len >= 1 => {
             *pwr = buf[0] as i8;
             radio.standby();
             radio.set_power(*pwr);
             radio.start_rx();
-            send_info(&mut put, radio, *freq, *sf, *bw, *cr, *pwr);
+            send_info(&mut put, radio, *freq, *sf, *bw, *cr, *pwr, RING.lost().min(u16::MAX as u32) as u16);
         }
         CMD_SET_SYNC if len >= 1 => {
             radio.standby();
             radio.set_sync(buf[0]);
             radio.start_rx();
-            send_info(&mut put, radio, *freq, *sf, *bw, *cr, *pwr);
+            send_info(&mut put, radio, *freq, *sf, *bw, *cr, *pwr, RING.lost().min(u16::MAX as u32) as u16);
         }
         CMD_SET_BEACON if len >= 1 => {
             *beacon_enabled = buf[0] != 0;
@@ -348,10 +442,10 @@ fn handle_cmd<SPI, NSS, RST, BSY, DIO1, RFSW, E, TX>(
                 // Optional second byte scales the base period (min ×1).
                 *beacon_period = BEACON_BASE_PERIOD.saturating_mul(buf[1].max(1) as u32);
             }
-            send_info(&mut put, radio, *freq, *sf, *bw, *cr, *pwr);
+            send_info(&mut put, radio, *freq, *sf, *bw, *cr, *pwr, RING.lost().min(u16::MAX as u32) as u16);
         }
         CMD_GET_INFO => {
-            send_info(&mut put, radio, *freq, *sf, *bw, *cr, *pwr);
+            send_info(&mut put, radio, *freq, *sf, *bw, *cr, *pwr, RING.lost().min(u16::MAX as u32) as u16);
         }
         _ => {}
     }
@@ -366,6 +460,7 @@ fn send_info<SPI, NSS, RST, BSY, DIO1, RFSW, E, F>(
     bw: u8,
     cr: u8,
     pwr: i8,
+    lost: u16,
 ) where
     SPI: embedded_hal::blocking::spi::Transfer<u8, Error = E>
         + embedded_hal::blocking::spi::Write<u8, Error = E>,
@@ -394,6 +489,10 @@ fn send_info<SPI, NSS, RST, BSY, DIO1, RFSW, E, F>(
         bw,
         cr,
         pwr as u8,
+        // Host bytes the ISR had to drop (ring full) or an overrun it caught. Should stay 0; a
+        // climbing count is the link telling you it is losing commands, which used to be invisible.
+        (lost >> 8) as u8,
+        lost as u8,
     ];
     send_frame(put, EVT_INFO, &payload);
 }

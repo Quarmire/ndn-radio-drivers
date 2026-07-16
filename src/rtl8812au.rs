@@ -5107,6 +5107,16 @@ impl Rtl8812auBackend {
         Self::set_desc_bits(&mut d, 4, 16, 5, RATEID_IDX_G); // RATE_ID
         Self::set_desc_bits(&mut d, 12, 8, 1, 1); // USE_RATE (forced rate)
         Self::set_desc_bits(&mut d, 16, 0, 7, hw_rate); // TX_RATE
+        // Send each frame exactly once. Every peer this radio injects to is in
+        // monitor mode and so never ACKs; left to itself the MAC reads that as
+        // loss and retransmits a *unicast* frame up to its retry limit. A monitor
+        // receiver does no duplicate filtering, so one datagram arrives many times
+        // over while the frames queued behind it starve. Measured on air before
+        // this: 20 receives of a single datagram, and none of the 19 after it.
+        // Broadcast was never affected — nothing ACKs those either, so the MAC
+        // already sent them once.
+        Self::set_desc_bits(&mut d, 16, 17, 1, 1); // RETRY_LIMIT_ENABLE
+        Self::set_desc_bits(&mut d, 16, 18, 6, 0); // DATA_RETRY_LIMIT = 0
         Self::set_desc_bits(&mut d, 32, 15, 1, 1); // HWSEQ_EN (HW sequence #)
         let mut csum: u16 = 0;
         for i in 0..16 {

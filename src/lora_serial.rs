@@ -248,9 +248,32 @@ impl Drop for SerialFd {
     }
 }
 
+/// How long to wait for a transmission to complete. The firmware's transmit polls the chip for at
+/// most ~2 s (SF12 at 125 kHz is ~1.5 s on air for a full frame); the rest is serial slack.
+const TXDONE_TIMEOUT: Duration = Duration::from_millis(3_000);
+/// How long to wait for a knob to be acknowledged. Each `SET_*` is standby → apply → re-arm RX →
+/// reply, all well under this.
+const INFO_TIMEOUT: Duration = Duration::from_millis(1_000);
+/// How many times to re-send an idempotent knob whose reply never came. See `exec_idempotent`.
+const KNOB_ATTEMPTS: usize = 4;
+
+/// The command side of the link: the port, plus the firmware's replies to whatever we last sent.
+///
+/// **This protocol is strictly request/response, one command in flight.** Every handler in the
+/// firmware runs to completion before the main loop drains the USART again — and the STM32F1's
+/// USART has no FIFO, so a second command sent while the first is still being serviced is not
+/// queued, it is destroyed by an overrun that neither side reports. A blocking transmit is the
+/// worst case (up to ~2 s on air), but even `SET_MOD` (standby → apply → re-arm → reply) is long
+/// enough to swallow the command behind it. So: hold this lock, send, and wait for the reply.
+struct CmdPort {
+    port: SerialFd,
+    /// `(event type, payload)` for every non-RX event the reader parses.
+    resp: std::sync::mpsc::Receiver<(u8, Vec<u8>)>,
+}
+
 /// A Waveshare USB-TO-LoRa dongle (open firmware) reached over its serial port.
 pub struct LoraSerialBackend {
-    tx: Arc<Mutex<SerialFd>>,
+    cmd: Arc<Mutex<CmdPort>>,
     rx: AsyncMutex<mpsc::UnboundedReceiver<CapturedFrame>>,
     /// Behind a mutex because [`RadioKnobs`] retunes the module at runtime; `capability()` and
     /// `params()` reflect the live values.
@@ -273,9 +296,10 @@ impl LoraSerialBackend {
             .try_clone()
             .map_err(|e| io_err(format!("lora clone: {e}")))?;
         let (txch, rxch) = mpsc::unbounded_channel();
-        std::thread::spawn(move || reader_loop(reader, txch));
+        let (respch, resprx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || reader_loop(reader, txch, respch));
         Ok(Self {
-            tx: Arc::new(Mutex::new(port)),
+            cmd: Arc::new(Mutex::new(CmdPort { port, resp: resprx })),
             rx: AsyncMutex::new(rxch),
             params: Arc::new(Mutex::new(params)),
         })
@@ -288,15 +312,64 @@ impl LoraSerialBackend {
 
     /// Toggle the firmware's on-air heartbeat beacon at runtime (off by default under host control).
     pub fn set_beacon(&self, on: bool) -> Result<(), FaceError> {
-        self.send(CMD_SET_BEACON, &[on as u8])?;
+        self.exec_idempotent(CMD_SET_BEACON, &[on as u8], EVT_INFO)?;
         self.params.lock().unwrap().beacon = on;
         Ok(())
     }
 
-    /// Frame and write one protocol command to the dongle.
-    fn send(&self, typ: u8, payload: &[u8]) -> Result<(), FaceError> {
-        let port = self.tx.lock().unwrap();
-        send_cmd(&port, typ, payload).map_err(|e| io_err(format!("lora cmd {typ:#04x}: {e}")))
+    /// Send an **idempotent** command, retrying if the firmware never answers.
+    ///
+    /// The firmware polls its FIFO-less USART from the main loop, so a byte that lands while it is
+    /// busy (an SPI `poll_rx`, a previous handler, a transmission) is simply gone — commands are
+    /// lost at a measurable rate. Re-sending a `SET_*` is harmless because it re-asserts a state
+    /// rather than causing an event, so retry it. `CMD_TX` gets no retry: a lost *reply* is
+    /// indistinguishable from a lost *command*, and re-sending would risk a duplicate frame on air.
+    /// The real repair is interrupt/DMA-driven RX in the firmware; this only buys reliability
+    /// against a defect the host cannot fix.
+    fn exec_idempotent(&self, typ: u8, payload: &[u8], expect: u8) -> Result<Vec<u8>, FaceError> {
+        let mut last = None;
+        for _ in 0..KNOB_ATTEMPTS {
+            match self.exec(typ, payload, expect, INFO_TIMEOUT) {
+                Ok(v) => return Ok(v),
+                Err(e) => last = Some(e),
+            }
+        }
+        Err(last.unwrap_or_else(|| io_err(format!("lora cmd {typ:#04x}: no attempt made"))))
+    }
+
+    /// Send one command and wait for the firmware's reply, with no other command in flight.
+    ///
+    /// Blocking by construction — see [`CmdPort`]. The wait is bounded by the device's own physics
+    /// (a frame's airtime), and the reader runs on its own thread, so reception keeps up meanwhile.
+    fn exec(
+        &self,
+        typ: u8,
+        payload: &[u8],
+        expect: u8,
+        timeout: Duration,
+    ) -> Result<Vec<u8>, FaceError> {
+        let cmd = self.cmd.lock().unwrap();
+        // Drop replies to earlier commands (e.g. one that timed out) so we read *this* one's.
+        while cmd.resp.try_recv().is_ok() {}
+        send_cmd(&cmd.port, typ, payload)
+            .map_err(|e| io_err(format!("lora cmd {typ:#04x}: {e}")))?;
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                return Err(io_err(format!("lora cmd {typ:#04x}: no reply in {timeout:?}")));
+            }
+            match cmd.resp.recv_timeout(left) {
+                Ok((t, p)) if t == expect => return Ok(p),
+                Ok(_) => continue, // some other event slipped in; keep waiting for ours
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    return Err(io_err(format!("lora cmd {typ:#04x}: no reply in {timeout:?}")));
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(FaceError::Closed);
+                }
+            }
+        }
     }
 
     /// Push the current SF/BW/CR triple to the firmware (any of them changing needs the full set).
@@ -305,7 +378,8 @@ impl LoraSerialBackend {
             let p = self.params.lock().unwrap();
             (p.sf, bw_to_fw(p.bw), p.cr)
         };
-        self.send(CMD_SET_MOD, &[sf, bw, cr])
+        self.exec_idempotent(CMD_SET_MOD, &[sf, bw, cr], EVT_INFO)?;
+        Ok(())
     }
 }
 
@@ -332,13 +406,24 @@ fn configure(port: &SerialFd, p: &LoraParams) -> Result<(), FaceError> {
     port.flush_input();
     std::thread::sleep(Duration::from_millis(200));
     let mkerr = |e: std::io::Error| io_err(format!("lora configure: {e}"));
+    // One command at a time, with room for the firmware to service it. The reader thread does not
+    // exist yet, so there is no reply to wait on here — but the same hazard applies as at runtime
+    // (see `CmdPort`): each handler runs to completion before the FIFO-less USART is drained again,
+    // and `SET_FREQ` runs a full image calibration. Blasting these back-to-back overruns the port
+    // and silently corrupts whatever follows, which is how the radio ends up half-configured.
+    let settle = || std::thread::sleep(Duration::from_millis(150));
     // Beacon state first: a host silencing it must not be beaten by a stray beacon that would fire
-    // during the slower radio reconfiguration below (SET_FREQ runs image calibration).
+    // during the slower radio reconfiguration below.
     send_cmd(port, CMD_SET_BEACON, &[p.beacon as u8]).map_err(mkerr)?;
+    settle();
     send_cmd(port, CMD_SET_FREQ, &channel_to_hz(p.tx_ch).to_be_bytes()).map_err(mkerr)?;
+    settle();
     send_cmd(port, CMD_SET_MOD, &[p.sf, bw_to_fw(p.bw), p.cr]).map_err(mkerr)?;
+    settle();
     send_cmd(port, CMD_SET_PWR, &[p.pwr]).map_err(mkerr)?;
+    settle();
     send_cmd(port, CMD_SET_SYNC, &[p.sync]).map_err(mkerr)?;
+    settle();
     port.flush_input();
     Ok(())
 }
@@ -346,7 +431,11 @@ fn configure(port: &SerialFd, p: &LoraParams) -> Result<(), FaceError> {
 /// Background reader: accumulate serial bytes, parse protocol frames, and hand each received LoRa
 /// frame up as a `CapturedFrame` stamped `HostRecv` with its RSSI. Non-RX events are logged under
 /// `LORA_DEBUG` and otherwise ignored; a crc miss resyncs on the next sync word.
-fn reader_loop(port: SerialFd, tx: mpsc::UnboundedSender<CapturedFrame>) {
+fn reader_loop(
+    port: SerialFd,
+    tx: mpsc::UnboundedSender<CapturedFrame>,
+    resp: std::sync::mpsc::Sender<(u8, Vec<u8>)>,
+) {
     let debug = std::env::var_os("LORA_DEBUG").is_some();
     let mut acc: Vec<u8> = Vec::new();
     let mut tmp = [0u8; 512];
@@ -357,7 +446,7 @@ fn reader_loop(port: SerialFd, tx: mpsc::UnboundedSender<CapturedFrame>) {
                 loop {
                     match next_event(&acc) {
                         EvParse::Event { typ, payload, consumed } => {
-                            handle_event(typ, &payload, &tx, debug);
+                            handle_event(typ, &payload, &tx, &resp, debug);
                             acc.drain(..consumed);
                             if tx.is_closed() {
                                 return;
@@ -381,7 +470,32 @@ fn reader_loop(port: SerialFd, tx: mpsc::UnboundedSender<CapturedFrame>) {
 }
 
 /// Dispatch one decoded event: an `EVT_RX` becomes a `CapturedFrame`; others are optional debug.
-fn handle_event(typ: u8, payload: &[u8], tx: &mpsc::UnboundedSender<CapturedFrame>, debug: bool) {
+fn handle_event(
+    typ: u8,
+    payload: &[u8],
+    tx: &mpsc::UnboundedSender<CapturedFrame>,
+    resp: &std::sync::mpsc::Sender<(u8, Vec<u8>)>,
+    debug: bool,
+) {
+    // Everything that is not a received frame is a reply to a command we sent; route it to the
+    // caller blocked in `exec` so the next command only goes out once this one is serviced.
+    if typ != EVT_RX {
+        if debug {
+            match typ {
+                EVT_TXDONE => {
+                    eprintln!("lora TXDONE ok={}", payload.first().copied().unwrap_or(0))
+                }
+                EVT_INFO => eprintln!("lora INFO {}", hex(payload)),
+                EVT_LOG => eprintln!("lora LOG: {}", String::from_utf8_lossy(payload)),
+                other => eprintln!("lora EVT {other:#04x} {}", hex(payload)),
+            }
+        }
+        // A LOG line is unsolicited chatter, not a reply — never let it satisfy a wait.
+        if typ != EVT_LOG {
+            let _ = resp.send((typ, payload.to_vec()));
+        }
+        return;
+    }
     match typ {
         EVT_RX if payload.len() >= 4 => {
             let rssi = i16::from_be_bytes([payload[0], payload[1]]);
@@ -400,12 +514,6 @@ fn handle_event(typ: u8, payload: &[u8], tx: &mpsc::UnboundedSender<CapturedFram
             };
             let _ = tx.send(cap);
         }
-        _ if debug => match typ {
-            EVT_TXDONE => eprintln!("lora TXDONE ok={}", payload.first().copied().unwrap_or(0)),
-            EVT_INFO => eprintln!("lora INFO {}", hex(payload)),
-            EVT_LOG => eprintln!("lora LOG: {}", String::from_utf8_lossy(payload)),
-            other => eprintln!("lora EVT {other:#04x} {}", hex(payload)),
-        },
         _ => {}
     }
 }
@@ -466,7 +574,11 @@ impl FrameIo for LoraSerialBackend {
                 frame_in.payload.len()
             )));
         }
-        self.send(CMD_TX, &frame_in.payload)
+        let ok = self.exec(CMD_TX, &frame_in.payload, EVT_TXDONE, TXDONE_TIMEOUT)?;
+        match ok.first() {
+            Some(1) => Ok(()),
+            _ => Err(io_err("lora TX reported failure".into())),
+        }
     }
 
     async fn recv_frame(&self) -> Result<CapturedFrame, FaceError> {
@@ -503,7 +615,7 @@ impl RadioProfile for LoraSerialBackend {
 impl RadioKnobs for LoraSerialBackend {
     fn set_channel(&self, channel: u8, _bw: Bandwidth) -> Result<(), FaceError> {
         // LoRa is half-duplex on a single carrier: point TX and RX at it together.
-        self.send(CMD_SET_FREQ, &channel_to_hz(channel).to_be_bytes())?;
+        self.exec_idempotent(CMD_SET_FREQ, &channel_to_hz(channel).to_be_bytes(), EVT_INFO)?;
         let mut p = self.params.lock().unwrap();
         p.tx_ch = channel;
         p.rx_ch = channel;
@@ -512,7 +624,7 @@ impl RadioKnobs for LoraSerialBackend {
 
     fn set_tx_power(&self, idx: u32) -> Result<(), FaceError> {
         let dbm = idx.clamp(10, 22) as u8;
-        self.send(CMD_SET_PWR, &[dbm])?;
+        self.exec_idempotent(CMD_SET_PWR, &[dbm], EVT_INFO)?;
         self.params.lock().unwrap().pwr = dbm;
         Ok(())
     }

@@ -102,6 +102,9 @@ const FEN_BB_GLB_RSTN: u8 = 1 << 1;
 const FEN_USBA: u8 = 1 << 2;
 /// MCU firmware-download control register.
 const REG_MCUFWDL: u16 = 0x0080;
+/// `REG_MCUFWDL[7]` — the 8051 is running a RAM image (firmware already loaded).
+/// A new image must not be written over it; see [`Rtl8812auBackend::download_firmware`].
+const MCUFWDL_RAM_DL_SEL: u8 = 0x80;
 /// Firmware RAM write window (the 4 KB page selected by `REG_MCUFWDL+2[2:0]`).
 const FW_START_ADDRESS: u16 = 0x1000;
 const MCUFWDL_RDY: u32 = 1 << 1;
@@ -3841,6 +3844,20 @@ impl ChipInfo {
     }
 }
 
+/// A failed vendor-request, named.
+///
+/// "rtl8812au usb: Operation timed out" says nothing about *where* the device
+/// stopped answering, which is the only interesting part when it wedges. Report
+/// the direction, the register, and how many control transfers had already
+/// succeeded — the register localises the step in the bring-up, and the count
+/// separates "died immediately" from "died after N ops".
+fn ctrl_err(e: rusb::Error, dir: &str, addr: u16, len: usize, seq: u64) -> FaceError {
+    FaceError::Io(io::Error::other(format!(
+        "rtl8812au usb {dir}{}({addr:#06x}) failed after {seq} ok control transfers: {e}",
+        len * 8
+    )))
+}
+
 fn usb_err(e: rusb::Error) -> FaceError {
     FaceError::Io(io::Error::other(format!("rtl8812au usb: {e}")))
 }
@@ -3866,6 +3883,9 @@ pub struct Rtl8812auBackend {
     /// Shared async-URB RX pipeline: the queue background pump threads fill and `recv_frame`
     /// drains (the 8812A stacks several 802.11 packets per USB transfer). See [`crate::rx_pump`].
     rx_pump: crate::rx_pump::RxPumpState,
+    /// Vendor-request control transfers issued so far — reported when one fails,
+    /// to separate "the device died immediately" from "it died after N ops".
+    ctrl_ops: std::sync::atomic::AtomicU64,
     /// Clock domain of this device's free-run RX-stamp TSF (per-device, from the USB bus/address).
     tsf_domain: ClockDomainId,
 }
@@ -3930,6 +3950,7 @@ impl Rtl8812auBackend {
             pid,
             format: FrameFormat::Raw80211,
             rx_pump: crate::rx_pump::RxPumpState::new(),
+            ctrl_ops: std::sync::atomic::AtomicU64::new(0),
             tsf_domain,
         })
     }
@@ -3947,10 +3968,11 @@ impl Rtl8812auBackend {
     // ── Realtek register I/O (the `usbctrl_vendorreq` path) ──────────────────
 
     fn read_reg(&self, addr: u16, buf: &mut [u8]) -> Result<(), FaceError> {
+        let seq = self.ctrl_ops.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let n = self
             .handle
             .read_control(REQ_READ, VENDOR_REQ, addr, 0, buf, CTRL_TIMEOUT)
-            .map_err(usb_err)?;
+            .map_err(|e| ctrl_err(e, "read", addr, buf.len(), seq))?;
         if n != buf.len() {
             return Err(init_err(format!(
                 "rtl8812au read_reg({addr:#06x}): short {n}/{}",
@@ -3961,10 +3983,11 @@ impl Rtl8812auBackend {
     }
 
     fn write_reg(&self, addr: u16, data: &[u8]) -> Result<(), FaceError> {
+        let seq = self.ctrl_ops.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let n = self
             .handle
             .write_control(REQ_WRITE, VENDOR_REQ, addr, 0, data, CTRL_TIMEOUT)
-            .map_err(usb_err)?;
+            .map_err(|e| ctrl_err(e, "write", addr, data.len(), seq))?;
         if n != data.len() {
             return Err(init_err(format!(
                 "rtl8812au write_reg({addr:#06x}): short {n}/{}",
@@ -4080,10 +4103,31 @@ impl Rtl8812auBackend {
     /// Download the vendored 8812A NIC firmware to the MCU and wait for it to
     /// boot (`WINTINI_RDY`). Requires [`power_on`](Self::power_on) first. Returns
     /// the firmware `(version, subversion)` from its header.
+    ///
+    /// Safe to re-run on a chip that is already up: it resets the 8051 first.
     pub fn download_firmware(&self) -> Result<(u16, u8), FaceError> {
         let version = u16::from_le_bytes([FW_NIC[4], FW_NIC[5]]);
         let subversion = FW_NIC[6];
         let body = &FW_NIC[FW_HDR_LEN..];
+
+        // Reset the 8051 if it is already running a RAM image, before writing a new
+        // one over it. Not a corner case: this is true on every bring-up after the
+        // first, because a process that is killed — a `timeout`, a Ctrl-C — leaves
+        // the chip live with its firmware running.
+        //
+        // Writing firmware over a running 8051 does not fail cleanly. The block
+        // write to FW_START_ADDRESS times out and the device drops off the USB bus
+        // entirely, recoverable only by a physical replug:
+        //   usb write1568(0x1000) failed after 535 ok control transfers: timed out
+        // and every subsequent open then fails on its first register read.
+        //
+        // The vendor driver guards it identically, and says why:
+        // "If 8051 is running in RAM code, driver should inform Fw to reset by
+        //  itself, or it will cause download Fw fail."
+        if self.read8(REG_MCUFWDL)? & MCUFWDL_RAM_DL_SEL != 0 {
+            self.write8(REG_MCUFWDL, 0)?;
+            self.reset_8051()?;
+        }
 
         self.fw_dl_enable(true)?;
         self.write_fw(body)?;

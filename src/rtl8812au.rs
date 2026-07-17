@@ -3816,6 +3816,17 @@ static PROGS_5G: &[(u8, RegProgram)] = &[
 /// Management-queue select (`QSLT_MGNT`) + its rate-adaptation group
 /// (`RATEID_IDX_G`, the OFDM/11g table).
 const QSLT_MGNT: u32 = 0x12;
+
+/// Best-effort **data** queue select. Data frames must not ride the management
+/// queue: `QSLT_MGNT` maps to the HIGH queue, whose reserved pool is `HPQ` (16
+/// pages in [`RQPN_3EP`]) and is sized for small management frames. See
+/// [`Rtl8812auBackend::tx_buffer`].
+const QSLT_BE: u32 = 0x0;
+
+/// 802.11 frame type 2 = Data (frame-control byte 0, bits 3:2).
+fn is_data_frame(fc0: u8) -> bool {
+    (fc0 >> 2) & 0x03 == 2
+}
 const RATEID_IDX_G: u32 = 7;
 /// Bulk-transfer timeouts (injection is fire-and-forget; capture polls).
 const TX_TIMEOUT: Duration = Duration::from_millis(100);
@@ -5140,14 +5151,14 @@ impl Rtl8812auBackend {
     /// at hardware rate `hw_rate` (`rtl8812a_fill_fake_txdesc` field set, with a
     /// forced legacy rate). The USB path drops frames whose descriptor checksum
     /// is wrong, so it is computed last over the first 32 bytes.
-    fn build_txdesc(frame_len: usize, hw_rate: u32) -> [u8; TXDESC_SIZE] {
+    fn build_txdesc(frame_len: usize, hw_rate: u32, qsel: u32) -> [u8; TXDESC_SIZE] {
         let mut d = [0u8; TXDESC_SIZE];
         Self::set_desc_bits(&mut d, 0, 0, 16, frame_len as u32); // PKT_SIZE
         Self::set_desc_bits(&mut d, 0, 16, 8, TXDESC_SIZE as u32); // OFFSET
         Self::set_desc_bits(&mut d, 0, 26, 1, 1); // LAST_SEG
         Self::set_desc_bits(&mut d, 0, 27, 1, 1); // FIRST_SEG
         Self::set_desc_bits(&mut d, 0, 31, 1, 1); // OWN
-        Self::set_desc_bits(&mut d, 4, 8, 5, QSLT_MGNT); // QUEUE_SEL
+        Self::set_desc_bits(&mut d, 4, 8, 5, qsel); // QUEUE_SEL
         Self::set_desc_bits(&mut d, 4, 16, 5, RATEID_IDX_G); // RATE_ID
         Self::set_desc_bits(&mut d, 12, 8, 1, 1); // USE_RATE (forced rate)
         Self::set_desc_bits(&mut d, 16, 0, 7, hw_rate); // TX_RATE
@@ -5173,7 +5184,16 @@ impl Rtl8812auBackend {
     /// Frame an 802.11 `frame` for bulk-OUT: descriptor ++ frame, padded off the
     /// USB 512-byte boundary (Realtek drops a bulk-out of exactly N×512 bytes).
     fn tx_buffer(frame: &[u8], hw_rate: u32) -> Vec<u8> {
-        let desc = Self::build_txdesc(frame.len(), hw_rate);
+        // Queue by what the frame *is*. Everything used to ride QSLT_MGNT, which
+        // maps to the HIGH queue and its 16 reserved HPQ pages — sized for small
+        // management frames. A data frame larger than that pool silently stops
+        // going out: measured, NDN objects delivered 12/12 up to 1400 B and 0/12
+        // from 2200 B, with 2200 B still a *single* fragment.
+        let qsel = match frame.first() {
+            Some(&fc0) if is_data_frame(fc0) => QSLT_BE,
+            _ => QSLT_MGNT, // beacons / action frames (NAN) belong here
+        };
+        let desc = Self::build_txdesc(frame.len(), hw_rate, qsel);
         let mut buf = Vec::with_capacity(TXDESC_SIZE + frame.len() + 8);
         buf.extend_from_slice(&desc);
         buf.extend_from_slice(frame);
@@ -5222,7 +5242,13 @@ impl Rtl8812auBackend {
         // USB delivery — which lags our software TSF (jammed off a received
         // beacon) by the same amount, so NAN Discovery-Window-timed transmits
         // land *after* a peer's RX window closes. 1 page / ~1 ms flushes promptly.
-        self.write16(0x0280, 0x0101)?;
+        // `NDN_RXDMA_AGG=0x2003` restores the reset value, to A/B whether this
+        // register is what caps large-frame RX (task #25).
+        let agg = std::env::var("NDN_RXDMA_AGG")
+            .ok()
+            .and_then(|v| u16::from_str_radix(v.trim().trim_start_matches("0x"), 16).ok())
+            .unwrap_or(0x0101);
+        self.write16(0x0280, agg)?;
         let v = self.read32(0x0284)?; // REG_RXPKT_NUM
         self.write32(0x0284, v & !(1 << 18))?;
         Ok(())

@@ -5383,8 +5383,20 @@ impl Rtl8812auBackend {
         self
     }
 
-    /// Start `depth` background reader threads — USB RX pipelining via the shared [`crate::rx_pump`]
-    /// (the async-URB path). Afterwards `recv_frame` drains the shared queue.
+    /// Start `depth` background reader threads — USB RX pipelining via the shared [`crate::rx_pump`].
+    /// Afterwards `recv_frame` / [`poll_frame`](Self::poll_frame) drain the shared queue.
+    ///
+    /// **Call this for any sustained receive.** Without it there is a bulk-IN read in flight only
+    /// *during* a `recv_frame` call, so everything arriving while the caller parses, reassembles, or
+    /// does anything else has nothing draining the dongle's RX FIFO and is lost. A single frame with
+    /// idle time around it survives that; a back-to-back burst does not — which makes the loss scale
+    /// with fragments-per-object and look like a flaky link. Measured: NDN objects at 4/8 fragments
+    /// went 0/12 -> 9/12 and 0/12 -> 5/12 on this alone, and single-frame delivery stopped
+    /// scattering (0-12/12 -> 12/12).
+    ///
+    /// Prefer **`depth = 1`**: one thread keeps a read permanently in flight, which is the whole
+    /// point. Several threads issue independent blocking reads against the *same* endpoint and race
+    /// to push, so frames reach the queue out of order.
     pub fn spawn_rx_pump(self: &Arc<Self>, depth: usize) -> Vec<std::thread::JoinHandle<()>> {
         crate::rx_pump::spawn_rx_pump(self, depth)
     }

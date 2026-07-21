@@ -26,7 +26,7 @@ pub use rtl8821c::{RTL8821CU_PIDS, Rtl8821cuBackend};
 mod mt7612;
 pub use mt7612::{MT7612U_PIDS, Mt7612uBackend};
 mod rtl8812au;
-pub use rtl8812au::{ChipInfo, IqkResult, RTL8812AU_PIDS, Rtl8812auBackend};
+pub use rtl8812au::{ChipInfo, IqkResult, PhySense, RTL8812AU_PIDS, Rtl8812auBackend};
 // RTL8731BU / RTL8733BU (halmac_87xx, 1x1 11ac) — ground-up port, M1 (open +
 // reg-I/O + chip-version). REALTEK_VID is already re-exported above.
 mod libusb_rtl8733b;

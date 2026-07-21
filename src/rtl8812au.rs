@@ -249,6 +249,30 @@ const REG_TX_PTCL_CTRL: u16 = 0x0520;
 const TX_PTCL_IGNORE_EDCCA: u16 = 1 << 15;
 const REG_RD_CTRL: u16 = 0x0524;
 const RD_CTRL_EDCCA_EN: u16 = 1 << 11;
+/// Frame-free PHY sensing (#30) — read channel occupancy/energy from the chip's
+/// own detectors WITHOUT the host decoding a single frame. The registers here are
+/// the ones **empirically validated on this silicon** by a quiet-vs-busy scan
+/// (`examples/sense_probe.rs scan`), *not* the phydm Jaguar OFDM FA block
+/// (`0xF48`–`0xF54`), which reads a flat 0 on this part (the counters are unarmed
+/// by our minimal bring-up — the scan proved they never move under traffic).
+///
+/// * `REG_IGI_A/B` (`0xC50`/`0xE50`, bits[6:0]): the AGC **Initial Gain Index** —
+///   the gain the AGC picks to sit above the noise+interference floor, so it is a
+///   direct instantaneous energy-floor proxy (a level, not a counter). Flat at
+///   sparse ambient; rises under sustained energy/interference.
+/// * `REG_RXERR_RPT` (`0x0664`, bits[15:0]): a MAC hardware counter that tracked
+///   the decoded-frame rate ~1:1 on busy (0→63 for 65 frames; activity/s == the
+///   decoded rate) and stayed 0 on a quiet channel — the validated occupancy
+///   signal. Free-running; sample + diff.
+///
+/// (`0x0F38[31:16]` looked promising in the scan but failed re-validation — 0 on
+/// busy, huge/erratic on quiet — so it is deliberately not shipped. And the phydm
+/// OFDM FA block at `0xF48`–`0xF54` reads a flat 0 here; both are excluded because
+/// the on-chip measurement refuted them.)
+const REG_IGI_A: u16 = 0x0C50;
+const REG_IGI_B: u16 = 0x0E50;
+const REG_RXERR_RPT: u16 = 0x0664;
+
 /// Written to both L2H and H2L to disable energy-detect deferral (`0x7f` = the
 /// most-permissive signed threshold; nothing short of a decodable preamble
 /// counts as busy).
@@ -3887,6 +3911,36 @@ impl ChipInfo {
     }
 }
 
+/// One frame-free PHY-sensing sample (#30) — the baseband's own view of the
+/// channel, read without decoding any frame. See [`Rtl8812auBackend::read_phy_sense`].
+/// The counters are free-running 16-bit accumulators; take two samples and diff
+/// ([`PhySense::delta`]) to get per-window rates. Field labels are phydm's,
+/// validated on-chip.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PhySense {
+    /// AGC initial gain, path A (`0xC50[6:0]`) — energy/noise-floor proxy, higher
+    /// = more energy present. Instantaneous (a level, not a counter).
+    pub igi_a: u8,
+    /// AGC initial gain, path B (`0xE50[6:0]`).
+    pub igi_b: u8,
+    /// `REG_RXERR_RPT[15:0]` (`0x0664`) — the validated occupancy counter; tracks
+    /// channel-frame activity ~1:1, read without host-side decode. Free-running.
+    pub rx_activity: u16,
+}
+
+impl PhySense {
+    /// Counter delta from `earlier` to `self`, wrapped at 16 bits (the counter is
+    /// a u16 accumulator and rolls over). IGI fields are copied from `self` (they
+    /// are levels, not counts).
+    pub fn delta(&self, earlier: &PhySense) -> PhySense {
+        PhySense {
+            igi_a: self.igi_a,
+            igi_b: self.igi_b,
+            rx_activity: self.rx_activity.wrapping_sub(earlier.rx_activity),
+        }
+    }
+}
+
 /// A failed vendor-request, named.
 ///
 /// "rtl8812au usb: Operation timed out" says nothing about *where* the device
@@ -5341,6 +5395,20 @@ impl Rtl8812auBackend {
         let h2l = ((v >> 8) & 0xff) as u8 as i8;
         let honored = self.read16(REG_TX_PTCL_CTRL)? & TX_PTCL_IGNORE_EDCCA == 0;
         Ok((l2h, h2l, honored))
+    }
+
+    /// Frame-free PHY sensing (#30): one snapshot of the baseband's energy
+    /// (IGI) and its free-running OFDM detector counters (cca / false-alarm) —
+    /// the channel's occupancy and interference read straight from the silicon,
+    /// with **no frame decoded and nothing transmitted**. Sample twice around a
+    /// window and [`PhySense::delta`] them for per-second rates. This is the raw
+    /// input the radio-cognition plane senses the medium with.
+    pub fn read_phy_sense(&self) -> Result<PhySense, FaceError> {
+        Ok(PhySense {
+            igi_a: (self.read32(REG_IGI_A)? & 0x7f) as u8,
+            igi_b: (self.read32(REG_IGI_B)? & 0x7f) as u8,
+            rx_activity: (self.read32(REG_RXERR_RPT)? & 0xffff) as u16,
+        })
     }
 
     /// Release (resume) RX DMA by clearing `RW_RELEASE_EN` (`REG_RXPKT_NUM[18]`).

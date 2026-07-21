@@ -78,6 +78,9 @@ mod radio_knobs {
         fn set_edcca_ignore(&self, on: bool) -> Result<(), FaceError> {
             crate::LibUsbRtl88xxBackend::set_edcca_ignore(self, on)
         }
+        fn read_channel_activity(&self) -> Result<Option<u16>, FaceError> {
+            crate::LibUsbRtl88xxBackend::read_channel_activity(self).map(Some)
+        }
     }
 
     impl RadioKnobs for crate::Mt7612uBackend {

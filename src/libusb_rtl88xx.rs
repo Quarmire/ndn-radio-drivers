@@ -676,6 +676,20 @@ impl LibUsbRtl88xxBackend {
         Ok(())
     }
 
+    /// Frame-free occupancy counter (#30): the free-running low word of
+    /// `REG_RXERR_RPT` (`0x0664`), a MAC hardware count of channel-frame activity
+    /// that needs **no host-side decode**. Validated on the 8812A (`0bda:8812`) to
+    /// track the decoded-frame rate ~1:1 (busy) and read 0 on a quiet channel —
+    /// see `ndn-radio-drivers/docs/frame-free-sensing.md`. Two reads across a
+    /// window, differenced (u16 wrap), give frames/s; the cognition plane maps
+    /// that to busy% (`ChannelOccupancy::from_activity`). Cheaper and validated
+    /// here, unlike [`measure_clm`](Self::measure_clm) (Jaguar3 registers, untested
+    /// on this Jaguar gen-1 part) — CLM would sense non-decodable energy too and is
+    /// the follow-on once validated on-chip.
+    pub fn read_channel_activity(&self) -> Result<u16, FaceError> {
+        Ok((self.read32(0x0664)? & 0xffff) as u16)
+    }
+
     /// Measure the channel busy-ratio (CLM — Channel Load Measurement) over a
     /// window, in percent (0–100). The BB counts 4 µs samples in which the
     /// medium is busy (energy above the CCA threshold), so this senses **all**

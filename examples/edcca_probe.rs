@@ -77,7 +77,7 @@ fn frame(phase: u8, seq: u16) -> Vec<u8> {
 /// starves TX" (L2H≈-20). A send that times out means the medium never fell
 /// below the threshold — the frame couldn't get on air = a deferral-drop, which
 /// we COUNT (not abort on) so one stall doesn't kill the sweep.
-const PHASES: &[Option<i8>] = &[None, Some(-12), Some(-14), Some(-16), Some(-18)];
+const PHASES: &[Option<i8>] = &[None, Some(-17), Some(-18), Some(-19), Some(-20)];
 /// Per-phase wall budget — a fully-stalled phase (every send timing out at 500ms)
 /// would otherwise take n×0.5s. Cap it so the sweep stays bounded.
 const PHASE_BUDGET: Duration = Duration::from_secs(5);
@@ -153,9 +153,52 @@ fn rx(b: &Arc<Rtl8812auBackend>, secs: u64) -> Result<(), Box<dyn std::error::Er
     Ok(())
 }
 
+/// Scan ambient load across 2.4 GHz channels on ONE bring-up (hop + count all
+/// frames per channel). Finds a mid-load channel — the regime where EDCCA's
+/// cliff should become a usable knob (ch6 ≈saturated, ch14 ≈quiet).
+fn amb(b: &Arc<Rtl8812auBackend>, chans: &[u8], secs: u64) -> Result<(), Box<dyn std::error::Error>> {
+    b.set_rx_group_filter(None)?; // promiscuous — count everything on air
+    println!("ambient scan: {secs}s per channel");
+    let mut buf = vec![0u8; 16384];
+    for &c in chans {
+        b.set_channel(c)?;
+        std::thread::sleep(Duration::from_millis(150)); // let the synth settle
+        let t0 = Instant::now();
+        let mut frames = 0u64;
+        while t0.elapsed() < Duration::from_secs(secs) {
+            if let Ok(n) = b.rx_raw(&mut buf)
+                && n > 0
+            {
+                frames += 1;
+            }
+        }
+        let rate = frames as f64 / t0.elapsed().as_secs_f64();
+        let tag = if rate < 5.0 {
+            "quiet"
+        } else if rate < 60.0 {
+            "MID-LOAD ← EDCCA operating point"
+        } else {
+            "saturated"
+        };
+        println!("  ch{c:>2}: {frames} frames  {rate:>5.0}/s   {tag}");
+    }
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mode = std::env::args().nth(1).unwrap_or_else(|| "rx".into());
     let ch: u8 = std::env::var("EDCCA_CH").ok().and_then(|s| s.parse().ok()).unwrap_or(6);
+    // Ambient scan brings up once on ch1 then hops; do it before the ch-specific arms.
+    if mode == "amb" {
+        let secs: u64 = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(4);
+        let chans: Vec<u8> = std::env::args()
+            .nth(3)
+            .map(|s| s.split(',').filter_map(|x| x.parse().ok()).collect())
+            .unwrap_or_else(|| vec![1, 3, 4, 6, 8, 9, 11, 13, 14]);
+        let b = bring_up(chans[0])?;
+        amb(&b, &chans, secs)?;
+        return Ok(());
+    }
     let b = bring_up(ch)?;
     match mode.as_str() {
         "tx" => {

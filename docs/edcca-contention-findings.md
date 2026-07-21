@@ -76,3 +76,44 @@ collisions and the "keep flowing" airtime are the same airtime.
 - Open follow-on: on a *moderately* loaded channel (not saturated) EDCCA should
   have a genuine operating point — the cliff becomes a knob when the medium is
   idle enough of the time. Worth a sweep on a mid-load channel to find it.
+  → **Done — see below. There is no usable static operating point.**
+
+## Follow-on: the mid-load sweep — no usable static operating point
+
+Later the same bench was quieter; an ambient hop-scan (`edcca_probe amb`) put ch6
+at **19 frames/s** (mid-load) with every other 2.4 GHz channel at 0–2/s. Swept
+EDCCA there (o5p-0→o5p-1, 400 frames/phase @ 300/s, 5 s per-phase budget):
+
+| L2H | sent-ok (FIFO-accepted) | stalls | received | end-to-end (recv/400) | delivered/s |
+|---|---|---|---|---|---|
+| off | 400 | 0 | 313 | 78% | **235** |
+| −16 | 400 | 0 | 321 | 80% | 241 (EDCCA inert — 0 stalls) |
+| −17 | 225 | 43 | 164 | 41% | 33 |
+| −18 | 0 | 50 | 0 | 0% | 0 |
+| −20 (coarse run) | 215 | 43 | 63 | 16% | ~13 |
+| −24, −28 | 0 | 50 | 0 | 0% | 0 |
+
+Three measured reasons EDCCA is **not a static knob** even at mid-load:
+
+1. **The usable window is ~1 register unit wide.** −16/−17 straddle inert →
+   partial, and −17 → −18 straddles partial → total starve. One LSB of threshold
+   is the whole operating range.
+2. **The window drifts with ambient.** L2H=−20 gave 215 sent-ok (partial) in the
+   coarse run and 0 sent-ok (total starve) in a fine run minutes later — same
+   register value, opposite behaviour, because the noise/interferer level moved.
+   A statically-set threshold cannot track a moving target.
+3. **Sensitive thresholds fall below the thermal noise floor.** At only 19/s
+   ambient, −24/−28 still total-starve — they trigger on receiver noise, not
+   traffic. So "just set it low" doesn't exist.
+
+And where it *did* partially engage (−17), it bought nothing: of the frames that
+escaped the FIFO it delivered 164/225 = 73%, statistically the same as off's 78%
+— no quality gain — while end-to-end delivery fell to 41% (FIFO aging drops the
+deferred frames) and throughput dropped 7× (235 → 33/s).
+
+**Conclusion.** EDCCA on this radio is a **closed-loop control problem, not a
+static register.** A usable deployment would have to port phydm's full adaptivity
+feedback (IGI tracking + false-alarm counter periodically recomputing TH_L2H to
+chase the noise floor), and even then it only defers politely — it still can't
+manufacture airtime. For named-radio the answer stands: **quiet channel + FEC**,
+with static EDCCA available purely as a coexistence courtesy, off by default.

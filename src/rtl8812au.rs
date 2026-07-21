@@ -222,6 +222,12 @@ const REG_BCNQ_BDNY: u16 = 0x0424;
 const REG_MGQ_BDNY: u16 = 0x0425;
 const REG_WMAC_LBK_BF_HD: u16 = 0x045D;
 const REG_RCR: u16 = 0x0608;
+/// Station address register (`REG_MACID`, addr1 exact-match target for RCR's APM
+/// bit; 6 bytes at 0x0610). Also the responder MAC for a hardware ACK.
+const REG_MACID: u16 = 0x0610;
+/// RCR bit 0 = **AAP** (Accept All Packets / promiscuous). Set in monitor mode;
+/// cleared to make the chip filter RX by addr1 (name-group hardware wake-filter).
+const RCR_AAP: u32 = 0x1;
 const REG_RX_DRVINFO_SZ: u16 = 0x060F;
 const REG_MAR: u16 = 0x0620;
 
@@ -5228,6 +5234,27 @@ impl Rtl8812auBackend {
             self.write32(reg, w)?;
         }
         Ok(())
+    }
+
+    /// Make the name-group hash a **hardware receive filter**: restrict the chip's
+    /// RX to frames whose `addr1` exactly matches `group` (RCR **APM**), plus
+    /// broadcast (**AB**), by clearing **AAP** (accept-all / promiscuous) and
+    /// writing `group` into `REG_MACID`. Non-matching frames are dropped by the
+    /// chip and never traverse USB — the data-centric equivalent of a NIC's
+    /// multicast address filter, so the host wakes only for its name-group. `None`
+    /// restores promiscuous monitor RX ([`MONITOR_RCR`]).
+    ///
+    /// (`APM` exact-matches `addr1` against `REG_MACID`; for a group/multicast
+    /// name-group MAC verify on-air that it still matches — if not, use a
+    /// locally-administered unicast name-group, or `AM`+`REG_MAR` hash filtering.)
+    pub fn set_rx_group_filter(&self, group: Option<[u8; 6]>) -> Result<(), FaceError> {
+        match group {
+            None => self.write32(REG_RCR, MONITOR_RCR),
+            Some(mac) => {
+                self.write_reg(REG_MACID, &mac)?;
+                self.write32(REG_RCR, MONITOR_RCR & !RCR_AAP)
+            }
+        }
     }
 
     /// Release (resume) RX DMA by clearing `RW_RELEASE_EN` (`REG_RXPKT_NUM[18]`).

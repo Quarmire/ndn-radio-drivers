@@ -231,6 +231,32 @@ const RCR_AAP: u32 = 0x1;
 const REG_RX_DRVINFO_SZ: u16 = 0x060F;
 const REG_MAR: u16 = 0x0620;
 
+/// EDCCA (energy-detect clear-channel-assessment) control — the carrier-sense
+/// knob for the contention fix (#37). Three registers, matched to the
+/// aircrack-ng/rtl8812au phydm adaptivity path:
+///
+/// * `REG_EDCCA_TH` (`0x08a4`, `rFPGA0_XB_LSSIReadBack` on Jaguar): the energy
+///   thresholds live in the low word — **byte0 = L2H** (busy-enter), **byte1 =
+///   H2L** (busy-exit, hysteresis). Both are signed. `0x7f/0x7f` = maxed out =
+///   energy-detect effectively **off** (the promiscuous-injection default).
+/// * `REG_TX_PTCL_CTRL` (`0x0520`) **BIT15** = *ignore EDCCA*: when set, the TX
+///   engine transmits without deferring to the energy-detect CCA. phydm sets it
+///   for `PhyDM_IGNORE_EDCCA`; clearing it makes TX **honor** the medium.
+/// * `REG_RD_CTRL` (`0x0524`) **BIT11**: the adaptivity path sets it alongside
+///   honoring EDCCA (RX-defer gate).
+const REG_EDCCA_TH: u16 = 0x08a4;
+const REG_TX_PTCL_CTRL: u16 = 0x0520;
+const TX_PTCL_IGNORE_EDCCA: u16 = 1 << 15;
+const REG_RD_CTRL: u16 = 0x0524;
+const RD_CTRL_EDCCA_EN: u16 = 1 << 11;
+/// Written to both L2H and H2L to disable energy-detect deferral (`0x7f` = the
+/// most-permissive signed threshold; nothing short of a decodable preamble
+/// counts as busy).
+const EDCCA_OFF: i8 = 0x7f;
+/// Default busy-enter → busy-exit hysteresis (dB-ish, register units), matching
+/// phydm's `TH_EDCCA_HL_diff` of 7.
+const EDCCA_HL_DIFF: i8 = 7;
+
 /// `REG_CR` block-enable bits set right after power-on: HCI TX/RX DMA, MAC TX/RX
 /// DMA, protocol, scheduler, security, and the 32k cal timer (= `0x063F`).
 const CR_DMA_ENABLE: u16 = 0x063F;
@@ -5255,6 +5281,66 @@ impl Rtl8812auBackend {
                 self.write32(REG_RCR, MONITOR_RCR & !RCR_AAP)
             }
         }
+    }
+
+    /// Program the EDCCA energy-detect thresholds (#37, contention fix). `l2h` is
+    /// the busy-**enter** threshold, `h2l` the busy-**exit** (hysteresis); both are
+    /// signed register units, lower = more sensitive (defer to weaker energy). This
+    /// only sets the thresholds — whether the **TX** engine defers to them is a
+    /// separate knob, [`set_edcca_honor`](Self::set_edcca_honor). Writing
+    /// `0x7f/0x7f` maxes them out (energy detect effectively off). Preserves the
+    /// upper half of `0x8a4` (the register is shared with the path-B LSSI readback).
+    pub fn set_edcca_threshold(&self, l2h: i8, h2l: i8) -> Result<(), FaceError> {
+        let v = (l2h as u8 as u32) | ((h2l as u8 as u32) << 8);
+        self.bb_set(REG_EDCCA_TH, 0x0000_FFFF, v)
+    }
+
+    /// Make the MAC TX engine **honor** (`true`) or **ignore** (`false`) the
+    /// EDCCA energy-detect carrier sense. Honoring clears `REG_TX_PTCL_CTRL[15]`
+    /// (the *ignore-EDCCA* bit) and sets the `REG_RD_CTRL[11]` gate, so the TX
+    /// backoff now waits for the medium to fall below the threshold before it
+    /// keys up — the CSMA deferral that the contention A/B tests. Ignoring
+    /// restores the blast-regardless behaviour.
+    pub fn set_edcca_honor(&self, honor: bool) -> Result<(), FaceError> {
+        let mut ctrl = self.read16(REG_TX_PTCL_CTRL)?;
+        ctrl = if honor {
+            ctrl & !TX_PTCL_IGNORE_EDCCA
+        } else {
+            ctrl | TX_PTCL_IGNORE_EDCCA
+        };
+        self.write16(REG_TX_PTCL_CTRL, ctrl)?;
+        let mut rd = self.read16(REG_RD_CTRL)?;
+        rd = if honor {
+            rd | RD_CTRL_EDCCA_EN
+        } else {
+            rd & !RD_CTRL_EDCCA_EN
+        };
+        self.write16(REG_RD_CTRL, rd)
+    }
+
+    /// Turn on energy-detect carrier sense at busy-enter threshold `l2h` (with the
+    /// default 7-unit exit hysteresis) **and** make TX defer to it. The one-call
+    /// "enable contention avoidance" path; A/B against [`disable_edcca`].
+    pub fn enable_edcca(&self, l2h: i8) -> Result<(), FaceError> {
+        self.set_edcca_threshold(l2h, l2h.saturating_sub(EDCCA_HL_DIFF))?;
+        self.set_edcca_honor(true)
+    }
+
+    /// Restore the promiscuous-injection default: max out the thresholds and let
+    /// the TX engine ignore energy detect (the behaviour before #37).
+    pub fn disable_edcca(&self) -> Result<(), FaceError> {
+        self.set_edcca_threshold(EDCCA_OFF, EDCCA_OFF)?;
+        self.set_edcca_honor(false)
+    }
+
+    /// Read back `(l2h, h2l, honored)` for verification — the thresholds from the
+    /// low word of `0x8a4`, and whether TX honors EDCCA (the *ignore* bit clear).
+    pub fn edcca_state(&self) -> Result<(i8, i8, bool), FaceError> {
+        let v = self.bb_query(REG_EDCCA_TH, 0x0000_FFFF)?;
+        let l2h = (v & 0xff) as u8 as i8;
+        let h2l = ((v >> 8) & 0xff) as u8 as i8;
+        let honored = self.read16(REG_TX_PTCL_CTRL)? & TX_PTCL_IGNORE_EDCCA == 0;
+        Ok((l2h, h2l, honored))
     }
 
     /// Release (resume) RX DMA by clearing `RW_RELEASE_EN` (`REG_RXPKT_NUM[18]`).

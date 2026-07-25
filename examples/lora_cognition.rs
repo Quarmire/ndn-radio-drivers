@@ -35,17 +35,42 @@ use std::time::{Duration, Instant};
 use ndn_frame_io::{FrameIo, InjectFrame, TxIntent};
 use ndn_radio_cognition::{
     DemandTracker, MediumState, MediumView, NameContext, Priority, RadioId, RadioPolicy,
-    lora_airtime_ms, prefix_hash,
+    STATIC_REQ_RSSI_SF, lora_airtime_ms, pick_sf_hysteretic, prefix_hash,
 };
 use ndn_radio_drivers::LoraSerialBackend;
-use ndn_radio_hal::{RadioKnobs, RadioProfile};
+use ndn_radio_hal::{Bandwidth, RadioKnobs, RadioProfile};
 
 const CHANNEL: u8 = 65; // 915 MHz (US ISM)
 const BW_KHZ: u32 = 125; // the backend's default bandwidth — airtime is computed against it
+/// SF hysteresis deadband. −92/−94 dBm sit on the −90 SF8/SF9 line; without a deadband the two
+/// nodes chatter across it and land on mismatched SFs (a total decode loss). 4 dB holds a converged
+/// pair together through the boundary wiggle. See `pick_sf_hysteretic`.
+const SF_HYST_DB: f32 = 4.0;
+/// Rendezvous fallback. Two ends dialing SF independently can split onto mismatched SFs, and LoRa
+/// SFs are quasi-orthogonal — a split pair is deaf to each other, so neither can hear the other's
+/// advertised SF and the split is stable (measured: A stuck SF7, B stuck SF9, 0 delivery). A node
+/// that has heard nothing from the peer for `RENDEZVOUS_MS` falls back to `RENDEZVOUS_SF` — a fixed,
+/// maximally-robust SF both agree on a priori — so the pair re-meets, then peer-SF agreement locks
+/// them together. This is the poor-man's version of a fixed rendezvous control SF / receiver-side SF
+/// auto-detect (ASFS); the real fix needs firmware CAD. See lora-adr-literature.
+///
+/// NOT SF12: a 40 B frame at SF12/BW125 is ~1.5 s on air — it blows the firmware `CMD_TX` 3 s reply
+/// deadline (measured: `TX FAILED … no reply in 3s`), the duty budget, and overlaps the half-duplex
+/// peer. SF10 closes a −94 dBm link with margin at ~1/8 the airtime, so the TX path actually works.
+const RENDEZVOUS_SF: u8 = 10;
+const RENDEZVOUS_MS: u64 = 12_000;
+/// Data-reply delay (LoRaWAN RECEIVE_DELAY analogue). A Data reply fires the instant we decode the
+/// Interest — which is right as the requester finishes *its* Interest TX and is still turning its
+/// radio from TX to RX. Replying into that turnaround gap loses the frame (measured: one direction
+/// delivered, the reverse got 0). A short wait lets the requester settle into RX first. (task #18)
+const RX_REPLY_DELAY: Duration = Duration::from_millis(400);
 const LOCAL_FACE: u64 = 0; // our own app face: where our consumer's Interests come from
 const PEER_FACE: u64 = 1; // the LoRa face the peer's Interests arrive on
 
-const TICK: Duration = Duration::from_millis(5_000);
+// One Interest per tick (round-robin over the classes), not a burst of all three: LoRa is
+// half-duplex, so bursting kept a node deaf across ~3 frame-times and the peer's Data reply collided
+// with our own next Interest. At 4 s/tick a class is serviced every ~12 s — inside GIVEUP_MS. (task #18)
+const TICK: Duration = Duration::from_millis(4_000);
 /// PIT entry lifetime: an in-record counts toward fan-out only while fresh.
 const PIT_LIFETIME_MS: u64 = 12_000;
 /// No Data within this → re-express. A re-expression before satisfaction IS the re-Interest signal.
@@ -88,14 +113,20 @@ fn parse_name(name: &str) -> Option<ParsedName<'_>> {
     Some(ParsedName { node, class })
 }
 
-/// A frame off the air: `I|<src>|<name>` or `D|<src>|<name>|<payload>`.
+/// A frame off the air: `I|<src>|<sf>|<name>` or `D|<src>|<sf>|<name>|<payload>`.
 ///
 /// The **sender** is carried explicitly because the name cannot supply it: an Interest for
 /// `ndn/lora-cog/A/...` names A's data but is sent *by* B. Link quality keys the neighbor who
 /// transmitted, so without `src` there is nothing honest to attribute RSSI to.
+///
+/// `sf` is the sender's *current* spreading factor, advertised so the peer can adopt the more
+/// robust of the two (SF agreement) and never sit below it. Note the LoRa constraint: SFs are
+/// quasi-orthogonal, so this advertisement is only *heard* while the pair is already SF-aligned —
+/// it prevents a converged pair from drifting apart, not recovery from a full split.
 struct ParsedWire<'a> {
     kind: &'a str,
     src: &'a str,
+    sf: u8,
     name: &'a str,
 }
 
@@ -106,11 +137,12 @@ fn parse_wire(wire: &str) -> Option<ParsedWire<'_>> {
         return None;
     }
     let src = it.next()?;
+    let sf = it.next()?.parse::<u8>().ok()?;
     let name = it.next()?;
-    if src.is_empty() || parse_name(name).is_none() {
+    if src.is_empty() || !(7..=12).contains(&sf) || parse_name(name).is_none() {
         return None;
     }
-    Some(ParsedWire { kind, src, name })
+    Some(ParsedWire { kind, src, sf, name })
 }
 
 /// Opaque sense-bus key for a neighbor, derived from who actually transmitted.
@@ -146,7 +178,16 @@ struct Node {
     policy: RadioPolicy,
     start: Instant,
     last_sf: u8,
+    /// The peer's last-advertised spreading factor (from a decodable frame), for SF agreement.
+    peer_sf: u8,
+    /// `at_ms` of the last decodable frame from the peer — drives the rendezvous fallback on silence.
+    last_heard_ms: u64,
+    /// Round-robin cursor: one Interest class is serviced per tick (half-duplex discipline).
+    tick_seq: u64,
     last_cr: u8,
+    /// Last-applied TX power (dBm) and bandwidth (kHz) — apply a knob only when its value changes.
+    last_power_dbm: i8,
+    last_bw_khz: u32,
     pending: HashMap<&'static str, Pending>,
     seq: HashMap<&'static str, u32>,
 }
@@ -163,9 +204,29 @@ impl Node {
 
         // Pull the knobs out before touching `self` again (the plan borrows nothing of it).
         let alloc = plan.allocation_for(self.radio);
-        let sf = alloc.and_then(|a| a.params.spreading_factor());
+        // The plan's raw SF is `pick_sf(rssi)` — right at a threshold it flips every tick and the two
+        // ends desync. Re-derive it with hysteresis around where we already are, then take the more
+        // robust of that and the peer's advertised SF (agreement). Hold on ticks with no fresh RSSI.
+        let sf = alloc.and_then(|a| a.params.spreading_factor()).map(|_| {
+            let cur = self.last_sf.max(7);
+            // Lost contact for too long → a stable split is the likely cause (each end deaf to the
+            // other's SF). Fall back to the rendezvous SF so the pair re-meets; holding `cur` here is
+            // the trap that freezes a stranded node forever.
+            if now.saturating_sub(self.last_heard_ms) > RENDEZVOUS_MS {
+                return RENDEZVOUS_SF;
+            }
+            let base = match self.medium.neighbor_rssi(self.radio, self.peer_key) {
+                Some(r) => pick_sf_hysteretic(r, cur, &STATIC_REQ_RSSI_SF, SF_HYST_DB),
+                None => cur,
+            };
+            base.max(self.peer_sf)
+        });
         let cr = alloc.and_then(|a| a.params.coding_rate());
         let fec = alloc.and_then(|a| a.params.link_fec_redundancy).unwrap_or(0);
+        // Power is set freely per-node (not a rendezvous parameter); bandwidth IS a rendezvous
+        // parameter but the policy dials it only from shared inputs, so both peers reach the same one.
+        let power = alloc.and_then(|a| a.params.tx_power_dbm);
+        let bw = alloc.and_then(|a| a.params.bandwidth_khz());
 
         let act = if plan.suppress {
             // A real gate, not a demo branch: a relay with nothing to add stays quiet, and a radio
@@ -196,8 +257,41 @@ impl Node {
                     Err(e) => eprintln!("[{}] set CR 4/{} failed: {e}", self.name, cr + 4),
                 }
             }
+            if let Some(dbm) = power
+                && dbm != self.last_power_dbm
+            {
+                match self.dev.set_tx_power(dbm.max(0) as u32) {
+                    Ok(()) => {
+                        self.last_power_dbm = dbm;
+                        applied.push("pwr");
+                    }
+                    Err(e) => eprintln!("[{}] set {dbm}dBm failed: {e}", self.name),
+                }
+            }
+            if let Some(khz) = bw
+                && khz != self.last_bw_khz
+            {
+                match self.dev.set_bandwidth_khz(khz) {
+                    Ok(()) => {
+                        self.last_bw_khz = khz;
+                        applied.push("bw");
+                    }
+                    Err(e) => eprintln!("[{}] set BW {khz}kHz failed: {e}", self.name),
+                }
+            }
+            // Splice our just-applied SF in after the src (KIND|SRC|SF|NAME[|payload]) so the frame
+            // advertises the SF it is actually sent at — the peer folds this into its own agreement.
+            let onair = {
+                let mut it = wire.splitn(3, '|');
+                match (it.next(), it.next(), it.next()) {
+                    (Some(k), Some(s), Some(rest)) => {
+                        format!("{k}|{s}|{}|{rest}", self.last_sf.max(7))
+                    }
+                    _ => wire.to_string(),
+                }
+            };
             let frame =
-                InjectFrame::broadcast(wire.as_bytes().to_vec().into(), TxIntent::CONSERVATIVE);
+                InjectFrame::broadcast(onair.as_bytes().to_vec().into(), TxIntent::CONSERVATIVE);
             // Never swallow this: a failed inject means nothing went on air, and a table that
             // reports "tx" for a frame that never left is worse than no table at all.
             match self.dev.inject(frame).await {
@@ -257,8 +351,11 @@ impl Node {
             .map(|c| format!("4/{}", c + 4))
             .unwrap_or_else(|| "---".into());
         let duty = self.medium.duty_used(self.radio, now) * 100.0;
+        // BW and TX power are cognition-driven too now — show the live actuated values.
+        let bw_s = if self.last_bw_khz > 0 { format!("BW{}", self.last_bw_khz) } else { "BW---".into() };
+        let pwr_s = if self.last_power_dbm > 0 { format!("{}dBm", self.last_power_dbm) } else { "--dBm".into() };
         println!(
-            "[{}] {secs:>3}s| {:<7?}| {rssi:>7} | fan={fanout} reI={reint:.2} PER={per:.2} | {sf_s} {cr_s} FEC{fec} duty={duty:.2}% | {act}",
+            "[{}] {secs:>3}s| {:<7?}| {rssi:>7} | fan={fanout} reI={reint:.2} PER={per:.2} | {sf_s} {cr_s} {bw_s} {pwr_s} FEC{fec} duty={duty:.2}% | {act}",
             self.name, ctx.priority,
         );
     }
@@ -283,6 +380,13 @@ impl Node {
             return; // our own name on the air; nothing to learn from it
         }
         let (kind, name) = (w.kind.to_string(), w.name.to_string());
+        // We heard the peer, so we are SF-aligned right now: record its advertised SF for agreement.
+        // The actuator never dials below this, so once one end climbs, the other follows rather than
+        // dropping back and splitting the pair.
+        if w.src == self.peer {
+            self.peer_sf = w.sf;
+            self.last_heard_ms = ev.at_ms;
+        }
         self.medium
             .observe_rx(self.radio, neighbor_key(w.src), ev.rssi, ev.at_ms);
 
@@ -304,6 +408,8 @@ impl Node {
                 ctx.priority = priority;
                 self.fold_demand();
                 let wire = format!("D|{}|{name}|payload-{}", self.name, "x".repeat(24));
+                // Let the requester finish turning its radio around to RX before we answer (task #18).
+                tokio::time::sleep(RX_REPLY_DELAY).await;
                 self.transmit(&ctx, &wire, &format!("D {name}")).await;
                 self.tracker.on_data(ph, self.now());
             }
@@ -327,30 +433,43 @@ impl Node {
         }
     }
 
-    /// Consumer side: express or re-express Interests for the peer's names.
+    /// Consumer side: express or re-express Interests for the peer's names. Half-duplex discipline
+    /// (task #18): age-out is bookkeeping for every class (no TX), but only ONE class is *expressed*
+    /// per tick — bursting all three kept the radio deaf across ~3 frame-times, so the peer's Data
+    /// reply to the first Interest collided with our own second/third Interest and never landed.
     async fn tick(&mut self) {
         let now = self.now();
 
-        for (class, priority) in CLASSES {
-            let ph = class_prefix(&self.peer, class);
-
-            // An outstanding Interest that has aged out entirely: score the loss and move on.
+        // Age out any class whose Interest has gone unanswered too long. Pure bookkeeping — no frame
+        // goes on air — so doing it for all three every tick costs no airtime.
+        for (class, _) in CLASSES {
             if let Some(p) = self.pending.get(class)
                 && now.saturating_sub(p.first_ms) >= GIVEUP_MS
             {
                 self.pending.remove(class);
-                self.tracker.on_data(ph, now); // clear the in-records; the ARQ history persists
+                self.tracker.on_data(class_prefix(&self.peer, class), now);
                 println!("[{}] xx gave up on {class}", self.name);
-                continue;
             }
+        }
 
-            // Either express a fresh Interest, or re-express an unsatisfied one. A re-expression
-            // before satisfaction is a REAL delivery miss — a frame was lost on air — and
-            // `on_interest` reports it as the re-Interest that inflates the redundancy budget.
+        // Round-robin from this tick's cursor, express the FIRST class that is due (no pending, or
+        // past RETX_MS). One TX per tick keeps us listening for the reply; scanning-for-due avoids
+        // wasting the slot on a class whose Interest is still fresh.
+        let start = (self.tick_seq % CLASSES.len() as u64) as usize;
+        self.tick_seq += 1;
+        let chosen = (0..CLASSES.len()).map(|i| CLASSES[(start + i) % CLASSES.len()]).find(
+            |(class, _)| match self.pending.get(class) {
+                Some(p) => now.saturating_sub(p.expressed_ms) >= RETX_MS,
+                None => true,
+            },
+        );
+
+        if let Some((class, priority)) = chosen {
+            let ph = class_prefix(&self.peer, class);
+            // Fresh express vs re-express. A re-expression before satisfaction is a REAL delivery
+            // miss — a frame was lost on air — so it inflates the redundancy budget.
             let name = match self.pending.get(class) {
-                Some(p) if now.saturating_sub(p.expressed_ms) < RETX_MS => continue,
                 Some(p) => {
-                    // Re-expressing: the previous round trip lost a frame in one direction.
                     self.medium.observe_phy_per(self.radio, 1.0);
                     p.name.clone()
                 }
@@ -362,11 +481,7 @@ impl Node {
             };
 
             let reexpressed = self.tracker.on_interest(ph, LOCAL_FACE, now);
-            let first_ms = self
-                .pending
-                .get(class)
-                .map(|p| p.first_ms)
-                .unwrap_or(now);
+            let first_ms = self.pending.get(class).map(|p| p.first_ms).unwrap_or(now);
             self.pending.insert(
                 class,
                 Pending {
@@ -423,6 +538,20 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let dev = Arc::new(LoraSerialBackend::open(&path)?);
     println!("[{name}] open OK — cognition plane driving {path}, consuming from {peer}");
 
+    // Frequency is a rendezvous parameter (both ends must sit on the same carrier). Derive the link's
+    // channel from the *pair identity* — name-keyed, task #40 in miniature — so both nodes compute the
+    // SAME channel with no negotiation. Kept in 914–916 MHz, tight around the known-good 915. This is
+    // the cognition-chosen frequency; per-name/per-time FHSS (tasks #40/#41) is the scalable version.
+    let (lo, hi) = if name <= peer { (&name, &peer) } else { (&peer, &name) };
+    let link_ch = 64 + (prefix_hash(&[b"lorach", lo.as_bytes(), hi.as_bytes()]) % 3) as u8;
+    if let Err(e) = dev.set_channel(link_ch, Bandwidth::from_code(0)) {
+        eprintln!("[{name}] set channel {link_ch} failed: {e}");
+    }
+    println!(
+        "[{name}] link channel = {link_ch} ({} MHz) — name-keyed from the pair {{{lo},{hi}}}",
+        850 + link_ch as u32
+    );
+
     let radio = RadioId(0);
     let mut medium = MediumState::new();
 
@@ -433,7 +562,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // believes it is enforcing. On an EU 868 channel, drop this line and the policy fail-closes at 1%
     // on its own. Airtime is still recorded either way, so the budget stays visible in the table.
     let mut cap = dev.capability();
-    cap.channels = vec![CHANNEL];
+    cap.channels = vec![link_ch];
     cap.duty_cycle_max = 1.0;
     medium.register_radio(radio, cap);
 
@@ -469,7 +598,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         policy: RadioPolicy::default(),
         start,
         last_sf: 0,
+        peer_sf: 7,
+        last_heard_ms: 0,
         last_cr: 0,
+        last_power_dbm: 0,
+        last_bw_khz: 0,
+        tick_seq: 0,
         pending: HashMap::new(),
         seq: HashMap::new(),
     };
@@ -517,16 +651,18 @@ mod tests {
     /// peer's link and dial the spreading factor from a neighbor that isn't there.
     #[test]
     fn only_attributable_frames_are_accepted() {
-        let w = parse_wire("I|B|ndn/lora-cog/A/alarm/7").expect("well-formed Interest");
-        assert_eq!((w.kind, w.src, w.name), ("I", "B", "ndn/lora-cog/A/alarm/7"));
-        let d = parse_wire("D|A|ndn/lora-cog/A/bulk/2|payload-xxx").expect("well-formed Data");
-        assert_eq!((d.kind, d.src), ("D", "A"));
+        let w = parse_wire("I|B|9|ndn/lora-cog/A/alarm/7").expect("well-formed Interest");
+        assert_eq!((w.kind, w.src, w.sf, w.name), ("I", "B", 9, "ndn/lora-cog/A/alarm/7"));
+        let d = parse_wire("D|A|12|ndn/lora-cog/A/bulk/2|payload-xxx").expect("well-formed Data");
+        assert_eq!((d.kind, d.src, d.sf), ("D", "A", 12));
 
         // The frames that were silently polluting the peer's RSSI before.
         assert!(parse_wire("LORA-BEACON seq=3").is_none(), "a beacon is not ours");
-        assert!(parse_wire("I|B|ndn/other-app/A/alarm/7").is_none(), "foreign name");
+        assert!(parse_wire("I|B|9|ndn/other-app/A/alarm/7").is_none(), "foreign name");
         assert!(parse_wire("I|B").is_none(), "truncated");
-        assert!(parse_wire("I||ndn/lora-cog/A/alarm/7").is_none(), "no sender");
+        assert!(parse_wire("I|B|9").is_none(), "no name");
+        assert!(parse_wire("I|B|99|ndn/lora-cog/A/alarm/7").is_none(), "SF out of range");
+        assert!(parse_wire("I||9|ndn/lora-cog/A/alarm/7").is_none(), "no sender");
         // Distinct senders key distinct neighbors — the whole point of carrying `src`.
         assert_ne!(neighbor_key("A"), neighbor_key("B"));
     }

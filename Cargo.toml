@@ -57,6 +57,10 @@ required-features = ["lora"]
 name = "ndn_dataplane_test"
 required-features = ["lora"]
 
+[[example]]
+name = "lora_dfu"
+required-features = ["lora"]
+
 [dev-dependencies]
 # Cross-repo: the live named-time driver (wifi transport) for the on-air node example.
 ndn-time-driver = { path = "../ndn-ext/crates/time/ndn-time-driver", features = ["wifi"] }

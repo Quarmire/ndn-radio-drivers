@@ -65,6 +65,7 @@ const CMD_DATAPLANE: u8 = 0x11; //       payload = [cs_serve, dedup, hop_on, hop
 const CMD_GET_STATS: u8 = 0x13; //       payload = []              → EVT_STATS
 const CMD_RESET_STATS: u8 = 0x14; //     payload = []              (clear all counters)
 const CMD_SET_DEBUG: u8 = 0x15; //       payload = [on]            (toggle EVT_LOG diagnostics)
+const CMD_ENTER_BOOTLOADER: u8 = 0x16; // payload = [0xB0,0x07]    (jump to ROM UART bootloader)
 // Firmware -> host events.
 const EVT_RX: u8 = 0x81; //     payload = [rssi i16 BE, snr i16 BE, ts_ms u32 BE, LoRa bytes] (#52)
 const EVT_TXDONE: u8 = 0x82; // payload = [ok, attempts]  (#52: attempts=0 for a plain CMD_TX)
@@ -369,18 +370,20 @@ impl LoraSerialBackend {
 
     // ---- #52 on-device NDN data plane (all runtime; no reflash) ----
 
-    /// Install the name-hash RX filter: only Interests whose name hashes to one of `names` are
-    /// delivered up; the rest are dropped at the antenna. An empty list clears the filter (pass-all).
-    /// The host hashes each name with the SAME [`name_hash`] the firmware uses, so the keyspaces match.
-    pub fn set_name_filter(&self, names: &[&[u8]]) -> Result<(), FaceError> {
-        self.exec_idempotent(CMD_SET_NAME_FILTER, &hash_payload(names), EVT_INFO)?;
+    /// Install the RX name filter as a set of **prefixes** (a FIB): an Interest is delivered up only if
+    /// one of `prefixes` is a name-prefix of it (NDN longest-prefix match in firmware); the rest are
+    /// dropped at the antenna. So `["ndn/lora-cog/A"]` covers every `ndn/lora-cog/A/...` under it. Empty
+    /// clears the filter (pass-all). Each prefix is hashed with the SAME [`name_hash`] the firmware's
+    /// rolling per-component hash lands on at that boundary, so the keyspaces match (#44).
+    pub fn set_name_filter(&self, prefixes: &[&[u8]]) -> Result<(), FaceError> {
+        self.exec_idempotent(CMD_SET_NAME_FILTER, &hash_payload(prefixes), EVT_INFO)?;
         Ok(())
     }
 
-    /// Install the relay set: frames whose name hashes into this set are re-broadcast AND delivered
-    /// (cooperative forwarding). Empty clears it.
-    pub fn set_relay(&self, names: &[&[u8]]) -> Result<(), FaceError> {
-        self.exec_idempotent(CMD_SET_RELAY, &hash_payload(names), EVT_INFO)?;
+    /// Install the relay set as a set of **prefixes**: a frame is re-broadcast AND delivered
+    /// (cooperative forwarding) if one of `prefixes` is a name-prefix of it. Empty clears it.
+    pub fn set_relay(&self, prefixes: &[&[u8]]) -> Result<(), FaceError> {
+        self.exec_idempotent(CMD_SET_RELAY, &hash_payload(prefixes), EVT_INFO)?;
         Ok(())
     }
 
@@ -428,6 +431,19 @@ impl LoraSerialBackend {
             cad_busy: u16be(20),
             defer: u16be(22),
         })
+    }
+
+    /// Jump the dongle into the GD32 ROM UART bootloader so `stm32flash` can reflash over this SAME
+    /// CH343/USB port — no ST-Link, no BOOT0 jumper, no replug (reflash in place on the OPi). This is
+    /// fire-and-forget: the firmware branches away immediately, so there is no reply to await; the next
+    /// thing on the wire is the ROM bootloader's autobaud. Follow with e.g.
+    /// `stm32flash -w firmware.bin -v -g 0x08000000 /dev/ttyACM0`. Guarded by a 2-byte magic so a
+    /// corrupt frame cannot trigger it. Requires firmware with `CMD_ENTER_BOOTLOADER` (else a no-op).
+    pub fn enter_bootloader(&self) -> Result<(), FaceError> {
+        let cmd = self.cmd.lock().unwrap();
+        send_cmd(&cmd.port, CMD_ENTER_BOOTLOADER, &[0xB0, 0x07])
+            .map_err(|e| io_err(format!("lora enter_bootloader: {e}")))?;
+        Ok(())
     }
 
     /// The radio parameters currently programmed (reflects runtime [`RadioKnobs`] changes).

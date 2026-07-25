@@ -157,6 +157,9 @@ const CMD_SET_SENSE_CFG: u8 = 0x12; //   payload = [rssi_thresh i16 BE, cad_repe
 const CMD_GET_STATS: u8 = 0x13; //       payload = []  → EVT_STATS
 const CMD_RESET_STATS: u8 = 0x14; //     payload = []  (clear all counters)
 const CMD_SET_DEBUG: u8 = 0x15; //       payload = [on] (toggle EVT_LOG diagnostics — no reflash)
+const CMD_ENTER_BOOTLOADER: u8 = 0x16; // payload = [0xB0,0x07] guard → jump to the GD32 ROM UART
+//                                       bootloader on USART1, so `stm32flash` reflashes over the SAME
+//                                       CH343/USB link — no ST-Link, no BOOT0 pin, no replug.
 // Firmware -> host events.
 const EVT_RX: u8 = 0x81; //    payload = [rssi i16 BE, snr i16 BE, ts_ms u32 BE, LoRa bytes]
 const EVT_TXDONE: u8 = 0x82; //payload = [ok, attempts]  (attempts=0 for a plain CMD_TX)
@@ -784,7 +787,44 @@ fn handle_cmd<SPI, NSS, RST, BSY, DIO1, RFSW, E, TX>(
         CMD_GET_INFO => {
             send_info(&mut put, radio, *freq, *sf, *bw, *cr, *pwr, lost, csma.cad_busy, csma.defer);
         }
+        // Software DFU: jump to the GD32 ROM UART bootloader so `stm32flash` can reflash over the same
+        // CH343/USB link — no ST-Link, no BOOT0 jumper, no replug. Guarded by a 2-byte magic so a
+        // stray/corrupt frame can't brick the radio mid-flight. This is a one-way trip: the next thing
+        // on the wire is the ROM bootloader's autobaud, then stm32flash.
+        CMD_ENTER_BOOTLOADER if len >= 2 && buf[0] == 0xB0 && buf[1] == 0x07 => {
+            enter_system_bootloader();
+        }
         _ => {}
+    }
+}
+
+/// Jump to the STM32F1/GD32F103 system-memory ROM bootloader (base `0x1FFF_F000`). The core already
+/// runs on 8 MHz HSI — exactly what the ROM bootloader expects — so no clock teardown is needed; we
+/// just quiesce interrupts, point VTOR + MSP at the bootloader vector table, and branch to its reset
+/// handler. SWD stays alive regardless, so a failed jump is still ST-Link-recoverable (not a brick).
+fn enter_system_bootloader() -> ! {
+    const SYSMEM_BASE: u32 = 0x1FFF_F000;
+    unsafe {
+        cortex_m::interrupt::disable();
+        // Stop SysTick and mask/clear every NVIC line so nothing fires into the bootloader.
+        let syst = &*cortex_m::peripheral::SYST::PTR;
+        syst.csr.write(0);
+        let nvic = &*cortex_m::peripheral::NVIC::PTR;
+        for r in nvic.icer.iter() {
+            r.write(0xFFFF_FFFF);
+        }
+        for r in nvic.icpr.iter() {
+            r.write(0xFFFF_FFFF);
+        }
+        let sp = core::ptr::read_volatile(SYSMEM_BASE as *const u32);
+        let entry = core::ptr::read_volatile((SYSMEM_BASE + 4) as *const u32);
+        // Relocate the vector table to system memory, load its initial stack pointer, and branch.
+        let scb = &*cortex_m::peripheral::SCB::PTR;
+        scb.vtor.write(SYSMEM_BASE);
+        cortex_m::asm::dsb();
+        cortex_m::register::msp::write(sp);
+        let boot: extern "C" fn() -> ! = core::mem::transmute(entry as *const ());
+        boot()
     }
 }
 

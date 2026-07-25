@@ -90,8 +90,9 @@ async fn tx(dev: Arc<LoraSerialBackend>, scenario: &str, secs: u64) -> Result<()
                 send(&dev, &format!("I|T|{SF}|ndn/keep")).await;
                 send(&dev, &format!("I|T|{SF}|ndn/drop")).await;
             }
-            // Same (run-unique) name every time — all but the first are duplicates.
-            "dedup" => send(&dev, &format!("I|T|{SF}|{dup_name}")).await,
+            // Same (run-unique) Data object every time — all but the first are duplicate objects.
+            // (Dedup is Data-only in firmware: Interests legitimately repeat as re-expression.)
+            "dedup" => send(&dev, &format!("D|T|{SF}|{dup_name}|hello")).await,
             // A name in the relay set — each should be re-broadcast and delivered.
             "relay" => send(&dev, &format!("I|T|{SF}|ndn/relayme")).await,
             // Prime the cache with Data, then ask for it — the RX node answers from cache.

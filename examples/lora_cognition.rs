@@ -676,6 +676,39 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut cap = dev.capability();
     cap.channels = vec![link_ch];
     cap.duty_cycle_max = 1.0;
+
+    // Wire the firmware's on-device NDN data plane FROM cognition (not a test harness). The policy
+    // decides the MECHANISM toggles from the face's capability — on this duty-limited LoRa broadcast
+    // bearer it turns on dedup (drop repeats at the antenna) and CS-serve (answer a repeat Interest
+    // from cache instead of re-fetching: the airtime-per-content win over a flood mesh). The NAME sets
+    // come from the forwarder's FIB: we SERVE our own prefix (answer only Interests under it) and we
+    // RELAY whatever prefixes this node forwards for others (env NDN_RELAY_PREFIXES, comma-separated —
+    // empty at N=2, set on the node that bridges others at N>=3). filter/relay match by PREFIX (LPM),
+    // so one entry covers every seq-varying name under it; dedup/CS still key on the full object name.
+    let dp = RadioPolicy::default().data_plane(&cap);
+    let own_prefix = format!("ndn/lora-cog/{name}");
+    let relay_prefixes: Vec<String> = std::env::var("NDN_RELAY_PREFIXES")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(|s| s.split(',').map(|p| p.trim().to_string()).collect())
+        .unwrap_or_default();
+    {
+        let relay_refs: Vec<&[u8]> = relay_prefixes.iter().map(|s| s.as_bytes()).collect();
+        if let Err(e) = dev.set_name_filter(&[own_prefix.as_bytes()]) {
+            eprintln!("[{name}] set_name_filter failed (pre-#55 firmware?): {e}");
+        }
+        if let Err(e) = dev.set_relay(&relay_refs) {
+            eprintln!("[{name}] set_relay failed: {e}");
+        }
+        if let Err(e) = dev.set_dataplane(dp.cs_serve, dp.dedup, dp.hop, 64, 3) {
+            eprintln!("[{name}] set_dataplane failed: {e}");
+        }
+    }
+    println!(
+        "[{name}] data plane ← cognition: dedup={} cs_serve={} hop={} | serve '{own_prefix}' | relay {relay_prefixes:?}",
+        dp.dedup, dp.cs_serve, dp.hop
+    );
+
     medium.register_radio(radio, cap);
 
     let (tx_ch, mut rx_ch) = tokio::sync::mpsc::channel::<RxEvent>(64);

@@ -130,11 +130,34 @@ impl DataPlane {
         self.hop_span = span.max(1);
     }
 
-    fn filter_contains(&self, h: u64) -> bool {
-        self.filter[..self.filter_len].contains(&h)
+    /// NDN longest-prefix match: does any prefix of `name` (at a '/' component boundary) hash into
+    /// `set`? This is what lets cognition install a few forwarding/subscription PREFIXES
+    /// (`ndn/lora-cog/A`) that cover every seq-varying name under them (`ndn/lora-cog/A/alarm/6`),
+    /// exactly like a FIB. Filter/relay match by prefix; dedup/CS still key on the FULL name (object
+    /// identity), because a duplicate or a cache hit is about the exact object, not its prefix.
+    ///
+    /// The rolling FNV-1a matches `fnv1a64(prefix_bytes)` at each boundary — the same hash the host
+    /// computes for the prefix string, so the #44 keyspace holds.
+    fn any_prefix_in(set: &[u64], name: &[u8]) -> bool {
+        const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+        const PRIME: u64 = 0x0000_0100_0000_01b3;
+        let mut hash = OFFSET;
+        for (i, &b) in name.iter().enumerate() {
+            // At a component boundary, the hash so far == fnv1a64 of the prefix before this '/'.
+            if b == b'/' && i > 0 && set.contains(&hash) {
+                return true;
+            }
+            hash ^= b as u64;
+            hash = hash.wrapping_mul(PRIME);
+        }
+        // Full name is also a prefix of itself.
+        set.contains(&hash)
     }
-    fn relay_contains(&self, h: u64) -> bool {
-        self.relay[..self.relay_len].contains(&h)
+    fn filter_contains(&self, name: &[u8]) -> bool {
+        Self::any_prefix_in(&self.filter[..self.filter_len], name)
+    }
+    fn relay_contains(&self, name: &[u8]) -> bool {
+        Self::any_prefix_in(&self.relay[..self.relay_len], name)
     }
     /// Record a hash in the dedup ring; return true if it was already present (a duplicate).
     fn seen(&mut self, h: u64) -> bool {
@@ -163,18 +186,20 @@ impl DataPlane {
         self.rx = self.rx.wrapping_add(1);
         let h = fnv1a64(name);
 
-        if self.dedup_on && self.seen(h) {
-            self.deduped = self.deduped.wrapping_add(1);
-            return RxAction::Drop;
-        }
-
         match Self::kind_of(frame) {
-            // A Data frame: cache it (edge caching), then let the host see it.
+            // A Data frame: suppress duplicate objects (the flooding-suppression win), else cache it
+            // (edge caching) and let the host see it. Dedup is Data-ONLY: an Interest legitimately
+            // repeats (re-expression is the ARQ signal; real NDN dedups Interests by Nonce, which our
+            // wire has no field for), so name-dedup on Interests would kill retries.
             Some(b'D') => {
+                if self.dedup_on && self.seen(h) {
+                    self.deduped = self.deduped.wrapping_add(1);
+                    return RxAction::Drop;
+                }
                 if frame.len() <= CS_MAX_LEN {
                     self.cs.insert(h, frame, 30_000, now_ms); // 30 s freshness
                 }
-                if self.relay_on && self.relay_contains(h) {
+                if self.relay_on && self.relay_contains(name) {
                     self.relayed = self.relayed.wrapping_add(1);
                     return RxAction::RelayAndDeliver;
                 }
@@ -187,11 +212,11 @@ impl DataPlane {
                     // Re-borrow to satisfy the borrow checker (lookup above was a probe).
                     return RxAction::Serve(self.cs.lookup(h, now_ms).unwrap());
                 }
-                if self.relay_on && self.relay_contains(h) {
+                if self.relay_on && self.relay_contains(name) {
                     self.relayed = self.relayed.wrapping_add(1);
                     return RxAction::RelayAndDeliver;
                 }
-                if self.filter_on && !self.filter_contains(h) {
+                if self.filter_on && !self.filter_contains(name) {
                     self.filtered = self.filtered.wrapping_add(1);
                     return RxAction::Drop;
                 }

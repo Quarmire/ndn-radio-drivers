@@ -63,7 +63,17 @@ const RENDEZVOUS_MS: u64 = 12_000;
 /// Interest — which is right as the requester finishes *its* Interest TX and is still turning its
 /// radio from TX to RX. Replying into that turnaround gap loses the frame (measured: one direction
 /// delivered, the reverse got 0). A short wait lets the requester settle into RX first. (task #18)
-const RX_REPLY_DELAY: Duration = Duration::from_millis(400);
+///
+/// #52 increment 1: the reply is no longer sent inline — it is SCHEDULED at `now + RX_GUARD_MS +
+/// rand(0..REPLY_JITTER_MS)` and CANCELLED if we overhear the name already answered. `RX_GUARD_MS`
+/// keeps the turnaround floor; the jitter de-synchronizes multiple holders so the first-to-fire wins
+/// and the rest suppress (receiver-agnostic, scales to N). At N=2 (one holder) it is slack, not dedup.
+const RX_GUARD_MS: u64 = 400;
+// Increment 1 keeps the pairwise TX offset, which assumes tight reply timing — so the jitter is small
+// here (just enough to de-sync without fighting the offset). It must GROW to ≥ one frame's airtime
+// once CSMA replaces the offset (increment 3), so a later reply is *heard* before earlier holders fire
+// and suppression actually engages. Measured: 600 ms jitter fought the offset (PER 0.04 → 0.10 at N=2).
+const REPLY_JITTER_MS: u64 = 200;
 const LOCAL_FACE: u64 = 0; // our own app face: where our consumer's Interests come from
 const PEER_FACE: u64 = 1; // the LoRa face the peer's Interests arrive on
 
@@ -157,6 +167,16 @@ struct Pending {
     first_ms: u64,
 }
 
+/// A Data reply we hold and have scheduled but not yet sent (#52 broadcast suppression). It fires at
+/// `fire_at`, unless we first overhear `name` answered by someone else — then it is cancelled.
+struct PendingReply {
+    fire_at: u64,
+    name: String,
+    wire: String,
+    prefix_hash: u64,
+    priority: Priority,
+}
+
 /// A frame off the air, handed to the single-owner state machine in the main loop.
 struct RxEvent {
     wire: String,
@@ -189,12 +209,48 @@ struct Node {
     last_power_dbm: i8,
     last_bw_khz: u32,
     pending: HashMap<&'static str, Pending>,
+    /// Data replies scheduled (with jittered delay) but not yet sent — drained by the reply pump,
+    /// cancelled on overhearing the name answered. The receiver-agnostic replacement for the inline
+    /// fixed-delay reply (#52).
+    pending_replies: Vec<PendingReply>,
+    /// xorshift64 state for reply jitter, seeded per node so peers de-synchronize.
+    rng: u64,
     seq: HashMap<&'static str, u32>,
 }
 
 impl Node {
     fn now(&self) -> u64 {
         self.start.elapsed().as_millis() as u64
+    }
+
+    /// xorshift64 — cheap per-node randomness for the reply jitter (no external RNG dep, and the
+    /// examples have no wall clock to seed from mid-run; the per-node name seed suffices to de-sync).
+    fn next_rand(&mut self) -> u64 {
+        let mut x = self.rng;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.rng = x;
+        x
+    }
+
+    /// The reply pump: send any scheduled Data reply whose time has come (and that was not cancelled
+    /// by overhearing). Draining here, off a fast timer, is what lets on_rx cancel a reply after it is
+    /// queued but before it fires — the whole point of the suppression window (#52).
+    async fn pump_replies(&mut self) {
+        let now = self.now();
+        let due: Vec<PendingReply> = {
+            let all = std::mem::take(&mut self.pending_replies);
+            let (ready, keep): (Vec<_>, Vec<_>) = all.into_iter().partition(|r| r.fire_at <= now);
+            self.pending_replies = keep;
+            ready
+        };
+        for r in due {
+            let mut ctx = NameContext::new(r.prefix_hash); // we produce this name → origin
+            ctx.priority = r.priority;
+            self.transmit(&ctx, &r.wire, &format!("D {}", r.name)).await;
+            self.tracker.on_data(r.prefix_hash, self.now());
+        }
     }
 
     /// DECIDE + ACT + TX for one named object. Returns the row describing what happened.
@@ -404,29 +460,44 @@ impl Node {
             "I" if node == self.name => {
                 let ph = class_prefix(&self.name, &class);
                 self.tracker.on_interest(ph, PEER_FACE, ev.at_ms);
-                let mut ctx = NameContext::new(ph); // we produce this name → origin
-                ctx.priority = priority;
                 self.fold_demand();
-                let wire = format!("D|{}|{name}|payload-{}", self.name, "x".repeat(24));
-                // Let the requester finish turning its radio around to RX before we answer (task #18).
-                tokio::time::sleep(RX_REPLY_DELAY).await;
-                self.transmit(&ctx, &wire, &format!("D {name}")).await;
-                self.tracker.on_data(ph, self.now());
+                // Don't answer inline. SCHEDULE the reply after a turnaround guard + random jitter, so
+                // the requester is in RX and multiple holders de-sync + suppress (#52). Dedup our own:
+                // one queued reply per name (a re-Interest before it fires does not stack a second).
+                if !self.pending_replies.iter().any(|r| r.name == name) {
+                    let fire_at = self.now() + RX_GUARD_MS + (self.next_rand() % REPLY_JITTER_MS);
+                    let wire = format!("D|{}|{name}|payload-{}", self.name, "x".repeat(24));
+                    self.pending_replies.push(PendingReply {
+                        fire_at,
+                        name: name.clone(),
+                        wire,
+                        prefix_hash: ph,
+                        priority,
+                    });
+                }
             }
-            // Data we asked for came back: satisfy the in-record and score the round trip as a hit.
-            "D" if node == self.peer => {
-                let ph = class_prefix(&self.peer, &class);
-                let matched = self
-                    .pending
-                    .iter()
-                    .find(|(_, p)| p.name == name)
-                    .map(|(k, _)| *k);
-                if let Some(k) = matched {
-                    self.pending.remove(k);
-                    self.tracker.on_data(ph, ev.at_ms);
-                    // A satisfied round trip: both our Interest and its Data made it over the air.
-                    self.medium.observe_phy_per(self.radio, 0.0);
-                    println!("[{}] <- D {name} ({}dBm)", self.name, fmt_rssi(ev.rssi));
+            // Any Data for a name we hold a queued reply for → someone answered; suppress ours (#52).
+            "D" => {
+                let before = self.pending_replies.len();
+                self.pending_replies.retain(|r| r.name != name);
+                if self.pending_replies.len() < before {
+                    println!("[{}] ~~ suppressed reply {name} (overheard Data)", self.name);
+                }
+                // Data we asked for came back: satisfy the in-record and score the round trip.
+                if node == self.peer {
+                    let ph = class_prefix(&self.peer, &class);
+                    let matched = self
+                        .pending
+                        .iter()
+                        .find(|(_, p)| p.name == name)
+                        .map(|(k, _)| *k);
+                    if let Some(k) = matched {
+                        self.pending.remove(k);
+                        self.tracker.on_data(ph, ev.at_ms);
+                        // Both our Interest and its Data made it over the air.
+                        self.medium.observe_phy_per(self.radio, 0.0);
+                        println!("[{}] <- D {name} ({}dBm)", self.name, fmt_rssi(ev.rssi));
+                    }
                 }
             }
             _ => {}
@@ -605,6 +676,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         last_bw_khz: 0,
         tick_seq: 0,
         pending: HashMap::new(),
+        pending_replies: Vec::new(),
+        // Seed the jitter PRNG from the node name (non-zero) so the two ends de-synchronize.
+        rng: prefix_hash(&[b"jitter", name.as_bytes()]) | 1,
         seq: HashMap::new(),
     };
 
@@ -621,10 +695,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         TICK / 2
     };
     let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + offset, TICK);
+    // Reply pump: a fast timer that fires scheduled Data replies once their (jittered) time comes and
+    // they were not cancelled by overhearing. 50 ms is well under the guard so timing stays tight.
+    let mut pump = tokio::time::interval(Duration::from_millis(50));
     loop {
         tokio::select! {
             Some(ev) = rx_ch.recv() => node.on_rx(ev).await,
             _ = ticker.tick() => node.tick().await,
+            _ = pump.tick() => node.pump_replies().await,
         }
     }
 }

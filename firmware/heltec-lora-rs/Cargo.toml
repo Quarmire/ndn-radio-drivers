@@ -29,6 +29,7 @@ esp-alloc        = "0.10.0"
 esp-rtos         = { version = "0.3.0", features = ["esp32", "embassy", "esp-alloc"] }
 embassy-executor = "0.10"
 embassy-time     = "0.5"
+embassy-futures  = "0.1"
 static_cell      = "2.1"
 
 [profile.dev]

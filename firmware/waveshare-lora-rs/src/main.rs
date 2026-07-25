@@ -787,44 +787,46 @@ fn handle_cmd<SPI, NSS, RST, BSY, DIO1, RFSW, E, TX>(
         CMD_GET_INFO => {
             send_info(&mut put, radio, *freq, *sf, *bw, *cr, *pwr, lost, csma.cad_busy, csma.defer);
         }
-        // Software DFU: jump to the GD32 ROM UART bootloader so `stm32flash` can reflash over the same
+        // Software DFU: arm the boot flag and system-reset. The #[pre_init] hook below re-enters as
+        // the ROM UART bootloader from a CLEAN reset state, so `stm32flash` reflashes over the same
         // CH343/USB link — no ST-Link, no BOOT0 jumper, no replug. Guarded by a 2-byte magic so a
-        // stray/corrupt frame can't brick the radio mid-flight. This is a one-way trip: the next thing
-        // on the wire is the ROM bootloader's autobaud, then stm32flash.
+        // stray frame can't trigger it. (A direct in-app jump does NOT work on this GD32: the bootloader
+        // needs reset-default clocks/peripherals, and the boot ROM bounces back to flash when it sees
+        // the app's live state — hence the reset round-trip.)
         CMD_ENTER_BOOTLOADER if len >= 2 && buf[0] == 0xB0 && buf[1] == 0x07 => {
-            enter_system_bootloader();
+            unsafe { core::ptr::write_volatile(BOOT_FLAG_ADDR as *mut u32, BOOT_MAGIC) };
+            cortex_m::asm::dsb();
+            cortex_m::peripheral::SCB::sys_reset(); // -> ! ; pre_init handles the rest post-reset
         }
         _ => {}
     }
 }
 
-/// Jump to the STM32F1/GD32F103 system-memory ROM bootloader (base `0x1FFF_F000`). The core already
-/// runs on 8 MHz HSI — exactly what the ROM bootloader expects — so no clock teardown is needed; we
-/// just quiesce interrupts, point VTOR + MSP at the bootloader vector table, and branch to its reset
-/// handler. SWD stays alive regardless, so a failed jump is still ST-Link-recoverable (not a brick).
-fn enter_system_bootloader() -> ! {
-    const SYSMEM_BASE: u32 = 0x1FFF_F000;
-    unsafe {
-        cortex_m::interrupt::disable();
-        // Stop SysTick and mask/clear every NVIC line so nothing fires into the bootloader.
-        let syst = &*cortex_m::peripheral::SYST::PTR;
-        syst.csr.write(0);
-        let nvic = &*cortex_m::peripheral::NVIC::PTR;
-        for r in nvic.icer.iter() {
-            r.write(0xFFFF_FFFF);
-        }
-        for r in nvic.icpr.iter() {
-            r.write(0xFFFF_FFFF);
-        }
+/// Reset-surviving handshake between CMD_ENTER_BOOTLOADER and [`maybe_enter_bootloader`]. The slot is
+/// the top 4 bytes of SRAM, carved out of the linker's RAM region in `memory.x` (so nothing else uses
+/// it) and retained across a SYSRESETREQ.
+const BOOT_FLAG_ADDR: u32 = 0x2000_4FF8;
+const BOOT_MAGIC: u32 = 0xB007_10AD;
+
+/// Runs before RAM init on every reset (`bl __pre_init`, stack already valid). If CMD_ENTER_BOOTLOADER
+/// armed the flag, jump to the GD32/STM32F1 system-memory ROM bootloader (`0x1FFF_F000`) NOW — while
+/// every clock and peripheral is still at its reset default, which is exactly the state the bootloader
+/// expects. We clear the flag first so a normal reset afterwards boots the app. Touches only a fixed
+/// address + inline asm — no statics (which are not yet initialised here), as `#[pre_init]` requires.
+#[cortex_m_rt::pre_init]
+unsafe fn maybe_enter_bootloader() {
+    if core::ptr::read_volatile(BOOT_FLAG_ADDR as *const u32) == BOOT_MAGIC {
+        core::ptr::write_volatile(BOOT_FLAG_ADDR as *mut u32, 0);
+        const SYSMEM_BASE: u32 = 0x1FFF_F000;
         let sp = core::ptr::read_volatile(SYSMEM_BASE as *const u32);
         let entry = core::ptr::read_volatile((SYSMEM_BASE + 4) as *const u32);
-        // Relocate the vector table to system memory, load its initial stack pointer, and branch.
-        let scb = &*cortex_m::peripheral::SCB::PTR;
-        scb.vtor.write(SYSMEM_BASE);
-        cortex_m::asm::dsb();
-        cortex_m::register::msp::write(sp);
-        let boot: extern "C" fn() -> ! = core::mem::transmute(entry as *const ());
-        boot()
+        core::arch::asm!(
+            "msr msp, {sp}",
+            "bx  {entry}",
+            sp = in(reg) sp,
+            entry = in(reg) entry,
+            options(noreturn),
+        );
     }
 }
 

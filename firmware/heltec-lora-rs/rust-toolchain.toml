@@ -1,0 +1,3 @@
+[toolchain]
+# The esp-rs Rust fork (via `espup install`) provides the xtensa-esp32-none-elf target.
+channel = "esp"

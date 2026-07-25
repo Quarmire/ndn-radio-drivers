@@ -1,0 +1,28 @@
+# Heltec WiFi LoRa 32 V2 (ESP32 Xtensa LX6 + SX1276) as a host-driven LoRa modem — the Rust
+# substrate for named-radio node C (task #54, N=3). Speaks the same 7E-A5 serial protocol as the
+# Waveshare `waveshare-lora-rs` firmware, so the OPi host drives it with LoraSerialBackend unchanged,
+# and reuses `ndn-embedded` for the on-device data plane. Standalone crate — the esp-rs dep tree is
+# incompatible with the host workspace (see the ndn-embedded esp32 BLE example this is modelled on).
+[package]
+name = "heltec-lora-rs"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+esp-hal                = { version = "1.1.1", features = ["esp32", "unstable"] }
+esp-println            = { version = "0.17.0", features = ["esp32", "log-04"] }
+esp-backtrace          = { version = "0.19.0", features = ["esp32", "panic-handler", "println"] }
+esp-bootloader-esp-idf = { version = "0.5.0", features = ["esp32"] }
+
+embedded-hal = "1"
+nb           = "1"
+
+[profile.dev]
+opt-level = "s"
+
+[profile.release]
+opt-level = "s"
+lto = true

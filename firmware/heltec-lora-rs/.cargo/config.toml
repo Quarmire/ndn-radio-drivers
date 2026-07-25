@@ -1,0 +1,19 @@
+# Single chip (ESP32 Xtensa LX6) — build/flash directly, no per-chip alias needed.
+#   cargo build --release          # compile
+#   cargo run --release            # flash + monitor over the CP2102 (espflash)
+[build]
+target = "xtensa-esp32-none-elf"
+
+[target.xtensa-esp32-none-elf]
+runner = "espflash flash --monitor"
+rustflags = [
+    "-C", "link-arg=-Tlinkall.x",
+    "-C", "force-frame-pointers",
+]
+
+[env]
+ESP_LOG = "info"
+
+# Rebuild core/alloc from source — required for the tier-3 xtensa target.
+[unstable]
+build-std = ["alloc", "core"]

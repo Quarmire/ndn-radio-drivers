@@ -280,26 +280,37 @@ impl Node {
         // The plan's raw SF is `pick_sf(rssi)` — right at a threshold it flips every tick and the two
         // ends desync. Re-derive it with hysteresis around where we already are, then take the more
         // robust of that and the peer's advertised SF (agreement). Hold on ticks with no fresh RSSI.
-        let sf = alloc.and_then(|a| a.params.spreading_factor()).map(|_| {
-            let cur = self.last_sf.max(7);
-            // Lost contact for too long → a stable split is the likely cause (each end deaf to the
-            // other's SF). Fall back to the rendezvous SF so the pair re-meets; holding `cur` here is
-            // the trap that freezes a stranded node forever.
-            if now.saturating_sub(self.last_heard_ms) > RENDEZVOUS_MS {
-                return RENDEZVOUS_SF;
-            }
-            let base = match self.medium.neighbor_rssi(self.radio, self.peer_key) {
-                Some(r) => pick_sf_hysteretic(r, cur, &STATIC_REQ_RSSI_SF, SF_HYST_DB),
-                None => cur,
-            };
-            base.max(self.peer_sf)
-        });
+        // NDN_LORA_SF pins the spreading factor and disables adaptation — the #54 N=3 measurement holds
+        // SF/BW fixed so the only variables are contention + LBT (the RSSI-driven SF rendezvous can
+        // otherwise diverge the two ends into mutual deafness, which is a separate rate-adaptation
+        // concern, not what the LBT experiment is testing).
+        let sf = if let Some(psf) = std::env::var("NDN_LORA_SF").ok().and_then(|s| s.parse::<u8>().ok()) {
+            Some(psf)
+        } else {
+            alloc.and_then(|a| a.params.spreading_factor()).map(|_| {
+                let cur = self.last_sf.max(7);
+                // Lost contact for too long → a stable split is the likely cause (each end deaf to the
+                // other's SF). Fall back to the rendezvous SF so the pair re-meets; holding `cur` here is
+                // the trap that freezes a stranded node forever.
+                if now.saturating_sub(self.last_heard_ms) > RENDEZVOUS_MS {
+                    return RENDEZVOUS_SF;
+                }
+                let base = match self.medium.neighbor_rssi(self.radio, self.peer_key) {
+                    Some(r) => pick_sf_hysteretic(r, cur, &STATIC_REQ_RSSI_SF, SF_HYST_DB),
+                    None => cur,
+                };
+                base.max(self.peer_sf)
+            })
+        };
         let cr = alloc.and_then(|a| a.params.coding_rate());
         let fec = alloc.and_then(|a| a.params.link_fec_redundancy).unwrap_or(0);
         // Power is set freely per-node (not a rendezvous parameter); bandwidth IS a rendezvous
         // parameter but the policy dials it only from shared inputs, so both peers reach the same one.
         let power = alloc.and_then(|a| a.params.tx_power_dbm);
-        let bw = alloc.and_then(|a| a.params.bandwidth_khz());
+        let bw = std::env::var("NDN_LORA_BW")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .or_else(|| alloc.and_then(|a| a.params.bandwidth_khz()));
 
         let act = if plan.suppress {
             // A real gate, not a demo branch: a relay with nothing to add stays quiet, and a radio
@@ -647,15 +658,25 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // node (delivery 13→7). This is the #37 EDCCA lesson on LoRa — you can't sense your way to better
     // delivery on a channel that isn't collision-limited. So LBT is OFF for the N=2 demo and ON for the
     // N≥3 contended case (flip to `true` + set_lbt_cfg when the Heltec joins as a third node).
-    dev.set_lbt(false);
-    println!("[{name}] open OK — cognition plane driving {path} (LBT off @ N=2), consuming from {peer}");
+    // LBT is OFF for N=2 (measured counterproductive on a clean channel) and ON for the N≥3 contended
+    // case — set NDN_LBT=1 to enable it (the #54 measurement: does carrier-sense help once a third node
+    // makes the channel collision-limited?).
+    let lbt_on = std::env::var("NDN_LBT").map(|v| v == "1" || v == "true").unwrap_or(false);
+    dev.set_lbt(lbt_on);
+    println!("[{name}] open OK — cognition plane driving {path} (LBT {}), consuming from {peer}",
+        if lbt_on { "ON" } else { "off" });
 
     // Frequency is a rendezvous parameter (both ends must sit on the same carrier). Derive the link's
     // channel from the *pair identity* — name-keyed, task #40 in miniature — so both nodes compute the
     // SAME channel with no negotiation. Kept in 914–916 MHz, tight around the known-good 915. This is
     // the cognition-chosen frequency; per-name/per-time FHSS (tasks #40/#41) is the scalable version.
+    // NDN_LORA_CHANNEL pins every node to one carrier (the #54 N=3 measurement needs A, B and the
+    // contender C on the SAME channel; the name-keyed default would scatter a 3rd node elsewhere).
     let (lo, hi) = if name <= peer { (&name, &peer) } else { (&peer, &name) };
-    let link_ch = 64 + (prefix_hash(&[b"lorach", lo.as_bytes(), hi.as_bytes()]) % 3) as u8;
+    let link_ch = std::env::var("NDN_LORA_CHANNEL")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| 64 + (prefix_hash(&[b"lorach", lo.as_bytes(), hi.as_bytes()]) % 3) as u8);
     if let Err(e) = dev.set_channel(link_ch, Bandwidth::from_code(0)) {
         eprintln!("[{name}] set channel {link_ch} failed: {e}");
     }

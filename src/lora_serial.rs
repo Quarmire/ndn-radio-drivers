@@ -51,10 +51,15 @@ const CMD_SET_SYNC: u8 = 0x05; //  payload = [sx127x sync byte]
 const CMD_GET_INFO: u8 = 0x06; //  payload = []
 const CMD_SET_BEACON: u8 = 0x07; // payload = [enabled(0/1)] (opt [enabled, period_mult])
 // Firmware -> host events.
-const EVT_RX: u8 = 0x81; //     payload = [rssi i16 BE, snr i16 BE, LoRa bytes]
-const EVT_TXDONE: u8 = 0x82; // payload = [ok]
-const EVT_INFO: u8 = 0x83; //   payload = [status, sync(2), errors(2), freq(4), sf, bw, cr, pwr]
+const EVT_RX: u8 = 0x81; //     payload = [rssi i16 BE, snr i16 BE, ts_ms u32 BE, LoRa bytes] (#52)
+const EVT_TXDONE: u8 = 0x82; // payload = [ok, attempts]  (#52: attempts=0 for a plain CMD_TX)
+const EVT_INFO: u8 = 0x83; //   payload = [status, sync(2), errors(2), freq(4), sf, bw, cr, pwr, lost(2), cad_busy(2), defer(2)]
 const EVT_LOG: u8 = 0x84; //    payload = ascii
+// #52 events (only parsed when the LBT/CAD host paths are wired; harmless to receive otherwise).
+const EVT_CAD: u8 = 0x85; //    payload = [busy(0/1)]
+const EVT_RSSI: u8 = 0x86; //   payload = [rssi i16 BE]
+const EVT_SF_DETECTED: u8 = 0x87; // payload = [sf | 0]
+const EVT_TX_STARTED: u8 = 0x88; //  payload = [airtime_ms u16 BE]
 
 /// Largest NDN payload carried in one LoRa frame. The SX1262 LoRa PHY caps a frame near 255 bytes;
 /// keeping a margin means one NDN packet is exactly one air frame — loss stays atomic (a dropped
@@ -497,12 +502,16 @@ fn handle_event(
         return;
     }
     match typ {
-        EVT_RX if payload.len() >= 4 => {
+        // #52: EVT_RX gained a 4-byte device (MCU-ms) arrival timestamp between SNR and the payload:
+        // [rssi(2), snr(2), ts_ms(4 BE), bytes]. Skip it (the device clock is surfaced separately when
+        // needed for common-view timing); the payload now starts at offset 8.
+        EVT_RX if payload.len() >= 8 => {
             let rssi = i16::from_be_bytes([payload[0], payload[1]]);
             let snr = i16::from_be_bytes([payload[2], payload[3]]);
-            let ndn = &payload[4..];
+            let ts_ms = u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]);
+            let ndn = &payload[8..];
             if debug {
-                eprintln!("lora RX [{rssi} dBm, SNR {snr}] {} bytes", ndn.len());
+                eprintln!("lora RX [{rssi} dBm, SNR {snr}, ts {ts_ms}ms] {} bytes", ndn.len());
             }
             let cap = CapturedFrame {
                 payload: ndn.to_vec().into(),

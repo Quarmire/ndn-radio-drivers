@@ -58,6 +58,13 @@ const CMD_SET_LBT_CFG: u8 = 0x0B; //payload = [cw_ms(2 BE), max_backoff, max_att
 const CMD_SET_PREAMBLE: u8 = 0x0C; //payload = [preamble(2 BE)]
 const CMD_SF_SCAN: u8 = 0x0D; //    payload = []            → EVT_SF_DETECTED [sf | 0]
 const CMD_TX_LBT: u8 = 0x0E; //     payload = LoRa bytes; firmware runs atomic CAD+backoff+key-up
+// #52 on-device NDN data plane (name filter / relay / CS-serve / dedup / hop / stats).
+const CMD_SET_NAME_FILTER: u8 = 0x0F; // payload = [u64 BE hash]*  (empty clears → pass-all)
+const CMD_SET_RELAY: u8 = 0x10; //       payload = [u64 BE hash]*  (relay set; empty clears)
+const CMD_DATAPLANE: u8 = 0x11; //       payload = [cs_serve, dedup, hop_on, hop_base_ch, hop_span]
+const CMD_GET_STATS: u8 = 0x13; //       payload = []              → EVT_STATS
+const CMD_RESET_STATS: u8 = 0x14; //     payload = []              (clear all counters)
+const CMD_SET_DEBUG: u8 = 0x15; //       payload = [on]            (toggle EVT_LOG diagnostics)
 // Firmware -> host events.
 const EVT_RX: u8 = 0x81; //     payload = [rssi i16 BE, snr i16 BE, ts_ms u32 BE, LoRa bytes] (#52)
 const EVT_TXDONE: u8 = 0x82; // payload = [ok, attempts]  (#52: attempts=0 for a plain CMD_TX)
@@ -68,6 +75,7 @@ const EVT_CAD: u8 = 0x85; //    payload = [busy(0/1)]
 const EVT_RSSI: u8 = 0x86; //   payload = [rssi i16 BE]
 const EVT_SF_DETECTED: u8 = 0x87; // payload = [sf | 0]
 const EVT_TX_STARTED: u8 = 0x88; //  payload = [airtime_ms u16 BE]
+const EVT_STATS: u8 = 0x89; //   payload = [rx(4), filtered(4), deduped(4), served(4), relayed(4), cad_busy(2), defer(2)]
 
 /// Largest NDN payload carried in one LoRa frame. The SX1262 LoRa PHY caps a frame near 255 bytes;
 /// keeping a margin means one NDN packet is exactly one air frame — loss stays atomic (a dropped
@@ -359,6 +367,69 @@ impl LoraSerialBackend {
         }
     }
 
+    // ---- #52 on-device NDN data plane (all runtime; no reflash) ----
+
+    /// Install the name-hash RX filter: only Interests whose name hashes to one of `names` are
+    /// delivered up; the rest are dropped at the antenna. An empty list clears the filter (pass-all).
+    /// The host hashes each name with the SAME [`name_hash`] the firmware uses, so the keyspaces match.
+    pub fn set_name_filter(&self, names: &[&[u8]]) -> Result<(), FaceError> {
+        self.exec_idempotent(CMD_SET_NAME_FILTER, &hash_payload(names), EVT_INFO)?;
+        Ok(())
+    }
+
+    /// Install the relay set: frames whose name hashes into this set are re-broadcast AND delivered
+    /// (cooperative forwarding). Empty clears it.
+    pub fn set_relay(&self, names: &[&[u8]]) -> Result<(), FaceError> {
+        self.exec_idempotent(CMD_SET_RELAY, &hash_payload(names), EVT_INFO)?;
+        Ok(())
+    }
+
+    /// Toggle the data-centric features: Content-Store serve (answer Interests from the on-device
+    /// cache), duplicate suppression, and name-keyed frequency hopping (`base_ch`, `span`).
+    pub fn set_dataplane(
+        &self,
+        cs_serve: bool,
+        dedup: bool,
+        hop_on: bool,
+        hop_base_ch: u8,
+        hop_span: u8,
+    ) -> Result<(), FaceError> {
+        let p = [cs_serve as u8, dedup as u8, hop_on as u8, hop_base_ch, hop_span];
+        self.exec_idempotent(CMD_DATAPLANE, &p, EVT_INFO)?;
+        Ok(())
+    }
+
+    /// Toggle firmware EVT_LOG diagnostics (data-plane decision traces) at runtime.
+    pub fn set_debug(&self, on: bool) -> Result<(), FaceError> {
+        self.exec_idempotent(CMD_SET_DEBUG, &[on as u8], EVT_INFO)?;
+        Ok(())
+    }
+
+    /// Clear the data-plane + CSMA observability counters (re-baseline before a test window).
+    pub fn reset_ndn_stats(&self) -> Result<(), FaceError> {
+        self.exec_idempotent(CMD_RESET_STATS, &[], EVT_INFO)?;
+        Ok(())
+    }
+
+    /// Read the on-device data-plane counters — proof each offload path actually fired on air.
+    pub fn ndn_stats(&self) -> Result<NdnStats, FaceError> {
+        let p = self.exec(CMD_GET_STATS, &[], EVT_STATS, INFO_TIMEOUT)?;
+        if p.len() < 24 {
+            return Err(io_err(format!("EVT_STATS short: {} bytes", p.len())));
+        }
+        let u32be = |o: usize| u32::from_be_bytes([p[o], p[o + 1], p[o + 2], p[o + 3]]);
+        let u16be = |o: usize| u16::from_be_bytes([p[o], p[o + 1]]);
+        Ok(NdnStats {
+            rx: u32be(0),
+            filtered: u32be(4),
+            deduped: u32be(8),
+            served: u32be(12),
+            relayed: u32be(16),
+            cad_busy: u16be(20),
+            defer: u16be(22),
+        })
+    }
+
     /// The radio parameters currently programmed (reflects runtime [`RadioKnobs`] changes).
     pub fn params(&self) -> LoraParams {
         *self.params.lock().unwrap()
@@ -435,6 +506,50 @@ impl LoraSerialBackend {
         self.exec_idempotent(CMD_SET_MOD, &[sf, bw, cr], EVT_INFO)?;
         Ok(())
     }
+}
+
+/// On-device NDN data-plane counters (from `EVT_STATS`). Each is a monotonic count since the last
+/// [`reset_ndn_stats`](LoraSerial::reset_ndn_stats) — nonzero proves the corresponding offload path
+/// fired on air, not just that the code compiled.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct NdnStats {
+    /// Frames the data plane classified (matched the `KIND|SRC|SF|NAME` wire shape).
+    pub rx: u32,
+    /// Interests dropped by the name-hash filter (name not in the allow-set).
+    pub filtered: u32,
+    /// Frames dropped as duplicates (name already in the dedup ring).
+    pub deduped: u32,
+    /// Interests answered from the on-device Content Store (host never woke).
+    pub served: u32,
+    /// Frames re-broadcast by the relay set (cooperative forwarding).
+    pub relayed: u32,
+    /// CSMA: times the channel was sensed busy before a key-up.
+    pub cad_busy: u16,
+    /// CSMA: times a transmission was deferred after exhausting backoff.
+    pub defer: u16,
+}
+
+/// FNV-1a/64 over a name's bytes — the #44 shared name-hash keyspace. This MUST stay
+/// byte-for-byte identical to `ndn_embedded::pit::fnv1a64` (which the firmware uses), or the host and
+/// dongle would disagree on which names a filter/relay/CS entry covers.
+pub fn name_hash(name: &[u8]) -> u64 {
+    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hash = OFFSET;
+    for &b in name {
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(PRIME);
+    }
+    hash
+}
+
+/// Pack a list of names into a `[u64 BE hash]*` payload for CMD_SET_NAME_FILTER / CMD_SET_RELAY.
+fn hash_payload(names: &[&[u8]]) -> Vec<u8> {
+    let mut p = Vec::with_capacity(names.len() * 8);
+    for n in names {
+        p.extend_from_slice(&name_hash(n).to_be_bytes());
+    }
+    p
 }
 
 /// Frame one command/event as `7E A5 | type | len | payload | xor-crc` and write it in one call.

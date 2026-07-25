@@ -50,6 +50,14 @@ const CMD_SET_SYNC: u8 = 0x05; //  payload = [sx127x sync byte]
 #[allow(dead_code)]
 const CMD_GET_INFO: u8 = 0x06; //  payload = []
 const CMD_SET_BEACON: u8 = 0x07; // payload = [enabled(0/1)] (opt [enabled, period_mult])
+// #52 carrier-sense / LBT.
+const CMD_CAD: u8 = 0x08; //        payload = []            → EVT_CAD [busy]
+const CMD_GET_RSSI: u8 = 0x09; //   payload = []            → EVT_RSSI [rssi i16 BE]
+const CMD_SET_CAD_CFG: u8 = 0x0A; //payload = [sym, det_peak, det_min]
+const CMD_SET_LBT_CFG: u8 = 0x0B; //payload = [cw_ms(2 BE), max_backoff, max_attempts]
+const CMD_SET_PREAMBLE: u8 = 0x0C; //payload = [preamble(2 BE)]
+const CMD_SF_SCAN: u8 = 0x0D; //    payload = []            → EVT_SF_DETECTED [sf | 0]
+const CMD_TX_LBT: u8 = 0x0E; //     payload = LoRa bytes; firmware runs atomic CAD+backoff+key-up
 // Firmware -> host events.
 const EVT_RX: u8 = 0x81; //     payload = [rssi i16 BE, snr i16 BE, ts_ms u32 BE, LoRa bytes] (#52)
 const EVT_TXDONE: u8 = 0x82; // payload = [ok, attempts]  (#52: attempts=0 for a plain CMD_TX)
@@ -256,6 +264,9 @@ impl Drop for SerialFd {
 /// How long to wait for a transmission to complete. The firmware's transmit polls the chip for at
 /// most ~2 s (SF12 at 125 kHz is ~1.5 s on air for a full frame); the rest is serial slack.
 const TXDONE_TIMEOUT: Duration = Duration::from_millis(3_000);
+// LBT can spend several CAD+backoff attempts before it keys up (or defers), on top of the frame's
+// airtime — give it more headroom than a plain TX. The firmware caps attempts, so this is bounded.
+const LBT_TIMEOUT: Duration = Duration::from_millis(5_000);
 /// How long to wait for a knob to be acknowledged. Each `SET_*` is standby → apply → re-arm RX →
 /// reply, all well under this.
 const INFO_TIMEOUT: Duration = Duration::from_millis(1_000);
@@ -283,6 +294,9 @@ pub struct LoraSerialBackend {
     /// Behind a mutex because [`RadioKnobs`] retunes the module at runtime; `capability()` and
     /// `params()` reflect the live values.
     params: Arc<Mutex<LoraParams>>,
+    /// #52: when set, `inject` uses the firmware's atomic listen-before-talk TX (`CMD_TX_LBT`) instead
+    /// of a plain blind `CMD_TX`. Off by default so a plain `lora_link` on any dongle still works.
+    lbt: std::sync::atomic::AtomicBool,
 }
 
 impl LoraSerialBackend {
@@ -307,7 +321,42 @@ impl LoraSerialBackend {
             cmd: Arc::new(Mutex::new(CmdPort { port, resp: resprx })),
             rx: AsyncMutex::new(rxch),
             params: Arc::new(Mutex::new(params)),
+            lbt: std::sync::atomic::AtomicBool::new(false),
         })
+    }
+
+    /// #52: route `inject` through the firmware's atomic listen-before-talk (`CMD_TX_LBT`) — carrier
+    /// sense + backoff before every key-up. Requires the #52 firmware; leave off for a plain dongle.
+    pub fn set_lbt(&self, on: bool) {
+        self.lbt.store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// #52: tune the LBT contention window (ms), max backoff exponent, and max attempts at runtime —
+    /// no reflash (Tier 2). Bigger `cw_ms` = better fairness (nodes separate more) at higher latency.
+    pub fn set_lbt_cfg(&self, cw_ms: u16, max_backoff: u8, max_attempts: u8) -> Result<(), FaceError> {
+        let p = [(cw_ms >> 8) as u8, cw_ms as u8, max_backoff, max_attempts];
+        self.exec_idempotent(CMD_SET_LBT_CFG, &p, EVT_INFO)?;
+        Ok(())
+    }
+
+    /// #52: tune CAD sensitivity (symbol-count code, detector peak/min) at runtime — no reflash.
+    pub fn set_cad_cfg(&self, sym: u8, det_peak: u8, det_min: u8) -> Result<(), FaceError> {
+        self.exec_idempotent(CMD_SET_CAD_CFG, &[sym, det_peak, det_min], EVT_INFO)?;
+        Ok(())
+    }
+
+    /// #52: read the firmware's CSMA observability counters `(cad_busy, deferred)` from `EVT_INFO`.
+    /// `cad_busy` climbing with `deferred` near zero means backoff is finding the channel and winning.
+    pub fn csma_counters(&self) -> Result<(u16, u16), FaceError> {
+        let p = self.exec(CMD_GET_INFO, &[], EVT_INFO, INFO_TIMEOUT)?;
+        // EVT_INFO tail (#52): ... lost(2), cad_busy(2), defer(2) → the last 4 bytes.
+        if p.len() >= 19 {
+            let cad = u16::from_be_bytes([p[15], p[16]]);
+            let def = u16::from_be_bytes([p[17], p[18]]);
+            Ok((cad, def))
+        } else {
+            Ok((0, 0)) // pre-#52 firmware: no counters
+        }
     }
 
     /// The radio parameters currently programmed (reflects runtime [`RadioKnobs`] changes).
@@ -583,10 +632,18 @@ impl FrameIo for LoraSerialBackend {
                 frame_in.payload.len()
             )));
         }
-        let ok = self.exec(CMD_TX, &frame_in.payload, EVT_TXDONE, TXDONE_TIMEOUT)?;
-        match ok.first() {
+        // #52: with LBT on, the firmware runs an atomic CAD → backoff → key-up and replies
+        // [sent, attempts]; sent=0 means the channel stayed busy for all attempts (DEFERRED), which we
+        // surface as a TX failure so the caller re-expresses (same as a lost frame). EVT_TX_STARTED
+        // arrives first but `exec` skips any non-matching event, so we still land on EVT_TXDONE.
+        let reply = if self.lbt.load(std::sync::atomic::Ordering::Relaxed) {
+            self.exec(CMD_TX_LBT, &frame_in.payload, EVT_TXDONE, LBT_TIMEOUT)?
+        } else {
+            self.exec(CMD_TX, &frame_in.payload, EVT_TXDONE, TXDONE_TIMEOUT)?
+        };
+        match reply.first() {
             Some(1) => Ok(()),
-            _ => Err(io_err("lora TX reported failure".into())),
+            _ => Err(io_err("lora TX reported failure/deferred".into())),
         }
     }
 

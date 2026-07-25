@@ -388,9 +388,30 @@ where
         self.set_mod_params(sf, bw, cr, ldro);
     }
 
-    /// Set TX power in dBm (SX1262: up to +22).
+    /// Set TX power in dBm (SX1262: up to +22), also re-optimising the PA config for the power band
+    /// (Semtech DS §13.1.14) so lower powers are efficient instead of using the fixed +22 dBm PA setup.
     pub fn set_power(&mut self, dbm: i8) {
+        // (paDutyCycle, hpMax) tiers; txParams power then fine-tunes within the band.
+        let (duty, hp) = match dbm {
+            d if d >= 20 => (0x04, 0x07), // +22 dBm optimal
+            d if d >= 15 => (0x03, 0x05), // +20 dBm optimal
+            d if d >= 10 => (0x02, 0x03), // +17 dBm optimal
+            _ => (0x02, 0x02),            // +14 dBm optimal
+        };
+        self.set_pa_config(duty, hp);
         self.set_tx_params(dbm, 0x04);
+    }
+
+    /// Energy-detect the channel: arm RX, sample instantaneous RSSI, return true if it exceeds
+    /// `thresh_dbm` (busy). Catches non-LoRa interference that CAD (preamble detect) is blind to.
+    /// Leaves the chip in standby.
+    pub fn rssi_busy(&mut self, thresh_dbm: i16) -> bool {
+        self.rf_rx();
+        self.set_rx(0xFFFFFF);
+        Self::delay_us(300); // let AGC settle
+        let r = self.rssi_inst();
+        self.set_standby(0x00);
+        r > thresh_dbm
     }
 
     /// Set the LoRa sync word using the SX127x single-byte convention (0x12 private / 0x34 public).

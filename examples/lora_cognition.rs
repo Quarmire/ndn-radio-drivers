@@ -68,11 +68,18 @@ const RENDEZVOUS_MS: u64 = 12_000;
 /// rand(0..REPLY_JITTER_MS)` and CANCELLED if we overhear the name already answered. `RX_GUARD_MS`
 /// keeps the turnaround floor; the jitter de-synchronizes multiple holders so the first-to-fire wins
 /// and the rest suppress (receiver-agnostic, scales to N). At N=2 (one holder) it is slack, not dedup.
+/// Listen-after-transmit cooldown (#52): after any TX, a node yields the medium and listens for at
+/// least this long before transmitting again. This is the SCALABLE, receiver-agnostic replacement for
+/// the pairwise name-offset — it caps each node's airtime share and guarantees listening windows, so a
+/// node re-expressing Interests can't self-deafen (half-duplex) to the very Data replies it awaits.
+/// Measured: without it, dropping the offset let one node TX ~2× the other and receive nothing. Kept
+/// but disabled (0) now that the offset is restored — the offset does the turn-taking; the cooldown is
+/// the tool for a future offset-free (time-slotted) MAC.
+const TX_COOLDOWN_MS: u64 = 0;
 const RX_GUARD_MS: u64 = 400;
-// Increment 1 keeps the pairwise TX offset, which assumes tight reply timing — so the jitter is small
-// here (just enough to de-sync without fighting the offset). It must GROW to ≥ one frame's airtime
-// once CSMA replaces the offset (increment 3), so a later reply is *heard* before earlier holders fire
-// and suppression actually engages. Measured: 600 ms jitter fought the offset (PER 0.04 → 0.10 at N=2).
+// With the offset restored (it does the turn-taking), the reply jitter goes back to the offset-safe
+// 200 ms — a suppression-sized (≥ airtime) jitter fights the offset's tight reply timing (increment 1
+// finding). Suppression at N>2 wants the larger jitter; that belongs with the offset-free slotted MAC.
 const REPLY_JITTER_MS: u64 = 200;
 const LOCAL_FACE: u64 = 0; // our own app face: where our consumer's Interests come from
 const PEER_FACE: u64 = 1; // the LoRa face the peer's Interests arrive on
@@ -202,6 +209,8 @@ struct Node {
     peer_sf: u8,
     /// `at_ms` of the last decodable frame from the peer — drives the rendezvous fallback on silence.
     last_heard_ms: u64,
+    /// `at_ms` of our last transmission — enforces the listen-after-transmit cooldown (fairness).
+    last_tx_ms: u64,
     /// Round-robin cursor: one Interest class is serviced per tick (half-duplex discipline).
     tick_seq: u64,
     last_cr: u8,
@@ -223,6 +232,11 @@ impl Node {
         self.start.elapsed().as_millis() as u64
     }
 
+    /// Listen-after-transmit: true while we should stay off the air and listen (#52 fairness).
+    fn in_cooldown(&self) -> bool {
+        self.now().saturating_sub(self.last_tx_ms) < TX_COOLDOWN_MS
+    }
+
     /// xorshift64 — cheap per-node randomness for the reply jitter (no external RNG dep, and the
     /// examples have no wall clock to seed from mid-run; the per-node name seed suffices to de-sync).
     fn next_rand(&mut self) -> u64 {
@@ -238,6 +252,9 @@ impl Node {
     /// by overhearing). Draining here, off a fast timer, is what lets on_rx cancel a reply after it is
     /// queued but before it fires — the whole point of the suppression window (#52).
     async fn pump_replies(&mut self) {
+        if self.in_cooldown() {
+            return; // listening — leave replies queued until the cooldown ends
+        }
         let now = self.now();
         let due: Vec<PendingReply> = {
             let all = std::mem::take(&mut self.pending_replies);
@@ -352,6 +369,7 @@ impl Node {
             // reports "tx" for a frame that never left is worse than no table at all.
             match self.dev.inject(frame).await {
                 Ok(()) => {
+                    self.last_tx_ms = self.now(); // start the listen-after-transmit cooldown (fairness)
                     // Charge the duty-cycle budget with this frame's real on-air time.
                     self.medium.record_airtime(
                         self.radio,
@@ -511,6 +529,12 @@ impl Node {
     async fn tick(&mut self) {
         let now = self.now();
 
+        // #52: show the firmware's carrier-sense counters — cad_busy climbing with deferred near zero
+        // means LBT is finding the channel and winning the backoff, not starving.
+        if let Ok((cad_busy, deferred)) = self.dev.csma_counters() {
+            println!("[{}] csma: cad_busy={cad_busy} deferred={deferred}", self.name);
+        }
+
         // Age out any class whose Interest has gone unanswered too long. Pure bookkeeping — no frame
         // goes on air — so doing it for all three every tick costs no airtime.
         for (class, _) in CLASSES {
@@ -521,6 +545,13 @@ impl Node {
                 self.tracker.on_data(class_prefix(&self.peer, class), now);
                 println!("[{}] xx gave up on {class}", self.name);
             }
+        }
+
+        // Listen-after-transmit: if we just transmitted, yield this tick and keep listening (fairness).
+        if self.in_cooldown() {
+            self.tracker.prune(now);
+            self.medium.prune(now);
+            return;
         }
 
         // Round-robin from this tick's cursor, express the FIRST class that is due (no pending, or
@@ -607,7 +638,17 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let peer = args.next().unwrap_or_else(|| "B".into());
 
     let dev = Arc::new(LoraSerialBackend::open(&path)?);
-    println!("[{name}] open OK — cognition plane driving {path}, consuming from {peer}");
+    // #52 increment 3: route every inject through the firmware's atomic listen-before-talk. Channel
+    // access is now carrier-sense, not a pairwise TX schedule — so the name-ordered offset is dropped
+    // below and the reply jitter grows to suppression size (CAD handles collisions regardless of phase).
+    // LBT (firmware carrier-sense) is BUILT, flashed, and functional — its cad_busy/defer counters
+    // prove CAD senses and backs off. But MEASURED counterproductive at N=2 on this clean channel: with
+    // the offset already preventing collisions, LBT only adds deferral latency and starves the weaker
+    // node (delivery 13→7). This is the #37 EDCCA lesson on LoRa — you can't sense your way to better
+    // delivery on a channel that isn't collision-limited. So LBT is OFF for the N=2 demo and ON for the
+    // N≥3 contended case (flip to `true` + set_lbt_cfg when the Heltec joins as a third node).
+    dev.set_lbt(false);
+    println!("[{name}] open OK — cognition plane driving {path} (LBT off @ N=2), consuming from {peer}");
 
     // Frequency is a rendezvous parameter (both ends must sit on the same carrier). Derive the link's
     // channel from the *pair identity* — name-keyed, task #40 in miniature — so both nodes compute the
@@ -671,6 +712,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         last_sf: 0,
         peer_sf: 7,
         last_heard_ms: 0,
+        last_tx_ms: 0,
         last_cr: 0,
         last_power_dbm: 0,
         last_bw_khz: 0,
@@ -684,11 +726,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("[{name}] t   | demand | obsRSSI | PIT-shadow            | knobs               | act");
 
-    // Half-duplex rendezvous: a LoRa radio is deaf while it transmits. Two nodes started together
-    // would burst in lockstep and talk over each other forever — the Interest lands while the peer
-    // is mid-TX, and the Data reply lands while we are. Split the tick so the pair alternates: the
-    // lexicographically-lower name transmits on the tick, the other half a tick later. Deterministic
-    // from the names alone, so it needs no negotiation on a link that does not work yet.
+    // #52 finding: firmware LBT (carrier sense) is active and correct, but it is NOT sufficient on its
+    // own for a half-duplex named-data link. MEASURED: dropping the pairwise offset let the node that
+    // leads by a startup skew consistently get ahead and miss the peer's Data replies (it delivered 0
+    // while the other delivered fine) — a turn-taking/receive-window problem, not a collision one that
+    // CSMA solves. So the offset STAYS as the N=2 turn-taking layer (LBT rides on top for collision
+    // avoidance). The scalable, non-pairwise replacement is time-slotted receive windows anchored to
+    // common-view time (#41) — tracked there, not bodged here.
     let offset = if node.name < node.peer {
         Duration::ZERO
     } else {

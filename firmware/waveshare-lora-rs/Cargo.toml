@@ -17,6 +17,10 @@ cortex-m-rt = "0.7"
 panic-halt = "0.2"
 embedded-hal = "0.2"
 nb = "1"
+# Reuse the no_std NDN forwarder's data-centric primitives on the MCU: fnv1a64 (the #44 shared
+# name-hash keyspace) and the fixed-capacity Content Store. `default-features = false` selects the
+# allocation-free path (see ndn-embedded's `forwarder` feature) so this no-heap binary links clean.
+ndn-embedded = { path = "../../../ndn-embedded/crates/ndn-embedded", default-features = false, features = ["cs"] }
 
 [dependencies.stm32f1xx-hal]
 version = "0.10"

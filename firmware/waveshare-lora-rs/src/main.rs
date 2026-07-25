@@ -16,6 +16,7 @@
 #![no_main]
 #![allow(dead_code)]
 
+mod ndn;
 mod sx1262;
 
 use core::cell::UnsafeCell;
@@ -148,6 +149,14 @@ const CMD_SET_LBT_CFG: u8 = 0x0B; //  payload = [cw_ms(2 BE), max_backoff, max_a
 const CMD_SET_PREAMBLE: u8 = 0x0C; // payload = [preamble(2 BE)]
 const CMD_SF_SCAN: u8 = 0x0D; //      payload = []            → EVT_SF_DETECTED [sf | 0]
 const CMD_TX_LBT: u8 = 0x0E; //       payload = LoRa frame bytes; atomic CAD+backoff+key-up
+// #52 data-centric offload config (the host installs name-hash routes; all default inert).
+const CMD_SET_NAME_FILTER: u8 = 0x0F; // payload = [u64 BE hash]*  (empty clears → pass-all)
+const CMD_SET_RELAY: u8 = 0x10; //       payload = [u64 BE hash]*  (relay set; empty clears)
+const CMD_DATAPLANE: u8 = 0x11; //       payload = [cs_serve, dedup, hop_on, hop_base_ch, hop_span]
+const CMD_SET_SENSE_CFG: u8 = 0x12; //   payload = [rssi_thresh i16 BE, cad_repeat] (energy-detect + N-CAD)
+const CMD_GET_STATS: u8 = 0x13; //       payload = []  → EVT_STATS
+const CMD_RESET_STATS: u8 = 0x14; //     payload = []  (clear all counters)
+const CMD_SET_DEBUG: u8 = 0x15; //       payload = [on] (toggle EVT_LOG diagnostics — no reflash)
 // Firmware -> host events.
 const EVT_RX: u8 = 0x81; //    payload = [rssi i16 BE, snr i16 BE, ts_ms u32 BE, LoRa bytes]
 const EVT_TXDONE: u8 = 0x82; //payload = [ok, attempts]  (attempts=0 for a plain CMD_TX)
@@ -157,6 +166,14 @@ const EVT_CAD: u8 = 0x85; //   payload = [busy(0/1)]
 const EVT_RSSI: u8 = 0x86; //  payload = [rssi i16 BE]
 const EVT_SF_DETECTED: u8 = 0x87; // payload = [sf | 0 = none]
 const EVT_TX_STARTED: u8 = 0x88; //  payload = [airtime_ms u16 BE] — emitted just before key-up
+const EVT_STATS: u8 = 0x89; //       payload = [rx(4), filtered(4), deduped(4), served(4), relayed(4), cad_busy(2), defer(2)]
+
+/// Runtime diagnostics toggle (CMD_SET_DEBUG) — emit EVT_LOG traces of data-plane decisions on demand,
+/// no reflash. Off by default (quiet link).
+static DEBUG: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+fn debug_on() -> bool {
+    DEBUG.load(Ordering::Relaxed)
+}
 
 /// #52 runtime state for carrier-sense/LBT (bundled so the command handler stays legible). Every
 /// field is host-tunable so tuning needs a serial command, not a reflash.
@@ -176,6 +193,11 @@ struct Csma {
     /// Observability counters, reported in EVT_INFO (you cannot tune CSMA blind).
     cad_busy: u16,
     defer: u16,
+    /// Energy-detect threshold (dBm) OR'd into the busy sense; `i16::MIN` disables it. Catches
+    /// non-LoRa interference. Runtime-tunable (CMD_SET_SENSE_CFG).
+    rssi_thresh: i16,
+    /// CAD samples per sense (OR'd) — more cuts false-negatives at the cost of airtime. Default 1.
+    cad_repeat: u8,
 }
 impl Csma {
     fn new() -> Self {
@@ -184,12 +206,14 @@ impl Csma {
             cad_sym: 0x02, // 4 symbols
             cad_peak: 0x18, // 24 — a mid default; tune on air per SF
             cad_min: 0x0A, // 10
-            lbt_cw: 5, // ms
-            lbt_max_backoff: 4, // window up to 5<<4 = 80 ms
+            lbt_cw: 20, // ms — the initial-backoff window must be ~a CAD slot (SF10 CAD ≈ 33 ms) to
+            lbt_max_backoff: 4, // separate two nodes; runtime-tunable via CMD_SET_LBT_CFG, no reflash
             lbt_max_attempts: 6,
             rng: 0x1234_5678,
             cad_busy: 0,
             defer: 0,
+            rssi_thresh: i16::MIN, // energy-detect disabled by default (CAD only)
+            cad_repeat: 1,
         }
     }
     fn next_rand(&mut self) -> u32 {
@@ -202,10 +226,25 @@ impl Csma {
     }
 }
 
-/// Free-running millisecond clock (SysTick ISR), for the EVT_RX hardware timestamp.
+/// Free-running millisecond clock (SysTick ISR).
 static MILLIS: AtomicU32 = AtomicU32::new(0);
 fn millis() -> u32 {
     MILLIS.load(Ordering::Relaxed)
+}
+
+/// Microsecond clock for the EVT_RX hardware timestamp (#41 common-view timing needs sub-ms). Combines
+/// the ms tick with the SysTick down-counter (reloads every 8000 cycles = 1 ms @ 8 MHz). Retries if a
+/// tick lands mid-read. u32 µs wraps ~every 71 min — fine for relative timing.
+fn micros() -> u32 {
+    const RELOAD: u32 = 8_000 - 1;
+    const SYST_CVR: *const u32 = 0xE000_E018 as *const u32; // SysTick current-value register
+    loop {
+        let ms1 = MILLIS.load(Ordering::Relaxed);
+        let cvr = unsafe { core::ptr::read_volatile(SYST_CVR) } & 0x00FF_FFFF;
+        if MILLIS.load(Ordering::Relaxed) == ms1 {
+            return ms1.wrapping_mul(1000).wrapping_add(RELOAD.saturating_sub(cvr) / 8);
+        }
+    }
 }
 
 // Heartbeat-beacon base period in main-loop iterations (~seconds; the loop is SPI-poll bound).
@@ -385,6 +424,9 @@ fn main() -> ! {
     if seed != 0 {
         csma.rng = seed;
     }
+    // #52 data-centric offload: name-hash filter / Content Store / relay / hop. All inert until the
+    // host installs routes, so a fresh dongle behaves exactly like the plain modem.
+    let mut plane = ndn::DataPlane::new();
     radio.start_rx();
 
     // Announce readiness (ascii log the host can print, plus a structured INFO).
@@ -425,20 +467,53 @@ fn main() -> ! {
                     &mut beacon_enabled,
                     &mut beacon_period,
                     &mut csma,
+                    &mut plane,
                 );
             }
         }
 
-        // 2) Deliver any received LoRa frame with RSSI/SNR + a hardware arrival timestamp (#52).
+        // 2) Classify a received frame by NAME (data-centric offload). With no host-installed filter /
+        //    CS / relay it always Delivers — identical to the plain modem; features light up on opt-in.
         if let Some(pkt) = radio.poll_rx(&mut rxbuf) {
-            let ts = millis();
+            let ts = micros();
             let n = core::cmp::min(pkt.len as usize, rxbuf.len());
-            let mut ev = [0u8; 72];
-            ev[0..2].copy_from_slice(&pkt.rssi_dbm.to_be_bytes());
-            ev[2..4].copy_from_slice(&pkt.snr_db.to_be_bytes());
-            ev[4..8].copy_from_slice(&ts.to_be_bytes());
-            ev[8..8 + n].copy_from_slice(&rxbuf[..n]);
-            send_frame(|b| { let _ = block!(tx.write(b)); }, EVT_RX, &ev[..8 + n]);
+            // Copy any CS-serve payload out so we don't hold the data-plane borrow across the TX below.
+            let mut serve = [0u8; ndn::CS_MAX_LEN];
+            let mut serve_len = 0usize;
+            let (deliver, relay) = match plane.on_rx(&rxbuf[..n], millis()) {
+                ndn::RxAction::Drop => (false, false),
+                ndn::RxAction::Serve(data) => {
+                    let m = data.len().min(serve.len());
+                    serve[..m].copy_from_slice(&data[..m]);
+                    serve_len = m;
+                    (false, false)
+                }
+                ndn::RxAction::Deliver => (true, false),
+                ndn::RxAction::RelayAndDeliver => (true, true),
+            };
+            if debug_on() {
+                let mut lg = BufWriter::new();
+                let _ = write!(lg, "rx n={n} serve={} relay={relay} deliver={deliver}", serve_len > 0);
+                send_frame(|b| { let _ = block!(tx.write(b)); }, EVT_LOG, lg.as_slice());
+            }
+            // Content-Store hit: serve the cached Data ourselves (LBT), the host never wakes.
+            if serve_len > 0 {
+                let _ = lbt_tx(&mut radio, &mut csma, &serve[..serve_len]);
+                radio.start_rx();
+            }
+            // Relay: re-broadcast (LBT) for cooperative forwarding, then also deliver.
+            if relay {
+                let _ = lbt_tx(&mut radio, &mut csma, &rxbuf[..n]);
+                radio.start_rx();
+            }
+            if deliver {
+                let mut ev = [0u8; 72];
+                ev[0..2].copy_from_slice(&pkt.rssi_dbm.to_be_bytes());
+                ev[2..4].copy_from_slice(&pkt.snr_db.to_be_bytes());
+                ev[4..8].copy_from_slice(&ts.to_be_bytes());
+                ev[8..8 + n].copy_from_slice(&rxbuf[..n]);
+                send_frame(|b| { let _ = block!(tx.write(b)); }, EVT_RX, &ev[..8 + n]);
+            }
         }
 
         // 3) Optional heartbeat beacon (host-toggleable via CMD_SET_BEACON) so TX is exercised and
@@ -460,6 +535,57 @@ fn main() -> ! {
     }
 }
 
+/// The atomic listen-before-talk TX loop (#52): a random backoff BEFORE each CAD (CSMA/CA, so no node
+/// deterministically captures the channel), transmit on a clear sense, give up after
+/// `lbt_max_attempts`. Shared by `CMD_TX_LBT` and the firmware-served Content-Store / relay paths.
+/// Leaves the chip in standby (the caller re-arms RX). Returns `(sent, attempts)`.
+fn lbt_tx<SPI, NSS, RST, BSY, DIO1, RFSW, E>(
+    radio: &mut Sx1262<SPI, NSS, RST, BSY, DIO1, RFSW>,
+    csma: &mut Csma,
+    payload: &[u8],
+) -> (bool, u8)
+where
+    SPI: embedded_hal::blocking::spi::Transfer<u8, Error = E>
+        + embedded_hal::blocking::spi::Write<u8, Error = E>,
+    NSS: embedded_hal::digital::v2::OutputPin,
+    RST: embedded_hal::digital::v2::OutputPin,
+    RFSW: embedded_hal::digital::v2::OutputPin,
+    BSY: embedded_hal::digital::v2::InputPin,
+    DIO1: embedded_hal::digital::v2::InputPin,
+{
+    radio.standby();
+    radio.set_cad_params(csma.cad_sym, csma.cad_peak, csma.cad_min);
+    let mut attempt: u8 = 0;
+    let mut sent = false;
+    while attempt < csma.lbt_max_attempts {
+        let shift = (attempt as u32).min(csma.lbt_max_backoff as u32);
+        let window = (csma.lbt_cw << shift).max(1);
+        let wait_ms = csma.next_rand() % window;
+        cortex_m::asm::delay(wait_ms.saturating_mul(8_000)); // 8 MHz core → 8000 cycles/ms
+        // Sense = CAD (N repeats OR'd) OR RSSI energy-detect (catches non-LoRa interference).
+        let mut busy = false;
+        for _ in 0..csma.cad_repeat.max(1) {
+            if radio.do_cad() {
+                busy = true;
+                break;
+            }
+        }
+        if !busy && csma.rssi_thresh > i16::MIN {
+            busy = radio.rssi_busy(csma.rssi_thresh);
+        }
+        if !busy {
+            sent = radio.transmit(payload);
+            break;
+        }
+        csma.cad_busy = csma.cad_busy.wrapping_add(1);
+        attempt += 1;
+    }
+    if !sent {
+        csma.defer = csma.defer.wrapping_add(1);
+    }
+    (sent, attempt)
+}
+
 /// Apply a decoded host command and emit its acknowledging event.
 #[allow(clippy::too_many_arguments)]
 fn handle_cmd<SPI, NSS, RST, BSY, DIO1, RFSW, E, TX>(
@@ -476,6 +602,7 @@ fn handle_cmd<SPI, NSS, RST, BSY, DIO1, RFSW, E, TX>(
     beacon_enabled: &mut bool,
     beacon_period: &mut u32,
     csma: &mut Csma,
+    plane: &mut ndn::DataPlane,
 ) where
     SPI: embedded_hal::blocking::spi::Transfer<u8, Error = E>
         + embedded_hal::blocking::spi::Write<u8, Error = E>,
@@ -502,25 +629,7 @@ fn handle_cmd<SPI, NSS, RST, BSY, DIO1, RFSW, E, TX>(
             let air = sx1262::airtime_ms(*sf, *bw, *cr, len as u8, csma.preamble);
             let air16 = (air.min(u16::MAX as u32) as u16).to_be_bytes();
             send_frame(&mut put, EVT_TX_STARTED, &air16);
-            radio.standby();
-            radio.set_cad_params(csma.cad_sym, csma.cad_peak, csma.cad_min);
-            let mut attempt: u8 = 0;
-            let mut sent = false;
-            while attempt < csma.lbt_max_attempts {
-                if !radio.do_cad() {
-                    sent = radio.transmit(&buf[..len]);
-                    break;
-                }
-                csma.cad_busy = csma.cad_busy.wrapping_add(1);
-                let shift = (attempt as u32).min(csma.lbt_max_backoff as u32);
-                let window = (csma.lbt_cw << shift).max(1);
-                let wait_ms = csma.next_rand() % window;
-                cortex_m::asm::delay(wait_ms.saturating_mul(8_000)); // 8 MHz core → 8000 cycles/ms
-                attempt += 1;
-            }
-            if !sent {
-                csma.defer = csma.defer.wrapping_add(1);
-            }
+            let (sent, attempt) = lbt_tx(radio, csma, &buf[..len]);
             radio.start_rx();
             send_frame(&mut put, EVT_TXDONE, &[sent as u8, attempt]);
         }
@@ -610,6 +719,66 @@ fn handle_cmd<SPI, NSS, RST, BSY, DIO1, RFSW, E, TX>(
                 // Optional second byte scales the base period (min ×1).
                 *beacon_period = BEACON_BASE_PERIOD.saturating_mul(buf[1].max(1) as u32);
             }
+            send_info(&mut put, radio, *freq, *sf, *bw, *cr, *pwr, lost, csma.cad_busy, csma.defer);
+        }
+        // #52 data-centric offload config. Filter/relay payloads are a list of u64 BE name-hashes.
+        CMD_SET_NAME_FILTER => {
+            let mut hashes = [0u64; 24];
+            let count = (len / 8).min(hashes.len());
+            for (i, h) in hashes[..count].iter_mut().enumerate() {
+                let o = i * 8;
+                *h = u64::from_be_bytes([
+                    buf[o], buf[o + 1], buf[o + 2], buf[o + 3],
+                    buf[o + 4], buf[o + 5], buf[o + 6], buf[o + 7],
+                ]);
+            }
+            plane.set_filter(&hashes[..count]);
+            send_info(&mut put, radio, *freq, *sf, *bw, *cr, *pwr, lost, csma.cad_busy, csma.defer);
+        }
+        CMD_SET_RELAY => {
+            let mut hashes = [0u64; 24];
+            let count = (len / 8).min(hashes.len());
+            for (i, h) in hashes[..count].iter_mut().enumerate() {
+                let o = i * 8;
+                *h = u64::from_be_bytes([
+                    buf[o], buf[o + 1], buf[o + 2], buf[o + 3],
+                    buf[o + 4], buf[o + 5], buf[o + 6], buf[o + 7],
+                ]);
+            }
+            plane.set_relay(&hashes[..count]);
+            send_info(&mut put, radio, *freq, *sf, *bw, *cr, *pwr, lost, csma.cad_busy, csma.defer);
+        }
+        CMD_DATAPLANE if len >= 5 => {
+            plane.set_cs_serve(buf[0] != 0);
+            plane.set_dedup(buf[1] != 0);
+            plane.set_hop(buf[2] != 0, buf[3], buf[4]);
+            send_info(&mut put, radio, *freq, *sf, *bw, *cr, *pwr, lost, csma.cad_busy, csma.defer);
+        }
+        // #52 tunables + diagnostics (all runtime — no reflash).
+        CMD_SET_SENSE_CFG if len >= 3 => {
+            csma.rssi_thresh = i16::from_be_bytes([buf[0], buf[1]]);
+            csma.cad_repeat = buf[2].max(1);
+            send_info(&mut put, radio, *freq, *sf, *bw, *cr, *pwr, lost, csma.cad_busy, csma.defer);
+        }
+        CMD_GET_STATS => {
+            let mut p = [0u8; 24];
+            p[0..4].copy_from_slice(&plane.rx.to_be_bytes());
+            p[4..8].copy_from_slice(&plane.filtered.to_be_bytes());
+            p[8..12].copy_from_slice(&plane.deduped.to_be_bytes());
+            p[12..16].copy_from_slice(&plane.served.to_be_bytes());
+            p[16..20].copy_from_slice(&plane.relayed.to_be_bytes());
+            p[20..22].copy_from_slice(&csma.cad_busy.to_be_bytes());
+            p[22..24].copy_from_slice(&csma.defer.to_be_bytes());
+            send_frame(&mut put, EVT_STATS, &p);
+        }
+        CMD_RESET_STATS => {
+            plane.reset_stats();
+            csma.cad_busy = 0;
+            csma.defer = 0;
+            send_info(&mut put, radio, *freq, *sf, *bw, *cr, *pwr, lost, csma.cad_busy, csma.defer);
+        }
+        CMD_SET_DEBUG if len >= 1 => {
+            DEBUG.store(buf[0] != 0, Ordering::Relaxed);
             send_info(&mut put, radio, *freq, *sf, *bw, *cr, *pwr, lost, csma.cad_busy, csma.defer);
         }
         CMD_GET_INFO => {

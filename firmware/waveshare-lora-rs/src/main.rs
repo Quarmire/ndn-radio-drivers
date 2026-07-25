@@ -21,7 +21,8 @@ mod sx1262;
 use core::cell::UnsafeCell;
 use core::fmt::Write as FmtWrite;
 use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
-use cortex_m_rt::entry;
+use cortex_m::peripheral::syst::SystClkSource;
+use cortex_m_rt::{entry, exception};
 use embedded_hal::spi::MODE_0;
 use nb::block;
 use panic_halt as _;
@@ -108,6 +109,12 @@ static RING: Ring = Ring::new();
 /// Reading DR *after* SR is also what clears an overrun (ORE). That matters: a latched ORE stops the
 /// peripheral delivering anything further, so missing this would take the host link down for good
 /// rather than costing a single byte.
+/// 1 kHz SysTick → the free-running millisecond clock behind `millis()` (EVT_RX timestamps).
+#[exception]
+fn SysTick() {
+    MILLIS.fetch_add(1, Ordering::Relaxed);
+}
+
 #[interrupt]
 fn USART1() {
     // SAFETY: after init, this ISR is the only code that touches USART1's SR/DR.
@@ -133,11 +140,73 @@ const CMD_SET_PWR: u8 = 0x04; //  payload = [i8 dBm]
 const CMD_SET_SYNC: u8 = 0x05; // payload = [sx127x sync byte]
 const CMD_GET_INFO: u8 = 0x06; // payload = []
 const CMD_SET_BEACON: u8 = 0x07; // payload = [enabled(0/1)] or [enabled, period_mult]
+// #52 additions.
+const CMD_CAD: u8 = 0x08; //          payload = []            → EVT_CAD [busy]
+const CMD_GET_RSSI: u8 = 0x09; //     payload = []            → EVT_RSSI [rssi i16 BE]
+const CMD_SET_CAD_CFG: u8 = 0x0A; //  payload = [sym, det_peak, det_min]
+const CMD_SET_LBT_CFG: u8 = 0x0B; //  payload = [cw_ms(2 BE), max_backoff, max_attempts]
+const CMD_SET_PREAMBLE: u8 = 0x0C; // payload = [preamble(2 BE)]
+const CMD_SF_SCAN: u8 = 0x0D; //      payload = []            → EVT_SF_DETECTED [sf | 0]
+const CMD_TX_LBT: u8 = 0x0E; //       payload = LoRa frame bytes; atomic CAD+backoff+key-up
 // Firmware -> host events.
-const EVT_RX: u8 = 0x81; //    payload = [rssi i16 BE, snr i16 BE, LoRa bytes]
-const EVT_TXDONE: u8 = 0x82; //payload = [ok]
-const EVT_INFO: u8 = 0x83; //  payload = [status, sync(2), errors(2), freq(4), sf, bw, cr, pwr, lost(2)]
+const EVT_RX: u8 = 0x81; //    payload = [rssi i16 BE, snr i16 BE, ts_ms u32 BE, LoRa bytes]
+const EVT_TXDONE: u8 = 0x82; //payload = [ok, attempts]  (attempts=0 for a plain CMD_TX)
+const EVT_INFO: u8 = 0x83; //  payload = [status, sync(2), errors(2), freq(4), sf, bw, cr, pwr, lost(2), cad_busy(2), defer(2)]
 const EVT_LOG: u8 = 0x84; //   payload = ascii
+const EVT_CAD: u8 = 0x85; //   payload = [busy(0/1)]
+const EVT_RSSI: u8 = 0x86; //  payload = [rssi i16 BE]
+const EVT_SF_DETECTED: u8 = 0x87; // payload = [sf | 0 = none]
+const EVT_TX_STARTED: u8 = 0x88; //  payload = [airtime_ms u16 BE] — emitted just before key-up
+
+/// #52 runtime state for carrier-sense/LBT (bundled so the command handler stays legible). Every
+/// field is host-tunable so tuning needs a serial command, not a reflash.
+struct Csma {
+    /// LoRa preamble length (symbols) — mirrors the value pushed into the radio.
+    preamble: u16,
+    /// CAD config: cadSymbolNum code (0..4 → 1/2/4/8/16 syms), detector peak/min.
+    cad_sym: u8,
+    cad_peak: u8,
+    cad_min: u8,
+    /// LBT: contention window (ms), max backoff exponent, max attempts before DEFERRED.
+    lbt_cw: u32,
+    lbt_max_backoff: u8,
+    lbt_max_attempts: u8,
+    /// Backoff PRNG (xorshift32), seeded once from the SX1262 hardware RNG.
+    rng: u32,
+    /// Observability counters, reported in EVT_INFO (you cannot tune CSMA blind).
+    cad_busy: u16,
+    defer: u16,
+}
+impl Csma {
+    fn new() -> Self {
+        Self {
+            preamble: 8,
+            cad_sym: 0x02, // 4 symbols
+            cad_peak: 0x18, // 24 — a mid default; tune on air per SF
+            cad_min: 0x0A, // 10
+            lbt_cw: 5, // ms
+            lbt_max_backoff: 4, // window up to 5<<4 = 80 ms
+            lbt_max_attempts: 6,
+            rng: 0x1234_5678,
+            cad_busy: 0,
+            defer: 0,
+        }
+    }
+    fn next_rand(&mut self) -> u32 {
+        let mut x = self.rng;
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        self.rng = x;
+        x
+    }
+}
+
+/// Free-running millisecond clock (SysTick ISR), for the EVT_RX hardware timestamp.
+static MILLIS: AtomicU32 = AtomicU32::new(0);
+fn millis() -> u32 {
+    MILLIS.load(Ordering::Relaxed)
+}
 
 // Heartbeat-beacon base period in main-loop iterations (~seconds; the loop is SPI-poll bound).
 // The beacon is runtime-toggleable via CMD_SET_BEACON and defaults OFF, so a fresh/reset dongle stays
@@ -250,10 +319,19 @@ fn send_frame<F: FnMut(u8)>(mut out: F, typ: u8, payload: &[u8]) {
 #[entry]
 fn main() -> ! {
     let dp = pac::Peripherals::take().unwrap();
+    let mut cp = cortex_m::Peripherals::take().unwrap();
 
     let mut flash = dp.FLASH.constrain();
     let rcc = dp.RCC.constrain();
     let clocks = rcc.cfgr.freeze(&mut flash.acr);
+
+    // 1 kHz SysTick for the millisecond clock (EVT_RX timestamps). Core clock is 8 MHz HSI (the same
+    // assumption sx1262.rs makes for its busy-wait delays), so reload = 8000 - 1.
+    cp.SYST.set_clock_source(SystClkSource::Core);
+    cp.SYST.set_reload(8_000 - 1);
+    cp.SYST.clear_current();
+    cp.SYST.enable_counter();
+    cp.SYST.enable_interrupt();
 
     let mut afio = dp.AFIO.constrain();
     let mut gpioa = dp.GPIOA.split();
@@ -301,6 +379,12 @@ fn main() -> ! {
     let mut pwr: i8 = 22;
 
     let diag = radio.init(freq, sf, bw, cr);
+    // #52 CSMA state; seed the backoff PRNG from the SX1262 hardware RNG (leaves the chip in standby).
+    let mut csma = Csma::new();
+    let seed = radio.hw_random();
+    if seed != 0 {
+        csma.rng = seed;
+    }
     radio.start_rx();
 
     // Announce readiness (ascii log the host can print, plus a structured INFO).
@@ -340,18 +424,21 @@ fn main() -> ! {
                     &mut pwr,
                     &mut beacon_enabled,
                     &mut beacon_period,
+                    &mut csma,
                 );
             }
         }
 
-        // 2) Deliver any received LoRa frame with RSSI/SNR.
+        // 2) Deliver any received LoRa frame with RSSI/SNR + a hardware arrival timestamp (#52).
         if let Some(pkt) = radio.poll_rx(&mut rxbuf) {
+            let ts = millis();
             let n = core::cmp::min(pkt.len as usize, rxbuf.len());
-            let mut ev = [0u8; 68];
+            let mut ev = [0u8; 72];
             ev[0..2].copy_from_slice(&pkt.rssi_dbm.to_be_bytes());
             ev[2..4].copy_from_slice(&pkt.snr_db.to_be_bytes());
-            ev[4..4 + n].copy_from_slice(&rxbuf[..n]);
-            send_frame(|b| { let _ = block!(tx.write(b)); }, EVT_RX, &ev[..4 + n]);
+            ev[4..8].copy_from_slice(&ts.to_be_bytes());
+            ev[8..8 + n].copy_from_slice(&rxbuf[..n]);
+            send_frame(|b| { let _ = block!(tx.write(b)); }, EVT_RX, &ev[..8 + n]);
         }
 
         // 3) Optional heartbeat beacon (host-toggleable via CMD_SET_BEACON) so TX is exercised and
@@ -388,6 +475,7 @@ fn handle_cmd<SPI, NSS, RST, BSY, DIO1, RFSW, E, TX>(
     pwr: &mut i8,
     beacon_enabled: &mut bool,
     beacon_period: &mut u32,
+    csma: &mut Csma,
 ) where
     SPI: embedded_hal::blocking::spi::Transfer<u8, Error = E>
         + embedded_hal::blocking::spi::Write<u8, Error = E>,
@@ -401,18 +489,78 @@ fn handle_cmd<SPI, NSS, RST, BSY, DIO1, RFSW, E, TX>(
     let mut put = |b: u8| {
         let _ = block!(tx.write(b));
     };
+    let lost = RING.lost().min(u16::MAX as u32) as u16;
     match typ {
         CMD_TX => {
             let ok = radio.transmit(&buf[..len]);
             radio.start_rx();
-            send_frame(&mut put, EVT_TXDONE, &[ok as u8]);
+            send_frame(&mut put, EVT_TXDONE, &[ok as u8, 0]);
+        }
+        // #52: atomic listen-before-talk. CAD → HW-RNG backoff → key-up, all on the MCU so no serial
+        // round-trip sits inside the sense-then-transmit window. Replies [sent, attempts].
+        CMD_TX_LBT => {
+            let air = sx1262::airtime_ms(*sf, *bw, *cr, len as u8, csma.preamble);
+            let air16 = (air.min(u16::MAX as u32) as u16).to_be_bytes();
+            send_frame(&mut put, EVT_TX_STARTED, &air16);
+            radio.standby();
+            radio.set_cad_params(csma.cad_sym, csma.cad_peak, csma.cad_min);
+            let mut attempt: u8 = 0;
+            let mut sent = false;
+            while attempt < csma.lbt_max_attempts {
+                if !radio.do_cad() {
+                    sent = radio.transmit(&buf[..len]);
+                    break;
+                }
+                csma.cad_busy = csma.cad_busy.wrapping_add(1);
+                let shift = (attempt as u32).min(csma.lbt_max_backoff as u32);
+                let window = (csma.lbt_cw << shift).max(1);
+                let wait_ms = csma.next_rand() % window;
+                cortex_m::asm::delay(wait_ms.saturating_mul(8_000)); // 8 MHz core → 8000 cycles/ms
+                attempt += 1;
+            }
+            if !sent {
+                csma.defer = csma.defer.wrapping_add(1);
+            }
+            radio.start_rx();
+            send_frame(&mut put, EVT_TXDONE, &[sent as u8, attempt]);
+        }
+        // #52: one CAD at the current modulation → busy/clear (sensing, not the access loop).
+        CMD_CAD => {
+            radio.standby();
+            radio.set_cad_params(csma.cad_sym, csma.cad_peak, csma.cad_min);
+            let busy = radio.do_cad();
+            radio.start_rx();
+            send_frame(&mut put, EVT_CAD, &[busy as u8]);
+        }
+        // #52: instantaneous channel RSSI (RX stays armed).
+        CMD_GET_RSSI => {
+            let r = radio.rssi_inst();
+            send_frame(&mut put, EVT_RSSI, &r.to_be_bytes());
+        }
+        // #52: sweep SF7..12 by CAD, report whichever a transmitter is actually using (ASFS primitive).
+        CMD_SF_SCAN => {
+            radio.standby();
+            radio.set_cad_params(csma.cad_sym, csma.cad_peak, csma.cad_min);
+            let mut found = 0u8;
+            let mut s = 7u8;
+            while s <= 12 {
+                radio.set_modulation(s, *bw, *cr);
+                if radio.do_cad() {
+                    found = s;
+                    break;
+                }
+                s += 1;
+            }
+            radio.set_modulation(*sf, *bw, *cr); // restore the operating SF
+            radio.start_rx();
+            send_frame(&mut put, EVT_SF_DETECTED, &[found]);
         }
         CMD_SET_FREQ if len >= 4 => {
             *freq = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
             radio.standby();
             radio.set_frequency(*freq);
             radio.start_rx();
-            send_info(&mut put, radio, *freq, *sf, *bw, *cr, *pwr, RING.lost().min(u16::MAX as u32) as u16);
+            send_info(&mut put, radio, *freq, *sf, *bw, *cr, *pwr, lost, csma.cad_busy, csma.defer);
         }
         CMD_SET_MOD if len >= 3 => {
             *sf = buf[0];
@@ -421,20 +569,40 @@ fn handle_cmd<SPI, NSS, RST, BSY, DIO1, RFSW, E, TX>(
             radio.standby();
             radio.set_modulation(*sf, *bw, *cr);
             radio.start_rx();
-            send_info(&mut put, radio, *freq, *sf, *bw, *cr, *pwr, RING.lost().min(u16::MAX as u32) as u16);
+            send_info(&mut put, radio, *freq, *sf, *bw, *cr, *pwr, lost, csma.cad_busy, csma.defer);
         }
         CMD_SET_PWR if len >= 1 => {
             *pwr = buf[0] as i8;
             radio.standby();
             radio.set_power(*pwr);
             radio.start_rx();
-            send_info(&mut put, radio, *freq, *sf, *bw, *cr, *pwr, RING.lost().min(u16::MAX as u32) as u16);
+            send_info(&mut put, radio, *freq, *sf, *bw, *cr, *pwr, lost, csma.cad_busy, csma.defer);
         }
         CMD_SET_SYNC if len >= 1 => {
             radio.standby();
             radio.set_sync(buf[0]);
             radio.start_rx();
-            send_info(&mut put, radio, *freq, *sf, *bw, *cr, *pwr, RING.lost().min(u16::MAX as u32) as u16);
+            send_info(&mut put, radio, *freq, *sf, *bw, *cr, *pwr, lost, csma.cad_busy, csma.defer);
+        }
+        // #52 Tier 2: tune CAD/LBT/preamble at runtime — so calibration never needs a reflash.
+        CMD_SET_CAD_CFG if len >= 3 => {
+            csma.cad_sym = buf[0];
+            csma.cad_peak = buf[1];
+            csma.cad_min = buf[2];
+            send_info(&mut put, radio, *freq, *sf, *bw, *cr, *pwr, lost, csma.cad_busy, csma.defer);
+        }
+        CMD_SET_LBT_CFG if len >= 4 => {
+            csma.lbt_cw = u16::from_be_bytes([buf[0], buf[1]]) as u32;
+            csma.lbt_max_backoff = buf[2];
+            csma.lbt_max_attempts = buf[3];
+            send_info(&mut put, radio, *freq, *sf, *bw, *cr, *pwr, lost, csma.cad_busy, csma.defer);
+        }
+        CMD_SET_PREAMBLE if len >= 2 => {
+            csma.preamble = u16::from_be_bytes([buf[0], buf[1]]).max(1);
+            radio.standby();
+            radio.set_preamble(csma.preamble);
+            radio.start_rx();
+            send_info(&mut put, radio, *freq, *sf, *bw, *cr, *pwr, lost, csma.cad_busy, csma.defer);
         }
         CMD_SET_BEACON if len >= 1 => {
             *beacon_enabled = buf[0] != 0;
@@ -442,10 +610,10 @@ fn handle_cmd<SPI, NSS, RST, BSY, DIO1, RFSW, E, TX>(
                 // Optional second byte scales the base period (min ×1).
                 *beacon_period = BEACON_BASE_PERIOD.saturating_mul(buf[1].max(1) as u32);
             }
-            send_info(&mut put, radio, *freq, *sf, *bw, *cr, *pwr, RING.lost().min(u16::MAX as u32) as u16);
+            send_info(&mut put, radio, *freq, *sf, *bw, *cr, *pwr, lost, csma.cad_busy, csma.defer);
         }
         CMD_GET_INFO => {
-            send_info(&mut put, radio, *freq, *sf, *bw, *cr, *pwr, RING.lost().min(u16::MAX as u32) as u16);
+            send_info(&mut put, radio, *freq, *sf, *bw, *cr, *pwr, lost, csma.cad_busy, csma.defer);
         }
         _ => {}
     }
@@ -461,6 +629,8 @@ fn send_info<SPI, NSS, RST, BSY, DIO1, RFSW, E, F>(
     cr: u8,
     pwr: i8,
     lost: u16,
+    cad_busy: u16,
+    defer: u16,
 ) where
     SPI: embedded_hal::blocking::spi::Transfer<u8, Error = E>
         + embedded_hal::blocking::spi::Write<u8, Error = E>,
@@ -493,6 +663,12 @@ fn send_info<SPI, NSS, RST, BSY, DIO1, RFSW, E, F>(
         // climbing count is the link telling you it is losing commands, which used to be invisible.
         (lost >> 8) as u8,
         lost as u8,
+        // #52 CSMA observability: CAD-busy (defers sensed) and DEFERRED transmissions. Cannot tune
+        // carrier-sense blind — a climbing cad_busy with flat defer means backoff is working.
+        (cad_busy >> 8) as u8,
+        cad_busy as u8,
+        (defer >> 8) as u8,
+        defer as u8,
     ];
     send_frame(put, EVT_INFO, &payload);
 }

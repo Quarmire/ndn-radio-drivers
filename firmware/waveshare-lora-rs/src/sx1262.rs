@@ -44,14 +44,20 @@ const OP_CALIBRATE_IMAGE: u8 = 0x98;
 const OP_SET_DIO3_TCXO: u8 = 0x97;
 const OP_SET_DIO2_RFSW: u8 = 0x9D;
 const OP_SET_REGULATOR: u8 = 0x96;
+const OP_SET_CAD_PARAMS: u8 = 0x88; // #52: Channel Activity Detection config
+const OP_SET_CAD: u8 = 0xC5; //        #52: run one CAD
+const OP_GET_RSSI_INST: u8 = 0x15; //  #52: instantaneous channel RSSI (must be in RX)
 
 // --- Registers ---
 const REG_LORA_SYNC_MSB: u16 = 0x0740;
+const REG_RANDOM_GEN: u16 = 0x0819; // #52: SX1262 hardware random-number registers (0x0819..0x081C)
 
 // --- IRQ bits ---
 pub const IRQ_TX_DONE: u16 = 0x0001;
 pub const IRQ_RX_DONE: u16 = 0x0002;
 pub const IRQ_CRC_ERR: u16 = 0x0040;
+pub const IRQ_CAD_DONE: u16 = 0x0080; //     #52: CAD finished
+pub const IRQ_CAD_DETECTED: u16 = 0x0100; // #52: CAD saw channel activity (busy)
 pub const IRQ_TIMEOUT: u16 = 0x0200;
 
 // --- LoRa modulation codes ---
@@ -89,6 +95,8 @@ pub struct Sx1262<SPI, NSS, RST, BSY, DIO1, RFSW> {
     busy: BSY,
     dio1: DIO1,
     rfsw: RFSW,
+    /// LoRa preamble length in symbols (runtime-tunable, #52). Longer = more reliable CAD by peers.
+    preamble: u16,
 }
 
 impl<SPI, NSS, RST, BSY, DIO1, RFSW, E> Sx1262<SPI, NSS, RST, BSY, DIO1, RFSW>
@@ -101,7 +109,7 @@ where
     DIO1: InputPin,
 {
     pub fn new(spi: SPI, nss: NSS, rst: RST, busy: BSY, dio1: DIO1, rfsw: RFSW) -> Self {
-        let mut s = Self { spi, nss, rst, busy, dio1, rfsw };
+        let mut s = Self { spi, nss, rst, busy, dio1, rfsw, preamble: 8 };
         let _ = s.nss.set_high();
         s
     }
@@ -340,7 +348,8 @@ where
     /// Transmit one LoRa frame, blocking until TxDone or a bounded timeout. Returns true on TxDone.
     pub fn transmit(&mut self, payload: &[u8]) -> bool {
         self.rf_tx();
-        self.set_pkt_params(8, 0x00, payload.len() as u8, 0x01, 0x00);
+        let pre = self.preamble;
+        self.set_pkt_params(pre, 0x00, payload.len() as u8, 0x01, 0x00);
         self.write_buffer(0, payload);
         self.clear_irq(0xFFFF);
         self.set_tx(0); // no timeout: transmit until done
@@ -399,7 +408,8 @@ where
     /// Arm continuous RX. Call once, then poll with `poll_rx`.
     pub fn start_rx(&mut self) {
         self.rf_rx();
-        self.set_pkt_params(8, 0x00, 0xFF, 0x01, 0x00);
+        let pre = self.preamble;
+        self.set_pkt_params(pre, 0x00, 0xFF, 0x01, 0x00);
         self.clear_irq(0xFFFF);
         self.set_rx(0xFFFFFF); // continuous
     }
@@ -430,4 +440,85 @@ where
         let snr_db = (ps[1] as i8) as i16 / 4;
         Some(RxPacket { len, rssi_dbm, snr_db })
     }
+
+    // --- #52: carrier sense (CAD), instantaneous RSSI, hardware RNG, preamble ---
+
+    /// Runtime preamble length in symbols (used by `transmit`/`start_rx`).
+    pub fn set_preamble(&mut self, preamble: u16) {
+        self.preamble = preamble.max(1);
+    }
+
+    /// Configure Channel Activity Detection. `sym` = cadSymbolNum code (0..4 → 1/2/4/8/16 symbols);
+    /// `det_peak`/`det_min` = detector sensitivity (SF-dependent, tune on air). Exit-mode STDBY.
+    pub fn set_cad_params(&mut self, sym: u8, det_peak: u8, det_min: u8) {
+        self.cmd(OP_SET_CAD_PARAMS, &[sym, det_peak, det_min, 0x00, 0x00, 0x00, 0x00]);
+    }
+
+    /// Run one CAD at the current modulation and block until it completes. Returns true if the channel
+    /// is BUSY (a LoRa preamble/energy was detected). Call `set_cad_params` first; leaves the chip in
+    /// STDBY (exit-mode 0), so the caller then transmits or re-arms RX.
+    pub fn do_cad(&mut self) -> bool {
+        self.rf_rx(); // CAD listens
+        self.clear_irq(0xFFFF);
+        self.cmd(OP_SET_CAD, &[]);
+        for _ in 0..2000 {
+            let irq = self.get_irq();
+            if irq & IRQ_CAD_DONE != 0 {
+                let busy = irq & IRQ_CAD_DETECTED != 0;
+                self.clear_irq(0xFFFF);
+                return busy;
+            }
+            Self::delay_us(100);
+        }
+        self.clear_irq(0xFFFF);
+        false // timed out → treat as clear
+    }
+
+    /// Instantaneous channel RSSI in dBm. Only meaningful with RX armed.
+    pub fn rssi_inst(&mut self) -> i16 {
+        let mut b = [0u8; 1];
+        self.read_cmd(OP_GET_RSSI_INST, &mut b);
+        -(b[0] as i16) / 2
+    }
+
+    /// One 32-bit sample from the SX1262 hardware RNG (LNA noise, read with IRQ masked while in RX).
+    /// One-shot at init to seed the MCU's backoff PRNG; leaves the chip in STDBY.
+    pub fn hw_random(&mut self) -> u32 {
+        self.set_dio_irq(0x0000, 0x0000);
+        self.rf_rx();
+        self.set_rx(0xFFFFFF);
+        Self::delay_ms(3);
+        let mut b = [0u8; 4];
+        self.read_regs(REG_RANDOM_GEN, &mut b);
+        self.set_standby(0x00);
+        self.set_dio_irq(0xFFFF, IRQ_TX_DONE | IRQ_RX_DONE | IRQ_TIMEOUT);
+        u32::from_be_bytes(b)
+    }
+}
+
+/// LoRa time-on-air in whole milliseconds (rounded up). Standard Semtech formula, explicit header +
+/// CRC on. Used to tell the host the real airtime so a fixed command timeout does not blow at high SF.
+pub fn airtime_ms(sf: u8, bw_code: u8, cr: u8, payload_len: u8, preamble: u16) -> u32 {
+    let bw_hz: u64 = match bw_code {
+        BW_250 => 250_000,
+        BW_500 => 500_000,
+        _ => 125_000,
+    };
+    let sf_i = sf as i64;
+    let de: i64 = if sf >= 11 && bw_code == BW_125 { 1 } else { 0 };
+    let cr_i = cr as i64; // 1..4
+    let pl = payload_len as i64;
+    // payloadSymbNb = 8 + max(ceil((8*PL - 4*SF + 28 + 16)/(4*(SF-2*DE))) * (CR+4), 0)
+    let num = 8 * pl - 4 * sf_i + 28 + 16;
+    let den = 4 * (sf_i - 2 * de);
+    let mut steps = if num <= 0 || den <= 0 { 0 } else { (num + den - 1) / den };
+    if steps < 0 {
+        steps = 0;
+    }
+    let payload_sym = 8 + steps * (cr_i + 4);
+    // Tsym (µs) = 2^SF * 1e6 / BW; preamble time = (preamble + 4.25) * Tsym = Tsym*(4*preamble+17)/4.
+    let tsym_us: u64 = ((1u64 << sf) * 1_000_000) / bw_hz;
+    let preamble_us = tsym_us * (4 * preamble as u64 + 17) / 4;
+    let payload_us = tsym_us * payload_sym as u64;
+    ((preamble_us + payload_us) / 1000 + 1) as u32
 }

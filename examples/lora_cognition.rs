@@ -303,7 +303,14 @@ impl Node {
             })
         };
         let cr = alloc.and_then(|a| a.params.coding_rate());
-        let fec = alloc.and_then(|a| a.params.link_fec_redundancy).unwrap_or(0);
+        // NDN_LORA_FEC caps link-FEC redundancy. The escalation to max FEC (8×) is counterproductive on
+        // this half-duplex link: it multiplies airtime, so a little loss → more redundancy → more airtime
+        // → collisions → total loss (a retry/FEC spiral that collapses a working link ~12 s in). Pin it
+        // low (0/1) to hold the link stable for the #54 measurement.
+        let fec = std::env::var("NDN_LORA_FEC")
+            .ok()
+            .and_then(|s| s.parse::<u16>().ok())
+            .unwrap_or_else(|| alloc.and_then(|a| a.params.link_fec_redundancy).unwrap_or(0));
         // Power is set freely per-node (not a rendezvous parameter); bandwidth IS a rendezvous
         // parameter but the policy dials it only from shared inputs, so both peers reach the same one.
         let power = alloc.and_then(|a| a.params.tx_power_dbm);

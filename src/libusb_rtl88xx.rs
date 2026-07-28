@@ -1510,6 +1510,57 @@ impl LibUsbRtl88xxBackend {
         result
     }
 
+    /// Emit a hardware-TSF-stamped timing frame through the beacon engine — intended as the
+    /// doctrine-clean, self-contained µs clock source (see docs/timing-rides-named-data.md, #74). `frame`
+    /// is a full 802.11 frame; the MAC is meant to overwrite its **body bytes 24–31** (offset 24 past the
+    /// MAC header — the beacon Timestamp slot) with the live 64-bit TSF at transmit, so every receiver
+    /// that hardware-RX-stamps it common-views this node's clock at the RX-stamp floor (~µs). Place the
+    /// TimeToken there and leave it zeroed; the hardware fills it.
+    ///
+    /// Arms the beacon engine to **stamp** (`EN_BCN_FUNCTION` on, `DIS_TSF_UDT` off — the opposite of the
+    /// reserved-page-download setup that preserves the body), sets AdHoc media status + the beacon
+    /// interval, points the beacon head at page 0 and loads the frame with `ENSWBCN` set (leaving the
+    /// engine armed, unlike [`dl_rsvd_page`](Self::dl_rsvd_page) which restores the head).
+    ///
+    /// **STATUS (#74, 2026-07-28): the frame LOADS but does NOT yet AIR on the 8822E in userspace
+    /// monitor mode.** BCN_VALID sets cleanly (371 loads, 0 errors), but a peer running `beacon_cv` never
+    /// sees our BSSID — the MAC's beacon timer does not transmit our loaded page. Full beacon-function
+    /// bring-up (persistent beacon-queue head/boundary, the TBTT hold timer, and likely firmware-owned
+    /// beacon transmission that this monitor/inject driver never configures) is the remaining gap. The
+    /// TSF-insertion hardware itself is confirmed present (the driver disables it via `DIS_TSF_UDT` to
+    /// protect reserved-page writes; real APs use it — measured 0.26–1.15 µs RX floor). Left as the
+    /// documented next step; do not treat as a working clock source until a peer confirms our BSSID airs.
+    pub fn emit_timing_frame(&self, frame: &[u8]) -> Result<(), FaceError> {
+        // EN_BCN_FUNCTION (bit3) on so the TSF runs; DIS_TSF_UDT (bit4) OFF so the MAC updates the
+        // beacon-body timestamp at TX instead of preserving it.
+        let bcn = self.read8(REG_BCN_CTRL)?;
+        self.write8(REG_BCN_CTRL, (bcn | (1 << 3)) & !(1 << 4))?;
+        // AdHoc media status (MSR bits[1:0]=01): the beacon function only transmits in a beaconing role.
+        let msr = (self.read8(0x0102)? & !0x03) | 0x01;
+        self.write8(0x0102, msr)?;
+        // REG_MBSSID_BCN_SPACE (0x0554) = beacon interval (TU). init_edca_cfg sets the TBTT sub-timers
+        // (DRVERLYINT/BCNDMATIM) but NOT the interval, so the TBTT never fires. Set it so the beacon
+        // timer transmits our loaded page.
+        let tu: u16 = std::env::var("NDN_BCN_SPACE").ok().and_then(|s| s.parse().ok()).unwrap_or(100);
+        self.write16(0x0554, tu)?;
+        // Load the beacon to page 0 and LEAVE the engine armed — unlike dl_rsvd_page (a reserved-page
+        // *download* that restores the beacon head to the reserved boundary, so the TBTT would air the
+        // firmware page, not ours), we point the beacon head at our page and leave ENSWBCN set, so the
+        // MAC's beacon timer transmits *our* frame each TBTT — stamping body[24:31] with the live TSF.
+        self.write16(REG_FIFOPAGE_CTRL_2, 1 << 15)?; // head = page 0, clear BCN_VALID
+        let cr1 = self.read8(REG_CR + 1)?;
+        self.write8(REG_CR + 1, cr1 | (1 << 0))?; // ENSWBCN
+        let txq = self.read8(REG_FWHW_TXQ_CTRL + 2)?;
+        self.write8(REG_FWHW_TXQ_CTRL + 2, txq & !(1 << 6))?; // un-gate HW beacon-Q
+        self.send_beacon_queue_pkt(frame)?;
+        for _ in 0..1000 {
+            if self.read8(REG_FIFOPAGE_CTRL_2 + 1)? & (1 << 7) != 0 {
+                break; // BCN_VALID
+            }
+        }
+        Ok(())
+    }
+
     /// `usb_write_data_not_xmitframe` (beacon qsel): prepend the 48-byte TX
     /// descriptor (with the 512-boundary packet-offset workaround) and write it
     /// to bulk OUT id 0 (beacon/high queue → first bulk OUT endpoint).

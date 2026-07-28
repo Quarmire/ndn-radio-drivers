@@ -286,6 +286,11 @@ pub struct LibUsbRtl88xxBackend {
     /// Forced TX DESC_RATE code, or `0xFF` for "use the resolved MCS". Set to a legacy OFDM code
     /// (0x04 = 6 Mbps) so broadcast frames are decodable by a legacy-only receiver like the 8733b.
     fixed_desc_rate: std::sync::atomic::AtomicU8,
+    /// Current transmit rate as **state** — the exact MCS every `inject` uses once the
+    /// control plane has set it via [`FrameIo::set_rate`]; `None` ⇒ resolve the
+    /// frame's `TxIntent`. This is the "rate as bearer state" seam that retires the
+    /// per-frame `inject_at` path from the driver.
+    cur_mcs: std::sync::Mutex<Option<crate::McsDescriptor>>,
     /// Subscribed name-groups for multi-prefix DCNLA (software set-membership
     /// over the hardware multicast-narrowed RX stream). Empty ⇒ no SW filter.
     mcast_groups: std::sync::Mutex<Vec<[u8; 6]>>,
@@ -297,6 +302,14 @@ pub struct LibUsbRtl88xxBackend {
     /// Clock domain of this device's free-run RX-stamp TSF (unique per physical device, from the
     /// USB bus/address) — the identity every RX [`LinkStamp`](ndn_frame_io::LinkStamp) is keyed on.
     tsf_domain: ClockDomainId,
+    /// Latest **common-view** beacon observation: `(beacon_tsf, our_rxtsfl, count, bssid)`. The RX
+    /// pump records it whenever it parses an 802.11 beacon — the transmitter's hardware TSF from the
+    /// beacon body, paired with OUR hardware RX stamp of that same on-air event. Every receiver of the
+    /// same beacon derives the same `beacon_tsf`, so disciplining a clock to `beacon_tsf − rxtsfl`
+    /// aligns all of them to the AP's TSF at the RX-stamp floor (~µs, #41): the transmitter's TX
+    /// latency cancels because it is one shared event. A side channel — beacons never enter the NDN
+    /// data path. See [`beacon_common_view`](Self::beacon_common_view).
+    beacon_cv: std::sync::Mutex<Option<(u64, u64, u64, [u8; 6])>>,
 }
 
 impl LibUsbRtl88xxBackend {
@@ -363,9 +376,11 @@ impl LibUsbRtl88xxBackend {
             cur_bw: std::sync::atomic::AtomicU8::new(ChannelBw::Bw20 as u8),
             tx_csd: std::sync::atomic::AtomicBool::new(false),
             fixed_desc_rate: std::sync::atomic::AtomicU8::new(0xFF),
+            cur_mcs: std::sync::Mutex::new(None),
             mcast_groups: std::sync::Mutex::new(Vec::new()),
             rx_pump: crate::rx_pump::RxPumpState::new(),
             tsf_domain,
+            beacon_cv: std::sync::Mutex::new(None),
         })
     }
 
@@ -432,6 +447,16 @@ impl LibUsbRtl88xxBackend {
     /// is plenty over USB.
     pub fn spawn_rx_pump(self: &Arc<Self>, depth: usize) -> Vec<std::thread::JoinHandle<()>> {
         crate::rx_pump::spawn_rx_pump(self, depth)
+    }
+
+    /// The latest common-view beacon observation `(beacon_tsf, our_rxtsfl, count, bssid)`, or `None`
+    /// until a beacon has been heard. `beacon_tsf` is the transmitter's hardware TSF (µs) from the
+    /// beacon body; `our_rxtsfl` is our hardware RX stamp of that same frame. `count` increments per
+    /// beacon (poll it to detect a fresh observation); `bssid` lets a caller lock onto one AP so two
+    /// nodes discipline to the *same* reference. Disciplining a clock to `beacon_tsf − our_rxtsfl`
+    /// gives cross-node common-view at the RX-stamp floor (~µs, #41). See [`beacon_cv`](Self::beacon_cv).
+    pub fn beacon_common_view(&self) -> Option<(u64, u64, u64, [u8; 6])> {
+        self.beacon_cv.lock().ok().and_then(|g| *g)
     }
 
     /// Force every injected frame to a fixed DESC_RATE code, or `None` to use the intent-resolved
@@ -992,15 +1017,29 @@ impl LibUsbRtl88xxBackend {
     /// path), so repeated runs land in the same state.
     pub fn power_on(&self) -> Result<(), FaceError> {
         let info = self.chip_info()?;
-        if info.chip_id != CHIP_ID_8822E {
+        // `REG_SYS_CFG2[7:0]` reports the 8822E id (0x17) once the system-cfg/power
+        // domain is up; a cold read can show a placeholder (e.g. 0x04). Setting
+        // `NDN_RADIO_FORCE_8822E=1` bypasses the pre-power gate and re-reads after
+        // `pre_init_system_cfg` for diagnosis.
+        let force = std::env::var("NDN_RADIO_FORCE_8822E").is_ok();
+        if info.chip_id != CHIP_ID_8822E && !force {
             return Err(init_err(format!(
                 "rtl88xx: chip id {:#04x} is not 8822E ({CHIP_ID_8822E:#04x}); refusing to run \
-                 the 8822E power sequence",
+                 the 8822E power sequence (set NDN_RADIO_FORCE_8822E=1 to override)",
                 info.chip_id
             )));
         }
+        if info.chip_id != CHIP_ID_8822E {
+            tracing::warn!(chip_id = format!("{:#04x}", info.chip_id),
+                "NDN_RADIO_FORCE_8822E: running the 8822E power sequence on a non-0x17 chip id");
+        }
 
         self.pre_init_system_cfg()?;
+        if force {
+            let post = self.chip_info()?;
+            tracing::warn!(chip_id_after_precfg = format!("{:#04x}", post.chip_id),
+                "chip id re-read after pre_init_system_cfg");
+        }
 
         self.leave_32k()?;
         if self.mac_power_is_on()? {
@@ -3967,10 +4006,20 @@ impl LibUsbRtl88xxBackend {
     /// in the MAC; if not, the analog TX path itself is dead.
     pub fn single_tone(&self, enable: bool) -> Result<(), FaceError> {
         if enable {
+            // TX gain index: 0 = lowest idx = MAX power. NDN_TONE_GAIN overrides
+            // (higher idx = lower power) — a brownout A/B knob for USB-power-limited
+            // ports. NDN_TONE_1T restricts to path A only (halve TX current).
+            let gain: u32 = std::env::var("NDN_TONE_GAIN")
+                .ok()
+                .and_then(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+                .unwrap_or(0)
+                & 0x1f;
+            let one_tx = std::env::var("NDN_TONE_1T").is_ok();
             self.bb_write(0x1d58, 0xff8, 0x1ff)?; // disable OFDM CCA
-            for path in [RfPath::A, RfPath::B] {
+            let paths: &[RfPath] = if one_tx { &[RfPath::A] } else { &[RfPath::A, RfPath::B] };
+            for &path in paths {
                 self.rf_write(path, 0x00, 0xf0000, 0x2)?; // TX mode
-                self.rf_write(path, 0x00, 0x1f, 0x0)?; // lowest gain idx = max pwr
+                self.rf_write(path, 0x00, 0x1f, gain)?; // gain idx (0=max pwr)
                 self.rf_write(path, 0x58, 1 << 1, 0x1)?; // RF LO enable
             }
         } else {
@@ -4558,14 +4607,35 @@ impl LibUsbRtl88xxBackend {
         // 2SS TX path (`0x820=0x31`, set in `set_channel_bw20`).
         // `mcs` is the resolved 802.11 rate for this frame — from the frame's
         // intent on the generic path, or an exact rate on the `WifiRadio` path.
-        let rate_code = if mcs.vht {
+        //
+        // A `MostRobust`-intent frame (cooperative reports, discovery, control — anything the
+        // worst receiver in range must decode) is forced to legacy 6 Mbps OFDM (DESC 0x04),
+        // overriding any control-plane HT/VHT `cur_mcs`. This is the doctrine's worst-overheard-
+        // receiver reach (§5): a legacy-only-RX neighbour — e.g. an 8812au whose 5 GHz golden-trace
+        // RX demods legacy OFDM but not HT-MCS (measured 2026-07-24) — can only decode the basic
+        // rate, exactly as 802.11 sends beacons/probes at basic rates. HT-only SGI/LDPC/STBC are
+        // suppressed for such frames below (legacy OFDM carries no HT-SIG/VHT-SIG to signal them).
+        let legacy_robust = frame.tx.reliability == crate::Reliability::MostRobust;
+        let rate_code = if legacy_robust {
+            0x04 // DESC_RATE6M — legacy OFDM, universally decodable
+        } else if mcs.vht {
             if mcs.nss >= 2 {
                 DESC_RATE_VHT2SS_MCS0 + mcs.index
             } else {
                 DESC_RATE_VHT1SS_MCS0 + mcs.index
             }
         } else {
-            DESC_RATE_MCS0 + mcs.index
+            // The 8822E's 802.11n (HT) TX is broken on air: every HT MCS 0-7 was undecodable
+            // by ANY receiver — a81a→a81a AND a81a→8812au — while every VHT MCS 0-8 decoded on
+            // both (bisection 2026-07-24). As an 802.11ac chip, emit the VHT-1SS equivalent of
+            // a requested HT MCS (indices 0-7 map 1:1; 2-stream HT MCS8-15 → VHT-2SS). This is
+            // why past a81a links hit 100+ Mbps — they were VHT; the fix routes cognition's HT
+            // rate decisions onto the VHT PHY that actually works.
+            if mcs.index >= 8 {
+                DESC_RATE_VHT2SS_MCS0 + (mcs.index - 8)
+            } else {
+                DESC_RATE_VHT1SS_MCS0 + mcs.index
+            }
         };
         // Rate override, in precedence order: an explicit programmatic fixed DESC_RATE
         // ([`set_fixed_desc_rate`](Self::set_fixed_desc_rate), `0xFF` = unset) — used to force a
@@ -4582,8 +4652,8 @@ impl LibUsbRtl88xxBackend {
         txdesc_set(&mut buf, 0x10, 0, 7, rate_code as u32);
         txdesc_set(&mut buf, 0x10, 17, 1, 1); // RTY_LMT_EN (use the limit below)
         txdesc_set(&mut buf, 0x10, 18, 6, 6); // RTS_DATA_RTY_LMT = 6 (kernel default)
-        if mcs.short_gi {
-            txdesc_set(&mut buf, 0x14, 4, 1, 1); // DATA_SHORT (SGI)
+        if mcs.short_gi && !legacy_robust {
+            txdesc_set(&mut buf, 0x14, 4, 1, 1); // DATA_SHORT (SGI) — HT/VHT only
         }
         // DATA_BW (0x14\[6:5\]) = the channel bandwidth (20/40/80). The frame is
         // sent at the full channel width, so DATA_SC stays DONT_CARE (0). The
@@ -4603,7 +4673,7 @@ impl LibUsbRtl88xxBackend {
         // advertises it in the HT-SIG/VHT-SIG; a non-LDPC receiver ignores the
         // frame, an LDPC-capable one (the kernel rtl8812eu) decodes it.
         // `NDN_RADIO_LDPC=1` forces it on for on-air A/B regardless of the rate.
-        let ldpc = mcs.ldpc || std::env::var("NDN_RADIO_LDPC").is_ok();
+        let ldpc = !legacy_robust && (mcs.ldpc || std::env::var("NDN_RADIO_LDPC").is_ok());
         if ldpc {
             txdesc_set(&mut buf, 0x14, 7, 1, 1);
         }
@@ -4618,7 +4688,8 @@ impl LibUsbRtl88xxBackend {
         } else {
             mcs.index < 8
         };
-        let stbc = (mcs.stbc || std::env::var("NDN_RADIO_STBC").is_ok()) && one_stream;
+        let stbc =
+            !legacy_robust && (mcs.stbc || std::env::var("NDN_RADIO_STBC").is_ok()) && one_stream;
         if stbc {
             txdesc_set(&mut buf, 0x14, 8, 2, 1);
         }
@@ -4941,6 +5012,20 @@ impl LibUsbRtl88xxBackend {
                 Some(f) => f,
                 None => return vec![],
             };
+            // #41 µs common-view side channel: an 802.11 BEACON (FC type/subtype byte0 = 0x80) carries
+            // the transmitter's hardware TSF in the first 8 bytes of its body (after the 24-byte MAC
+            // header: FC2 Dur2 A1·6 A2·6 A3/BSSID·6 Seq2). Pair it with OUR hardware RX stamp (dword5,
+            // dw(0x14)) of the same on-air event and stash it. Recorded here, before the Data-type gate
+            // that drops management frames — so the clock sees beacons the NDN path never does.
+            if frame.len() >= 32 && frame[0] == 0x80 {
+                let btsf = u64::from_le_bytes(frame[24..32].try_into().unwrap());
+                let mut bssid = [0u8; 6];
+                bssid.copy_from_slice(&frame[16..22]);
+                if let Ok(mut cv) = self.beacon_cv.lock() {
+                    let count = cv.map(|(.., c, _)| c).unwrap_or(0) + 1;
+                    *cv = Some((btsf, dw(0x14) as u64, count, bssid));
+                }
+            }
             // Non-`RawNdn` formats (the ESP-NOW vendor-action frame, …) share the
             // platform-neutral de-framer: it keys on the format's own header — a
             // Mgmt/Action frame for ESP-NOW, not a Data frame, so the Data-type
@@ -5028,22 +5113,30 @@ impl LibUsbRtl88xxBackend {
 #[async_trait]
 impl FrameIo for LibUsbRtl88xxBackend {
     async fn inject(&self, frame: InjectFrame) -> Result<(), FaceError> {
-        // Generic path: resolve the frame's intent to this radio's rate.
-        let mcs = crate::McsDescriptor::for_intent(&frame.tx, crate::MAX_RELIABLE_MCS, true);
+        // Rate is state: transmit at the control-plane-set MCS if one has landed,
+        // else resolve the frame's intent (robust bring-up default).
+        let mcs = self.resolved_mcs(&frame);
         let buf = self.build_tx(&frame, mcs, None)?;
         self.send_buf(buf, "inject").await
     }
 
     async fn inject_batch(&self, frames: Vec<InjectFrame>) -> Result<(), FaceError> {
-        // Resolve each frame's intent, then reuse the exact-rate A-MSDU batcher.
+        // Resolve each frame's rate from state (or intent), then A-MSDU-bundle runs
+        // that share dst/src/rate — the amortization lever toward the USB 2.0 ceiling.
         let pairs = frames
             .into_iter()
             .map(|f| {
-                let mcs = crate::McsDescriptor::for_intent(&f.tx, crate::MAX_RELIABLE_MCS, true);
+                let mcs = self.resolved_mcs(&f);
                 (f, mcs)
             })
             .collect();
-        crate::WifiRadio::inject_batch_at(self, pairs).await
+        self.amsdu_batch(pairs).await
+    }
+
+    /// Rate as bearer state: store the exact MCS every subsequent `inject` uses.
+    fn set_rate(&self, mcs: crate::McsDescriptor) -> Result<(), FaceError> {
+        *self.cur_mcs.lock().unwrap() = Some(mcs);
+        Ok(())
     }
 
     // NOTE: `inject` builds the descriptor + frame correctly and the chip
@@ -5129,24 +5222,26 @@ impl RadioProfile for LibUsbRtl88xxBackend {
     }
 }
 
-#[async_trait]
-impl crate::WifiRadio for LibUsbRtl88xxBackend {
-    /// Inject one frame at an exact rate (the cognitive/adaptive face and
-    /// fixed-rate benches). The rate travels here, not on the frame's intent.
-    async fn inject_at(
-        &self,
-        frame: InjectFrame,
-        mcs: crate::McsDescriptor,
-    ) -> Result<(), FaceError> {
-        let buf = self.build_tx(&frame, mcs, None)?;
-        self.send_buf(buf, "inject_at").await
+// `WifiRadio` is now a marker (a `dyn WifiRadio` still names this as a Wi-Fi radio);
+// `inject_at` is the derived HAL default (`set_rate` + `inject`), so the driver holds
+// rate as state and no longer implements a per-frame exact-rate path.
+impl crate::WifiRadio for LibUsbRtl88xxBackend {}
+
+impl LibUsbRtl88xxBackend {
+    /// The rate to transmit `frame` at: the control-plane-set MCS (state) if present,
+    /// else the frame's `TxIntent` resolved to this 2×2 5 GHz radio.
+    fn resolved_mcs(&self, frame: &InjectFrame) -> crate::McsDescriptor {
+        self.cur_mcs
+            .lock()
+            .unwrap()
+            .unwrap_or_else(|| crate::McsDescriptor::for_intent(&frame.tx, crate::MAX_RELIABLE_MCS, true))
     }
 
-    /// A-MSDU-bundle maximal runs sharing dst/src/**rate** into one MPDU, bounded
-    /// by the 7935-byte A-MSDU max — the amortization lever that reached ~265 Mb/s
-    /// toward the USB 2.0 ceiling. Each frame carries its own resolved rate, so a
-    /// rate change mid-batch simply starts a new aggregate.
-    async fn inject_batch_at(
+    /// A-MSDU-bundle maximal runs sharing dst/src/**rate** into one MPDU, bounded by
+    /// the 7935-byte A-MSDU max — the amortization lever that reached ~265 Mb/s toward
+    /// the USB 2.0 ceiling. Rate is resolved from state, so a batch is normally uniform
+    /// and bundles freely; a rate change simply starts a new aggregate.
+    async fn amsdu_batch(
         &self,
         frames: Vec<(InjectFrame, crate::McsDescriptor)>,
     ) -> Result<(), FaceError> {
@@ -5166,7 +5261,8 @@ impl crate::WifiRadio for LibUsbRtl88xxBackend {
                 j += 1;
             }
             if j - i == 1 {
-                self.inject_at(frames[i].0.clone(), mcs0).await?;
+                let buf = self.build_tx(&frames[i].0, mcs0, None)?;
+                self.send_buf(buf, "inject").await?;
             } else {
                 let payloads: Vec<Bytes> =
                     frames[i..j].iter().map(|(f, _)| f.payload.clone()).collect();

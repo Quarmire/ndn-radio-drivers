@@ -310,6 +310,11 @@ pub struct LibUsbRtl88xxBackend {
     /// latency cancels because it is one shared event. A side channel — beacons never enter the NDN
     /// data path. See [`beacon_common_view`](Self::beacon_common_view).
     beacon_cv: std::sync::Mutex<Option<(u64, u64, u64, [u8; 6])>>,
+    /// Like [`beacon_cv`](Self::beacon_cv) but restricted to **mesh** transmitters — a
+    /// locally-administered BSSID (bit 0x02 of the first octet), i.e. our own ephemeral-nonce nodes,
+    /// not infrastructure APs. This is what a self-contained mesh disciplines its clock to; the
+    /// unfiltered `beacon_cv` is the measurement instrument. See [`mesh_common_view`](Self::mesh_common_view).
+    mesh_cv: std::sync::Mutex<Option<(u64, u64, u64, [u8; 6])>>,
 }
 
 impl LibUsbRtl88xxBackend {
@@ -381,6 +386,7 @@ impl LibUsbRtl88xxBackend {
             rx_pump: crate::rx_pump::RxPumpState::new(),
             tsf_domain,
             beacon_cv: std::sync::Mutex::new(None),
+            mesh_cv: std::sync::Mutex::new(None),
         })
     }
 
@@ -5105,6 +5111,14 @@ impl LibUsbRtl88xxBackend {
                     let count = cv.map(|(.., c, _)| c).unwrap_or(0) + 1;
                     *cv = Some((btsf, dw(0x14) as u64, count, bssid));
                 }
+                // Mesh clock source: only a locally-administered BSSID (0x02 bit) — our own ephemeral-
+                // nonce nodes, never an infrastructure AP. This is what the scheduler disciplines to.
+                if bssid[0] & 0x02 != 0 {
+                    if let Ok(mut cv) = self.mesh_cv.lock() {
+                        let count = cv.map(|(.., c, _)| c).unwrap_or(0) + 1;
+                        *cv = Some((btsf, dw(0x14) as u64, count, bssid));
+                    }
+                }
             }
             // Non-`RawNdn` formats (the ESP-NOW vendor-action frame, …) share the
             // platform-neutral de-framer: it keys on the format's own header — a
@@ -5217,6 +5231,10 @@ impl FrameIo for LibUsbRtl88xxBackend {
     fn set_rate(&self, mcs: crate::McsDescriptor) -> Result<(), FaceError> {
         *self.cur_mcs.lock().unwrap() = Some(mcs);
         Ok(())
+    }
+
+    fn mesh_common_view(&self) -> Option<(u64, u64, u64, [u8; 6])> {
+        self.mesh_cv.lock().ok().and_then(|g| *g)
     }
 
     // NOTE: `inject` builds the descriptor + frame correctly and the chip

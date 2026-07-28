@@ -341,15 +341,34 @@ async fn main(_spawner: Spawner) {
                         let mut attempts = 0u8;
                         if f.typ == CMD_TX_LBT {
                             // LBT: CAD up to 8 times, backing off; defer if the channel stays busy.
+                            // Each CAD is time-bounded: with only DIO0 wired, lora-phy's SX1276 CAD-done
+                            // IRQ can fail to assert and `lora.cad().await` would hang forever — starving
+                            // the whole command loop so the host never gets EVT_TXDONE (measured: CMD_TX_LBT
+                            // "no reply in 3s"). A timeout or CAD error is treated as "clear" so LBT
+                            // degrades to a plain TX instead of wedging — it never blocks a transmission.
                             let mut clear = false;
                             for a in 0..8u8 {
                                 attempts = a + 1;
-                                match lora.cad(&mdltn).await {
-                                    Ok(false) => {
+                                let cad = select(
+                                    lora.cad(&mdltn),
+                                    Timer::after(Duration::from_millis(60)),
+                                )
+                                .await;
+                                match cad {
+                                    // Channel sensed clear → transmit now.
+                                    Either::First(Ok(false)) => {
                                         clear = true;
                                         break;
                                     }
-                                    _ => Timer::after(Duration::from_millis(8 + (a as u64) * 6)).await,
+                                    // Channel busy → exponential-ish backoff, sense again.
+                                    Either::First(Ok(true)) => {
+                                        Timer::after(Duration::from_millis(8 + (a as u64) * 6)).await
+                                    }
+                                    // CAD error OR CAD timed out (IRQ never asserted) → don't wedge; send.
+                                    Either::First(Err(_)) | Either::Second(_) => {
+                                        clear = true;
+                                        break;
+                                    }
                                 }
                             }
                             if !clear {
@@ -365,7 +384,16 @@ async fn main(_spawner: Spawner) {
                         send_frame(&mut uart_tx, EVT_TXDONE, &[ok, attempts]).await;
                     }
                     CMD_CAD => {
-                        let busy = matches!(lora.cad(&mdltn).await, Ok(true)) as u8;
+                        // Time-bounded (see CMD_TX_LBT): a hung CAD-done IRQ must not wedge the loop.
+                        let busy = match select(
+                            lora.cad(&mdltn),
+                            Timer::after(Duration::from_millis(60)),
+                        )
+                        .await
+                        {
+                            Either::First(Ok(b)) => b as u8,
+                            _ => 0, // error/timeout → report clear
+                        };
                         send_frame(&mut uart_tx, EVT_CAD, &[busy]).await;
                     }
                     CMD_GET_RSSI => {

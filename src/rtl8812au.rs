@@ -6053,18 +6053,18 @@ impl Rtl8812auBackend {
     /// is released. **Call this as the final bring-up step** — IQ calibration
     /// re-pauses RX DMA, so releasing earlier has no lasting effect.
     pub fn start_rx_dma(&self) -> Result<(), FaceError> {
-        // Minimise RX-DMA aggregation latency. The reset value
-        // `REG_RXDMA_AGG_PG_TH = 0x2003` (timeout 0x20 ≈ 32 ms, 3-page threshold)
-        // lets captured frames sit in the dongle's RX FIFO for tens of ms before
-        // USB delivery — which lags our software TSF (jammed off a received
-        // beacon) by the same amount, so NAN Discovery-Window-timed transmits
-        // land *after* a peer's RX window closes. 1 page / ~1 ms flushes promptly.
-        // `NDN_RXDMA_AGG=0x2003` restores the reset value, to A/B whether this
-        // register is what caps large-frame RX (task #25).
+        // RX-DMA aggregation `REG_RXDMA_AGG_PG_TH` = [15:8] timeout · [7:0] page threshold. The old
+        // default `0x0101` (1 page / ~1 ms) flushed each frame in its own tiny USB transfer for NAN
+        // TSF latency — but that CAPS RX THROUGHPUT to ~200 f/s (measured: the 881a observer under-
+        // received most on-air frames, inflating the token-test "drop ratio"). `0x2010` (timeout 0x20,
+        // 16-page threshold) batches frames per transfer → ~500 f/s (2.5×) with ~tens-of-ms latency,
+        // which is fine for the data path. **NAN / latency-sensitive callers: `NDN_RXDMA_AGG=0x0101`**
+        // restores prompt flushing. (Higher thresholds don't help — the 8812au's residual gap to the
+        // a81a's 924 f/s is the chip's RX-DMA/USB aggregation, not this page threshold.)
         let agg = std::env::var("NDN_RXDMA_AGG")
             .ok()
             .and_then(|v| u16::from_str_radix(v.trim().trim_start_matches("0x"), 16).ok())
-            .unwrap_or(0x0101);
+            .unwrap_or(0x2010);
         self.write16(0x0280, agg)?;
         let v = self.read32(0x0284)?; // REG_RXPKT_NUM
         self.write32(0x0284, v & !(1 << 18))?;

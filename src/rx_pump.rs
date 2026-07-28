@@ -102,6 +102,9 @@ pub fn spawn_rx_pump<B: Pumpable>(backend: &Arc<B>, depth: usize) -> Vec<JoinHan
             let weak = Arc::downgrade(backend);
             let handle = handle.clone();
             std::thread::spawn(move || {
+                // 16 KB holds a full aggregated bulk-IN transfer at the tuned RX-DMA page threshold
+                // (the a81a sustains 924 f/s with this size). Larger buffers did not raise 8812au
+                // throughput — the cap there is the chip's RX-DMA/USB aggregation, not the host buffer.
                 let mut buf = vec![0u8; 16384];
                 loop {
                     let Some(b) = weak.upgrade() else { break };

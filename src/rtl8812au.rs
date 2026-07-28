@@ -6053,20 +6053,30 @@ impl Rtl8812auBackend {
     /// is released. **Call this as the final bring-up step** — IQ calibration
     /// re-pauses RX DMA, so releasing earlier has no lasting effect.
     pub fn start_rx_dma(&self) -> Result<(), FaceError> {
-        // RX-DMA aggregation `REG_RXDMA_AGG_PG_TH` = [15:8] timeout · [7:0] page threshold. The old
-        // default `0x0101` (1 page / ~1 ms) flushed each frame in its own tiny USB transfer for NAN
-        // TSF latency — but that CAPS RX THROUGHPUT to ~200 f/s (measured: the 881a observer under-
-        // received most on-air frames, inflating the token-test "drop ratio"). `0x2010` (timeout 0x20,
-        // 16-page threshold) batches frames per transfer → ~500 f/s (2.5×) with ~tens-of-ms latency,
-        // which is fine for the data path. **NAN / latency-sensitive callers: `NDN_RXDMA_AGG=0x0101`**
-        // restores prompt flushing. (Higher thresholds don't help — the 8812au's residual gap to the
-        // a81a's 924 f/s is the chip's RX-DMA/USB aggregation, not this page threshold.)
+        // **USB RX aggregation** — the throughput lever that reaches a81a parity. Ported from the
+        // aircrack-ng rtl8812au vendor `usb_AggSettingRxUpdate_8812A` + mainline rtl8xxxu. The MISSING
+        // piece was the enable bit: RXDMA_AGG_EN = BIT(2) of REG_TRXDMA_CTRL (0x010C). Without it the
+        // chip ships ~1 frame per bulk-IN transfer → ~200 f/s; page-threshold tuning alone only reached
+        // ~500. In USB-agg mode REG_RXDMA_AGG_PG_TH (0x0280) is `size | (timeout<<8)` where size is in
+        // **512-byte units** (NOT the 128-B DMA-mode page). Default 0x1020 = size 0x20 (16 KB) · timeout
+        // 0x10 → pack toward the 32 KB pump buffer, cutting per-transfer overhead. The parse
+        // (`parse_rx_transfer`) already length-walks each subframe 8-byte aligned, matching the vendor.
+        //  - NDN_RXDMA_AGG=<hex> overrides the 0x0280 size|timeout word.
+        //  - NDN_RX_AGG_OFF=1 leaves aggregation DISABLED (prompt 1-frame flush) if a caller ever needs it.
         let agg = std::env::var("NDN_RXDMA_AGG")
             .ok()
             .and_then(|v| u16::from_str_radix(v.trim().trim_start_matches("0x"), 16).ok())
-            .unwrap_or(0x2010);
-        self.write16(0x0280, agg)?;
-        let v = self.read32(0x0284)?; // REG_RXPKT_NUM
+            .unwrap_or(0x1020);
+        // mainline parity: USB agg is NOT gated by REG_USB_SPECIAL_OPTION — clear its bit3.
+        let spec = self.read8(0xFE55)?;
+        self.write8(0xFE55, spec & !(1 << 3))?;
+        self.write16(0x0280, agg)?; // REG_RXDMA_AGG_PG_TH = size(512B units) | timeout<<8
+        self.write8(0xFE5B, (agg >> 8) as u8)?; // REG_USB_DMA_AGG_TO = the same timeout (belt-and-suspenders)
+        if std::env::var_os("NDN_RX_AGG_OFF").is_none() {
+            let ctrl = self.read8(REG_TRXDMA_CTRL)?; // 0x010C low byte
+            self.write8(REG_TRXDMA_CTRL, ctrl | 0x04)?; // RXDMA_AGG_EN = BIT(2), set LAST
+        }
+        let v = self.read32(0x0284)?; // REG_RXPKT_NUM — clear RW_RELEASE_EN to resume RX DMA
         self.write32(0x0284, v & !(1 << 18))?;
         Ok(())
     }

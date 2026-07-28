@@ -4231,6 +4231,9 @@ pub struct Rtl8812auBackend {
     /// Saved `0x838[3:0]` (the OFDM CCA-mode nibble) before [`set_cca_ignore`](Self::set_cca_ignore)
     /// forced it off, so the knob can restore the bring-up value. `0xffff` = nothing saved yet.
     cca_saved: std::sync::atomic::AtomicU16,
+    /// Saved `REG_EDCA_BE_PARAM` (0x0508) before [`set_cca_ignore`](Self::set_cca_ignore) zeroed the
+    /// contention window (aggressive-EDCA blast). `0xffff_ffff` = nothing saved yet.
+    edca_saved: std::sync::atomic::AtomicU32,
 }
 
 impl Rtl8812auBackend {
@@ -4318,6 +4321,7 @@ impl Rtl8812auBackend {
             cur_channel: std::sync::atomic::AtomicU8::new(0),
             tx_power_info: std::sync::Mutex::new(None),
             cca_saved: std::sync::atomic::AtomicU16::new(0xffff),
+            edca_saved: std::sync::atomic::AtomicU32::new(0xffff_ffff),
         })
     }
 
@@ -5990,16 +5994,30 @@ impl Rtl8812auBackend {
     /// is fine for a TX-only blast node. This is the doctrine's "monitor mode without CSMA".
     pub fn set_cca_ignore(&self, ignore: bool) -> Result<(), FaceError> {
         use std::sync::atomic::Ordering;
+        // `REG_EDCA_BE_PARAM` (0x0508): TXOP[31:16] | ECWmax[15:12] | ECWmin[11:8] | AIFS[7:0]. The
+        // 8812au never programs it, so it runs the firmware default backoff and gets out-competed on a
+        // busy channel (measured: 330 f/s vs an a81a's ~13000, because the a81a wins EDCA contention).
+        // Zeroing the contention window (ECWmin=ECWmax=0) + minimal AIFS makes it transmit with no
+        // random backoff — the aggressive "blast" config (TXOP kept from the a81a's 0x005e).
+        const REG_EDCA_BE_PARAM: u16 = 0x0508;
+        const EDCA_BLAST: u32 = 0x005e_0002; // TXOP 0x5e, CWmax 0, CWmin 0, AIFS 2
         if ignore {
-            // Save the bring-up CCA nibble once, then force CCA off.
+            // Save the bring-up CCA nibble + EDCA-BE once, then force CCA off + zero-backoff EDCA.
             let cur = (self.bb_query(0x838, 0xf)? & 0xf) as u16;
             let _ = self.cca_saved.compare_exchange(0xffff, cur, Ordering::SeqCst, Ordering::SeqCst);
+            let edca = self.read32(REG_EDCA_BE_PARAM)?;
+            let _ = self.edca_saved.compare_exchange(0xffff_ffff, edca, Ordering::SeqCst, Ordering::SeqCst);
             self.bb_set(0x838, 0xf, 0xc)?; // OFDM CCA off — the MAC now reads the medium idle
+            self.write32(REG_EDCA_BE_PARAM, EDCA_BLAST)?; // no EDCA backoff on the BE (data) queue
             self.disable_edcca() // energy-detect path too (thresholds max + ignore-EDCCA bit)
         } else {
             let saved = self.cca_saved.swap(0xffff, Ordering::SeqCst);
             if saved != 0xffff {
                 self.bb_set(0x838, 0xf, saved as u32)?;
+            }
+            let edca = self.edca_saved.swap(0xffff_ffff, Ordering::SeqCst);
+            if edca != 0xffff_ffff {
+                self.write32(REG_EDCA_BE_PARAM, edca)?;
             }
             self.set_edcca_honor(true)
         }

@@ -84,10 +84,25 @@ pub fn open_named_radio(
         let index = std::env::var("NDN_USB_INDEX").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
         let d = Arc::new(Rtl8812auBackend::open_nth(index)?.with_format(fmt));
         d.bring_up_monitor(channel)?;
+        // `NDN_NO_PUMP=1` skips the RX pump — a pure TX-blast node needs no RX, and the pump's bulk-IN
+        // threads otherwise contend with inject for USB bandwidth on a busy channel (measured: an 8812au
+        // TX collapses to ~250 f/s under heavy RX while the pump drains thousands of frames/s).
+        if std::env::var_os("NDN_NO_PUMP").is_some() {
+            if std::env::var_os("NDN_CCA_OFF").is_some() {
+                let _ = d.set_cca_ignore(true);
+            }
+            return Ok(d);
+        }
         // `bring_up_monitor` sets TXAGC to full 0x3f; on a USB-power-limited host a full-power 2-chain
         // TX can brown the PA out so the FIFO never drains. `NDN_TX_PWR=<0..63>` overrides the index.
         if let Some(p) = std::env::var("NDN_TX_PWR").ok().and_then(|s| s.parse::<u8>().ok()) {
             let _ = d.set_tx_power(p.min(63));
+        }
+        // `NDN_CCA_OFF=1` forces full carrier-sense off (EDCCA + OFDM packet CCA) so this radio blasts
+        // regardless of a busy medium — the doctrine's monitor-mode-without-CSMA sender for the token
+        // test, where the slot (not CSMA) is the only collision-avoidance.
+        if std::env::var_os("NDN_CCA_OFF").is_some() {
+            let _ = d.set_cca_ignore(true);
         }
         std::mem::forget(d.spawn_rx_pump(8));
         d
@@ -165,8 +180,9 @@ mod radio_knobs {
             crate::Rtl8812auBackend::set_tx_power(self, idx.min(63) as u8)
         }
         fn set_edcca_ignore(&self, on: bool) -> Result<(), FaceError> {
-            // ignore == TX does not defer to energy-detect carrier sense.
-            crate::Rtl8812auBackend::set_edcca_honor(self, !on)
+            // ignore == TX does not defer to carrier sense at all — both the energy-detect EDCCA and
+            // the OFDM packet CCA (the latter is what still deferred an 8812au on a busy channel).
+            crate::Rtl8812auBackend::set_cca_ignore(self, on)
         }
         fn read_channel_activity(&self) -> Result<Option<u16>, FaceError> {
             // REG_RXERR_RPT occupancy counter — frame-free channel-activity sensing.

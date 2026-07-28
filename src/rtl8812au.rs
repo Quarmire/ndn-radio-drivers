@@ -4228,6 +4228,9 @@ pub struct Rtl8812auBackend {
     /// `set_tx_power` folds the requested backoff onto this adapter's *fused* full-power
     /// base per channel/rate instead of writing a flat uncalibrated index.
     tx_power_info: std::sync::Mutex<Option<TxPowerInfo>>,
+    /// Saved `0x838[3:0]` (the OFDM CCA-mode nibble) before [`set_cca_ignore`](Self::set_cca_ignore)
+    /// forced it off, so the knob can restore the bring-up value. `0xffff` = nothing saved yet.
+    cca_saved: std::sync::atomic::AtomicU16,
 }
 
 impl Rtl8812auBackend {
@@ -4314,6 +4317,7 @@ impl Rtl8812auBackend {
             mesh_cv: std::sync::Mutex::new(None),
             cur_channel: std::sync::atomic::AtomicU8::new(0),
             tx_power_info: std::sync::Mutex::new(None),
+            cca_saved: std::sync::atomic::AtomicU16::new(0xffff),
         })
     }
 
@@ -5972,6 +5976,33 @@ impl Rtl8812auBackend {
     pub fn disable_edcca(&self) -> Result<(), FaceError> {
         self.set_edcca_threshold(EDCCA_OFF, EDCCA_OFF)?;
         self.set_edcca_honor(false)
+    }
+
+    /// **Full carrier-sense off** — the knob that makes the TX engine transmit regardless of a busy
+    /// medium. Disabling EDCCA ([`disable_edcca`](Self::disable_edcca)) alone is NOT enough: on a
+    /// channel occupied by other transmitters the 8812A still defers via the OFDM **packet/preamble
+    /// CCA** (a separate baseband gate from energy-detect). Measured: with only EDCCA off, an 8812au
+    /// against two saturating neighbours sent ~600 frames in 20 s (deferred); the a81a/8822E — which
+    /// does not gate TX on this CCA — blasted ~14000. This forces the OFDM CCA-mode nibble
+    /// `0x838[3:0]=0xc` ("CCA off", the same value IQK uses to quiesce the BB) so the MAC always reads
+    /// the medium idle, saving the bring-up value to restore on `ignore=false`. `ignore=true` also
+    /// applies the EDCCA-ignore path; `false` restores both. RX detection is affected while off, which
+    /// is fine for a TX-only blast node. This is the doctrine's "monitor mode without CSMA".
+    pub fn set_cca_ignore(&self, ignore: bool) -> Result<(), FaceError> {
+        use std::sync::atomic::Ordering;
+        if ignore {
+            // Save the bring-up CCA nibble once, then force CCA off.
+            let cur = (self.bb_query(0x838, 0xf)? & 0xf) as u16;
+            let _ = self.cca_saved.compare_exchange(0xffff, cur, Ordering::SeqCst, Ordering::SeqCst);
+            self.bb_set(0x838, 0xf, 0xc)?; // OFDM CCA off — the MAC now reads the medium idle
+            self.disable_edcca() // energy-detect path too (thresholds max + ignore-EDCCA bit)
+        } else {
+            let saved = self.cca_saved.swap(0xffff, Ordering::SeqCst);
+            if saved != 0xffff {
+                self.bb_set(0x838, 0xf, saved as u32)?;
+            }
+            self.set_edcca_honor(true)
+        }
     }
 
     /// Read back `(l2h, h2l, honored)` for verification — the thresholds from the

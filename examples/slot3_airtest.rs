@@ -14,8 +14,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use ndn_radio_drivers::{LibUsbRtl88xxBackend, Rtl8812auBackend};
-use ndn_frame_io::{BROADCAST, FrameIo, InjectFrame, TxIntent};
+use ndn_frame_io::{BROADCAST, InjectFrame, TxIntent};
 
 const N: u64 = 3;
 const FRAME_BYTES: usize = 900;
@@ -36,18 +35,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let my_slot = node as u64 % N;
     let my_tag = 0xA0u8 | node;
 
-    // Open whichever radio this node has → box as Arc<dyn FrameIo> for the shared TX/RX loops.
-    let d: Arc<dyn FrameIo> = if env("NDN_PID").as_deref() == Some("au") {
-        let d = Arc::new(Rtl8812auBackend::open()?);
-        d.bring_up_monitor(ch)?;
-        let p = d.spawn_rx_pump(8); std::mem::forget(p);
-        d
-    } else {
-        let pid = u16::from_str_radix(env("NDN_PID").unwrap_or_else(|| "a81a".into()).trim_start_matches("0x"), 16)?;
-        let d = Arc::new(LibUsbRtl88xxBackend::open_monitor_pid(pid, ch)?);
-        let p = d.spawn_rx_pump(8); std::mem::forget(p);
-        d
+    // One standardized open — the canonical named-data format + monitor + pump handled beneath, so all
+    // three nodes interoperate on air by construction regardless of chip.
+    let pid: u16 = match env("NDN_PID").as_deref() {
+        Some("au") => 0x8812,
+        Some(p) => u16::from_str_radix(p.trim_start_matches("0x"), 16)?,
+        None => 0xa81a,
     };
+    let d = ndn_radio_drivers::open_named_radio(pid, ch)?;
     let src = [0x02, b'M', b'D', b'R', node, 0x01];
     println!("slot3 node={node} slot={my_slot}/{N} mode={} ch{ch} secs={secs}",
         if slotted { "slotted" } else { "contention" });

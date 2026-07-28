@@ -50,6 +50,44 @@ mod lora_serial;
 #[cfg(feature = "lora")]
 pub use lora_serial::{LORA_BAUD, LoraParams, LoraSerialBackend, MAX_LORA_PAYLOAD};
 
+/// The canonical named-data-over-802.11 EtherType — the LLC/SNAP protocol id every backend uses so a
+/// payload injected on one radio de-frames identically on any other. (Matches `FrameFormat::default()`.)
+pub const NDN_ETHERTYPE: u16 = 0x8624;
+
+/// **The standardized way to open a named-data radio.** Dispatches by USB product id to the right
+/// chip-specific backend, runs *that* chip's own power-on / monitor / calibration sequence beneath, sets
+/// the **one canonical on-air format** (`RawNdn { ethertype: 0x8624 }`) so any two radios opened this way
+/// interoperate on air by construction, brings up monitor on `channel`, and starts the RX pump. Returns
+/// an [`ndn_radio_hal::FrameIo`] — the caller holds one uniform handle and never touches chip specifics
+/// (the leak that made "both implement FrameIo" not mean "they interoperate"). Broadcast rate is legacy
+/// 6 Mbps by default (universally decodable); override per-driver with `NDN_RADIO_TX_RATE`.
+///
+/// Chip family from the PID: `0xa81a`/`0xa811`/`0x8814` = **RTL8822E** (chip 0x17, the 88xx backend);
+/// everything else in the 8812au PID set (`0x8812`/`0x881a`/…, chip 0x04) = **RTL8812AU**. (The 8812au
+/// backend opens the first matching device; for multiple 8812au on one host it takes the first.)
+pub fn open_named_radio(
+    pid: u16,
+    channel: u8,
+) -> Result<std::sync::Arc<dyn FrameIo>, FaceError> {
+    use std::sync::Arc;
+    let fmt = FrameFormat::RawNdn { ethertype: NDN_ETHERTYPE };
+    let radio: Arc<dyn FrameIo> = if matches!(pid, 0xa81a | 0xa811 | 0x8814) {
+        // RTL8822E: `open_monitor_pid` claims + BB/RF-inits + monitors + channel in one call, and its
+        // default format is already the canonical RawNdn(0x8624).
+        let d = Arc::new(LibUsbRtl88xxBackend::open_monitor_pid(pid, channel)?);
+        std::mem::forget(d.spawn_rx_pump(8)); // pump lives for the radio's (process) lifetime
+        d
+    } else {
+        // RTL8812AU: force the canonical format (its own default is Raw80211 for the NAN path), then
+        // bring up monitor (MAC/BB/RF + IQK/LCK) on the channel.
+        let d = Arc::new(Rtl8812auBackend::open()?.with_format(fmt));
+        d.bring_up_monitor(channel)?;
+        std::mem::forget(d.spawn_rx_pump(8));
+        d
+    };
+    Ok(radio)
+}
+
 // The control-plane `RadioKnobs` impls for the driver backends. These live with
 // the driver types (the trait is from `ndn-radio-hal`, the types are declared
 // here) — the orphan rule requires the impl travel with the local type. The
@@ -99,5 +137,33 @@ mod radio_knobs {
         }
         // set_tx_power / set_tx_csd / set_edcca_ignore: default no-ops until the
         // mt76x2 power-table / TXOP-CTRL / ED-CCA registers are ported.
+    }
+
+    impl RadioKnobs for crate::Rtl8812auBackend {
+        fn set_channel(&self, channel: u8, bw: Bandwidth) -> Result<(), FaceError> {
+            // Monitor bring-up tunes 20 MHz; other bandwidths need their per-channel
+            // RF/BB program captured (docs/RADIO_SUBSYSTEM.md "Adding a channel").
+            if bw == Bandwidth::Bw20 {
+                crate::Rtl8812auBackend::set_channel(self, channel)
+            } else {
+                Err(FaceError::Io(std::io::Error::other(format!(
+                    "rtl8812au: only 20 MHz tuned so far (requested ch{channel}/{bw:?})"
+                ))))
+            }
+        }
+        fn set_tx_power(&self, idx: u32) -> Result<(), FaceError> {
+            // Per-rate TXAGC index (0.5 dB/step) — the devourer jaguar1 power knob,
+            // validated monotone on air (#38). This is the actuator behind the
+            // cognition policy's reciprocity `decide_power` backoff.
+            crate::Rtl8812auBackend::set_tx_power(self, idx.min(63) as u8)
+        }
+        fn set_edcca_ignore(&self, on: bool) -> Result<(), FaceError> {
+            // ignore == TX does not defer to energy-detect carrier sense.
+            crate::Rtl8812auBackend::set_edcca_honor(self, !on)
+        }
+        fn read_channel_activity(&self) -> Result<Option<u16>, FaceError> {
+            // REG_RXERR_RPT occupancy counter — frame-free channel-activity sensing.
+            crate::Rtl8812auBackend::read_phy_sense(self).map(|s| Some(s.rx_activity))
+        }
     }
 }

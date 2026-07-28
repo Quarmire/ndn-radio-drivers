@@ -35,7 +35,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // contention). NDN_MODE=slotted → transmit only in this node's slot of an N=3 superframe (all
         // three disjoint, collision-free); NDN_MODE=contention → transmit a random ~1/3 of slots
         // (independent → same-slot collisions ~2/9). A neutral RX observer compares total received.
-        let slotted = env("NDN_MODE").as_deref() != Some("contention");
+        let mode = env("NDN_MODE").unwrap_or_default();
+        let flood = mode == "flood"; // continuous TX every iteration — for the RX-ceiling / link probe
+        let slotted = mode != "contention" && !flood;
         let slot_us: u64 = env("NDN_SLOT_US").and_then(|s| s.parse().ok()).unwrap_or(20_000);
         let my_slot = (tag as u64) % 3;
         let mut rng: u64 = (std::process::id() as u64).wrapping_mul(0x9E37_79B9) ^ (tag as u64 + 1);
@@ -47,10 +49,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let (mut cur_epoch, mut tx_this) = (u64::MAX, false);
         let now_us = || std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_micros() as u64).unwrap_or(0);
         while Instant::now() < deadline {
-            let epoch = now_us() / slot_us;
-            if epoch != cur_epoch {
-                cur_epoch = epoch;
-                tx_this = if slotted { epoch % 3 == my_slot } else { coin() };
+            if flood {
+                tx_this = true;
+            } else {
+                let epoch = now_us() / slot_us;
+                if epoch != cur_epoch {
+                    cur_epoch = epoch;
+                    tx_this = if slotted { epoch % 3 == my_slot } else { coin() };
+                }
             }
             if !tx_this {
                 tokio::time::sleep(Duration::from_micros(500)).await;
@@ -74,8 +80,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("=== TX DONE sent={sent} mode={} ===", if slotted { "slotted" } else { "contention" });
     } else {
         let counts = [Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0))];
+        // RSSI accumulator (sum, min, max, n) — distinguishes a weak/attenuated LINK (low RSSI, RF loss)
+        // from an RX-side drop (strong RSSI but frames still missing = pump/USB/FIFO ceiling).
+        let rssi = Arc::new(std::sync::Mutex::new((0i64, i32::MAX, i32::MIN, 0u64)));
+        let start = Instant::now();
         let rx = {
-            let (d, counts) = (d.clone(), counts.clone());
+            let (d, counts, rssi) = (d.clone(), counts.clone(), rssi.clone());
             tokio::spawn(async move {
                 while Instant::now() < deadline {
                     if let Ok(Ok(f)) = tokio::time::timeout(Duration::from_millis(20), d.recv_frame()).await {
@@ -83,6 +93,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         if p.len() >= 2 && (p[0] & 0xf0) == 0xA0 {
                             let t = (p[1] & 0x03) as usize;
                             counts[t].fetch_add(1, Ordering::Relaxed);
+                            if let Some(r) = f.rssi_dbm {
+                                let mut g = rssi.lock().unwrap();
+                                g.0 += r as i64; g.1 = g.1.min(r as i32); g.2 = g.2.max(r as i32); g.3 += 1;
+                            }
                         }
                     }
                 }
@@ -91,11 +105,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         while Instant::now() < deadline {
             tokio::time::sleep(Duration::from_secs(1)).await;
             let c: Vec<u64> = counts.iter().map(|a| a.load(Ordering::Relaxed)).collect();
-            println!("  RX heard tag0={} tag1={} tag2={} tag3={}", c[0], c[1], c[2], c[3]);
+            let total: u64 = c.iter().sum();
+            println!("  RX heard tag0={} tag1={} tag2={} tag3={} ({:.0}/s)", c[0], c[1], c[2], c[3],
+                total as f64 / start.elapsed().as_secs_f64().max(0.001));
         }
         let _ = rx.await;
         let c: Vec<u64> = counts.iter().map(|a| a.load(Ordering::Relaxed)).collect();
-        println!("=== RX DONE tag0={} tag1={} tag2={} tag3={} ===", c[0], c[1], c[2], c[3]);
+        let total: u64 = c.iter().sum();
+        let (sum, mn, mx, n) = *rssi.lock().unwrap();
+        let avg = if n > 0 { sum as f64 / n as f64 } else { 0.0 };
+        println!("=== RX DONE tag0={} tag1={} tag2={} tag3={} | rate={:.0}/s rssi avg={:.1} min={} max={} dBm (n={}) ===",
+            c[0], c[1], c[2], c[3], total as f64 / start.elapsed().as_secs_f64().max(0.001),
+            avg, if n > 0 { mn } else { 0 }, if n > 0 { mx } else { 0 }, n);
     }
     Ok(())
 }

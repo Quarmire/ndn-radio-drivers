@@ -16,7 +16,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use ndn_frame_io::{
     CapturedFrame, ClockDomainId, FrameFormat, FrameIo, InjectFrame, LatchPoint, LinkStamp,
-    McsDescriptor, RadioCapability, RadioProfile, RadioTime, RadioTimeSource, WifiRadio, frame,
+    RadioCapability, RadioProfile, RadioTime, RadioTimeSource, WifiRadio, frame,
 };
 
 /// Host monotonic clock domain — shared by every host-stamped frame in this process (the serial
@@ -228,13 +228,9 @@ impl FrameIo for Bw16SerialBackend {
     }
 }
 
-#[async_trait]
-impl WifiRadio for Bw16SerialBackend {
-    async fn inject_at(&self, frame_in: InjectFrame, _mcs: McsDescriptor) -> Result<(), FaceError> {
-        // The Ameba management-TX path picks the rate; the exact MCS doesn't apply.
-        self.inject(frame_in).await
-    }
-}
+// Marker only: the Ameba board's management-TX path picks its own rate, so `set_rate`
+// (the FrameIo default no-op) and the derived `inject_at` both just inject.
+impl WifiRadio for Bw16SerialBackend {}
 
 impl RadioKnobs for Bw16SerialBackend {
     fn set_channel(&self, channel: u8, bw: Bandwidth) -> Result<(), FaceError> {

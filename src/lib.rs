@@ -79,9 +79,16 @@ pub fn open_named_radio(
         d
     } else {
         // RTL8812AU: force the canonical format (its own default is Raw80211 for the NAN path), then
-        // bring up monitor (MAC/BB/RF + IQK/LCK) on the channel.
-        let d = Arc::new(Rtl8812auBackend::open()?.with_format(fmt));
+        // bring up monitor (MAC/BB/RF + IQK/LCK) on the channel. `NDN_USB_INDEX` selects which adapter
+        // when several identical 8812au dongles share the host (0 = first enumerated).
+        let index = std::env::var("NDN_USB_INDEX").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+        let d = Arc::new(Rtl8812auBackend::open_nth(index)?.with_format(fmt));
         d.bring_up_monitor(channel)?;
+        // `bring_up_monitor` sets TXAGC to full 0x3f; on a USB-power-limited host a full-power 2-chain
+        // TX can brown the PA out so the FIFO never drains. `NDN_TX_PWR=<0..63>` overrides the index.
+        if let Some(p) = std::env::var("NDN_TX_PWR").ok().and_then(|s| s.parse::<u8>().ok()) {
+            let _ = d.set_tx_power(p.min(63));
+        }
         std::mem::forget(d.spawn_rx_pump(8));
         d
     };

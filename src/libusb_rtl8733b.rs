@@ -3107,27 +3107,30 @@ impl FrameIo for Rtl8733buBackend {
             }
         }
     }
-}
 
-#[async_trait]
-impl WifiRadio for Rtl8733buBackend {
-    async fn inject_at(&self, frame_in: InjectFrame, mcs: McsDescriptor) -> Result<(), FaceError> {
-        // Map the MCS to a Realtek HwRate + per-frame descriptor flags. The 8731bu is 1x1
-        // (single chain), so only single-stream rates apply: HT MCS0-7 (DESC_RATEMCS0=0x0c)
-        // or VHT-1SS MCS0-9 (DESC_RATEVHTSS1MCS0=0x2c). STBC and 2-stream (nss=2) rates are
-        // suppressed — they need a second TX chain this part doesn't have. SGI and LDPC are
-        // single-chain-safe and honoured. 40 MHz is carried by set_bandwidth, so preserve the
-        // current bw40 flag rather than deriving it here.
+    /// Rate as bearer state: map the MCS to a Realtek HwRate + descriptor flags and
+    /// store them (`inject` reads `tx_rate`/`tx_flags`). The 8731bu is 1x1, so only
+    /// single-stream rates apply: HT MCS0-7 (DESC_RATEMCS0=0x0c) or VHT-1SS MCS0-9
+    /// (DESC_RATEVHTSS1MCS0=0x2c); STBC and 2-stream rates are suppressed (no second
+    /// TX chain), SGI/LDPC honoured. 40 MHz is carried by `set_bandwidth`, so the
+    /// current bw40 flag is preserved rather than re-derived.
+    fn set_rate(&self, mcs: McsDescriptor) -> Result<(), FaceError> {
         let hw_rate = if mcs.vht {
-            0x2c + (mcs.index & 0x0f).min(9) // VHT 1SS MCS0-9
+            0x2c + (mcs.index & 0x0f).min(9)
         } else {
-            0x0c + (mcs.index & 0x0f).min(7) // HT MCS0-7 (1 stream)
+            0x0c + (mcs.index & 0x0f).min(7)
         };
         let bw40 = (self.tx_flags.load(Ordering::Relaxed) >> 3) & 1;
-        let flags = (mcs.ldpc as u8) | ((mcs.short_gi as u8) << 1) | (bw40 << 3); // STBC omitted (1x1)
-        self.tx_dot11(frame_in, hw_rate, flags).await
+        let flags = (mcs.ldpc as u8) | ((mcs.short_gi as u8) << 1) | (bw40 << 3);
+        self.tx_rate.store(hw_rate, Ordering::Relaxed);
+        self.tx_flags.store(flags, Ordering::Relaxed);
+        Ok(())
     }
 }
+
+// Marker only: `inject_at` is the derived HAL default (`set_rate` + `inject`); rate
+// lives in `tx_rate`/`tx_flags`, which `inject` already uses.
+impl WifiRadio for Rtl8733buBackend {}
 
 impl RadioKnobs for Rtl8733buBackend {
     fn set_channel(&self, channel: u8, bw: Bandwidth) -> Result<(), FaceError> {

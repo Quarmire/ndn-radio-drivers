@@ -187,6 +187,9 @@ pub struct Mt7612uBackend {
     ep_ins: Vec<u8>,
     /// MCU command sequence (1..=15, never 0).
     mcu_seq: std::sync::atomic::AtomicU8,
+    /// Current transmit rate as state ([`FrameIo::set_rate`]); `None` ⇒ resolve the
+    /// frame's intent. Retires the per-frame `inject_at` path.
+    cur_mcs: std::sync::Mutex<Option<crate::McsDescriptor>>,
     /// When true the background RX-drain thread stops reading ep 0x84 (so a
     /// foreground `read_rx`/FrameIo consumer gets every frame instead of racing
     /// the drain). Toggled by [`pause_drain`](Self::pause_drain).
@@ -321,6 +324,7 @@ impl Mt7612uBackend {
             ep_in: ep_in.unwrap(),
             ep_ins: ins,
             mcu_seq: std::sync::atomic::AtomicU8::new(0),
+            cur_mcs: std::sync::Mutex::new(None),
             drain_pause: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             format: FrameFormat::default(),
             seq: std::sync::atomic::AtomicU16::new(0),
@@ -1465,11 +1469,17 @@ impl FrameIo for Mt7612uBackend {
         // NDN frames are 802.11 DATA frames → data TXWI (wcid 0xff, no-ACK) on the
         // data AC endpoint (0x04). Mgmt TXWI/ep 0x07 would be dropped (see
         // build_data_bulk / docs/RADIO_SUBSYSTEM.md).
-        // Resolve the bearer-agnostic transmit intent to a concrete 802.11 rate
-        // (the MT7612U is 11ac-capable).
-        let mcs = crate::McsDescriptor::for_intent(&frame.tx, crate::MAX_RELIABLE_MCS, true);
+        // Rate is bearer state: the control-plane-set MCS if present, else resolve the
+        // frame's intent (the MT7612U is 11ac-capable).
+        let mcs = self.resolved_mcs(&frame);
         let buf = self.build_data_bulk(&dot11, &mcs);
         self.send_bulk(buf).await
+    }
+
+    /// Rate as bearer state: store the exact MCS every subsequent `inject` uses.
+    fn set_rate(&self, mcs: crate::McsDescriptor) -> Result<(), FaceError> {
+        *self.cur_mcs.lock().unwrap() = Some(mcs);
+        Ok(())
     }
 
     /// Inject a batch. **Unlike the RTL8812EU, the MT7612 does NOT A-MSDU-bundle
@@ -1532,17 +1542,16 @@ impl FrameIo for Mt7612uBackend {
     }
 }
 
-#[async_trait]
-impl crate::WifiRadio for Mt7612uBackend {
-    async fn inject_at(
-        &self,
-        frame: InjectFrame,
-        mcs: crate::McsDescriptor,
-    ) -> Result<(), FaceError> {
-        // Same DATA-TXWI path as `inject`, at an exact rate instead of resolving
-        // the frame's intent.
-        let dot11 = crate::frame::build_dot11(self.format, &frame)?;
-        let buf = self.build_data_bulk(&dot11, &mcs);
-        self.send_bulk(buf).await
+// Marker only: `inject_at` is the derived HAL default (`set_rate` + `inject`).
+impl crate::WifiRadio for Mt7612uBackend {}
+
+impl Mt7612uBackend {
+    /// The rate to transmit `frame` at: the control-plane-set MCS (state) if present,
+    /// else the frame's intent resolved to this 11ac radio.
+    fn resolved_mcs(&self, frame: &InjectFrame) -> crate::McsDescriptor {
+        self.cur_mcs
+            .lock()
+            .unwrap()
+            .unwrap_or_else(|| crate::McsDescriptor::for_intent(&frame.tx, crate::MAX_RELIABLE_MCS, true))
     }
 }

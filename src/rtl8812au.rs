@@ -4235,16 +4235,35 @@ impl Rtl8812auBackend {
     /// it from any kernel driver. Never matches the 8812EU (`0xa81a`), so a
     /// co-resident EU monitor dongle is left untouched.
     pub fn open() -> Result<Self, FaceError> {
+        Self::open_nth(0)
+    }
+
+    /// Open the **nth** (0-based) matching RTL8812AU-family adapter in USB-enumeration order.
+    /// A host can carry several identical 8812au dongles (e.g. two `0bda:8812` on one OPi); `open()`
+    /// always grabs the first, which is useless when that one is wedged and a fresh one sits behind it.
+    /// This is the device selector the standardized open needs — `open_named_radio` drives it from
+    /// `NDN_USB_INDEX`. Logs bus:addr of every candidate so the caller can see what it picked.
+    pub fn open_nth(index: usize) -> Result<Self, FaceError> {
         let context = Context::new().map_err(usb_err)?;
+        let mut seen = 0usize;
         for device in context.devices().map_err(usb_err)?.iter() {
             let desc = device.device_descriptor().map_err(usb_err)?;
             if desc.vendor_id() == REALTEK_VID && RTL8812AU_PIDS.contains(&desc.product_id()) {
-                return Self::claim(device, desc.product_id());
+                tracing::info!(
+                    target: "named_radio",
+                    candidate = seen, bus = device.bus_number(), addr = device.address(),
+                    pid = format_args!("0x{:04x}", desc.product_id()), want = index,
+                    "8812au candidate"
+                );
+                if seen == index {
+                    return Self::claim(device, desc.product_id());
+                }
+                seen += 1;
             }
         }
         Err(FaceError::Io(io::Error::new(
             io::ErrorKind::NotFound,
-            "no RTL8812AU found (Realtek 0bda:{8812,881a,881b,881c,8813})",
+            format!("no RTL8812AU at index {index} ({seen} found; 0bda:{{8812,881a,881b,881c,8813}})"),
         )))
     }
 

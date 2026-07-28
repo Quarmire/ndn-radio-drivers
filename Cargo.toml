@@ -9,6 +9,8 @@ description = "Userspace USB Wi-Fi monitor-mode driver backends (RTL8812EU/8822E
 [dependencies]
 ndn-radio-hal = { path = "../ndn-rs/crates/core/ndn-radio-hal" }
 ndn-frame-io  = { path = "../ndn-rs/crates/core/ndn-frame-io" }
+# RefBelief (#75) parsed from mesh timing beacons.
+ndn-time      = { path = "../ndn-rs/crates/core/ndn-time", default-features = false }
 ndn-transport = { path = "../ndn-rs/crates/core/ndn-transport" }
 async-trait = "0.1"
 tracing = "0.1"

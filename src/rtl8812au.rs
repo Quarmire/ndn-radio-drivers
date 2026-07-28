@@ -3869,6 +3869,7 @@ static PROGS_5G: &[(u8, RegProgram)] = &[
 ];
 
 
+
 /// Management-queue select (`QSLT_MGNT`) + its rate-adaptation group
 /// (`RATEID_IDX_G`, the OFDM/11g table).
 const QSLT_MGNT: u32 = 0x12;
@@ -3963,6 +3964,236 @@ fn init_err(what: impl Into<String>) -> FaceError {
     FaceError::Io(io::Error::other(what.into()))
 }
 
+// ── EFUSE TX-power calibration ────────────────────────────────────────────────
+// Port of OpenIPC devourer `src/jaguar1/EepromManager.cpp` (`ReadEFuseByte`,
+// `Hal_EfuseReadEFuse8812A`, `LoadTxPowerInfo`, `GetTxPowerIndexBase`), itself a
+// port of mainline Realtek `hal_com_phycfg.c` / `rtw_efuse.c`. Turns the flat
+// uncalibrated TXAGC index into one referenced to THIS adapter's fused full-power
+// point per channel/rate — the base a dB-accurate power knob needs.
+
+const REG_EFUSE_CTRL: u16 = 0x0030; // E-Fuse control (addr in +1/+2, flag in +3, data via read32)
+const REG_EFUSE_TEST: u16 = 0x0034;
+const REG_EFUSE_BURN_GNT_8812: u16 = 0x00cf;
+const EFUSE_ACCESS_ON_JAGUAR: u8 = 0x69;
+const EFUSE_ACCESS_OFF_JAGUAR: u8 = 0x00;
+const FEN_ELDR: u16 = 1 << 12; // REG_SYS_FUNC_EN eldr reset
+const LOADER_CLK_EN: u16 = 1 << 5; // REG_SYS_CLKR
+const ANA8M: u16 = 1 << 1; // REG_SYS_CLKR
+const REG_SYS_CLKR: u16 = 0x0008;
+const EFUSE_MAP_LEN_JAGUAR: usize = 512;
+const EFUSE_REAL_CONTENT_LEN_JAGUAR: u16 = 512;
+const EFUSE_MAX_SECTION_JAGUAR: usize = 64;
+const EFUSE_MAX_WORD_UNIT: usize = 4;
+const PG_TXPWR_SADDR: usize = 0x10; // EFUSE PG tx-power block start
+const TXAGC_MAX: u8 = 63; // 6-bit TXAGC index rail
+
+/// 5 GHz center channels the per-group base table is scattered across (mirrors
+/// devourer `kCenterCh5gAll`).
+const CENTER_CH_5G: [u8; 65] = [
+    15, 16, 17, 18, 20, 24, 28, 32, 36, 38, 40, 42, 44, 46, 48, 52, 54, 56, 58, 60, 62, 64, 68, 72,
+    76, 80, 84, 88, 92, 96, 100, 102, 104, 106, 108, 110, 112, 116, 118, 120, 122, 124, 126, 128,
+    132, 134, 136, 138, 140, 142, 144, 149, 151, 153, 155, 157, 159, 161, 165, 167, 169, 171, 173,
+    175, 177,
+];
+
+/// Rate-group classifier (port of Realtek `rtw_get_ch_group`). Returns
+/// `Some((band, group, cck_group))` — band 0 = 2.4 GHz, 1 = 5 GHz — or `None` for
+/// an invalid channel.
+fn classify_channel(ch: u8) -> Option<(u8, u8, u8)> {
+    if ch <= 14 {
+        let gp = match ch {
+            1..=2 => 0,
+            3..=5 => 1,
+            6..=8 => 2,
+            9..=11 => 3,
+            12..=14 => 4,
+            _ => return None,
+        };
+        let cck_gp = if ch == 14 { 5 } else { gp };
+        return Some((0, gp, cck_gp));
+    }
+    let gp = match ch {
+        15..=42 => 0,
+        44..=48 => 1,
+        50..=58 => 2,
+        60..=98 => 3,
+        100..=106 => 4,
+        108..=114 => 5,
+        116..=122 => 6,
+        124..=130 => 7,
+        132..=138 => 8,
+        140..=144 => 9,
+        149..=155 => 10,
+        157..=161 => 11,
+        165..=171 => 12,
+        173..=253 => 13,
+        _ => return None,
+    };
+    Some((1, gp, 0))
+}
+
+/// Sign-extend the high nibble of a PG diff byte (`pg_msb_diff`).
+fn pg_msb_diff(v: u8) -> i8 {
+    let n = (v >> 4) & 0x0f;
+    if n & 0x08 != 0 { (n | 0xf0) as i8 } else { n as i8 }
+}
+/// Sign-extend the low nibble of a PG diff byte (`pg_lsb_diff`).
+fn pg_lsb_diff(v: u8) -> i8 {
+    let n = v & 0x0f;
+    if n & 0x08 != 0 { (n | 0xf0) as i8 } else { n as i8 }
+}
+
+/// MGN_* rate classifiers (from Realtek `phydm_types.h`).
+fn is_cck(r: u8) -> bool {
+    matches!(r, 0x02 | 0x04 | 0x0b | 0x16)
+}
+fn is_ofdm(r: u8) -> bool {
+    matches!(r, 0x0c | 0x12 | 0x18 | 0x24 | 0x30 | 0x48 | 0x60 | 0x6c)
+}
+
+/// This adapter's EFUSE-programmed TX-power calibration (base index per channel +
+/// signed per-Ntx bandwidth/modulation diffs), parsed by
+/// [`Rtl8812auBackend::load_tx_power_info`]. Indices are 0–63 TXAGC steps (0.5 dB).
+#[derive(Clone)]
+struct TxPowerInfo {
+    cck_base_2g: [[u8; 14]; 2],  // [path][ch_idx 0..13]
+    bw40_base_2g: [[u8; 14]; 2], // [path][ch_idx]
+    bw40_base_5g: [[u8; 65]; 2], // [path][5g ch_idx]
+    ofdm_2g_diff: [[i8; 4]; 2],  // [path][ntx]
+    cck_2g_diff: [[i8; 4]; 2],
+    bw20_2g_diff: [[i8; 4]; 2],
+    bw40_2g_diff: [[i8; 4]; 2],
+    ofdm_5g_diff: [[i8; 4]; 2],
+    bw20_5g_diff: [[i8; 4]; 2],
+    bw40_5g_diff: [[i8; 4]; 2],
+    bw80_5g_diff: [[i8; 4]; 2],
+}
+
+impl TxPowerInfo {
+    fn zeroed() -> Self {
+        TxPowerInfo {
+            cck_base_2g: [[0; 14]; 2],
+            bw40_base_2g: [[0; 14]; 2],
+            bw40_base_5g: [[0; 65]; 2],
+            ofdm_2g_diff: [[0; 4]; 2],
+            cck_2g_diff: [[0; 4]; 2],
+            bw20_2g_diff: [[0; 4]; 2],
+            bw40_2g_diff: [[0; 4]; 2],
+            ofdm_5g_diff: [[0; 4]; 2],
+            bw20_5g_diff: [[0; 4]; 2],
+            bw40_5g_diff: [[0; 4]; 2],
+            bw80_5g_diff: [[0; 4]; 2],
+        }
+    }
+
+    /// The calibrated TXAGC base index (0–63) for `rate` (MGN_*) on `channel` at
+    /// `path` (0=A,1=B), `ntx_idx` (0-based extra-stream count), `bw` (0=20,1=40,
+    /// 2=80). Port of `GetTxPowerIndexBase`; the by-rate overlay is a no-op in the
+    /// USB reference build (`CONFIG_TXPWR_BY_RATE_EN=n`).
+    fn index_base(&self, path: usize, rate: u8, ntx_idx: u8, bw: u8, channel: u8) -> u8 {
+        let path = path.min(1);
+        let Some((band, group, cck_group)) = classify_channel(channel) else {
+            return 0;
+        };
+        let mut p: i32 = 0;
+        if band == 0 {
+            let ch_idx = (channel as usize).saturating_sub(1).min(13);
+            let _ = group; // group indexes the per-group source, already scattered per-channel
+            if is_cck(rate) {
+                p = self.cck_base_2g[path][ch_idx] as i32;
+                p += self.cck_2g_diff[path][0] as i32;
+                for t in 1..=ntx_idx.min(3) as usize {
+                    p += self.cck_2g_diff[path][t] as i32;
+                }
+                return p.clamp(0, TXAGC_MAX as i32) as u8;
+            }
+            let _ = cck_group;
+            p = self.bw40_base_2g[path][ch_idx] as i32;
+            if is_ofdm(rate) {
+                p += self.ofdm_2g_diff[path][0] as i32;
+                for t in 1..=ntx_idx.min(3) as usize {
+                    p += self.ofdm_2g_diff[path][t] as i32;
+                }
+                return p.clamp(0, TXAGC_MAX as i32) as u8;
+            }
+            // MCS/VHT: cumulative BW20/BW40 diffs by stream count.
+            let diff = if bw == 0 {
+                &self.bw20_2g_diff[path]
+            } else {
+                &self.bw40_2g_diff[path]
+            };
+            p += mcs_diff_sum(rate, diff);
+        } else {
+            if rate < 0x0c {
+                return 0;
+            }
+            let ch_idx = self.ch_idx_5g(channel);
+            p = self.bw40_base_5g[path][ch_idx] as i32;
+            if is_ofdm(rate) {
+                p += self.ofdm_5g_diff[path][0] as i32;
+                for t in 1..=ntx_idx.min(3) as usize {
+                    p += self.ofdm_5g_diff[path][t] as i32;
+                }
+                return p.clamp(0, TXAGC_MAX as i32) as u8;
+            }
+            let diff = match bw {
+                0 => &self.bw20_5g_diff[path],
+                1 => &self.bw40_5g_diff[path],
+                _ => &self.bw80_5g_diff[path],
+            };
+            p += mcs_diff_sum(rate, diff);
+        }
+        p.clamp(0, TXAGC_MAX as i32) as u8
+    }
+
+    /// Nearest 5 GHz center-channel index (exact hit wins).
+    fn ch_idx_5g(&self, channel: u8) -> usize {
+        let mut best = 0usize;
+        let mut best_d = i32::MAX;
+        for (i, &c) in CENTER_CH_5G.iter().enumerate() {
+            let d = (c as i32 - channel as i32).abs();
+            if d < best_d {
+                best_d = d;
+                best = i;
+            }
+            if d == 0 {
+                break;
+            }
+        }
+        best
+    }
+}
+
+/// Cumulative MCS/VHT stream diffs (port of the `ge_1s..ge_4s` accumulation).
+fn mcs_diff_sum(r: u8, diff: &[i8; 4]) -> i32 {
+    let mcs0_7 = (0x80..=0x87).contains(&r);
+    let mcs8_15 = (0x88..=0x8f).contains(&r);
+    let mcs16_23 = (0x90..=0x97).contains(&r);
+    let mcs24_31 = (0x98..=0x9f).contains(&r);
+    let vht1 = (0xa0..=0xa9).contains(&r);
+    let vht2 = (0xaa..=0xb3).contains(&r);
+    let vht3 = (0xb4..=0xbd).contains(&r);
+    let vht4 = (0xbe..=0xc7).contains(&r);
+    let ge_1s = mcs0_7 || mcs8_15 || mcs16_23 || mcs24_31 || vht1 || vht2 || vht3 || vht4;
+    let ge_2s = mcs8_15 || mcs16_23 || mcs24_31 || vht2 || vht3 || vht4;
+    let ge_3s = mcs16_23 || mcs24_31 || vht3 || vht4;
+    let ge_4s = mcs24_31 || vht4;
+    let mut s = 0i32;
+    if ge_1s {
+        s += diff[0] as i32;
+    }
+    if ge_2s {
+        s += diff[1] as i32;
+    }
+    if ge_3s {
+        s += diff[2] as i32;
+    }
+    if ge_4s {
+        s += diff[3] as i32;
+    }
+    s
+}
+
 /// A userspace RTL8812AU radio. Open with [`open`](Self::open); the handle keeps
 /// interface 0 claimed for the backend's lifetime.
 pub struct Rtl8812auBackend {
@@ -3985,6 +4216,18 @@ pub struct Rtl8812auBackend {
     ctrl_ops: std::sync::atomic::AtomicU64,
     /// Clock domain of this device's free-run RX-stamp TSF (per-device, from the USB bus/address).
     tsf_domain: ClockDomainId,
+    /// Latest **mesh** common-view observation (#75) — a locally-administered neighbour's HW-TSF-stamped
+    /// timing beacon + our RXTSFL + its advertised belief. Lets an 8812au (e.g. an Alfa) be a leaf node
+    /// in the network-time tree (receive-only). See [`mesh_common_view`](<Self as FrameIo>::mesh_common_view).
+    mesh_cv: std::sync::Mutex<Option<ndn_radio_hal::MeshCv>>,
+    /// Current channel (set by [`set_channel`](Self::set_channel)). The EFUSE-calibrated
+    /// TX-power base is per-channel, so `set_tx_power` needs it. 0 = not yet tuned.
+    cur_channel: std::sync::atomic::AtomicU8,
+    /// Parsed EFUSE per-rate TX-power calibration ([`TxPowerInfo`]), `None` until
+    /// [`load_tx_power_info`](Self::load_tx_power_info) reads the fuse. When present,
+    /// `set_tx_power` folds the requested backoff onto this adapter's *fused* full-power
+    /// base per channel/rate instead of writing a flat uncalibrated index.
+    tx_power_info: std::sync::Mutex<Option<TxPowerInfo>>,
 }
 
 impl Rtl8812auBackend {
@@ -4049,6 +4292,9 @@ impl Rtl8812auBackend {
             rx_pump: crate::rx_pump::RxPumpState::new(),
             ctrl_ops: std::sync::atomic::AtomicU64::new(0),
             tsf_domain,
+            mesh_cv: std::sync::Mutex::new(None),
+            cur_channel: std::sync::atomic::AtomicU8::new(0),
+            tx_power_info: std::sync::Mutex::new(None),
         })
     }
 
@@ -4520,6 +4766,9 @@ impl Rtl8812auBackend {
     /// ([`rf_config`](Self::rf_config)). Verify by reading RF `0x18` back (byte 0
     /// = channel).  Assumes `rfe_type == 0` (the common generic-dongle RFE).
     pub fn set_channel(&self, channel: u8) -> Result<(), FaceError> {
+        // Record the channel for the per-channel EFUSE-calibrated TX-power base.
+        self.cur_channel
+            .store(channel, std::sync::atomic::Ordering::Relaxed);
         // 5 GHz: replay the kernel rtw88 driver's exact per-channel program (usbmon golden traces
         // in golden/). The band switch (BB + RFE), the RF `0x18`/LSSI channel writes, and the 5 GHz
         // TXAGC tables are a single interdependent sequence — piecemeal deltas onto the 2.4 path did
@@ -4767,10 +5016,23 @@ impl Rtl8812auBackend {
         self.write32(0x97c, 0xa900_2000)?;
         self.write32(0x984, 0x0046_2910)?;
         self.page(true)?;
-        self.write32(0xc88, 0x8214_03f1)?; // ext_pa_5g = 0
+        self.write32(0xc88, 0x8214_03f1)?; // ext_pa_5g = 0 (generic dongle, no ext 5G PA)
         self.write32(0xe88, 0x8214_03f1)?;
-        self.write32(0xc8c, 0x2816_3e96)?; // band 2.4G
-        self.write32(0xe8c, 0x2816_3e96)?;
+        // IQK tone LO band-select (0xc8c/0xe8c[30]) — the ONE band-dependent write in the
+        // 8812A TX IQK (vendor `_iqk_tx_8812a`: 5G→0x68163e96, 2.4G→0x28163e96; 0xc88 varies
+        // by ext-PA not band, 0xc80/0xc84/0xce8 are band-fixed). Running the 2.4G value on a
+        // 5 GHz channel injects the IQK tone at the wrong LO, so the TX + loopback RX I/Q
+        // correction is solved for the wrong band → RX EVM stays skewed and dense-QAM HT-MCS
+        // won't demodulate while robust BPSK legacy OFDM still does (measured 2026-07-24:
+        // 8812au on ch149 decoded 206 legacy frames but ~0 HT). Reads `cur_channel`, which
+        // `set_channel` stamped before `iq_calibrate` runs in `bring_up_monitor`.
+        let iqk_tone_lo = if self.cur_channel.load(std::sync::atomic::Ordering::Relaxed) > 14 {
+            0x6816_3e96 // 5 GHz
+        } else {
+            0x2816_3e96 // 2.4 GHz
+        };
+        self.write32(0xc8c, iqk_tone_lo)?;
+        self.write32(0xe8c, iqk_tone_lo)?;
         self.write32(0xc80, 0x1800_8c10)?; // TX tone idx = 16
         self.write32(0xc84, 0x3800_8c10)?;
         self.write32(0xce8, 0x0)?;
@@ -4912,15 +5174,23 @@ impl Rtl8812auBackend {
         self.write32(0xeb0, 0x7777_7717)?;
         self.write32(0xeb4, 0x0200_0077)?;
         self.page(true)?;
+        // RX IQK tone setup. Two values here were mis-transcribed from vendor
+        // `_iqk_rx_8812a` and made the RX IQK converge only marginally (one of the two
+        // paths per run, alternating — measured on 5 GHz 2026-07-24):
+        //   * 0xc88/0xe88 must be 0x0214_0119 — bit 31 is set in the *TX* IQK
+        //     (0x8214_03f1) but CLEAR in the RX IQK; it had been left set (0x8214_0119).
+        //   * path B uses RX tone byte 0x15 (0x..8c15), not path A's 0x10 — the path-B
+        //     writes had been copied from path A (0x..8c10).
+        // Both paths now lock, which is what the 5 GHz HT-MCS demod needs.
         if tx0_fin {
             self.write32(0xc80, 0x3800_8c10)?;
             self.write32(0xc84, 0x1800_8c10)?;
-            self.write32(0xc88, 0x8214_0119)?;
+            self.write32(0xc88, 0x0214_0119)?;
         }
         if tx1_fin {
-            self.write32(0xe80, 0x3800_8c10)?;
-            self.write32(0xe84, 0x1800_8c10)?;
-            self.write32(0xe88, 0x8214_0119)?;
+            self.write32(0xe80, 0x3800_8c15)?;
+            self.write32(0xe84, 0x1800_8c15)?;
+            self.write32(0xe88, 0x0214_0119)?;
         }
 
         // ── RX IQK measurement loop ──
@@ -5299,21 +5569,319 @@ impl Rtl8812auBackend {
         Ok(())
     }
 
-    /// Set a uniform TX power index (`idx`, 0–63) for every legacy and HT rate on
-    /// both RF paths — the 8812A per-rate "power-by-rate" registers
-    /// (`PHY_SetTxPowerIndex_8812A`). A pragmatic stand-in for the full EFUSE
-    /// `PHY_SetTxPowerLevel8812` table (which we don't parse): without it these
-    /// registers stay at reset and the PA emits nothing. Run after
-    /// [`set_channel`](Self::set_channel) / calibration.
+    /// Arm **modulated continuous TX** (port of devourer jaguar1 `StartContinuousTx`,
+    /// itself `hal_mpt_SetSingleToneTx`/`mpt_StartOfdmContTx`). After arming, injecting
+    /// a frame makes the 8812A radiate a **continuous OFDM carrier** at the current
+    /// TXAGC power — a steady 100%-duty signal for conducted power measurement, with
+    /// none of the frame-injection duty gaps. Output power still tracks
+    /// [`set_tx_power`](Self::set_tx_power) (the TXAGC path). End with
+    /// [`stop_continuous_tx`](Self::stop_continuous_tx). Call after channel + power set.
+    pub fn start_continuous_tx(&self) -> Result<(), FaceError> {
+        self.bb_set(0x800, 0x0200_0000, 1)?; // rFPGA0_RFMOD[bOFDMEn] = 1 (OFDM block on)
+        self.bb_set(0xa00, 0x3, 0)?; // rCCK0_System[bCCKBBMode] = 0 (CCK test mode off)
+        self.bb_set(0xa00, 0x8, 1)?; // [bCCKScramble] = 1
+        self.bb_set(0x914, 0x7_0000, 1)?; // 0x914[18:16] = OFDM_ContinuousTx
+        self.write32(0x820, 0x0100_0500)?; // rFPGA0_XA_HSSIParameter1 (vendor cont-TX value)
+        self.write32(0x828, 0x0100_0500)?; // rFPGA0_XB_HSSIParameter1
+        Ok(())
+    }
+
+    /// Stop continuous TX and restore the BB (port of `StopContinuousTx`).
+    pub fn stop_continuous_tx(&self) -> Result<(), FaceError> {
+        self.bb_set(0x914, 0x7_0000, 0)?;
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        self.bb_set(0x100, 0x100, 0)?; // rPMAC_Reset[bBBResetB] pulse
+        self.bb_set(0x100, 0x100, 1)?;
+        self.write32(0x820, 0x0100_0100)?;
+        self.write32(0x828, 0x0100_0100)?;
+        Ok(())
+    }
+
+    /// Read one physical EFUSE byte via `REG_EFUSE_CTRL` (port of devourer
+    /// `RtlAdapter::ReadEFuseByte`): per-read `EFUSE_TEST` clear, write the address,
+    /// clear the read flag, poll the ready bit, return the data byte.
+    fn read_efuse_byte(&self, offset: u16) -> Result<u8, FaceError> {
+        let _ = self.read16(REG_EFUSE_TEST)?;
+        self.write16(REG_EFUSE_TEST, 0x0000)?;
+        self.write8(REG_EFUSE_CTRL + 1, (offset & 0xff) as u8)?;
+        let hi = self.read8(REG_EFUSE_CTRL + 2)?;
+        self.write8(REG_EFUSE_CTRL + 2, (((offset >> 8) & 0x03) as u8) | (hi & 0xfc))?;
+        let b3 = self.read8(REG_EFUSE_CTRL + 3)?;
+        self.write8(REG_EFUSE_CTRL + 3, b3 & 0x7f)?; // bit31=0 => request READ
+        let mut v = self.read32(REG_EFUSE_CTRL)?;
+        let mut retry = 0;
+        while (v >> 24) & 0x80 == 0 && retry < 10000 {
+            v = self.read32(REG_EFUSE_CTRL)?;
+            retry += 1;
+        }
+        let v = self.read32(REG_EFUSE_CTRL)?;
+        Ok((v & 0xff) as u8)
+    }
+
+    /// EFUSE read-access power switch (read side of `EfusePowerSwitch8812A`): grant
+    /// access, ensure the ELDR reset + loader/8M clocks are on.
+    fn efuse_power_switch(&self, on: bool) -> Result<(), FaceError> {
+        if on {
+            self.write8(REG_EFUSE_BURN_GNT_8812, EFUSE_ACCESS_ON_JAGUAR)?;
+            let fe = self.read16(REG_SYS_FUNC_EN)?;
+            if fe & FEN_ELDR == 0 {
+                self.write16(REG_SYS_FUNC_EN, fe | FEN_ELDR)?;
+            }
+            let clk = self.read16(REG_SYS_CLKR)?;
+            if clk & LOADER_CLK_EN == 0 || clk & ANA8M == 0 {
+                self.write16(REG_SYS_CLKR, clk | LOADER_CLK_EN | ANA8M)?;
+            }
+        } else {
+            self.write8(REG_EFUSE_BURN_GNT_8812, EFUSE_ACCESS_OFF_JAGUAR)?;
+        }
+        Ok(())
+    }
+
+    /// Read + decode the logical 512-byte EFUSE map (port of
+    /// `Hal_EfuseReadEFuse8812A`): walk the physical PG headers (plain + extended),
+    /// gather the enabled words into 64 sections × 4 word-units, flatten to bytes.
+    fn read_efuse_map(&self) -> Result<[u8; EFUSE_MAP_LEN_JAGUAR], FaceError> {
+        self.efuse_power_switch(true)?;
+        let mut words = [[0xffffu16; EFUSE_MAX_WORD_UNIT]; EFUSE_MAX_SECTION_JAGUAR];
+        let r = (|| -> Result<(), FaceError> {
+            let mut addr: u16 = 0;
+            let mut hdr = self.read_efuse_byte(addr)?;
+            if hdr == 0xff {
+                return Ok(()); // empty fuse
+            }
+            addr += 1;
+            while hdr != 0xff && addr < EFUSE_REAL_CONTENT_LEN_JAGUAR {
+                let offset: u8;
+                let mut wren: u8;
+                if hdr & 0x1f == 0x0f {
+                    // extended header: second byte carries offset[hi]|wren.
+                    let u1 = (hdr & 0xe0) >> 5;
+                    hdr = self.read_efuse_byte(addr)?;
+                    if hdr & 0x0f == 0x0f {
+                        addr += 1;
+                        hdr = self.read_efuse_byte(addr)?;
+                        if hdr != 0xff && addr < EFUSE_REAL_CONTENT_LEN_JAGUAR {
+                            addr += 1;
+                        }
+                        continue;
+                    }
+                    offset = ((hdr & 0xf0) >> 1) | u1;
+                    wren = hdr & 0x0f;
+                    addr += 1;
+                } else {
+                    offset = (hdr >> 4) & 0x0f;
+                    wren = hdr & 0x0f;
+                }
+                for i in 0..EFUSE_MAX_WORD_UNIT {
+                    if wren & 0x01 == 0 {
+                        let lo = self.read_efuse_byte(addr)?;
+                        addr += 1;
+                        if (offset as usize) < EFUSE_MAX_SECTION_JAGUAR {
+                            words[offset as usize][i] = lo as u16;
+                        }
+                        if addr >= EFUSE_REAL_CONTENT_LEN_JAGUAR {
+                            break;
+                        }
+                        let hi = self.read_efuse_byte(addr)?;
+                        addr += 1;
+                        if (offset as usize) < EFUSE_MAX_SECTION_JAGUAR {
+                            words[offset as usize][i] |= (hi as u16) << 8;
+                        }
+                        if addr >= EFUSE_REAL_CONTENT_LEN_JAGUAR {
+                            break;
+                        }
+                    }
+                    wren >>= 1;
+                }
+                hdr = self.read_efuse_byte(addr)?;
+                if hdr != 0xff && addr < EFUSE_REAL_CONTENT_LEN_JAGUAR {
+                    addr += 1;
+                }
+            }
+            Ok(())
+        })();
+        self.efuse_power_switch(false)?;
+        r?;
+        let mut map = [0u8; EFUSE_MAP_LEN_JAGUAR];
+        for i in 0..EFUSE_MAX_SECTION_JAGUAR {
+            for j in 0..EFUSE_MAX_WORD_UNIT {
+                map[i * 8 + j * 2] = (words[i][j] & 0xff) as u8;
+                map[i * 8 + j * 2 + 1] = ((words[i][j] >> 8) & 0xff) as u8;
+            }
+        }
+        Ok(map)
+    }
+
+    /// Read the EFUSE and parse this adapter's per-rate TX-power calibration into
+    /// [`Self::tx_power_info`] (port of `LoadTxPowerInfo`). After this, `set_tx_power`
+    /// references the chip's *fused* full-power point per channel/rate. Best-effort:
+    /// on a USB error the info stays unset and `set_tx_power` uses the flat fallback.
+    /// Run after the MAC is up (needs register access). Idempotent.
+    pub fn load_tx_power_info(&self) -> Result<(), FaceError> {
+        let map = self.read_efuse_map()?;
+        // Base cell fallback: an unprogrammed cell (>63) uses the vendor generic
+        // default, whose 2.4G/5G base bytes are all 0x2d (`kPgTxpwrDefGeneric`).
+        let read_base = |o: usize| -> u8 {
+            let v = map[o];
+            if v <= TXAGC_MAX { v } else { 0x2d }
+        };
+        let mut info = TxPowerInfo::zeroed();
+        let mut cck_g = [[0u8; 6]; 2];
+        let mut bw40_g = [[0u8; 6]; 2];
+        let mut bw40_5g_g = [[0u8; 14]; 2];
+        let mut off = PG_TXPWR_SADDR;
+        for path in 0..2 {
+            // ── 2.4G (18 bytes): 6 CCK base, 5 BW40 base, then per-Ntx diffs ──
+            for g in cck_g[path].iter_mut() {
+                *g = read_base(off);
+                off += 1;
+            }
+            for g in bw40_g[path].iter_mut().take(5) {
+                *g = read_base(off);
+                off += 1;
+            }
+            let v = map[off];
+            off += 1;
+            info.bw20_2g_diff[path][0] = pg_msb_diff(v);
+            info.ofdm_2g_diff[path][0] = pg_lsb_diff(v);
+            for t in 1..4 {
+                let v = map[off];
+                off += 1;
+                info.bw40_2g_diff[path][t] = pg_msb_diff(v);
+                info.bw20_2g_diff[path][t] = pg_lsb_diff(v);
+                let v = map[off];
+                off += 1;
+                info.ofdm_2g_diff[path][t] = pg_msb_diff(v);
+                info.cck_2g_diff[path][t] = pg_lsb_diff(v);
+            }
+            // ── 5G (24 bytes): 14 BW40 base, per-Ntx diffs, BW80 ──
+            for g in bw40_5g_g[path].iter_mut() {
+                *g = read_base(off);
+                off += 1;
+            }
+            let v = map[off];
+            off += 1;
+            info.bw20_5g_diff[path][0] = pg_msb_diff(v);
+            info.ofdm_5g_diff[path][0] = pg_lsb_diff(v);
+            for t in 1..4 {
+                let v = map[off];
+                off += 1;
+                info.bw40_5g_diff[path][t] = pg_msb_diff(v);
+                info.bw20_5g_diff[path][t] = pg_lsb_diff(v);
+            }
+            let v = map[off];
+            off += 1;
+            info.ofdm_5g_diff[path][1] = pg_msb_diff(v);
+            info.ofdm_5g_diff[path][2] = pg_lsb_diff(v);
+            let v = map[off];
+            off += 1;
+            info.ofdm_5g_diff[path][3] = pg_lsb_diff(v);
+            for t in 0..4 {
+                let v = map[off];
+                off += 1;
+                info.bw80_5g_diff[path][t] = pg_msb_diff(v);
+            }
+        }
+        // Scatter per-group bases to per-channel (Stage 2 of hal_load_txpwr_info).
+        for path in 0..2 {
+            for ch_idx in 0..14 {
+                if let Some((0, group, cck_group)) = classify_channel((ch_idx + 1) as u8) {
+                    info.cck_base_2g[path][ch_idx] = cck_g[path][cck_group as usize];
+                    info.bw40_base_2g[path][ch_idx] = bw40_g[path][group as usize];
+                }
+            }
+            for ch_idx in 0..65 {
+                if let Some((1, group, _)) = classify_channel(CENTER_CH_5G[ch_idx]) {
+                    info.bw40_base_5g[path][ch_idx] = bw40_5g_g[path][group as usize];
+                }
+            }
+        }
+        if std::env::var("NDN_TXPWR_DBG").is_ok() {
+            let ch = self.cur_channel.load(std::sync::atomic::Ordering::Relaxed);
+            eprintln!(
+                "TXPWR8812 efuse[0x10..0x22]={:02x?} ch{ch}: A OFDM base={} CCK base={} | B OFDM base={}",
+                &map[0x10..0x22],
+                info.index_base(0, 0x0c, 0, 0, ch.max(1)),
+                info.index_base(0, 0x02, 0, 0, ch.max(1)),
+                info.index_base(1, 0x0c, 0, 0, ch.max(1)),
+            );
+        }
+        *self.tx_power_info.lock().unwrap() = Some(info);
+        Ok(())
+    }
+
+    /// Set the TX power. `idx` is a TXAGC target where **63 = the adapter's fused
+    /// full-power point** and each step down is ~0.5 dB (matching the cognition
+    /// policy's `DB_PER_POWER_IDX`).
+    ///
+    /// When [`load_tx_power_info`](Self::load_tx_power_info) has read the EFUSE, this
+    /// folds `idx` as an offset onto the per-rate **calibrated base** for the current
+    /// channel — so the output is referenced to *this* adapter's characterized power,
+    /// per rate group, on both RF paths (the devourer `ComputeTxPowerIndex` model:
+    /// base + offset, clamped 0..63). Without a fuse read it falls back to writing the
+    /// flat index (uncalibrated, but still makes the otherwise-silent PA radiate).
+    ///
+    /// Registers: the 8812A power-by-rate `rTxAGC_*_JAguar` at `0xC2x` (path A) /
+    /// `0xE2x` (path B). The BB **TX swing** (`0xC1C[31:21]`) is a per-band constant
+    /// the channel tables program, not this knob.
     pub fn set_tx_power(&self, idx: u8) -> Result<(), FaceError> {
+        let idx = idx.min(TXAGC_MAX);
+        {
+            let guard = self.tx_power_info.lock().unwrap();
+            let ch = self.cur_channel.load(std::sync::atomic::Ordering::Relaxed);
+            if let (Some(info), true) = (guard.as_ref(), ch != 0) {
+                let offset = idx as i32 - TXAGC_MAX as i32; // 0 at full, negative = backoff
+                // (path-A reg, path-B reg, representative MGN_* rate) per group.
+                let groups = [
+                    (0xc20u16, 0xe20u16, 0x02u8), // CCK 11-1
+                    (0xc24, 0xe24, 0x0c),         // OFDM 18-6
+                    (0xc28, 0xe28, 0x30),         // OFDM 54-24
+                    (0xc2c, 0xe2c, 0x80),         // MCS 3-0
+                    (0xc30, 0xe30, 0x84),         // MCS 7-4
+                ];
+                for (reg_a, reg_b, rate) in groups {
+                    for (path, reg) in [(0usize, reg_a), (1usize, reg_b)] {
+                        let base = info.index_base(path, rate, 0, 0, ch) as i32;
+                        let v = (base + offset).clamp(0, TXAGC_MAX as i32) as u8;
+                        self.write32(reg, u32::from_le_bytes([v, v, v, v]))?;
+                    }
+                }
+                return Ok(());
+            }
+        }
+        // Uncalibrated fallback: flat index on every rate/path.
+        self.set_tx_power_raw(idx)
+    }
+
+    /// Write the **raw** TXAGC index `idx` (0–63) to every per-rate register on both
+    /// paths, bypassing the EFUSE regulatory calibration. `set_tx_power` caps output
+    /// at the fused *regulatory* base (≈ index 27 on this ch6 adapter); this reaches
+    /// the chip's full range for **rated/max output** or bench characterization.
+    ///
+    /// On-air (#38, conducted SDR, randomized+replicated, 40 dB SNR): the register→
+    /// power transfer is monotone over the full 0–63 span, ~33 dB range, with the step
+    /// **accelerating 0.5→1.0 dB/idx** up the range (the documented Realtek TXAGC
+    /// non-linearity). ⚠️ Above the regulatory base this can exceed the licensed EIRP —
+    /// an explicit operator/bench opt-in, not for unattended regulatory operation.
+    pub fn set_tx_power_raw(&self, idx: u8) -> Result<(), FaceError> {
+        let idx = idx.min(TXAGC_MAX);
         let w = u32::from_le_bytes([idx, idx, idx, idx]);
-        // CCK, OFDM18-6, OFDM54-24, MCS3-0, MCS7-4 — paths A (0xC2x) and B (0xE2x).
         for reg in [
             0xc20u16, 0xc24, 0xc28, 0xc2c, 0xc30, 0xe20, 0xe24, 0xe28, 0xe2c, 0xe30,
         ] {
             self.write32(reg, w)?;
         }
         Ok(())
+    }
+
+    /// Force **both** antenna paths to transmit (rTxPath_Jaguar `0x80C` low word =
+    /// 0x3333 = A+B for every rate group). A legacy-OFDM frame is otherwise single-
+    /// stream on path A; enabling 2T drives both PAs (more radiated power + the second
+    /// connector carries signal). Call after channel setup.
+    pub fn set_tx_2t(&self, on: bool) -> Result<(), FaceError> {
+        let cur = self.read32(0x80c)?;
+        let low = if on { 0x3333 } else { 0x1111 };
+        self.write32(0x80c, (cur & 0xffff_0000) | low)
     }
 
     /// Make the name-group hash a **hardware receive filter**: restrict the chip's
@@ -5449,12 +6017,41 @@ impl Rtl8812auBackend {
         self.bb_config()?;
         self.rf_config()?;
         self.set_channel(channel)?;
+        // Read the EFUSE TX-power calibration so `set_tx_power` is referenced to this
+        // adapter's fused full-power point (best-effort: falls back to a flat index if
+        // the fuse read fails). Must precede set_tx_power.
+        let _ = self.load_tx_power_info();
         // TXAGC: without this the TXAGC registers sit at their reset default (~0), so injected
         // frames leave the PA at essentially zero power — the frame is built + queued but never
-        // radiates decodably (SDR-confirmed: no on-air energy until this is set). A mid-high
-        // uniform index gives real range for a monitor/broadcast face.
+        // radiates decodably (SDR-confirmed: no on-air energy until this is set). idx=0x3f = the
+        // fused full-power point (calibrated) or a flat mid-high index (fallback).
         self.set_tx_power(0x3f)?;
-        let _ = self.iq_calibrate(); // best-effort; tunes RX EVM, not the on-air gate
+        // Monitor injection must not defer to energy-detect carrier sense: the reset
+        // default can leave the TX engine holding frames when the channel reads "busy".
+        // Blast regardless (cognition can re-arm EDCCA via `set_edcca_ignore`).
+        let _ = self.disable_edcca();
+        // IQK is best-effort (tunes RX EVM, not the on-air gate) but each RX path only
+        // converges marginally — one of the two per attempt, alternating (measured on
+        // 5 GHz). The vendor retries the whole IQK up to 3× for exactly this; do the same
+        // and keep re-running until BOTH RX paths lock (the last run's corrections are the
+        // ones left applied), so 5 GHz HT-MCS demod gets a fully-calibrated RX. Falls
+        // through after the cap with whatever the best-effort last attempt produced.
+        let mut iqk = self.iq_calibrate();
+        for _ in 0..5 {
+            match &iqk {
+                Ok(r) if r.tx_a && r.rx_a && r.tx_b && r.rx_b => break,
+                _ => iqk = self.iq_calibrate(),
+            }
+        }
+        match iqk {
+            Ok(r) => tracing::info!(
+                target: "named_radio",
+                tx_a = r.tx_a, rx_a = r.rx_a, tx_b = r.tx_b, rx_b = r.rx_b,
+                ch = self.cur_channel.load(std::sync::atomic::Ordering::Relaxed),
+                "8812au IQK done"
+            ),
+            Err(e) => tracing::warn!(target: "named_radio", error = ?e, "8812au IQK failed"),
+        }
         let _ = self.lc_calibrate();
         self.start_rx_dma()?;
         Ok(())
@@ -5503,6 +6100,18 @@ impl Rtl8812auBackend {
             if end > n - off {
                 break;
             }
+            // Pre-CRC debug: CRC-failed frames are dropped below, so they never reach the
+            // post-parse `RX8812AU` log — but their *rate* tells whether an HT frame arrived
+            // and failed demod (IQK/EVM issue) vs never arrived (tuning/sensitivity). Logged
+            // separately so the 5 GHz HT-RX diagnosis can tell the two apart.
+            if crc_err && !rpt_sel && std::env::var("NDN_RX_META_DBG").is_ok() {
+                let rate = (u32::from_le_bytes([d[12], d[13], d[14], d[15]]) & 0x7f) as u8;
+                let rssi = (drvinfo >= 1 && rate >= 0x04)
+                    .then(|| realtek_rx::rssi_dbm(d[RXDESC_SIZE + 1]));
+                let w3 = u32::from_le_bytes([d[12], d[13], d[14], d[15]]);
+                let w4 = u32::from_le_bytes([d[16], d[17], d[18], d[19]]);
+                eprintln!("RX8812AU_CRCERR len={pkt_len} rate=0x{rate:02x} rssi={rssi:?} w3={w3:08x} w4={w4:08x}");
+            }
             if !crc_err && !rpt_sel && pkt_len >= DOT11_HDR_LEN {
                 let body = &d[start..end];
                 // Same Realtek RX-descriptor field interpretation as the sibling backends
@@ -5512,17 +6121,40 @@ impl Rtl8812auBackend {
                 let mcs_index = realtek_rx::mcs_from_desc_rate(rate);
                 let rssi_dbm = (drvinfo >= 1 && rate >= 0x04)
                     .then(|| realtek_rx::rssi_dbm(d[RXDESC_SIZE + 1]));
-                let stamp = Some(realtek_rx::rx_stamp(
-                    u32::from_le_bytes([d[20], d[21], d[22], d[23]]),
-                    self.tsf_domain,
-                ));
+                let rxtsfl = u32::from_le_bytes([d[20], d[21], d[22], d[23]]);
+                let stamp = Some(realtek_rx::rx_stamp(rxtsfl, self.tsf_domain));
+                // #75 mesh common-view leaf: a locally-administered BEACON (FC 0x80) carries a
+                // neighbour's HW TSF at body[24:32] and its network-time belief at body[32:49]. Pair with
+                // our RXTSFL; lets this 8812au (e.g. an Alfa) compose network time as a receive-only node.
+                if body.len() >= 32 && body[0] == 0x80 {
+                    let mut bssid = [0u8; 6];
+                    bssid.copy_from_slice(&body[16..22]);
+                    if bssid[0] & 0x02 != 0 {
+                        let btsf = u64::from_le_bytes(body[24..32].try_into().unwrap());
+                        let belief = body
+                            .get(32..32 + ndn_time::REF_BELIEF_BYTES)
+                            .and_then(ndn_time::RefBelief::from_beacon_bytes);
+                        if let Ok(mut cv) = self.mesh_cv.lock() {
+                            let count = cv.map(|c: ndn_radio_hal::MeshCv| c.count).unwrap_or(0) + 1;
+                            *cv = Some(ndn_radio_hal::MeshCv {
+                                peer_tsf: btsf,
+                                our_rxtsfl: rxtsfl as u64,
+                                count,
+                                bssid,
+                                belief,
+                            });
+                        }
+                    }
+                }
                 // Raw capture debug (pre-parse): shows every 802.11 frame the chip delivered,
                 // independent of whether parse_dot11 accepts it — isolates RX-capture vs RX-parse.
                 // First 2 header bytes (frame-control) + first payload byte after the 24-B hdr.
                 if std::env::var("NDN_RX_META_DBG").is_ok() {
                     let fc = if body.len() >= 2 { (body[0], body[1]) } else { (0, 0) };
+                    let w3 = u32::from_le_bytes([d[12], d[13], d[14], d[15]]);
+                    let w4 = u32::from_le_bytes([d[16], d[17], d[18], d[19]]);
                     eprintln!(
-                        "RX8812AU len={pkt_len} rate=0x{rate:02x} rssi={rssi_dbm:?} fc={:02x}{:02x}",
+                        "RX8812AU len={pkt_len} rate=0x{rate:02x} rssi={rssi_dbm:?} fc={:02x}{:02x} w3={w3:08x} w4={w4:08x}",
                         fc.0, fc.1
                     );
                 }
@@ -5620,6 +6252,10 @@ impl crate::rx_pump::Pumpable for Rtl8812auBackend {
 /// USB I/O runs on the blocking pool so the async reactor is never stalled.
 #[async_trait]
 impl FrameIo for Rtl8812auBackend {
+    fn mesh_common_view(&self) -> Option<ndn_radio_hal::MeshCv> {
+        self.mesh_cv.lock().ok().and_then(|g| *g)
+    }
+
     async fn inject(&self, frame: InjectFrame) -> Result<(), FaceError> {
         // Build the on-air 802.11 frame under the configured format (Raw80211 = the payload IS the
         // frame, verbatim, the NAN path; RawNdn = wrap the NDN payload in an 802.11 data frame),
@@ -5673,18 +6309,10 @@ impl FrameIo for Rtl8812auBackend {
     }
 }
 
-#[async_trait]
-impl crate::WifiRadio for Rtl8812auBackend {
-    async fn inject_at(
-        &self,
-        frame: InjectFrame,
-        _mcs: crate::McsDescriptor,
-    ) -> Result<(), FaceError> {
-        // Whole-frame legacy 6 Mbps injection (NAN management frames); the exact
-        // HT/VHT rate does not apply, so it is ignored — same as `inject`.
-        self.inject(frame).await
-    }
-}
+// Marker only: this backend injects whole-frame legacy 6 Mbps (NAN management
+// frames), so the exact HT/VHT rate does not apply — `set_rate` (the FrameIo default
+// no-op) and the derived `inject_at` both just inject.
+impl crate::WifiRadio for Rtl8812auBackend {}
 
 /// Exposes the always-on free-run per-frame RX-stamp clock (RXTSFL) now latched onto every
 /// received management frame. No read-now port TSF here, so `read_clock` stays the default `None`.

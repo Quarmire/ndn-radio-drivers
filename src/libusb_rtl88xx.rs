@@ -314,7 +314,7 @@ pub struct LibUsbRtl88xxBackend {
     /// locally-administered BSSID (bit 0x02 of the first octet), i.e. our own ephemeral-nonce nodes,
     /// not infrastructure APs. This is what a self-contained mesh disciplines its clock to; the
     /// unfiltered `beacon_cv` is the measurement instrument. See [`mesh_common_view`](Self::mesh_common_view).
-    mesh_cv: std::sync::Mutex<Option<(u64, u64, u64, [u8; 6])>>,
+    mesh_cv: std::sync::Mutex<Option<ndn_radio_hal::MeshCv>>,
 }
 
 impl LibUsbRtl88xxBackend {
@@ -5114,9 +5114,20 @@ impl LibUsbRtl88xxBackend {
                 // Mesh clock source: only a locally-administered BSSID (0x02 bit) — our own ephemeral-
                 // nonce nodes, never an infrastructure AP. This is what the scheduler disciplines to.
                 if bssid[0] & 0x02 != 0 {
+                    // #75: the emitter's advertised network-time belief, if the beacon carried one after
+                    // its 8-byte timestamp (body offset 8 = frame offset 32).
+                    let belief = frame
+                        .get(32..32 + ndn_time::REF_BELIEF_BYTES)
+                        .and_then(ndn_time::RefBelief::from_beacon_bytes);
                     if let Ok(mut cv) = self.mesh_cv.lock() {
-                        let count = cv.map(|(.., c, _)| c).unwrap_or(0) + 1;
-                        *cv = Some((btsf, dw(0x14) as u64, count, bssid));
+                        let count = cv.map(|c: ndn_radio_hal::MeshCv| c.count).unwrap_or(0) + 1;
+                        *cv = Some(ndn_radio_hal::MeshCv {
+                            peer_tsf: btsf,
+                            our_rxtsfl: dw(0x14) as u64,
+                            count,
+                            bssid,
+                            belief,
+                        });
                     }
                 }
             }
@@ -5233,7 +5244,7 @@ impl FrameIo for LibUsbRtl88xxBackend {
         Ok(())
     }
 
-    fn mesh_common_view(&self) -> Option<(u64, u64, u64, [u8; 6])> {
+    fn mesh_common_view(&self) -> Option<ndn_radio_hal::MeshCv> {
         self.mesh_cv.lock().ok().and_then(|g| *g)
     }
 

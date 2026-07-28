@@ -42,7 +42,9 @@ use rusb::{Context, Device, DeviceHandle, Direction, TransferType, UsbContext};
 use ndn_transport::FaceError;
 
 use crate::frame::{self, LLC_SNAP_PREFIX};
+use crate::realtek_rx;
 use crate::{CapturedFrame, FrameFormat, FrameIo, InjectFrame};
+use ndn_frame_io::ClockDomainId;
 
 mod coex;
 mod efuse;
@@ -161,6 +163,9 @@ pub struct Rtl8821cuBackend {
     bulk_in: u8,
     format: FrameFormat,
     seq: AtomicU16,
+    /// Current transmit rate as state ([`FrameIo::set_rate`]); `None` ⇒ resolve the
+    /// frame's intent. Retires the per-frame `inject_at` path.
+    cur_mcs: std::sync::Mutex<Option<crate::McsDescriptor>>,
     /// Monotonic H2C packet sequence (firmware echoes it; must increment).
     h2c_seq: AtomicU16,
     /// Round-robin HMEBOX index (0-3) for the H2C mailbox path.
@@ -187,6 +192,9 @@ pub struct Rtl8821cuBackend {
     /// Count of every raw 802.11 RX unit seen on bulk-IN (before any NDN
     /// filtering) — the honest "is the receiver working at all" metric.
     rx_raw_count: std::sync::atomic::AtomicU64,
+    /// Per-device TSF clock domain (`bus<<8 | address`) — the identity every RX hardware stamp is
+    /// keyed on, so a receiver's [`CapturedFrame::stamp`] is comparable only within this device (#41).
+    tsf_domain: ClockDomainId,
 }
 
 impl Rtl8821cuBackend {
@@ -227,6 +235,9 @@ impl Rtl8821cuBackend {
     }
 
     fn claim(device: Device<Context>) -> Result<Self, FaceError> {
+        // Per-device TSF clock domain (bus<<8 | address) — read before the device is opened (#41).
+        let tsf_domain =
+            ClockDomainId((u32::from(device.bus_number()) << 8) | u32::from(device.address()));
         let handle = Arc::new(device.open().map_err(usb_err)?);
         let _ = handle.set_auto_detach_kernel_driver(true);
         let config = device.active_config_descriptor().map_err(usb_err)?;
@@ -286,6 +297,7 @@ impl Rtl8821cuBackend {
             bulk_in: bulk_in.unwrap(),
             format: FrameFormat::default(),
             seq: AtomicU16::new(0),
+            cur_mcs: std::sync::Mutex::new(None),
             h2c_seq: AtomicU16::new(0),
             h2c_box: AtomicU8::new(0),
             cur_channel: AtomicU8::new(0),
@@ -298,6 +310,7 @@ impl Rtl8821cuBackend {
             rx_pumped: std::sync::atomic::AtomicBool::new(false),
             rx_notify: tokio::sync::Notify::new(),
             rx_raw_count: std::sync::atomic::AtomicU64::new(0),
+            tsf_domain,
         })
     }
 
@@ -1169,7 +1182,11 @@ impl Rtl8821cuBackend {
         let body = &buf[off + hdr_off..off + hdr_off + pkt_len];
         // Strip the trailing FCS (4 bytes) that monitor RX appends.
         let body = if body.len() >= 4 { &body[..body.len() - 4] } else { body };
-        let decoded = frame::parse_dot11(self.format, body, rssi, Some(rate), None)
+        // #41: per-frame hardware RX timestamp — RX descriptor dword5 (bytes 20-23) is the free-run
+        // RX TSF-low latched at MAC-done (RXTSFL, µs). Same 88xx layout as the 8733b/8812au backends.
+        let rxtsfl = u32::from_le_bytes([d[20], d[21], d[22], d[23]]);
+        let stamp = Some(realtek_rx::rx_stamp(rxtsfl, self.tsf_domain));
+        let decoded = frame::parse_dot11(self.format, body, rssi, Some(rate), stamp)
             .into_iter()
             .collect();
         Some((decoded, stride.max(8)))
@@ -1300,9 +1317,15 @@ impl Rtl8821cuBackend {
 #[async_trait]
 impl FrameIo for Rtl8821cuBackend {
     async fn inject(&self, frame: InjectFrame) -> Result<(), FaceError> {
-        let mcs = crate::McsDescriptor::for_intent(&frame.tx, crate::MAX_RELIABLE_MCS, true);
+        let mcs = self.resolved_mcs(&frame);
         let buf = self.build_tx(&frame, mcs)?;
         self.send(buf).await
+    }
+
+    /// Rate as bearer state: store the exact MCS every subsequent `inject` uses.
+    fn set_rate(&self, mcs: crate::McsDescriptor) -> Result<(), FaceError> {
+        *self.cur_mcs.lock().unwrap() = Some(mcs);
+        Ok(())
     }
 
     async fn recv_frame(&self) -> Result<CapturedFrame, FaceError> {
@@ -1360,14 +1383,16 @@ impl FrameIo for Rtl8821cuBackend {
     }
 }
 
-#[async_trait]
-impl crate::WifiRadio for Rtl8821cuBackend {
-    async fn inject_at(
-        &self,
-        frame: InjectFrame,
-        mcs: crate::McsDescriptor,
-    ) -> Result<(), FaceError> {
-        let buf = self.build_tx(&frame, mcs)?;
-        self.send(buf).await
+// Marker only: `inject_at` is the derived HAL default (`set_rate` + `inject`).
+impl crate::WifiRadio for Rtl8821cuBackend {}
+
+impl Rtl8821cuBackend {
+    /// The rate to transmit `frame` at: the control-plane-set MCS (state) if present,
+    /// else the frame's intent resolved to this radio.
+    fn resolved_mcs(&self, frame: &InjectFrame) -> crate::McsDescriptor {
+        self.cur_mcs
+            .lock()
+            .unwrap()
+            .unwrap_or_else(|| crate::McsDescriptor::for_intent(&frame.tx, crate::MAX_RELIABLE_MCS, true))
     }
 }

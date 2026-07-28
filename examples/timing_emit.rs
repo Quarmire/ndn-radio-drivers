@@ -45,27 +45,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok()
         .and_then(|s| u16::from_str_radix(s.trim_start_matches("0x"), 16).ok())
         .unwrap_or(0xa81a);
-    let period_ms: u64 = std::env::var("NDN_EMIT_MS").ok().and_then(|s| s.parse().ok()).unwrap_or(50);
+    let period_ms: u64 = std::env::var("NDN_EMIT_MS").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
 
     let d = Arc::new(LibUsbRtl88xxBackend::open_monitor_pid(pid, ch)?);
     let bssid = BSSID.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(":");
     println!("timing_emit: pid={pid:04x} ch{ch} bssid={bssid} — on-demand HW-stamped frames every {period_ms}ms for {secs}s");
 
     let frame = timing_beacon();
-    let deadline = Instant::now() + Duration::from_secs(secs);
+    // Arm the beacon engine once — the hardware then transmits this frame every TBTT (the beacon
+    // interval), stamping body[24:31] with the live TSF. `period_ms=0` (default) = arm once and let the
+    // TBTT run; `period_ms>0` re-arms/re-loads at that cadence (a keepalive / content refresh).
     let (mut ok, mut err) = (0u64, 0u64);
-    while Instant::now() < deadline {
-        match d.emit_timing_frame(&frame) {
-            Ok(()) => ok += 1,
-            Err(e) => {
-                if err == 0 {
-                    eprintln!("emit_timing_frame error: {e:?}");
-                }
-                err += 1;
-            }
-        }
-        std::thread::sleep(Duration::from_millis(period_ms));
+    match d.emit_timing_frame(&frame) {
+        Ok(()) => ok += 1,
+        Err(e) => { eprintln!("emit_timing_frame error: {e:?}"); err += 1; }
     }
-    println!("emitted={ok} errors={err}  (receiver runs beacon_cv; look for bssid {bssid})");
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    while Instant::now() < deadline {
+        if period_ms > 0 {
+            std::thread::sleep(Duration::from_millis(period_ms));
+            match d.emit_timing_frame(&frame) {
+                Ok(()) => ok += 1,
+                Err(_) => err += 1,
+            }
+        } else {
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
+    // On-demand hygiene: disarm the beacon queue so it stops airing once we're done.
+    let _ = d.stop_timing_beacon();
+    println!("armed={ok} errors={err}  (TBTT airs it every {}TU; receiver runs beacon_cv, look for {bssid})",
+        std::env::var("NDN_BCN_SPACE").unwrap_or_else(|_| "100".into()));
     Ok(())
 }

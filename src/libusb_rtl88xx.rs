@@ -1531,34 +1531,62 @@ impl LibUsbRtl88xxBackend {
     /// protect reserved-page writes; real APs use it — measured 0.26–1.15 µs RX floor). Left as the
     /// documented next step; do not treat as a working clock source until a peer confirms our BSSID airs.
     pub fn emit_timing_frame(&self, frame: &[u8]) -> Result<(), FaceError> {
-        // EN_BCN_FUNCTION (bit3) on so the TSF runs; DIS_TSF_UDT (bit4) OFF so the MAC updates the
-        // beacon-body timestamp at TX instead of preserving it.
-        let bcn = self.read8(REG_BCN_CTRL)?;
-        self.write8(REG_BCN_CTRL, (bcn | (1 << 3)) & !(1 << 4))?;
-        // AdHoc media status (MSR bits[1:0]=01): the beacon function only transmits in a beaconing role.
+        const REG_MBSSID_BCN_SPACE: u16 = 0x0554;
+        const REG_TXPAUSE: u16 = 0x0522;
+        const EN_BCN_FUNCTION: u8 = 1 << 3; // REG_BCN_CTRL 0x0550
+        const DIS_TSF_UDT: u8 = 1 << 4; // REG_BCN_CTRL 0x0550
+        const ENSWBCN: u8 = 1 << 0; // REG_CR+1 0x0101
+        const EN_BCNQ_DL: u8 = 1 << 6; // REG_FWHW_TXQ_CTRL+2 0x0422 (= 0x0420 bit22)
+        const BIT_HIGH_QUEUE: u8 = 1 << 5; // REG_TXPAUSE
+
+        // Beacon role (rtw_ops_add_interface): EN_BCN_FUNCTION | DIS_TSF_UDT. The TX-time Timestamp
+        // insertion into body[24:31] is a *separate always-on* HW function — DIS_TSF_UDT only stops a
+        // RECEIVED beacon from resetting our local TSF (which would jerk our TBTT phase). So both bits.
+        let bcn_backup = self.read8(REG_BCN_CTRL)?;
+        // AdHoc media status (MSR bits[1:0]=01) so the port beacons.
         let msr = (self.read8(0x0102)? & !0x03) | 0x01;
         self.write8(0x0102, msr)?;
-        // REG_MBSSID_BCN_SPACE (0x0554) = beacon interval (TU). init_edca_cfg sets the TBTT sub-timers
-        // (DRVERLYINT/BCNDMATIM) but NOT the interval, so the TBTT never fires. Set it so the beacon
-        // timer transmits our loaded page.
+        // Beacon interval (TU) = the TBTT period. init_edca_cfg leaves it unset.
         let tu: u16 = std::env::var("NDN_BCN_SPACE").ok().and_then(|s| s.parse().ok()).unwrap_or(100);
-        self.write16(0x0554, tu)?;
-        // Load the beacon to page 0 and LEAVE the engine armed — unlike dl_rsvd_page (a reserved-page
-        // *download* that restores the beacon head to the reserved boundary, so the TBTT would air the
-        // firmware page, not ours), we point the beacon head at our page and leave ENSWBCN set, so the
-        // MAC's beacon timer transmits *our* frame each TBTT — stamping body[24:31] with the live TSF.
-        self.write16(REG_FIFOPAGE_CTRL_2, 1 << 15)?; // head = page 0, clear BCN_VALID
+        self.write16(REG_MBSSID_BCN_SPACE, tu)?;
+
+        // Download the beacon to the RESERVED BOUNDARY page — where the beacon queue DMAs from
+        // (priority_queue_cfg set REG_BCNQ_BDNY_V1 0x0424 / 0x0204 = RSVD_BOUNDARY), NOT page 0.
+        // rtw_fw_write_data_rsvd_page: head→rsvd_boundary + clear BCN_VALID; ENSWBCN; beacon function
+        // OFF during the write; send; poll BCN_VALID; restore head, ENSWBCN, and the beacon role.
+        self.write16(REG_FIFOPAGE_CTRL_2, (Self::RSVD_BOUNDARY & 0x0fff) | (1 << 15))?;
         let cr1 = self.read8(REG_CR + 1)?;
-        self.write8(REG_CR + 1, cr1 | (1 << 0))?; // ENSWBCN
-        let txq = self.read8(REG_FWHW_TXQ_CTRL + 2)?;
-        self.write8(REG_FWHW_TXQ_CTRL + 2, txq & !(1 << 6))?; // un-gate HW beacon-Q
+        self.set8(REG_CR + 1, ENSWBCN)?;
+        self.write8(REG_BCN_CTRL, (bcn_backup & !EN_BCN_FUNCTION) | DIS_TSF_UDT)?;
         self.send_beacon_queue_pkt(frame)?;
+        let mut valid = false;
         for _ in 0..1000 {
             if self.read8(REG_FIFOPAGE_CTRL_2 + 1)? & (1 << 7) != 0 {
-                break; // BCN_VALID
+                valid = true;
+                break;
             }
         }
+        self.write16(REG_FIFOPAGE_CTRL_2, (Self::RSVD_BOUNDARY & 0x0fff) | (1 << 15))?;
+        self.write8(REG_CR + 1, cr1)?;
+        self.write8(REG_BCN_CTRL, bcn_backup | EN_BCN_FUNCTION | DIS_TSF_UDT)?;
+        if !valid {
+            return Err(init_err("rtl88xx timing beacon: BCN_VALID poll timeout".into()));
+        }
+
+        // THE step that was missing: arm periodic TBTT transmission. EN_BCNQ_DL (0x0422 bit6) SET arms
+        // the beacon queue for the MAC's TBTT DMA (rtw88 BSS_CHANGED_BEACON_ENABLED / rtl8xxxu
+        // start_tx_beacon). My earlier code CLEARED it (inverted comment) — that gated the queue OFF.
+        self.set8(REG_FWHW_TXQ_CTRL + 2, EN_BCNQ_DL)?;
+        // Un-pause the high/beacon queue (rtw_core_enable_beacon clears TXPAUSE BIT_HIGH_QUEUE).
+        self.clr8(REG_TXPAUSE, BIT_HIGH_QUEUE)?;
         Ok(())
+    }
+
+    /// Stop beacon transmission: clear `EN_BCNQ_DL` (the TBTT-DMA arm) so no further beacons air. Pairs
+    /// with [`emit_timing_frame`](Self::emit_timing_frame) for on-demand single-shot use — arm, let one
+    /// TBTT fire, disarm — rather than a free-running periodic beacon (rtl8xxxu `stop_tx_beacon`).
+    pub fn stop_timing_beacon(&self) -> Result<(), FaceError> {
+        self.clr8(REG_FWHW_TXQ_CTRL + 2, 1 << 6)
     }
 
     /// `usb_write_data_not_xmitframe` (beacon qsel): prepend the 48-byte TX

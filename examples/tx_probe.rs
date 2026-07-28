@@ -31,27 +31,47 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("tx_probe role={role} pid=0x{pid:04x} ch{ch} secs={secs} tag={tag}");
 
     if role == "tx" {
+        // TX-only sender (never runs a concurrent RX task, so it can't hit the a81a's TX+RX libusb
+        // contention). NDN_MODE=slotted → transmit only in this node's slot of an N=3 superframe (all
+        // three disjoint, collision-free); NDN_MODE=contention → transmit a random ~1/3 of slots
+        // (independent → same-slot collisions ~2/9). A neutral RX observer compares total received.
+        let slotted = env("NDN_MODE").as_deref() != Some("contention");
+        let slot_us: u64 = env("NDN_SLOT_US").and_then(|s| s.parse().ok()).unwrap_or(20_000);
+        let my_slot = (tag as u64) % 3;
+        let mut rng: u64 = (std::process::id() as u64).wrapping_mul(0x9E37_79B9) ^ (tag as u64 + 1);
+        let mut coin = || { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; rng % 3 == my_slot };
         let src = [0x02, b'M', b'D', b'R', tag, 0x01];
         let pad = vec![0u8; 900];
         let mut sent = 0u64;
         let mut last = Instant::now();
+        let (mut cur_epoch, mut tx_this) = (u64::MAX, false);
+        let now_us = || std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_micros() as u64).unwrap_or(0);
         while Instant::now() < deadline {
-            let mut payload = Vec::with_capacity(902);
-            payload.push(0xA0 | tag);
-            payload.push(tag);
-            payload.extend_from_slice(&pad);
-            // Bound each inject so a blocking write can't wedge the loop silently — we want to SEE the rate.
-            match tokio::time::timeout(Duration::from_millis(200),
-                d.inject(InjectFrame { payload: payload.into(), tx: TxIntent::CONSERVATIVE, dst: BROADCAST, src })).await {
-                Ok(_) => sent += 1,
-                Err(_) => {} // inject exceeded 200ms — FIFO stalled; keep counting elapsed
+            let epoch = now_us() / slot_us;
+            if epoch != cur_epoch {
+                cur_epoch = epoch;
+                tx_this = if slotted { epoch % 3 == my_slot } else { coin() };
+            }
+            if !tx_this {
+                tokio::time::sleep(Duration::from_micros(500)).await;
+            } else {
+                let mut payload = Vec::with_capacity(902);
+                payload.push(0xA0 | tag);
+                payload.push(tag);
+                payload.extend_from_slice(&pad);
+                match tokio::time::timeout(Duration::from_millis(200),
+                    d.inject(InjectFrame { payload: payload.into(), tx: TxIntent::CONSERVATIVE, dst: BROADCAST, src })).await {
+                    Ok(_) => sent += 1,
+                    Err(_) => {}
+                }
+                tokio::task::yield_now().await;
             }
             if last.elapsed() >= Duration::from_secs(1) {
-                println!("  TX sent={sent} ({:.0}/s)", sent as f64 / (secs as f64 - deadline.saturating_duration_since(Instant::now()).as_secs_f64()).max(0.001));
+                println!("  TX sent={sent} mode={}", if slotted { "slotted" } else { "contention" });
                 last = Instant::now();
             }
         }
-        println!("=== TX DONE sent={sent} ===");
+        println!("=== TX DONE sent={sent} mode={} ===", if slotted { "slotted" } else { "contention" });
     } else {
         let counts = [Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0))];
         let rx = {

@@ -25,7 +25,7 @@ fn now_us() -> u64 { SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_m
 struct Rng(u64);
 impl Rng { fn coin(&mut self) -> bool { let mut x=self.0; x^=x<<13; x^=x>>7; x^=x<<17; self.0=x; x&1==0 } }
 
-#[tokio::main(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ch: u8 = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(40);
     let secs: u64 = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(22);
@@ -66,6 +66,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                 }
+                // Cooperate: under a flooded RX queue `recv_frame` returns instantly every time, so
+                // without an explicit yield this task never releases the worker and starves the TX
+                // loop's inject (the a81a's heavier RX volume made this fatal on a 2-worker runtime).
+                tokio::task::yield_now().await;
             }
         })
     };
@@ -93,11 +97,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tokio::time::sleep(Duration::from_micros(500)).await;
         }
     }
-    let _ = rx.await;
+    // Don't block shutdown on the background RX task — the counters are shared atomics, so read them
+    // directly and let process exit drop the task. (Awaiting a hot RX task that shares the USB handle
+    // with a saturating TX loop could stall at shutdown; the tally is already in the atomics.)
+    rx.abort();
 
     let (r0, r1, r2) = (recv[0].load(Ordering::Relaxed), recv[1].load(Ordering::Relaxed), recv[2].load(Ordering::Relaxed));
     let peers: u64 = r0 + r1 + r2;
     println!("=== node={node} mode={} === sent={} recv_from_peers={peers} (n0={r0} n1={r1} n2={r2})",
         if slotted { "slotted" } else { "contention" }, sent.load(Ordering::Relaxed));
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
     Ok(())
 }

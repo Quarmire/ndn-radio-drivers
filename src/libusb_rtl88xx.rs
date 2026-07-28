@@ -1510,27 +1510,21 @@ impl LibUsbRtl88xxBackend {
         result
     }
 
-    /// Emit a hardware-TSF-stamped timing frame through the beacon engine — intended as the
-    /// doctrine-clean, self-contained µs clock source (see docs/timing-rides-named-data.md, #74). `frame`
-    /// is a full 802.11 frame; the MAC is meant to overwrite its **body bytes 24–31** (offset 24 past the
-    /// MAC header — the beacon Timestamp slot) with the live 64-bit TSF at transmit, so every receiver
-    /// that hardware-RX-stamps it common-views this node's clock at the RX-stamp floor (~µs). Place the
-    /// TimeToken there and leave it zeroed; the hardware fills it.
+    /// **Arm** the beacon engine to transmit `frame` — the doctrine-clean, self-contained µs clock
+    /// source (docs/timing-rides-named-data.md, #74). `frame` is a full 802.11 frame; the MAC overwrites
+    /// its **body bytes 24–31** (offset 24 past the MAC header — the Timestamp slot) with the live 64-bit
+    /// TSF at each transmit, so every receiver that hardware-RX-stamps it common-views this node's clock
+    /// at the RX-stamp floor. Place the TimeToken there zeroed; the hardware fills it. Once armed the MAC
+    /// re-transmits it every `interval_tu` (TBTT); pair with [`stop_timing_beacon`](Self::stop_timing_beacon)
+    /// for on-demand control, or use [`emit_timing_pulse`](Self::emit_timing_pulse) for a single shot.
     ///
-    /// Arms the beacon engine to **stamp** (`EN_BCN_FUNCTION` on, `DIS_TSF_UDT` off — the opposite of the
-    /// reserved-page-download setup that preserves the body), sets AdHoc media status + the beacon
-    /// interval, points the beacon head at page 0 and loads the frame with `ENSWBCN` set (leaving the
-    /// engine armed, unlike [`dl_rsvd_page`](Self::dl_rsvd_page) which restores the head).
-    ///
-    /// **STATUS (#74, 2026-07-28): the frame LOADS but does NOT yet AIR on the 8822E in userspace
-    /// monitor mode.** BCN_VALID sets cleanly (371 loads, 0 errors), but a peer running `beacon_cv` never
-    /// sees our BSSID — the MAC's beacon timer does not transmit our loaded page. Full beacon-function
-    /// bring-up (persistent beacon-queue head/boundary, the TBTT hold timer, and likely firmware-owned
-    /// beacon transmission that this monitor/inject driver never configures) is the remaining gap. The
-    /// TSF-insertion hardware itself is confirmed present (the driver disables it via `DIS_TSF_UDT` to
-    /// protect reserved-page writes; real APs use it — measured 0.26–1.15 µs RX floor). Left as the
-    /// documented next step; do not treat as a working clock source until a peer confirms our BSSID airs.
-    pub fn emit_timing_frame(&self, frame: &[u8]) -> Result<(), FaceError> {
+    /// **PROVEN ON AIR (#74, 2026-07-28): self-contained, sub-µs, no AP.** o5p-0 armed this; o5p-1's
+    /// `beacon_cv` received our BSSID at **0.56 µs** first-diff jitter (3 µs spread) — our own node is a
+    /// common-view time reference for its neighbours. The full rtw88 sequence: EN_BCN_FUNCTION |
+    /// DIS_TSF_UDT (`rtw_ops_add_interface`), load to `RSVD_BOUNDARY` where the beacon queue DMAs from,
+    /// and — the arm that makes it fire — `EN_BCNQ_DL` (`REG_FWHW_TXQ_CTRL 0x0422` bit6) SET
+    /// (`rtw_core_enable_beacon` / `rtl8xxxu_start_tx_beacon`).
+    pub fn emit_timing_frame(&self, frame: &[u8], interval_tu: u16) -> Result<(), FaceError> {
         const REG_MBSSID_BCN_SPACE: u16 = 0x0554;
         const REG_TXPAUSE: u16 = 0x0522;
         const EN_BCN_FUNCTION: u8 = 1 << 3; // REG_BCN_CTRL 0x0550
@@ -1547,8 +1541,7 @@ impl LibUsbRtl88xxBackend {
         let msr = (self.read8(0x0102)? & !0x03) | 0x01;
         self.write8(0x0102, msr)?;
         // Beacon interval (TU) = the TBTT period. init_edca_cfg leaves it unset.
-        let tu: u16 = std::env::var("NDN_BCN_SPACE").ok().and_then(|s| s.parse().ok()).unwrap_or(100);
-        self.write16(REG_MBSSID_BCN_SPACE, tu)?;
+        self.write16(REG_MBSSID_BCN_SPACE, interval_tu.max(1))?;
 
         // Download the beacon to the RESERVED BOUNDARY page — where the beacon queue DMAs from
         // (priority_queue_cfg set REG_BCNQ_BDNY_V1 0x0424 / 0x0204 = RSVD_BOUNDARY), NOT page 0.
@@ -1582,9 +1575,17 @@ impl LibUsbRtl88xxBackend {
         Ok(())
     }
 
-    /// Stop beacon transmission: clear `EN_BCNQ_DL` (the TBTT-DMA arm) so no further beacons air. Pairs
-    /// with [`emit_timing_frame`](Self::emit_timing_frame) for on-demand single-shot use — arm, let one
-    /// TBTT fire, disarm — rather than a free-running periodic beacon (rtl8xxxu `stop_tx_beacon`).
+    /// Stop beacon transmission: clear `EN_BCNQ_DL` (the TBTT-DMA arm) so no further beacons air
+    /// (rtl8xxxu `stop_tx_beacon`). Together with [`emit_timing_frame`](Self::emit_timing_frame) this is
+    /// the **on-demand-window** control: a node arms a timing beacon only while it wants to be a
+    /// reference (before a scheduled burst, while a neighbour is syncing), then disarms — never a
+    /// blindly free-running periodic beacon.
+    ///
+    /// NOTE (#74, measured): a *single-frame* pulse (rapid arm→one-beacon→disarm) does NOT work on this
+    /// silicon — the beacon engine must stay stably armed across a couple of TBTTs to fire (the
+    /// BCNDMATIM/DRVERLYINT prep pipeline + TSF-phase settling), so toggling the arm per frame never
+    /// lets it emit. The controllable unit is therefore the armed *window* (≥ a few TBTTs), not one
+    /// frame. Within a window the MAC beacons at the interval; the node controls the windows.
     pub fn stop_timing_beacon(&self) -> Result<(), FaceError> {
         self.clr8(REG_FWHW_TXQ_CTRL + 2, 1 << 6)
     }

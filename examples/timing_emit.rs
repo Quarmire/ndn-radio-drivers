@@ -52,29 +52,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("timing_emit: pid={pid:04x} ch{ch} bssid={bssid} — on-demand HW-stamped frames every {period_ms}ms for {secs}s");
 
     let frame = timing_beacon();
-    // Arm the beacon engine once — the hardware then transmits this frame every TBTT (the beacon
-    // interval), stamping body[24:31] with the live TSF. `period_ms=0` (default) = arm once and let the
-    // TBTT run; `period_ms>0` re-arms/re-loads at that cadence (a keepalive / content refresh).
-    let (mut ok, mut err) = (0u64, 0u64);
-    match d.emit_timing_frame(&frame) {
-        Ok(()) => ok += 1,
-        Err(e) => { eprintln!("emit_timing_frame error: {e:?}"); err += 1; }
-    }
+    let tu: u16 = std::env::var("NDN_BCN_SPACE").ok().and_then(|s| s.parse().ok()).unwrap_or(100);
+    // ON-DEMAND WINDOW control (the doctrine's demand-driven emission, NOT a blind free-running beacon):
+    // the node ARMS a timing beacon only while it wants to be a reference, then DISARMS. Here we hold one
+    // window for the run; a real node arms before a scheduled burst / while a neighbour syncs and disarms
+    // after. Within the window the MAC re-stamps + re-airs at TBTT (every `tu` TU); the node owns the
+    // window boundaries. (True one-frame-per-call single-shot is not possible — the beacon engine must
+    // stay stably armed across a couple of TBTTs to fire; see stop_timing_beacon.)
+    let _ = period_ms; // (window model; per-frame pulsing isn't a thing on this silicon)
     let deadline = Instant::now() + Duration::from_secs(secs);
-    while Instant::now() < deadline {
-        if period_ms > 0 {
-            std::thread::sleep(Duration::from_millis(period_ms));
-            match d.emit_timing_frame(&frame) {
-                Ok(()) => ok += 1,
-                Err(_) => err += 1,
-            }
-        } else {
-            std::thread::sleep(Duration::from_millis(200));
-        }
+    let (mut armed, mut err) = (0u64, 0u64);
+    match d.emit_timing_frame(&frame, tu) {
+        Ok(()) => armed = 1,
+        Err(e) => { eprintln!("emit_timing_frame error: {e:?}"); err = 1; }
     }
-    // On-demand hygiene: disarm the beacon queue so it stops airing once we're done.
-    let _ = d.stop_timing_beacon();
-    println!("armed={ok} errors={err}  (TBTT airs it every {}TU; receiver runs beacon_cv, look for {bssid})",
-        std::env::var("NDN_BCN_SPACE").unwrap_or_else(|_| "100".into()));
+    while Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let _ = d.stop_timing_beacon(); // close the window — the node stops being a reference
+    println!("on-demand window: armed={armed} errors={err} (HW-stamped, TBTT every {tu}TU; beacon_cv → {bssid})");
     Ok(())
 }

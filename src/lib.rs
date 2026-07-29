@@ -75,7 +75,7 @@ pub fn open_named_radio(
         // RTL8822E: `open_monitor_pid` claims + BB/RF-inits + monitors + channel in one call, and its
         // default format is already the canonical RawNdn(0x8624).
         let d = Arc::new(LibUsbRtl88xxBackend::open_monitor_pid(pid, channel)?);
-        std::mem::forget(d.spawn_rx_pump(pump_depth())); // pump lives for the radio's (process) lifetime
+        start_pump(&d); // async (NDN_ASYNC_PUMP) or sync pump, lives for the process
         d
     } else {
         // RTL8812AU: force the canonical format (its own default is Raw80211 for the NAN path), then
@@ -104,16 +104,27 @@ pub fn open_named_radio(
         if std::env::var_os("NDN_CCA_OFF").is_some() {
             let _ = d.set_cca_ignore(true);
         }
-        std::mem::forget(d.spawn_rx_pump(pump_depth()));
+        start_pump(&d);
         d
     };
     Ok(radio)
 }
 
-/// RX-pump reader-thread count (parallel bulk-IN + parse). Default 8; `NDN_RX_PUMP_DEPTH` overrides —
-/// the 8812au-family RX cap is per-frame parse, not transfer count, so more parsing threads can lift it.
+/// RX-pump reader-thread / transfer-pool count. Default 8; `NDN_RX_PUMP_DEPTH` overrides.
 fn pump_depth() -> usize {
     std::env::var("NDN_RX_PUMP_DEPTH").ok().and_then(|s| s.parse().ok()).filter(|&n| n > 0).unwrap_or(8)
+}
+
+/// Start the RX pump for a backend. `NDN_ASYNC_PUMP=1` uses the libusb async submit-ahead pump (keeps
+/// the transfer pool continuously in flight — matches the kernel driver's throughput, ~2× the sync
+/// pump on the 8812au); default is the synchronous read_bulk pump. The pump lives for the process.
+fn start_pump<B: rx_pump::Pumpable>(backend: &std::sync::Arc<B>) {
+    let depth = pump_depth();
+    if std::env::var_os("NDN_ASYNC_PUMP").is_some() {
+        std::mem::forget(rx_pump::spawn_rx_pump_async(backend, depth));
+    } else {
+        std::mem::forget(rx_pump::spawn_rx_pump(backend, depth));
+    }
 }
 
 // The control-plane `RadioKnobs` impls for the driver backends. These live with

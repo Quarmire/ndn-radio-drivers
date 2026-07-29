@@ -11,8 +11,8 @@
 use crate::CapturedFrame;
 use rusb::{Context, DeviceHandle};
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -127,4 +127,144 @@ pub fn spawn_rx_pump<B: Pumpable>(backend: &Arc<B>, depth: usize) -> Vec<JoinHan
             })
         })
         .collect()
+}
+
+// ── Async (submit-ahead) RX pump — libusb async FFI ──────────────────────────────────────────────
+//
+// The sync `spawn_rx_pump` above does one blocking `read_bulk` per thread: submit → wait → parse →
+// resubmit, so each thread has NO transfer in flight while it parses, and libusb's SYNC API also
+// serialises threads on its internal event lock (which is why 8→48 threads only moved 8812au RX
+// 528→560). The KERNEL rtw88_8812au pulls ~1106 f/s off the SAME chip by keeping many URBs
+// continuously in flight, completion-driven. This mirrors that: a pool of `depth` bulk-IN transfers,
+// each resubmitted the instant its callback runs, driven by ONE `libusb_handle_events` thread.
+// Enable with `NDN_ASYNC_PUMP=1`.
+
+/// Raw bulk-IN buffers awaiting parse — filled by the completion callback (a cheap memcpy on the
+/// event thread), drained by a pool of parse threads so de-aggregation/RSSI/TSF extraction runs in
+/// PARALLEL and off the single event thread (which otherwise serialised parse and capped the rate).
+struct RawQueue {
+    q: Mutex<VecDeque<Vec<u8>>>,
+    cv: Condvar,
+}
+
+/// Heap context carried as each transfer's `user_data` — leaked with `Box::into_raw`, reclaimed in
+/// the callback only when the backend is gone (Weak fails).
+struct AsyncXfer<B: Pumpable> {
+    backend: Weak<B>,
+    raw: Arc<RawQueue>,
+    inflight: Arc<AtomicUsize>,
+    buf: Vec<u8>,
+}
+
+/// libusb completion callback (runs on the event thread): hand the received bytes to the parse pool
+/// (copy — the buffer is reused on resubmit) and resubmit immediately, so the transfer is back in
+/// flight without waiting for parse. Frees the transfer only when the backend is gone.
+extern "system" fn async_xfer_cb<B: Pumpable>(t: *mut rusb::ffi::libusb_transfer) {
+    let ctxp = unsafe { (*t).user_data as *mut AsyncXfer<B> };
+    let ctx = unsafe { &mut *ctxp };
+    if ctx.backend.strong_count() > 0 {
+        let status = unsafe { (*t).status };
+        let n = unsafe { (*t).actual_length } as usize;
+        if status == rusb::constants::LIBUSB_TRANSFER_COMPLETED && n > 0 {
+            let mut q = ctx.raw.q.lock().unwrap();
+            if q.len() < 2048 {
+                // bounded — drop under sustained overload rather than OOM
+                q.push_back(ctx.buf[..n].to_vec());
+                drop(q);
+                ctx.raw.cv.notify_one();
+            }
+        }
+        // Resubmit the same transfer (buffer reused) — back in flight immediately.
+        if unsafe { rusb::ffi::libusb_submit_transfer(t) } == 0 {
+            return;
+        }
+    }
+    // Backend gone (or resubmit failed): free the transfer + reclaim the leaked box.
+    ctx.inflight.fetch_sub(1, Ordering::SeqCst);
+    unsafe {
+        rusb::ffi::libusb_free_transfer(t);
+        drop(Box::from_raw(ctxp));
+    }
+}
+
+/// Raw libusb context pointer wrapper so it can move into the event thread (`*mut` isn't `Send`).
+struct SendCtx(*mut rusb::ffi::libusb_context);
+unsafe impl Send for SendCtx {}
+
+/// Start the async submit-ahead pump: `depth` bulk-IN transfers always in flight, one event thread,
+/// and a pool of parse threads draining the raw queue in parallel.
+pub fn spawn_rx_pump_async<B: Pumpable>(backend: &Arc<B>, depth: usize) -> JoinHandle<()> {
+    use rusb::UsbContext;
+    use std::os::raw::{c_int, c_void};
+    backend.pump_state().mark_pumped();
+    let handle = backend.pump_handle();
+    let dev = handle.as_raw();
+    let ctx = SendCtx(handle.context().as_raw());
+    let ep = backend.pump_bulk_in();
+    let inflight = Arc::new(AtomicUsize::new(0));
+    let raw = Arc::new(RawQueue { q: Mutex::new(VecDeque::new()), cv: Condvar::new() });
+
+    // Parse pool: de-aggregate each transfer into frames on its own thread, in parallel.
+    let n_parse = 6.min(depth.max(1)).max(2);
+    for _ in 0..n_parse {
+        let raw = raw.clone();
+        let wb = Arc::downgrade(backend);
+        std::thread::spawn(move || loop {
+            let buf = {
+                let mut q = raw.q.lock().unwrap();
+                while q.is_empty() {
+                    q = raw.cv.wait(q).unwrap();
+                }
+                q.pop_front()
+            };
+            match (buf, wb.upgrade()) {
+                (Some(buf), Some(b)) => b.pump_state().push(b.parse_transfer(&buf)),
+                _ => break, // backend dropped
+            }
+        });
+    }
+
+    for _ in 0..depth.max(1) {
+        let boxed = Box::new(AsyncXfer::<B> {
+            backend: Arc::downgrade(backend),
+            raw: raw.clone(),
+            inflight: inflight.clone(),
+            buf: vec![0u8; 32768],
+        });
+        let ctxp = Box::into_raw(boxed);
+        unsafe {
+            let t = rusb::ffi::libusb_alloc_transfer(0);
+            if t.is_null() {
+                drop(Box::from_raw(ctxp));
+                continue;
+            }
+            rusb::ffi::libusb_fill_bulk_transfer(
+                t,
+                dev,
+                ep,
+                (*ctxp).buf.as_mut_ptr(),
+                (*ctxp).buf.len() as c_int,
+                async_xfer_cb::<B>,
+                ctxp as *mut c_void,
+                0, // timeout 0 = never expire — the transfer completes when a frame arrives
+            );
+            if rusb::ffi::libusb_submit_transfer(t) == 0 {
+                inflight.fetch_add(1, Ordering::SeqCst);
+            } else {
+                rusb::ffi::libusb_free_transfer(t);
+                drop(Box::from_raw(ctxp));
+            }
+        }
+    }
+
+    // Single event thread drives every transfer's completion (no per-transfer event-lock contention).
+    // Runs until all transfers have been freed (which only happens after the backend is dropped).
+    std::thread::spawn(move || {
+        let ctx = ctx; // move the wrapper in
+        while inflight.load(Ordering::SeqCst) > 0 {
+            unsafe {
+                rusb::ffi::libusb_handle_events(ctx.0);
+            }
+        }
+    })
 }

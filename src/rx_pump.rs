@@ -106,10 +106,21 @@ pub fn spawn_rx_pump<B: Pumpable>(backend: &Arc<B>, depth: usize) -> Vec<JoinHan
                 // 512-B units + slack) fits in ONE read. With USB RX aggregation enabled (RXDMA_AGG_EN),
                 // the chip packs many frames per transfer; a too-small buffer would truncate them.
                 let mut buf = vec![0u8; 32768];
+                let dbg = std::env::var_os("NDN_RX_AGG_DBG").is_some();
+                let (mut reads, mut bytes) = (0u64, 0u64);
                 loop {
                     let Some(b) = weak.upgrade() else { break };
                     match handle.read_bulk(ep, &mut buf, Duration::from_millis(200)) {
-                        Ok(n) if n > 0 => b.pump_state().push(b.parse_transfer(&buf[..n])),
+                        Ok(n) if n > 0 => {
+                            if dbg {
+                                reads += 1;
+                                bytes += n as u64;
+                                if reads % 300 == 0 {
+                                    eprintln!("PUMP: {reads} reads, avg {} B/transfer (last {n} B)", bytes / reads);
+                                }
+                            }
+                            b.pump_state().push(b.parse_transfer(&buf[..n]))
+                        }
                         _ => {} // timeout / empty / error: re-submit the read
                     }
                 }

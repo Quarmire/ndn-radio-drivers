@@ -6078,6 +6078,15 @@ impl Rtl8812auBackend {
         }
         let v = self.read32(0x0284)?; // REG_RXPKT_NUM — clear RW_RELEASE_EN to resume RX DMA
         self.write32(0x0284, v & !(1 << 18))?;
+        if std::env::var_os("NDN_RX_AGG_DBG").is_some() {
+            let ctrl = self.read16(REG_TRXDMA_CTRL).unwrap_or(0);
+            let pgth = self.read16(0x0280).unwrap_or(0);
+            let spec = self.read8(0xFE55).unwrap_or(0);
+            eprintln!(
+                "RXAGG_DBG: TRXDMA_CTRL(0x10C)=0x{ctrl:04x} (RXDMA_AGG_EN bit2={}) AGG_PG_TH(0x280)=0x{pgth:04x} USB_SPEC(0xFE55)=0x{spec:02x}",
+                (ctrl >> 2) & 1
+            );
+        }
         Ok(())
     }
 

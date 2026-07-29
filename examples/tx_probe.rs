@@ -79,6 +79,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         println!("=== TX DONE sent={sent} mode={} ===", if slotted { "slotted" } else { "contention" });
     } else {
+        let raw0 = ndn_radio_drivers::rx_raw_frames(); // pump's raw pull count (pre-CRC filter)
         let counts = [Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0))];
         // RSSI accumulator (sum, min, max, n) — distinguishes a weak/attenuated LINK (low RSSI, RF loss)
         // from an RX-side drop (strong RSSI but frames still missing = pump/USB/FIFO ceiling).
@@ -114,8 +115,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let total: u64 = c.iter().sum();
         let (sum, mn, mx, n) = *rssi.lock().unwrap();
         let avg = if n > 0 { sum as f64 / n as f64 } else { 0.0 };
-        println!("=== RX DONE tag0={} tag1={} tag2={} tag3={} | rate={:.0}/s rssi avg={:.1} min={} max={} dBm (n={}) ===",
-            c[0], c[1], c[2], c[3], total as f64 / start.elapsed().as_secs_f64().max(0.001),
+        let raw_rate = (ndn_radio_drivers::rx_raw_frames() - raw0) as f64 / start.elapsed().as_secs_f64().max(0.001);
+        println!("=== RX DONE tag0={} tag1={} tag2={} tag3={} | tag_rate={:.0}/s RAW_PULL={:.0}/s rssi avg={:.1} min={} max={} dBm (n={}) ===",
+            c[0], c[1], c[2], c[3], total as f64 / start.elapsed().as_secs_f64().max(0.001), raw_rate,
             avg, if n > 0 { mn } else { 0 }, if n > 0 { mx } else { 0 }, n);
     }
     Ok(())

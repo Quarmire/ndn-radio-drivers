@@ -6187,6 +6187,9 @@ impl Rtl8812auBackend {
             if end > n - off {
                 break;
             }
+            // Raw pump throughput: every RX unit pulled off USB, counted BEFORE the CRC/name filter
+            // below, so it's comparable to a kernel monitor iface's rx_packets (which counts bad-FCS).
+            crate::RX_RAW_FRAMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             // Pre-CRC debug: CRC-failed frames are dropped below, so they never reach the
             // post-parse `RX8812AU` log — but their *rate* tells whether an HT frame arrived
             // and failed demod (IQK/EVM issue) vs never arrived (tuning/sensitivity). Logged

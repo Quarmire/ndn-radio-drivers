@@ -54,6 +54,16 @@ pub use lora_serial::{LORA_BAUD, LoraParams, LoraSerialBackend, MAX_LORA_PAYLOAD
 /// payload injected on one radio de-frames identically on any other. (Matches `FrameFormat::default()`.)
 pub const NDN_ETHERTYPE: u16 = 0x8624;
 
+/// Diagnostic: total RX units the pump has PULLED off USB (incremented per subframe in
+/// `parse_transfer`, BEFORE the CRC/name filter) — the pump's raw throughput, directly comparable to a
+/// kernel monitor iface's `rx_packets`. Read via [`rx_raw_frames`] to isolate pump speed from parse
+/// acceptance (the kernel counts bad-FCS frames; our parse drops them).
+pub static RX_RAW_FRAMES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Snapshot of [`RX_RAW_FRAMES`].
+pub fn rx_raw_frames() -> u64 {
+    RX_RAW_FRAMES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// **The standardized way to open a named-data radio.** Dispatches by USB product id to the right
 /// chip-specific backend, runs *that* chip's own power-on / monitor / calibration sequence beneath, sets
 /// the **one canonical on-air format** (`RawNdn { ethertype: 0x8624 }`) so any two radios opened this way
@@ -75,6 +85,11 @@ pub fn open_named_radio(
         // RTL8822E: `open_monitor_pid` claims + BB/RF-inits + monitors + channel in one call, and its
         // default format is already the canonical RawNdn(0x8624).
         let d = Arc::new(LibUsbRtl88xxBackend::open_monitor_pid(pid, channel)?);
+        // `NDN_TX_PWR=<idx>` lowers this radio's TX power (e.g. to dial an RX peer out of front-end
+        // overload for a clean-RSSI measurement); the 88xx set_tx_power is a per-rate TXAGC index.
+        if let Some(p) = std::env::var("NDN_TX_PWR").ok().and_then(|s| s.parse::<u32>().ok()) {
+            let _ = d.set_tx_power(p);
+        }
         start_pump(&d); // async (NDN_ASYNC_PUMP) or sync pump, lives for the process
         d
     } else {

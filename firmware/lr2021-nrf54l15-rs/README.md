@@ -19,6 +19,10 @@ This is not just another LoRa node. It is the only hardware in the rig that can 
 
 ## Status
 
+**#104/#105 done — and both are negative results worth having.** Stamping on the chip's SYNC event
+gains nothing (the receiver is not the jitter source), the RF-switch pins make no measurable
+difference, and the guard-band figure is **less precise than M5 implied**: see "#104/#105" below.
+
 **M6 complete — the node speaks the rig's 7E-A5 host protocol on `/dev/ttyACM0`.** All five
 sub-GHz/2.4 GHz nodes are now one fleet. See "M6 result" below.
 
@@ -135,6 +139,63 @@ Further shield facts for later milestones: `reg-mode = DCDC`, `lf-clk = RC`, `tc
 wakeup 0, `rx-boost-cfg = 7`, `tx-power-offset = 0`, calibration at 470 MHz / 897.5 MHz / 2441 MHz,
 and per-dBm PA tables for both LF and HF paths. Two SMAs: **LF** (150–960 MHz) and **HF** (2.4 GHz +
 S-band).
+
+## #104 / #105 — two negative results, and a correction to the M5 number
+
+### #105 — the RF-switch pins make no measurable difference
+
+Zephyr's dts asserts `rfsw_ctl` (P2.05, active low) and `rfsw_pwr` (P2.03, active high) at boot;
+our firmware never did. Driven vs floating, back to back at the same geometry:
+
+| arm | delivery | crc_err | rssi_raw |
+|---|---|---|---|
+| floating | 125/126 | 21 | 190 / 199 / 198 |
+| driven | 125/126 | 18 | 187 / 192 / 199 |
+
+Identical delivery, overlapping RSSI. **They are driven by default now anyway** — it matches what the
+board's own devicetree does and costs nothing — but the unknown is closed by measurement rather than
+by assumption. Build with `--features no-rf-switch` to reproduce the floating arm.
+
+### #104 — the receiver is *not* the jitter source
+
+`SetTimestampSource(TS0, SYNC)` + `GetTimestampValue` let the chip stamp **syncword detection** — a
+fixed, early point in the frame — instead of packet-done, and report the delay to the SPI NSS edge in
+32 MHz ticks. Reconstructed onto our 16 MHz timer and compared against the DIO edge **on the same
+frames** (n≈2000):
+
+```
+DIO  (packet-done) min=320835 mean=321163 max=321526 p2p=691 ticks
+SYNC (chip stamp)  min=320834 mean=321163 max=321526 p2p=692 ticks   ts_fail 0
+```
+
+**Identical to within one tick, means exactly equal.** The receiving radio's demodulate-to-DIO path
+is already as deterministic as its own SYNC stamp, so the packet-done latency M5 flagged as a
+suspect contributes nothing. That *localizes* the residual: not the receiver, and not oscillator
+drift either (two crystals at ±20 ppm over a 20 ms period is ~13 ticks, against a spread of ~600).
+What remains is the transmitter's internal trigger→on-air path.
+
+`RampTime` is now **`Ramp2u` instead of `Ramp16u`** regardless — the PA ramp sits between the trigger
+and the first on-air symbol, so a shorter ramp is strictly less offset. Whether it reduced *jitter*
+is unproven; see below.
+
+### The correction: 58.9 µs was over-precise
+
+Three runs of nominally the same measurement:
+
+| run | config | p2p |
+|---|---|---|
+| M5 | Ramp16u, RF switch floating | 942 ticks = 58.9 µs |
+| #104 a | Ramp16u, RF switch driven | 691 ticks = 43.2 µs |
+| #104 b | Ramp2u, RF switch driven | 596–620 ticks = 37.3–38.8 µs |
+
+The trend is downward, but run 1→2 changed nothing that should affect transmit timing and still moved
+by 250 ticks. **Run-to-run variation of this statistic is large, so quoting "58.9 µs" to three
+significant figures was wrong of me.** The defensible statement is **~40–60 µs end to end**, and a
+guard band should be sized on the worst of several runs, not one run's peak-to-peak.
+
+This does not change the conclusion for #93 — at ~785 µs of airtime a 40–60 µs guard is still
+5–8% overhead, and still sub-millisecond base slots — but it changes how the number should be quoted
+and re-measured.
 
 ## M6 result — the host bridge
 

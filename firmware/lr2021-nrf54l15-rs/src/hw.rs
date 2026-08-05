@@ -73,6 +73,15 @@ pub fn init(p: Peripherals) -> (Radio, TimingParts, UartParts) {
     // Pulls follow the shield devicetree exactly: BUSY pulls up, DIO8/IRQ pulls down.
     let busy = Input::new(p.P1_05, Pull::Up);
 
+    // Assert the board's RF-switch controls, as Zephyr's `regulator-boot-on` nodes do (see
+    // `board::PIN_RFSW_CTL` / `PIN_RFSW_PWR`). Leaked deliberately: these must stay asserted for the
+    // life of the program, and dropping the `Output` would release the pin mid-experiment.
+    #[cfg(not(feature = "no-rf-switch"))]
+    {
+        core::mem::forget(Output::new(p.P2_05, Level::Low, OutputDrive::Standard)); // rfsw_ctl, active low
+        core::mem::forget(Output::new(p.P2_03, Level::High, OutputDrive::Standard)); // rfsw_pwr, active high
+    }
+
     let timing = TimingParts { dio: p.P1_04, timer: p.TIMER20, gpiote: p.GPIOTE20_CH0, ppi: p.PPI20_CH0 };
     let uart = UartParts { uart: p.SERIAL20, tx: p.P1_09, rx: p.P1_08 };
     (Lr2021::new(nreset, busy, spi, nss), timing, uart)

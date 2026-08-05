@@ -12,6 +12,10 @@ edition = "2021"
 description = "Open Rust firmware for the XIAO nRF54L15 + LR2021 named-radio MAC testbed"
 license = "MIT OR Apache-2.0"
 
+[features]
+# Leave the board RF-switch control pins floating, to A/B against driving them (#105).
+no-rf-switch = []
+
 [dependencies]
 cortex-m = { version = "0.7", features = ["inline-asm", "critical-section-single-core"] }
 cortex-m-rt = "0.7"

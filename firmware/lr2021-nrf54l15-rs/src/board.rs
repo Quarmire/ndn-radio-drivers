@@ -38,3 +38,24 @@ pub const SPI_FREQ_HZ: u32 = 8_000_000;
 
 /// The SPI ceiling the shield devicetree declares. Do not exceed.
 pub const SPI_FREQ_MAX_HZ: u32 = 16_000_000;
+
+// ── RF switch control ────────────────────────────────────────────────────────────────────────────
+
+/// **RF-switch control pins the board expects firmware to drive.**
+///
+/// Zephyr's board dts (`boards/seeed/xiao_nrf54l15/xiao_nrf54l15_nrf54l15_cpuapp.dts`) declares
+/// both as `regulator-fixed` with `regulator-boot-on`, i.e. Zephyr asserts them at startup:
+///
+/// ```text
+///   rfsw_ctl: enable-gpios = <&gpio2 5 GPIO_ACTIVE_LOW>;   // P2.05 — assert = drive LOW
+///   rfsw_pwr: enable-gpios = <&gpio2 3 GPIO_ACTIVE_HIGH>;  // P2.03 — assert = drive HIGH
+/// ```
+///
+/// M0–M6 ran without driving either and still linked at ~99%, so the pins evidently settle
+/// somewhere usable — but "usable" was an inference, not a measurement, and the switch sits in the
+/// path every RSSI and TX-power number is read through. Driven by default now; build with
+/// `--features no-rf-switch` to leave them floating for the A/B.
+/// Assert = drive LOW.
+pub const PIN_RFSW_CTL: (u8, u8) = (2, 5);
+/// Assert = drive HIGH.
+pub const PIN_RFSW_PWR: (u8, u8) = (2, 3);

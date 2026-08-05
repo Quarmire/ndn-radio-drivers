@@ -91,7 +91,11 @@ where
     // HF front end for the 2.4 GHz port: PA on the HF path, RX on the HF path with full boost
     // (rx-boost-cfg = 7 in the shield devicetree).
     radio.set_pa_hf().await?;
-    radio.set_tx_params(TX_POWER_DBM, RampTime::Ramp16u).await?;
+    // **Ramp2u, not Ramp16u** (#104 lever 3). The PA ramp sits between the TX trigger and the first
+    // on-air symbol, so its duration is pure transmit-instant offset — and any variation in it is
+    // transmit-instant jitter, which is exactly the residual M5 left unexplained. 16 µs was an
+    // arbitrary bring-up default; the shortest ramp is the right default for a slot MAC.
+    radio.set_tx_params(TX_POWER_DBM, RampTime::Ramp2u).await?;
     radio.set_rx_path(RxPath::HfPath, RxBoost::Max).await?;
     radio.set_rf(FREQ_HZ).await?;
 

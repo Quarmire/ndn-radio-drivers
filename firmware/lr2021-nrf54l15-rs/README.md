@@ -19,9 +19,8 @@ This is not just another LoRa node. It is the only hardware in the rig that can 
 
 ## Status
 
-**M5 PARTIAL — hardware-triggered TX demonstrated, not yet reliable enough to yield the guard-band
-number.** The software-timed baseline *is* measured: **p2p = 1615 ticks = 100.9 µs** over 1698
-consecutive pairs. See "M5 status" below.
+**M5 complete — hardware-scheduled TX, 100% of armed slots transmit, and the guard band is
+measured: 58.9 µs vs 100.9 µs software.** See "M5 result" below.
 
 **M4 complete — the hardware RX timestamp works, and its resolution floor is below what the
 instrument can measure: 62.5 ns.** See "M4 result" below.
@@ -51,7 +50,7 @@ handler `0x479`. The memory map in `memory.x` is therefore consistent with the p
 | **M2** | ✅ SPI up, `get_version()` = fw 1.24 | yes | the `board` pin map, SPI mode and wiring |
 | **M3** | ✅ FLRC link, 125/126 delivered | yes | an on-air link at a usable rate |
 | **M4** | ✅ DPPI+TIMER RX capture, jitter measured | yes | the RX-timestamp floor: **≤62.5 ns**, below instrument resolution |
-| **M5** | ⚠ partial — trigger fires, slots drop | yes | software baseline measured (100.9 µs); HW figure blocked on trigger reliability |
+| **M5** | ✅ scheduled TX, 1100/1100 slots | yes | guard-band floor **58.9 µs** (vs 100.9 µs software) ⇒ sub-ms base slots for #93 |
 | **M6** | 7E-A5 serial bridge + `ndn-embedded` data plane | yes | parity with the Waveshare/Heltec nodes so all five interoperate |
 | **M7** | Tier-0 prefix-set filter on the FLPR coprocessor | yes | the NDN-NIC architecture in real silicon (#91) |
 
@@ -134,11 +133,9 @@ wakeup 0, `rx-boost-cfg = 7`, `tx-power-offset = 0`, calibration at 470 MHz / 89
 and per-dBm PA tables for both LF and HF paths. Two SMAs: **LF** (150–960 MHz) and **HF** (2.4 GHz +
 S-band).
 
-## M5 status — hardware-scheduled TX
+## M5 result — hardware-scheduled TX and the guard band
 
-**Mechanism confirmed real.** The LR2021 supports *DIO TX/RX triggers* natively (the command spec
-programs default timeouts "to be used for DIO RX/TX triggers" and defines an error for a trigger
-that "could not be executed because chip was busy changing mode"). Wiring:
+**Mechanism.** The LR2021 supports *DIO TX/RX triggers* natively, so:
 
 ```
 TIMER20.CC[2] == target ──event──▶ DPPI ──task──▶ GPIOTE OUT sets P1.04
@@ -146,33 +143,60 @@ TIMER20.CC[2] == target ──event──▶ DPPI ──task──▶ GPIOTE OUT
                                      LR2021 DIO8 = DioFunc::TxTrigger → transmit starts
 ```
 
-No SPI and no CPU between the timer and the transmission. `tx_done` over SPI confirms transmits
-really are being started this way.
+No SPI and no CPU between the timer and the transmission. The shield exposes exactly one DIO, so the
+TX node trades its IRQ pin for the trigger — acceptable, because completion timing cannot move the
+transmit *instant*, and the receiver keeps its IRQ pin and does the timestamping.
 
-**Measured so far**
+**Reliability: 1100 armed slots, 1100 transmits, 0 errors.**
 
-| transmit scheduling | consecutive-pair spread |
-|---|---|
-| **software** (`Timer::after` + `set_tx()` over SPI — what the Wi-Fi face does today) | **p2p 1615 ticks = 100.9 µs** (n=1698) |
-| **hardware-triggered** | closest pairs land at 320839–320965 ticks against an intended 320000, but `mean` sits near *two* periods — a large share of scheduled slots do not transmit |
+**The number**, measured end to end by the M4 receiver over consecutive-slot pairs:
 
-**Why the hardware number is not quotable yet.** Roughly a third to a half of armed slots produce no
-transmission. The prime suspect is the chip's own documented condition — a DIO trigger that "could
-not be executed because chip was busy changing mode", i.e. the part has not returned to a
-trigger-ready state from the previous transmit by the time the next edge arrives. Next step is to
-read that error flag per slot and, if confirmed, return the chip to standby between slots.
-Reporting the spread before that is fixed would describe the chip's mode transitions, not the
-scheduler's precision.
+| transmit scheduling | consecutive-pair spread | delivery |
+|---|---|---|
+| **software** — `Timer::after` + `set_tx()` over SPI (what the Wi-Fi face does today) | **1615 ticks = 100.9 µs** (n=1698) | — |
+| **hardware-triggered** — timer compare → DPPI → DIO | **942 ticks = 58.9 µs** (n=1998) | 1 gap in ~2000 |
+
+**What the 58.9 µs is, honestly.** This is a *two-node, end-to-end* figure: it contains the
+transmitter's scheduling error, the two nodes' relative oscillator drift, **and the receiving
+radio's internal demodulate-to-DIO variability** — which M4 could not isolate, because M4 measured
+only the MCU-side path *after* the DIO edge. So 58.9 µs is an upper bound on transmit jitter and the
+correct number for sizing a guard band, but it is **not** proof that the transmitter alone is that
+loose. Separating the terms needs a wired trigger-to-trigger measurement between the two boards.
+
+**What it means for the MAC (#93).** At FLRC 2.6 Mbit/s a 255-byte frame is ~785 µs of airtime, so a
+base slot of `airtime + guard` costs **~7% guard overhead at 58.9 µs**, against ~13% with software
+scheduling — and against the Wi-Fi path, where the guard is *milliseconds* and dominates any slot
+short enough to be useful. The lease MAC gets **sub-millisecond base slots** on this hardware. The
+slot length is set by airtime, not by scheduling error, which is exactly the regime a slot MAC wants.
+
+## Root-causing the dropped slots (#103) — three bugs, none of them the radio
+
+The first attempt transmitted ~68% of armed slots. Reading the chip's own `GetErrors` per slot
+settled it immediately: **`chip_busy` never asserted once in 1292 slots.** The prime suspect — the
+documented "DIO trigger could not be executed because chip was busy changing mode" — was wrong, and
+only the error read disproved it. All three real causes were mine:
+
+1. **Re-arming an already-fired compare.** A 15 ms sleep against a 20 ms period meant roughly one
+   iteration in four came round while `target` was still in the future and re-armed a compare that
+   had already fired. Writing a CC value the counter has passed produces no event. (`armed`/slots =
+   1292/1000 = 1.29, exactly the 20/15 ratio.) Fixed by arming each target exactly once.
+2. **Never clearing the TX FIFO.** `wr_tx_fifo_from` *appends*, so any slot that did not transmit
+   left its frame behind and the FIFO filled monotonically. This one is worth remembering because it
+   presents as a *scheduling* failure while being a buffer-management one: 7% → 72% delivery.
+3. **Polling `tx_done` before the transmit had happened.** The fixed sleep frequently woke *before*
+   the scheduled instant, read a not-yet-set `tx_done`, and cleared the IRQ — so a perfectly good
+   slot was recorded as silent. About a quarter of the apparent failures were the instrument, not
+   the radio. Fixed by sleeping until past the target, computed from the hardware clock: 72% → 100%.
 
 ### The bug worth carrying into the MAC work
 
-The first version accumulated the next transmit instant (`target += PERIOD`). It transmitted **74
-times and then stopped for good**: one slow iteration pushed the target into the past, and a compare
-armed in the past never matches until the 32-bit counter wraps (~4.5 min at 16 MHz).
+The very first version accumulated the next transmit instant (`target += PERIOD`). It transmitted
+**74 times and then stopped for good**: one slow iteration pushed the target into the past, and a
+compare armed in the past never matches until the 32-bit counter wraps (~4.5 min at 16 MHz).
 
 That is not a quirk of this binary — **it is exactly the defect a slot scheduler has if it advances
 its slot pointer by addition instead of recomputing the next boundary from the common-view clock.**
-The fix here (re-derive `target` from the clock, and make the sequence number *be* the slot index
+The fix (re-derive `target` from the clock, and make the sequence number *be* the slot index
 `target / PERIOD`) is the same discipline #84/#85 need. Deriving the sequence from the slot also
 makes "consecutive sequence numbers" and "consecutive slots" the same statement by construction, so
 a skipped slot can never masquerade as transmit jitter.

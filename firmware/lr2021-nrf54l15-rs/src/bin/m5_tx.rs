@@ -110,7 +110,12 @@ async fn main(_spawner: Spawner) {
     );
 
     let mut tx_done: u32 = 0;
-    let mut skipped: u32 = 0;
+    let mut advances: u32 = 0;
+    let mut last_armed: u32 = u32::MAX;
+    let mut armed: u32 = 0;
+    let mut busy_err: u32 = 0;
+    let mut pll_err: u32 = 0;
+    let mut silent_no_err: u32 = 0;
     let mut target = hwt.cc(5).capture().wrapping_add(PERIOD_TICKS);
 
     loop {
@@ -125,8 +130,22 @@ async fn main(_spawner: Spawner) {
         let now = hwt.cc(5).capture();
         while target.wrapping_sub(now) > i32::MAX as u32 || target.wrapping_sub(now) < MIN_LEAD_TICKS {
             target = target.wrapping_add(PERIOD_TICKS);
-            skipped = skipped.wrapping_add(1);
+            advances = advances.wrapping_add(1);
         }
+
+        // **Arm each target exactly once.**
+        //
+        // Measured root cause of the dropped slots (#103), and it was not the radio: with a 15 ms
+        // sleep against a 20 ms period, roughly one iteration in four came round while `target` was
+        // still in the future and re-armed a compare that had ALREADY fired. Re-writing a CC value
+        // that the counter has passed produces no event, so that slot silently transmitted nothing.
+        // The chip's own `chip_busy` flag never asserted once in 1292 armed slots — the suspicion
+        // that the part was "busy changing mode" was wrong, and only the error read disproved it.
+        if target == last_armed {
+            Timer::after(Duration::from_millis(2)).await;
+            continue;
+        }
+        last_armed = target;
 
         // **The sequence number IS the slot index.** Deriving it from the scheduled tick rather than
         // counting loop iterations means "consecutive sequence numbers" and "consecutive slots" are
@@ -144,23 +163,71 @@ async fn main(_spawner: Spawner) {
         // compare makes a clean rising edge, then the FIFO is loaded over SPI. By the time the
         // compare fires, the radio has nothing left to do but transmit.
         trigger.clear();
+        // Clear before every write: `wr_tx_fifo_from` APPENDS, so a slot whose trigger did not fire
+        // leaves its frame in the FIFO. Without this the FIFO monotonically fills and TX degrades —
+        // which looks like a scheduling failure but is a buffer-management one.
+        let _ = radio.clear_tx_fifo().await;
+        let lvl_before = radio.get_tx_fifo_lvl().await.unwrap_or(0xffff);
         if let Err(e) = radio.wr_tx_fifo_from(&frame).await {
             defmt::error!("m5_tx: fifo write: {}", defmt::Debug2Format(&e));
         }
+        let lvl_after = radio.get_tx_fifo_lvl().await.unwrap_or(0xffff);
         hwt.cc(CC_SCHED).clear_events();
         hwt.cc(CC_SCHED).write(target);
 
-        // Sleep past the scheduled instant. The wake-up is sloppy on purpose — it must not matter,
-        // and that is the whole claim being tested.
-        Timer::after(Duration::from_millis(15)).await;
+        // Sleep until *past* the scheduled instant, computed from the hardware clock.
+        //
+        // A fixed sleep was wrong for a subtle reason worth recording: the target can be up to a
+        // full period ahead, so a fixed 15 ms wake-up frequently polled `tx_done` BEFORE the
+        // transmit had happened, then cleared the IRQ — making a perfectly good slot read as
+        // "silent". Roughly a quarter of the apparent failures were the instrument, not the radio.
+        // The sleep itself is still deliberately sloppy; it just has to land on the correct side of
+        // the event it is measuring.
+        let after_arm = hwt.cc(5).capture();
+        let remaining_ticks = target.wrapping_sub(after_arm);
+        let wait_ms = if remaining_ticks > i32::MAX as u32 { 0 } else { remaining_ticks / 16_000 };
+        Timer::after(Duration::from_millis(wait_ms as u64 + 3)).await;
 
-        if let Ok(irq) = radio.get_and_clear_irq().await {
-            if irq.tx_done() {
-                tx_done = tx_done.wrapping_add(1);
+        let fired = radio.get_and_clear_irq().await.map(|i| i.tx_done()).unwrap_or(false);
+        if fired {
+            tx_done = tx_done.wrapping_add(1);
+        }
+
+        // Per-slot error read — the root-cause probe for #103.
+        //
+        // `chip_busy` is the chip's own statement that "a DIO TX or RX trigger could not be executed
+        // because chip was busy changing mode". Errors are sticky until ClearErrors, so they are
+        // cleared every slot; otherwise one early error would read as every slot failing.
+        match radio.get_errors().await {
+            Ok(e) => {
+                if e.chip_busy() {
+                    busy_err = busy_err.wrapping_add(1);
+                }
+                if e.pll_lock() {
+                    pll_err = pll_err.wrapping_add(1);
+                }
+                if !fired && !e.chip_busy() {
+                    // The interesting case: no transmit AND the chip does not blame busy-mode.
+                    silent_no_err = silent_no_err.wrapping_add(1);
+                }
             }
+            Err(_) => {}
         }
+        let _ = radio.cmd_wr(&lr2021::cmd::cmd_system::clear_errors_cmd()).await;
+
         if slot % 100 == 0 {
-            defmt::info!("m5_tx: slot {} | tx_done {} | slots skipped {}", slot, tx_done, skipped);
+            defmt::info!(
+                "m5_tx: slot {} | armed {} tx_done {} | chip_busy {} pll {} silent-no-err {} | period advances {}",
+                slot,
+                armed,
+                tx_done,
+                busy_err,
+                pll_err,
+                silent_no_err,
+                advances
+            );
+            defmt::info!("        | tx fifo lvl before {=u16} after {=u16}", lvl_before, lvl_after);
         }
+        armed = armed.wrapping_add(1);
     }
 }

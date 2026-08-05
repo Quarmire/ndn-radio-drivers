@@ -1370,7 +1370,7 @@ impl Rtl8733buBackend {
     /// power_off/card-disable; re-establishes the device the way a kernel-driver bind/unbind
     /// does. In-process register resets do NOT re-randomize the per-boot analog TX state
     /// (retry stays stuck), but only a fresh process — which involves a kernel USB cycle —
-    /// does; this exposes that cycle in-process. Re-run [`bring_up_monitor`] after it.
+    /// does; this exposes that cycle in-process. Re-run [`Self::bring_up_monitor`] after it.
     pub fn usb_reset(&self) -> Result<(), FaceError> {
         self.handle.reset().map_err(usb_err)
     }

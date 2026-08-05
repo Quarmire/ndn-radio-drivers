@@ -17,11 +17,35 @@
 //! - CFG read/write `0x47`/`0x46`, FCE write `0x42` (value in `wValue`),
 //!   EEPROM read `0x09`, dev-mode/power `0x01`.
 //!
-//! ## Status
-//! Bring-up scaffold: USB open + register access + **firmware download**
-//! (ROM patch + ILM/DLM via the FCE DMA path) are implemented and structured to
-//! validate against the golden trace. EEPROM/cal, MAC init, monitor RX, and the
-//! `FrameIo` TX/RX impl are the next stages.
+//! ## Status: complete and radiating — the rig's highest-throughput radio
+//! The full path is implemented and validated on hardware: USB open + register
+//! access, **firmware download** (ROM patch + ILM/DLM via the FCE DMA path),
+//! EEPROM/cal, MAC init, monitor RX, and the [`FrameIo`] TX/RX impl. Host-injected
+//! frames **radiate** (no firmware TX gate, unlike the RTL8821c). Two RF programs
+//! are captured and replayed: 2.4 GHz **ch6 / 20 MHz**
+//! ([`set_channel_ch6`](Mt7612uBackend::set_channel_ch6)) and 5 GHz **ch36 /
+//! 80 MHz VHT80** ([`set_channel_5g80`](Mt7612uBackend::set_channel_5g80)), the
+//! latter with both TX chains (2 spatial streams). One-call bring-up for the
+//! high-throughput NDN path is [`start_ndn_vht80`](Mt7612uBackend::start_ndn_vht80).
+//!
+//! Two throughput levers, both measured, both unlike the Realtek parts:
+//!   1. plain MPDUs radiate intact to **~5650 B**
+//!      ([`MAX_MPDU_PAYLOAD`](Mt7612uBackend::MAX_MPDU_PAYLOAD)), so a large send
+//!      MTU amortises the ~300 µs/MPDU fixed overhead (≈142 Mb/s at VHT80 2×2 SGI
+//!      vs ≈37 Mb/s at a 1500 B MTU), and
+//!   2. a background **TX pump** ([`spawn_tx_pump`](Mt7612uBackend::spawn_tx_pump))
+//!      that pipelines per-frame injects while staying RX-compatible.
+//!
+//! Host-built **A-MSDU does not radiate** on monitor injection here (firmware-gated;
+//! verified 0/200 on air), so `inject_batch` deliberately sends plain MPDUs rather
+//! than bundling — the opposite of the RTL8812EU backend.
+//!
+//! Known gap: adding another channel means capturing its RF program the same way
+//! (see `docs/RADIO_SUBSYSTEM.md`, "Adding a channel"), and the
+//! [`RadioKnobs`](ndn_radio_hal::RadioKnobs) `set_channel` currently exposes only
+//! the ch6/20 MHz replay — the VHT80 program is reachable through the inherent
+//! method but not yet through the uniform knob. The power / TXOP / ED-CCA registers
+//! are unported, so those knobs are still no-ops.
 #![allow(dead_code)]
 
 use std::io;

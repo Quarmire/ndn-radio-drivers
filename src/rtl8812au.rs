@@ -17,19 +17,39 @@
 //! the 8812AU product ids ([`RTL8812AU_PIDS`]) — never `a81a` — and claims that
 //! one device, so bringing up the AU never detaches the EU sniffer.
 //!
-//! ## Status: full bring-up implemented, on-hardware validation pending
+//! ## Status: validated on air — one of the two load-bearing Wi-Fi drivers
 //!
-//! Implemented (ported from the C reference): device-targeted USB open + the
-//! Realtek register-I/O protocol + chip-version identification
+//! Ported from the C reference and **confirmed on hardware** (the OPi 5 Pro rig,
+//! several 8812AU and 8812AU-VS dongles): device-targeted USB open + the Realtek
+//! register-I/O protocol + chip-version identification
 //! ([`chip_info`](Rtl8812auBackend::chip_info)), the power-on sequence
 //! ([`power_on`](Rtl8812auBackend::power_on)), firmware download
 //! ([`download_firmware`](Rtl8812auBackend::download_firmware)), MAC/BB/RF init
 //! ([`mac_config`](Rtl8812auBackend::mac_config) /
 //! [`bb_config`](Rtl8812auBackend::bb_config) /
 //! [`rf_config`](Rtl8812auBackend::rf_config)), monitor bring-up
-//! ([`bring_up_monitor`](Rtl8812auBackend::bring_up_monitor)), and the
-//! [`FrameIo`] inject/capture path. On-hardware validation against the golden
-//! trace is the remaining step.
+//! ([`bring_up_monitor`](Rtl8812auBackend::bring_up_monitor)), and the [`FrameIo`]
+//! inject/capture path. Both directions are proven on air: injected frames radiate
+//! and are decoded by an independent receiver, and capture sustains **~500–640
+//! frames/s** in monitor mode (it was ~200 f/s until the RX-DMA aggregation default
+//! was corrected from `0x0101` to `0x2010` and `RXDMA_AGG_EN` was enabled). Several
+//! identical dongles on one host are selected with
+//! [`open_nth`](Rtl8812auBackend::open_nth) / `NDN_USB_INDEX`.
+//!
+//! Control-plane knobs wired through [`RadioKnobs`](ndn_radio_hal::RadioKnobs):
+//! channel (**20 MHz only** — wider widths need their per-channel RF/BB program
+//! captured), TXAGC index ([`set_tx_power`](Rtl8812auBackend::set_tx_power),
+//! validated monotone on air), carrier-sense defeat
+//! ([`set_cca_ignore`](Rtl8812auBackend::set_cca_ignore) — EDCCA *and* the OFDM
+//! packet CCA, the latter being what still deferred TX on a busy channel), and
+//! frame-free occupancy sensing
+//! ([`read_phy_sense`](Rtl8812auBackend::read_phy_sense), `REG_RXERR_RPT`).
+//!
+//! Limits, each measured rather than assumed: 20 MHz only; the RX rate is **not** a
+//! silicon ceiling (the in-kernel `rtw88_8812au` on the same chip at the same
+//! geometry runs ~24% ahead — inherent userspace/usbfs overhead, not a driver
+//! defect); and for the highest-fidelity receiver in a delivery measurement prefer
+//! the 8822E ([`LibUsbRtl88xxBackend`](crate::LibUsbRtl88xxBackend), ~924 f/s).
 
 use std::io;
 use std::sync::Arc;
@@ -5969,7 +5989,7 @@ impl Rtl8812auBackend {
 
     /// Turn on energy-detect carrier sense at busy-enter threshold `l2h` (with the
     /// default 7-unit exit hysteresis) **and** make TX defer to it. The one-call
-    /// "enable contention avoidance" path; A/B against [`disable_edcca`].
+    /// "enable contention avoidance" path; A/B against [`Self::disable_edcca`].
     pub fn enable_edcca(&self, l2h: i8) -> Result<(), FaceError> {
         self.set_edcca_threshold(l2h, l2h.saturating_sub(EDCCA_HL_DIFF))?;
         self.set_edcca_honor(true)

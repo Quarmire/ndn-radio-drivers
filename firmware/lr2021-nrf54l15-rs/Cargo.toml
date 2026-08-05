@@ -26,9 +26,13 @@ embassy-time-driver = { version = "0.2", default-features = false }
 embassy-futures = "0.1"
 embedded-hal = "1.0"
 embedded-hal-async = "1.0"
+embedded-io-async = "0.7"
 embedded-hal-bus = { version = "0.3", features = ["async"] }
 # Vendored from crates.io 0.13.1 with one local patch — see README "Vendored LR2021 driver".
 lr2021 = { path = "vendor/lr2021", features = ["defmt"] }
+# The SAME no_std NDN data plane the Waveshare/Heltec nodes run — shared by path, not copied, so
+# name-hash/filter/dedup semantics cannot drift between the nodes that must interoperate.
+ndn-embedded = { path = "../../../ndn-embedded/crates/ndn-embedded", default-features = false, features = ["cs"] }
 defmt = "1"
 defmt-rtt = "1"
 panic-probe = { version = "1", features = ["print-defmt"] }

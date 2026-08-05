@@ -19,6 +19,9 @@ This is not just another LoRa node. It is the only hardware in the rig that can 
 
 ## Status
 
+**M6 complete — the node speaks the rig's 7E-A5 host protocol on `/dev/ttyACM0`.** All five
+sub-GHz/2.4 GHz nodes are now one fleet. See "M6 result" below.
+
 **M5 complete — hardware-scheduled TX, 100% of armed slots transmit, and the guard band is
 measured: 58.9 µs vs 100.9 µs software.** See "M5 result" below.
 
@@ -51,7 +54,7 @@ handler `0x479`. The memory map in `memory.x` is therefore consistent with the p
 | **M3** | ✅ FLRC link, 125/126 delivered | yes | an on-air link at a usable rate |
 | **M4** | ✅ DPPI+TIMER RX capture, jitter measured | yes | the RX-timestamp floor: **≤62.5 ns**, below instrument resolution |
 | **M5** | ✅ scheduled TX, 1100/1100 slots | yes | guard-band floor **58.9 µs** (vs 100.9 µs software) ⇒ sub-ms base slots for #93 |
-| **M6** | 7E-A5 serial bridge + `ndn-embedded` data plane | yes | parity with the Waveshare/Heltec nodes so all five interoperate |
+| **M6** | ✅ 7E-A5 bridge on `/dev/ttyACM0` | yes | parity with the Waveshare/Heltec nodes — all five are one fleet |
 | **M7** | Tier-0 prefix-set filter on the FLPR coprocessor | yes | the NDN-NIC architecture in real silicon (#91) |
 
 ## Toolchain findings (the de-risking, recorded)
@@ -132,6 +135,47 @@ Further shield facts for later milestones: `reg-mode = DCDC`, `lf-clk = RC`, `tc
 wakeup 0, `rx-boost-cfg = 7`, `tx-power-offset = 0`, calibration at 470 MHz / 897.5 MHz / 2441 MHz,
 and per-dBm PA tables for both LF and HF paths. Two SMAs: **LF** (150–960 MHz) and **HF** (2.4 GHz +
 S-band).
+
+## M6 result — the host bridge
+
+Speaks the same 7E-A5 protocol as the Waveshare and Heltec nodes, on **UART20** — the UART the
+XIAO's onboard CMSIS-DAP probe bridges to `/dev/ttyACM0` (Zephyr's dts: `zephyr,console = &uart20`;
+the header UART `uart21` on D6/D7 goes to the pin header instead and the host could not reach it).
+No new host transport needed.
+
+```
+EVT_INFO         payload=00 01 18 93a40540 00   → status ok, fw 1.24, 2477000000 Hz, 0 dBm
+EVT_RSSI         payload=00c7
+EVT_UNSUPPORTED  payload=9901                   → cmd 0x99 rejected, not ignored
+```
+
+Why parity matters: the rig's five nodes (2 LR2021 + 2 Waveshare + 1 Heltec) become one addressable
+fleet, which is what the N≥3 MAC experiments need — the claimable-slot and hidden-terminal tests
+(#94/#95) cannot run on a two-node link.
+
+Two deliberate differences from the Waveshare node, both documented in `src/serial.rs`:
+
+- **`EVT_RX.ts_us` carries the M4 hardware capture** (DPPI-latched at the DIO edge, 62.5 ns), not a
+  software millisecond counter. Same field, far better number — stamp precision is a per-node
+  property the host should read rather than assume.
+- **LoRa-only commands are answered with `EVT_UNSUPPORTED`, not ignored.** A host that assumes a
+  spreading-factor knob gets an error instead of silence: a diagnosable bug rather than a mystery.
+
+The on-device NDN data plane is **shared by path** with `waveshare-lora-rs` (`#[path]` to its
+`ndn.rs`), not copied. Filter/dedup/relay semantics must be byte-identical across nodes that
+interoperate; two implementations agreeing today would drift, and the failure mode — one node
+silently dropping traffic its neighbour forwards — is indistinguishable from a link problem.
+
+### The bug this reproduced, and it was already in the tracker
+
+The first version used single-byte `Uarte::read` in the same loop that polls the radio over SPI, and
+**dropped host commands**: `CMD_GET_INFO` vanished while later commands got through. At 115200 a byte
+is ~87 µs and an SPI poll easily exceeds that, so bytes arriving mid-poll were simply lost.
+
+That is the *identical* defect that cost the Waveshare firmware ~50% of its commands — **task #17,
+"interrupt/DMA-driven USART RX"**. An interrupt/DMA-backed ring (`BufferedUarte`) is the fix there
+and here. **Any host-facing serial loop that also drives SPI needs one**; the unbuffered version
+fails intermittently and looks like a host or cabling problem.
 
 ## M5 result — hardware-scheduled TX and the guard band
 

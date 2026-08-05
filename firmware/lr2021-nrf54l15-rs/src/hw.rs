@@ -14,6 +14,7 @@ use crate::board;
 
 bind_interrupts!(pub struct Irqs {
     SERIAL00 => spim::InterruptHandler<peripherals::SERIAL00>;
+    SERIAL20 => embassy_nrf::buffered_uarte::InterruptHandler<peripherals::SERIAL20>;
 });
 
 /// The concrete driver type on this board: GPIO-driven NSS/NRESET, SPIM00, and an async BUSY pin
@@ -37,10 +38,22 @@ pub struct TimingParts {
     pub ppi: Peri<'static, peripherals::PPI20_CH0>,
 }
 
+/// The host-bridge UART. **UART20 specifically**, because that is the one the XIAO's onboard
+/// CMSIS-DAP debug probe bridges to `/dev/ttyACM0` (Zephyr's board dts names it
+/// `zephyr,console = &uart20`). The header UART — `uart21` on D6/D7 — goes to the pin header
+/// instead, and using it would leave the host with nothing to talk to.
+pub struct UartParts {
+    pub uart: Peri<'static, peripherals::SERIAL20>,
+    /// TX, P1.09.
+    pub tx: Peri<'static, peripherals::P1_09>,
+    /// RX, P1.08 (the board pulls it up).
+    pub rx: Peri<'static, peripherals::P1_08>,
+}
+
 /// Claim the pins named in [`crate::board`] and build the radio, handing back the peripherals the
 /// timestamp path needs. `dio` is deliberately *not* turned into an `Input` here: at M4 it becomes a
 /// GPIOTE `InputChannel` instead, and that constructor wants the raw pin.
-pub fn init(p: Peripherals) -> (Radio, TimingParts) {
+pub fn init(p: Peripherals) -> (Radio, TimingParts, UartParts) {
     let mut cfg = spim::Config::default();
     cfg.frequency = spim::Frequency::M8; // board::SPI_FREQ_HZ; shield ceiling is 16 MHz
     cfg.mode = spim::MODE_0; // LR2021: CPOL=0, CPHA=0
@@ -61,5 +74,6 @@ pub fn init(p: Peripherals) -> (Radio, TimingParts) {
     let busy = Input::new(p.P1_05, Pull::Up);
 
     let timing = TimingParts { dio: p.P1_04, timer: p.TIMER20, gpiote: p.GPIOTE20_CH0, ppi: p.PPI20_CH0 };
-    (Lr2021::new(nreset, busy, spi, nss), timing)
+    let uart = UartParts { uart: p.SERIAL20, tx: p.P1_09, rx: p.P1_08 };
+    (Lr2021::new(nreset, busy, spi, nss), timing, uart)
 }

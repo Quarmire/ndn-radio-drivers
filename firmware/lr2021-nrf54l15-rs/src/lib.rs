@@ -13,5 +13,6 @@
 pub mod board;
 pub mod flrc_link;
 pub mod hw;
+pub mod serial;
 pub mod timing;
 

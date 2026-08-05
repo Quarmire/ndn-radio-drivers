@@ -58,7 +58,7 @@ async fn main(_spawner: Spawner) {
     defmt::info!("lr2021-nrf54l15-rs M1: target alive, RTT up, embassy time driver running");
 
     // ── M2: SPI to the LR2021, via the shared pin map in `hw` ────────────────────────────────
-    let (mut radio, _timing) = hw::init(p);
+    let (mut radio, _timing, _uart) = hw::init(p);
 
     match radio.reset().await {
         Ok(()) => defmt::info!("M2: LR2021 reset asserted"),

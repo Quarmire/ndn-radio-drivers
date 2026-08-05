@@ -24,6 +24,7 @@ embassy-nrf = { version = "0.11", features = ["nrf54l15-app-s", "time-driver-grt
 # also exactly the 1 µs resolution the MAC clock wants (see src/timing.rs).
 embassy-time-driver = { version = "0.2", default-features = false }
 embassy-futures = "0.1"
+embedded-hal = "1.0"
 embedded-hal-async = "1.0"
 embedded-hal-bus = { version = "0.3", features = ["async"] }
 # Vendored from crates.io 0.13.1 with one local patch — see README "Vendored LR2021 driver".

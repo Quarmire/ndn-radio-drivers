@@ -19,6 +19,10 @@ This is not just another LoRa node. It is the only hardware in the rig that can 
 
 ## Status
 
+**M3 complete — on-air FLRC link, 125/126 frames delivered (~99.2%).**
+o5p-0 → o5p-1 at 2477 MHz, 2.6 Mbit/s, 0 dBm, one 200 ms beacon carrying a sequence number, over
+~25 s. Exactly **one** frame lost after the first, sustained. See "M3 result" below.
+
 **M2 complete — the LR2021 answers on both boards.** `get_version()` returns **firmware 1.24**
 (`major=0x01 minor=0x18`), status OK, BUSY idle, on o5p-0 (probe `DDCBDC3E`) and o5p-1
 (`8369B83C`). A plausible value, not the all-`0x00`/all-`0xff` signature of a mis-wired bus.
@@ -38,7 +42,7 @@ handler `0x479`. The memory map in `memory.x` is therefore consistent with the p
 | **M0** | ✅ builds for `thumbv8m.main-none-eabihf` | no | embassy-nrf `nrf54l15-app-s` + the `lr2021` driver resolve and link |
 | **M1** | ✅ RTT on both boards | yes | flash + run + debug I/O, and the GRTC time driver |
 | **M2** | ✅ SPI up, `get_version()` = fw 1.24 | yes | the `board` pin map, SPI mode and wiring |
-| **M3** | FLRC TX↔RX between the two kits | yes | an on-air link at a usable rate |
+| **M3** | ✅ FLRC link, 125/126 delivered | yes | an on-air link at a usable rate |
 | **M4** | DPPI+TIMER RX capture, **jitter measured** | yes | the RX-timestamp floor — *the number this board exists for* |
 | **M5** | DPPI+TIMER scheduled TX, **error measured** | yes | the guard-band floor ⇒ µs or ms base slots for the lease MAC (#93) |
 | **M6** | 7E-A5 serial bridge + `ndn-embedded` data plane | yes | parity with the Waveshare/Heltec nodes so all five interoperate |
@@ -122,6 +126,35 @@ Further shield facts for later milestones: `reg-mode = DCDC`, `lf-clk = RC`, `tc
 wakeup 0, `rx-boost-cfg = 7`, `tx-power-offset = 0`, calibration at 470 MHz / 897.5 MHz / 2441 MHz,
 and per-dBm PA tables for both LF and HF paths. Two SMAs: **LF** (150–960 MHz) and **HF** (2.4 GHz +
 S-band).
+
+## M3 result — the on-air FLRC link
+
+```
+INFO  m3_rx: FLRC 2477000000 Hz, 2.6 Mbit/s, syncword 0x86244e44 — listening
+INFO  m3_rx: FIRST FRAME, seq 82
+INFO  m3_rx: got  25 / expected  26 (lost 1), crc_err  4, last seq 107, rssi_raw 190
+INFO  m3_rx: got  50 / expected  51 (lost 1), crc_err 12, last seq 132, rssi_raw 179
+INFO  m3_rx: got 125 / expected 126 (lost 1), crc_err 31, last seq 207, rssi_raw 196
+```
+
+`m3_tx` beacons a 4-byte big-endian sequence number plus a `NDN-M3` tag every 200 ms; `m3_rx` tracks
+the sequence, so the result is a **delivery ratio, not a liveness blink** — the loss count stays flat
+at 1 across the whole run, i.e. nothing is lost after the initial frame.
+
+**Unexplained, and deliberately not explained away:** `crc_err` climbs steadily (~31 over 126 good
+frames) while the *lost payload* count stays at 1. Frames arriving corrupted would show up as
+losses, and they do not — so these are most likely **false syncword matches on ambient 2.4 GHz
+noise**, not damaged packets. That is a hypothesis, not a measurement; confirm it (e.g. by counting
+CRC errors with the transmitter off) before relying on it.
+
+### Band choice — reasoned, not yet measured
+
+2.4 GHz (**HF** port) rather than sub-GHz, because 902–928 MHz on this bench already carries **LoRa
+*and* HaLow**, which have been measured interfering there. This board exists to measure microsecond
+timing; siting it in the one band with known self-interference would pollute exactly the numbers it
+is here to produce. 2477 MHz is the quiet corner — above US Wi-Fi ch11 (~2473; ch12–14 are not
+permitted in the US) and below the BLE advertising channel at 2480, so a ~2.4 MHz-wide signal clears
+both. **Verify with a spectrum look before trusting timing results taken here.**
 
 ## Three traps hit during bring-up, all now pinned in config
 

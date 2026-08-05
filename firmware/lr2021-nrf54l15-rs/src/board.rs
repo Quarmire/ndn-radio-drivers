@@ -1,51 +1,40 @@
-//! Board pin map — **Seeed XIAO nRF54L15 ↔ Semtech LR2021**.
+//! Board pin map — **Seeed XIAO nRF54L15 ↔ Semtech LR2021 LoRa Plus expansion board**.
 //!
-//! ## ⚠ Every constant here is UNVERIFIED until the board is on the bench
+//! **Source of truth, not a guess.** Composed from two authoritative devicetrees:
 //!
-//! This map is the XIAO form-factor default (the standard XIAO SPI trio on D8/D9/D10 plus three
-//! control lines). It has **not** been checked against the actual kit, and on this rig guessing a
-//! pinout has a near-zero hit rate. **Before the first flash: read continuity or the kit schematic
-//! and correct this file.** A wrong map fails as "the radio never answers" — which looks exactly
-//! like a dead chip, and has cost this project days before.
+//! - Semtech's own shield overlay, `boards/shields/semtech_wio_lr20xx/semtech_wio_lr20xx_common.dtsi`
+//!   in [`Lora-net/usp_zephyr`](https://github.com/Lora-net/usp_zephyr) — gives the LR2021 control
+//!   lines in XIAO `D<n>` terms, their polarities and pulls, and the SPI ceiling.
+//! - Zephyr's XIAO board definition, `boards/seeed/xiao_nrf54l15/seeed_xiao_connector.dtsi` and
+//!   `xiao_nrf54l15-pinctrl.dtsi` — maps `D<n>` onto nRF54L15 port/pin and fixes the SPI instance.
 //!
-//! The LR2021 needs four lines beyond power (per the driver's `Lr2021::new`):
+//! Recorded because the earlier placeholder here was the XIAO form-factor *default*, and it was
+//! wrong on **every single line** — different port, different pins, different order. On this rig a
+//! wrong pinout presents as "the radio never answers", which is indistinguishable from a dead part.
 //!
-//! | signal  | direction | purpose |
-//! |---------|-----------|---------|
-//! | `SCK` / `MOSI` / `MISO` | SPI | command + FIFO transport |
-//! | `NSS`   | MCU → radio | SPI chip select (driven by us, not the SPIM, so a whole command
-//! |         |             | sequence holds CS low) |
-//! | `RESET` | MCU → radio | active-low reset |
-//! | `BUSY`  | radio → MCU | radio is processing; every command waits for it to fall |
-//! | `DIO`   | radio → MCU | IRQ line — **and the timing reference, see [`crate::timing`]** |
+//! | signal | XIAO | nRF54L15 | polarity / pull | notes |
+//! |---|---|---|---|---|
+//! | `DIO8` (IRQ) | D0 | **P1.04** | active high, pull-down | LR2021 DIO8 is the IRQ line, `IRQ_ALL_MASK`. **Also the hardware-timestamp reference** — see [`crate::timing`] |
+//! | `BUSY` | D1 | **P1.05** | active high, pull-up | every command waits on this |
+//! | `NRESET` | D2 | **P1.06** | active **low** | |
+//! | `NSS` | D3 | **P1.07** | active **low** | driven by us as a GPIO, not by the SPIM, so a whole command holds CS low |
+//! | `SCK` | D8 | **P2.01** | — | `SPIM00` |
+//! | `MOSI` | D10 | **P2.02** | — | |
+//! | `MISO` | D9 | **P2.04** | — | |
 //!
-//! `DIO_IRQ` is the load-bearing one for this whole testbed: its edge is the on-air event we
-//! capture in hardware to get a sub-µs RX timestamp, so it must land on a pin that GPIOTE can
-//! observe and DPPI can route.
+//! The SPI pins sit on **P2.x**, which is why the instance must be **`SERIAL00`/`SPIM00`** (the
+//! high-speed one, clocked from the 128/64 MHz PLL domain) rather than one of the `SERIAL2x`
+//! peripherals. `embassy-nrf` implements `SPIM00` only under its `_s` feature, which
+//! `nrf54l15-app-s` provides.
+//!
+//! Other facts from the shield devicetree, for later milestones: `reg-mode = DCDC`,
+//! `lf-clk = RC`, `tcxo-voltage = 1.8 V` with `tcxo-wakeup-time = 0`, `rx-boost-cfg = 7`,
+//! `tx-power-offset = 0`, and calibration frequencies 470 MHz / 897.5 MHz / 2441 MHz. The board has
+//! two SMA ports: **LF** (sub-GHz, 150–960 MHz) and **HF** (2.4 GHz ISM + S-band).
 
-/// SPI clock. The LR2021 tolerates a fast SPI; start slow and raise it only after the version
-/// read is stable — a marginal SPI reads as a flaky radio.
+/// SPI clock for bring-up. Semtech's devicetree sets `spi-max-frequency = 16 MHz`; start at half
+/// that and raise it only once `get_version()` is stable — a marginal SPI reads as a flaky radio.
 pub const SPI_FREQ_HZ: u32 = 8_000_000;
 
-/// Which of the three SPIM instances to use (SPIM20/21/22 exist on this part). SPIM21 is chosen
-/// only because it is unlikely to clash with the XIAO's other default peripherals; re-check when
-/// the pin map is confirmed.
-pub const SPIM_INSTANCE: &str = "SPIM21";
-
-// ── Pin numbers, as (port, pin) so they can be checked against the schematic at a glance ────────
-// P<port>_<pin>. Fill these in from the board, then wire them in `main.rs`.
-
-/// SPI clock — XIAO D8.
-pub const PIN_SCK: (u8, u8) = (1, 11);
-/// SPI MOSI — XIAO D10.
-pub const PIN_MOSI: (u8, u8) = (1, 12);
-/// SPI MISO — XIAO D9.
-pub const PIN_MISO: (u8, u8) = (1, 13);
-/// SPI chip select, driven as a plain GPIO output (active low).
-pub const PIN_NSS: (u8, u8) = (1, 14);
-/// LR2021 reset, active low.
-pub const PIN_RESET: (u8, u8) = (1, 10);
-/// LR2021 BUSY, input.
-pub const PIN_BUSY: (u8, u8) = (1, 9);
-/// LR2021 DIO used as the IRQ + hardware-timestamp reference. See [`crate::timing`].
-pub const PIN_DIO_IRQ: (u8, u8) = (1, 8);
+/// The SPI ceiling the shield devicetree declares. Do not exceed.
+pub const SPI_FREQ_MAX_HZ: u32 = 16_000_000;

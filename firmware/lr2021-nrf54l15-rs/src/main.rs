@@ -34,6 +34,8 @@
 #![no_main]
 
 use embassy_executor::Spawner;
+use embassy_nrf::gpio::{Input, Level, Output, OutputDrive, Pull};
+use embassy_nrf::{bind_interrupts, peripherals, spim};
 use embassy_time::{Duration, Instant, Timer};
 
 use defmt_rtt as _;
@@ -41,6 +43,10 @@ use panic_probe as _;
 
 pub mod board;
 pub mod timing;
+
+bind_interrupts!(struct Irqs {
+    SERIAL00 => spim::InterruptHandler<peripherals::SERIAL00>;
+});
 
 /// **M1** — prove the flash → run → debug-I/O path end to end.
 ///
@@ -52,21 +58,63 @@ pub mod timing;
 /// A frozen counter means the clock/time-driver feature is wrong, not the radio.
 #[embassy_executor::main]
 async fn main(_spawner: Spawner) {
-    let _p = embassy_nrf::init(Default::default());
+    let p = embassy_nrf::init(Default::default());
 
     defmt::info!("lr2021-nrf54l15-rs M1: target alive, RTT up, embassy time driver running");
 
-    // M2 lands here: bring up SPIM on the `board` pins, drive NSS and RESET as GPIO outputs, take
-    // BUSY and DIO as inputs, hand them to `Lr2021::new`, then `reset()` and `get_version()`.
-    //
-    // Not written blind. The pin map in `board` is unverified, and on this rig a guessed pinout
-    // presents as "the radio never answers" — indistinguishable from a dead part, a misdiagnosis
-    // that has cost this project days. Confirm the wiring, then fill this in.
+    // ── M2: SPI to the LR2021 ────────────────────────────────────────────────────────────────
+    // Pin map is from Semtech's + Zephyr's devicetrees, not guessed — see [`board`].
+    let mut cfg = spim::Config::default();
+    cfg.frequency = spim::Frequency::M8; // board::SPI_FREQ_HZ; the shield's ceiling is 16 MHz
+    cfg.mode = spim::MODE_0; // LR2021: CPOL=0, CPHA=0
+    // SPIM00 (SERIAL00) because the shield's SPI lands on P2.x — see [`board`].
+    let spi = spim::Spim::new(
+        p.SERIAL00, Irqs, p.P2_01, /* SCK, D8 */
+        p.P2_04, /* MISO, D9 */ p.P2_02, /* MOSI, D10 */
+        cfg,
+    );
+
+    // NSS and NRESET are both active-low, driven by us rather than by the SPIM so that a whole
+    // command sequence can hold CS low. Start NSS high (deselected) and NRESET high (not in reset).
+    let nss = Output::new(p.P1_07, Level::High, OutputDrive::Standard);
+    let nreset = Output::new(p.P1_06, Level::High, OutputDrive::Standard);
+    // Pulls follow the shield devicetree exactly: BUSY pulls up, DIO8/IRQ pulls down.
+    let busy = Input::new(p.P1_05, Pull::Up);
+    let _dio_irq = Input::new(p.P1_04, Pull::Down); // M4 will route this edge through DPPI
+
+    let mut radio = lr2021::Lr2021::new(nreset, busy, spi, nss);
+
+    match radio.reset().await {
+        Ok(()) => defmt::info!("M2: LR2021 reset asserted"),
+        Err(e) => defmt::error!("M2: reset FAILED: {}", defmt::Debug2Format(&e)),
+    }
+    Timer::after(Duration::from_millis(50)).await;
+
+    // The M2 pass/fail: a chip that answers on SPI returns its version. A wrong pin map, a wrong
+    // SPI mode, or a part held in reset all show up here as an error or an implausible value.
+    match radio.get_version().await {
+        // Printed field by field rather than as an opaque blob: an all-zero or all-0xff version is
+        // the classic signature of a mis-wired or unpowered SPI, and it must not look like a pass.
+        Ok(mut v) => defmt::info!(
+            "M2 PASS: LR2021 firmware {}.{} (raw major={=u8:#04x} minor={=u8:#04x}) status_ok={}",
+            v.major(),
+            v.minor(),
+            v.major(),
+            v.minor(),
+            v.status().is_ok()
+        ),
+        Err(e) => defmt::error!("M2 FAIL: get_version: {}", defmt::Debug2Format(&e)),
+    }
 
     let mut tick = 0u32;
     loop {
         Timer::after(Duration::from_secs(1)).await;
         tick += 1;
-        defmt::info!("tick {} uptime {} ms", tick, Instant::now().as_millis());
+        defmt::info!(
+            "tick {} uptime {} ms busy={}",
+            tick,
+            Instant::now().as_millis(),
+            radio.is_busy()
+        );
     }
 }

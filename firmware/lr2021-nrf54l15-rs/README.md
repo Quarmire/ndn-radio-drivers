@@ -19,7 +19,9 @@ This is not just another LoRa node. It is the only hardware in the rig that can 
 
 ## Status
 
-**M1 complete — running on both boards** (o5p-0 probe `DDCBDC3E`, o5p-1 probe `8369B83C`).
+**M2 complete — the LR2021 answers on both boards.** `get_version()` returns **firmware 1.24**
+(`major=0x01 minor=0x18`), status OK, BUSY idle, on o5p-0 (probe `DDCBDC3E`) and o5p-1
+(`8369B83C`). A plausible value, not the all-`0x00`/all-`0xff` signature of a mis-wired bus.
 Embassy is up, the GRTC time driver ticks at exactly 1000 ms, and RTT is readable over SWD.
 
 ```
@@ -35,7 +37,7 @@ handler `0x479`. The memory map in `memory.x` is therefore consistent with the p
 |---|---|---|---|
 | **M0** | ✅ builds for `thumbv8m.main-none-eabihf` | no | embassy-nrf `nrf54l15-app-s` + the `lr2021` driver resolve and link |
 | **M1** | ✅ RTT on both boards | yes | flash + run + debug I/O, and the GRTC time driver |
-| **M2** | SPI up, `get_version()` answers | yes | the `board` pin map — **most likely first failure** |
+| **M2** | ✅ SPI up, `get_version()` = fw 1.24 | yes | the `board` pin map, SPI mode and wiring |
 | **M3** | FLRC TX↔RX between the two kits | yes | an on-air link at a usable rate |
 | **M4** | DPPI+TIMER RX capture, **jitter measured** | yes | the RX-timestamp floor — *the number this board exists for* |
 | **M5** | DPPI+TIMER scheduled TX, **error measured** | yes | the guard-band floor ⇒ µs or ms base slots for the lease MAC (#93) |
@@ -92,12 +94,34 @@ sudo -n $P verify   --chip nRF54L15 <elf>
 
 Target confirmed live over SWD: Cortex-M33, ARMv8-M, Nordic VLSI ASA, DPv2.
 
-## Before M2 — one unknown left, cheap to resolve and expensive to guess
+## The pin map — resolved from two devicetrees
 
-1. **The pin map in `src/board.rs` is a guess.** It is the XIAO form-factor default, unverified
-   against the kit. On this rig a wrong pinout presents as *"the radio never answers"*, which is
-   indistinguishable from a dead part and has cost days before. Check continuity or the kit
-   schematic and correct the file. `get_version()` (M2) is the test.
+| signal | XIAO | nRF54L15 | polarity / pull |
+|---|---|---|---|
+| `DIO8` (IRQ) | D0 | **P1.04** | active high, pull-down |
+| `BUSY` | D1 | **P1.05** | active high, pull-up |
+| `NRESET` | D2 | **P1.06** | active **low** |
+| `NSS` | D3 | **P1.07** | active **low** |
+| `SCK` | D8 | **P2.01** | `SPIM00`, ≤16 MHz |
+| `MOSI` | D10 | **P2.02** | |
+| `MISO` | D9 | **P2.04** | |
+
+Sources: Semtech's shield overlay `boards/shields/semtech_wio_lr20xx/semtech_wio_lr20xx_common.dtsi`
+in [Lora-net/usp_zephyr](https://github.com/Lora-net/usp_zephyr) (control lines, polarities, pulls,
+SPI ceiling) and Zephyr's `boards/seeed/xiao_nrf54l15/seeed_xiao_connector.dtsi` (D*n* → port/pin).
+
+**The earlier placeholder was wrong on every single line** — different port, different pins,
+different order. That is exactly why `main()` was left stopping short of SPI until the map was
+sourced: a guessed pinout fails as "the radio never answers", indistinguishable from a dead part.
+
+The SPI pins are on **P2.x**, which forces the instance to `SERIAL00`/`SPIM00` (the high-speed one
+off the 128/64 MHz PLL domain), not a `SERIAL2x`. `embassy-nrf` implements `SPIM00` only under `_s`,
+which `nrf54l15-app-s` provides.
+
+Further shield facts for later milestones: `reg-mode = DCDC`, `lf-clk = RC`, `tcxo = 1.8 V` with
+wakeup 0, `rx-boost-cfg = 7`, `tx-power-offset = 0`, calibration at 470 MHz / 897.5 MHz / 2441 MHz,
+and per-dBm PA tables for both LF and HF paths. Two SMAs: **LF** (150–960 MHz) and **HF** (2.4 GHz +
+S-band).
 
 ## Three traps hit during bring-up, all now pinned in config
 

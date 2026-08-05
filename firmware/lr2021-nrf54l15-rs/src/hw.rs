@@ -4,8 +4,9 @@
 //! milestone binaries wiring SPI independently is precisely how two nodes end up disagreeing about a
 //! pin and failing as "the radio never answers".
 
-use embassy_nrf::gpio::{Input, Level, Output, OutputDrive, Pull};
-use embassy_nrf::{Peripherals, bind_interrupts, peripherals, spim};
+use embassy_nrf::gpio::{Level, Output, OutputDrive, Pull};
+use embassy_nrf::gpio::Input;
+use embassy_nrf::{Peri, Peripherals, bind_interrupts, peripherals, spim};
 
 use lr2021::{BusyAsync, Lr2021};
 
@@ -19,10 +20,27 @@ bind_interrupts!(pub struct Irqs {
 /// (so a command waits on an edge rather than spinning on a poll).
 pub type Radio = Lr2021<Output<'static>, spim::Spim<'static>, BusyAsync<Input<'static>>>;
 
-/// Claim the pins named in [`crate::board`] and build the radio. Also returns the DIO8/IRQ input:
-/// it is the radio's interrupt line *and* the hardware-timestamp reference [`crate::timing`] will
-/// route through DPPI at M4, so it is handed back rather than consumed here.
-pub fn init(p: Peripherals) -> (Radio, Input<'static>) {
+/// The peripherals the hardware-timestamp path needs, handed out rather than consumed here.
+///
+/// All four must live in the **same DPPI domain**, and that is not a style preference — a DPPI
+/// channel cannot connect peripherals across domains. `P1_04` belongs to `GPIOTE20`, which forces
+/// `TIMER20` and a `PPI20_*` channel. Bundling them makes the constraint impossible to violate by
+/// picking a peripheral at a call site.
+pub struct TimingParts {
+    /// LR2021 DIO8 — the radio IRQ line, and the event whose edge is captured in hardware.
+    pub dio: Peri<'static, peripherals::P1_04>,
+    /// The free-running MAC clock (domain 20).
+    pub timer: Peri<'static, peripherals::TIMER20>,
+    /// GPIOTE channel that turns the DIO edge into an event (domain 20).
+    pub gpiote: Peri<'static, peripherals::GPIOTE20_CH0>,
+    /// DPPI channel wiring that event to the timer's capture task (domain 20).
+    pub ppi: Peri<'static, peripherals::PPI20_CH0>,
+}
+
+/// Claim the pins named in [`crate::board`] and build the radio, handing back the peripherals the
+/// timestamp path needs. `dio` is deliberately *not* turned into an `Input` here: at M4 it becomes a
+/// GPIOTE `InputChannel` instead, and that constructor wants the raw pin.
+pub fn init(p: Peripherals) -> (Radio, TimingParts) {
     let mut cfg = spim::Config::default();
     cfg.frequency = spim::Frequency::M8; // board::SPI_FREQ_HZ; shield ceiling is 16 MHz
     cfg.mode = spim::MODE_0; // LR2021: CPOL=0, CPHA=0
@@ -41,7 +59,7 @@ pub fn init(p: Peripherals) -> (Radio, Input<'static>) {
     let nreset = Output::new(p.P1_06, Level::High, OutputDrive::Standard);
     // Pulls follow the shield devicetree exactly: BUSY pulls up, DIO8/IRQ pulls down.
     let busy = Input::new(p.P1_05, Pull::Up);
-    let dio_irq = Input::new(p.P1_04, Pull::Down);
 
-    (Lr2021::new(nreset, busy, spi, nss), dio_irq)
+    let timing = TimingParts { dio: p.P1_04, timer: p.TIMER20, gpiote: p.GPIOTE20_CH0, ppi: p.PPI20_CH0 };
+    (Lr2021::new(nreset, busy, spi, nss), timing)
 }

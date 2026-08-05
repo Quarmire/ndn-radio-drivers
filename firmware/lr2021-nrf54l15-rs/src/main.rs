@@ -34,19 +34,14 @@
 #![no_main]
 
 use embassy_executor::Spawner;
-use embassy_nrf::gpio::{Input, Level, Output, OutputDrive, Pull};
-use embassy_nrf::{bind_interrupts, peripherals, spim};
 use embassy_time::{Duration, Instant, Timer};
 
 use defmt_rtt as _;
 use panic_probe as _;
 
-pub mod board;
-pub mod timing;
-
-bind_interrupts!(struct Irqs {
-    SERIAL00 => spim::InterruptHandler<peripherals::SERIAL00>;
-});
+// The pin map, the radio construction and the link definition all live in the lib
+// (`lr2021_nrf54l15_rs`), so every milestone binary shares exactly one copy of each.
+use lr2021_nrf54l15_rs::hw;
 
 /// **M1** — prove the flash → run → debug-I/O path end to end.
 ///
@@ -62,27 +57,8 @@ async fn main(_spawner: Spawner) {
 
     defmt::info!("lr2021-nrf54l15-rs M1: target alive, RTT up, embassy time driver running");
 
-    // ── M2: SPI to the LR2021 ────────────────────────────────────────────────────────────────
-    // Pin map is from Semtech's + Zephyr's devicetrees, not guessed — see [`board`].
-    let mut cfg = spim::Config::default();
-    cfg.frequency = spim::Frequency::M8; // board::SPI_FREQ_HZ; the shield's ceiling is 16 MHz
-    cfg.mode = spim::MODE_0; // LR2021: CPOL=0, CPHA=0
-    // SPIM00 (SERIAL00) because the shield's SPI lands on P2.x — see [`board`].
-    let spi = spim::Spim::new(
-        p.SERIAL00, Irqs, p.P2_01, /* SCK, D8 */
-        p.P2_04, /* MISO, D9 */ p.P2_02, /* MOSI, D10 */
-        cfg,
-    );
-
-    // NSS and NRESET are both active-low, driven by us rather than by the SPIM so that a whole
-    // command sequence can hold CS low. Start NSS high (deselected) and NRESET high (not in reset).
-    let nss = Output::new(p.P1_07, Level::High, OutputDrive::Standard);
-    let nreset = Output::new(p.P1_06, Level::High, OutputDrive::Standard);
-    // Pulls follow the shield devicetree exactly: BUSY pulls up, DIO8/IRQ pulls down.
-    let busy = Input::new(p.P1_05, Pull::Up);
-    let _dio_irq = Input::new(p.P1_04, Pull::Down); // M4 will route this edge through DPPI
-
-    let mut radio = lr2021::Lr2021::new(nreset, busy, spi, nss);
+    // ── M2: SPI to the LR2021, via the shared pin map in `hw` ────────────────────────────────
+    let (mut radio, _timing) = hw::init(p);
 
     match radio.reset().await {
         Ok(()) => defmt::info!("M2: LR2021 reset asserted"),

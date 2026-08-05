@@ -33,6 +33,8 @@ use embedded_hal_async::spi::SpiBus;
 
 use lr2021::flrc::{AgcPblLen, Crc, FlrcBitrate, FlrcCr, FlrcPacketParams, PktFormat, SwLen, SwMatch, SwTx};
 use lr2021::radio::{PacketType, RampTime, RxBoost, RxPath};
+use lr2021::system::DioNum;
+use lr2021::status::Intr;
 use lr2021::{BusyPin, Lr2021, Lr2021Error, PulseShape};
 
 /// Centre frequency, Hz — the quiet corner above US Wi-Fi ch11 and below BLE 2480. See module docs.
@@ -92,6 +94,15 @@ where
     radio.set_tx_params(TX_POWER_DBM, RampTime::Ramp16u).await?;
     radio.set_rx_path(RxPath::HfPath, RxBoost::Max).await?;
     radio.set_rf(FREQ_HZ).await?;
+
+    // Route interrupts out on **DIO8**, which the shield wires to the MCU's P1.04.
+    //
+    // Easy to miss and expensive when missed: M3 polled the IRQ over SPI and never needed this pin,
+    // so DIO8 sat idle and undriven. M4 then armed a DPPI capture on its edge and measured nothing —
+    // a silent zero-sample result that looks exactly like "hardware timestamping does not work"
+    // rather than "the interrupt was never routed to the pin". Configured here, in the shared setup,
+    // so no binary can forget it.
+    radio.set_dio_irq(DioNum::Dio8, Intr::new_txrx()).await?;
 
     Ok(())
 }

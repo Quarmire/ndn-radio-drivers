@@ -19,6 +19,9 @@ This is not just another LoRa node. It is the only hardware in the rig that can 
 
 ## Status
 
+**M4 complete — the hardware RX timestamp works, and its resolution floor is below what the
+instrument can measure: 62.5 ns.** See "M4 result" below.
+
 **M3 complete — on-air FLRC link, 125/126 frames delivered (~99.2%).**
 o5p-0 → o5p-1 at 2477 MHz, 2.6 Mbit/s, 0 dBm, one 200 ms beacon carrying a sequence number, over
 ~25 s. Exactly **one** frame lost after the first, sustained. See "M3 result" below.
@@ -43,7 +46,7 @@ handler `0x479`. The memory map in `memory.x` is therefore consistent with the p
 | **M1** | ✅ RTT on both boards | yes | flash + run + debug I/O, and the GRTC time driver |
 | **M2** | ✅ SPI up, `get_version()` = fw 1.24 | yes | the `board` pin map, SPI mode and wiring |
 | **M3** | ✅ FLRC link, 125/126 delivered | yes | an on-air link at a usable rate |
-| **M4** | DPPI+TIMER RX capture, **jitter measured** | yes | the RX-timestamp floor — *the number this board exists for* |
+| **M4** | ✅ DPPI+TIMER RX capture, jitter measured | yes | the RX-timestamp floor: **≤62.5 ns**, below instrument resolution |
 | **M5** | DPPI+TIMER scheduled TX, **error measured** | yes | the guard-band floor ⇒ µs or ms base slots for the lease MAC (#93) |
 | **M6** | 7E-A5 serial bridge + `ndn-embedded` data plane | yes | parity with the Waveshare/Heltec nodes so all five interoperate |
 | **M7** | Tier-0 prefix-set filter on the FLPR coprocessor | yes | the NDN-NIC architecture in real silicon (#91) |
@@ -127,6 +130,45 @@ wakeup 0, `rx-boost-cfg = 7`, `tx-power-offset = 0`, calibration at 470 MHz / 89
 and per-dBm PA tables for both LF and HF paths. Two SMAs: **LF** (150–960 MHz) and **HF** (2.4 GHz +
 S-band).
 
+## M4 result — the RX-timestamp floor
+
+Every frame is stamped twice from **one** timer: `CC[0]` by DPPI at the DIO8 edge (no CPU), `CC[1]`
+by the CPU when the async task wakes. `CC[1] − CC[0]` is therefore the whole software path, and one
+timer means no inter-oscillator drift contaminates it.
+
+At 1 MHz (1 µs/tick):
+
+```
+SW-PATH LATENCY  min=30 mean=30 max=31 p2p=1 us        (n=700)
+```
+
+`p2p = 1 µs` is *exactly one tick* — the result sat on the quantization floor and could not tell
+"1 µs of jitter" from "less than the ruler can see". So the clock was raised 16× and it was re-run:
+
+```
+SW-PATH LATENCY  min=494 mean=494 max=494 p2p=0 ticks @62.5 ns   (n=500)
+hw inter-arrival min=323190 ticks = 20.2 ms  (matches the 20 ms TX period)
+```
+
+**Peak-to-peak zero.** 494 ticks = **30.9 µs, constant to within one 62.5 ns tick over 500 frames**.
+16 MHz is the nRF timer's maximum, so 62.5 ns is the instrument's floor, not the signal's.
+
+### What this establishes, and what it does not
+
+- **The DPPI capture path is live and correct.** Two independent checks: the software–hardware delta
+  stays *exactly* constant (a stale `CC[0]` would make it grow without bound), and the hardware
+  inter-arrival reproduces the 20 ms transmit period (a stale register would give 0).
+- **RX-timestamp resolution ≤ 62.5 ns.** For scale, the Wi-Fi path measured ~0.4 µs with the Realtek
+  RXTSFL hardware stamp and ~55 µs in software.
+- **The honest caveat: the software path was *also* perfect here — 0 ticks of jitter.** That is a
+  property of *this workload*, not of software timestamping: one task, an idle 128 MHz M33, an
+  identical instruction sequence every time. Under a real MAC — SPI in flight, several tasks, other
+  interrupts — the software number will degrade and the hardware number will not. **The value of
+  DPPI is not the 30.9 µs offset (a constant offset calibrates out); it is that the hardware figure
+  cannot get worse under load.** Re-measure the software path under load before quoting it anywhere.
+- Still open, as flagged before the run: the DIO edge marks packet-done *inside* the radio, not the
+  first on-air symbol. That offset is constant-looking here but has not been separated.
+
 ## M3 result — the on-air FLRC link
 
 ```
@@ -156,8 +198,13 @@ is here to produce. 2477 MHz is the quiet corner — above US Wi-Fi ch11 (~2473;
 permitted in the US) and below the BLE advertising channel at 2480, so a ~2.4 MHz-wide signal clears
 both. **Verify with a spectrum look before trusting timing results taken here.**
 
-## Three traps hit during bring-up, all now pinned in config
+## Four traps hit during bring-up, all now pinned in code or config
 
+0. **The LR2021 does not drive its IRQ pin until told to.** M3 polled the IRQ over SPI and never
+   needed DIO8, so it sat undriven. M4 then armed a DPPI capture on its edge and measured **nothing**
+   — a silent zero-sample result that reads as "hardware timestamping does not work" rather than
+   "the interrupt was never routed to the pin". Fixed by `set_dio_irq(Dio8, ...)` inside the shared
+   `flrc_link::configure`, where no binary can forget it.
 1. **`time-driver-rtc1` is wrong for this part** — nRF54L uses **`time-driver-grtc`** (1 MHz, which
    is conveniently the 1 µs resolution `src/timing.rs` wants). The wrong one still *builds*.
 2. **`TICK_HZ` defined twice.** `embassy-time-driver`'s default feature selects `tick-hz-32_768`

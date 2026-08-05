@@ -66,10 +66,19 @@ use embassy_nrf::timer::Frequency;
 
 /// Timer frequency for the MAC clock: 1 MHz ⇒ 1 tick = 1 µs, matching the µs vocabulary used by
 /// `ndn-time` and the face scheduler. See the module note on when to raise it.
-pub const MAC_CLOCK: Frequency = Frequency::F1MHz;
+/// **16 MHz (62.5 ns/tick), raised from 1 MHz after the first M4 run.**
+///
+/// At 1 MHz the software-path spread measured `p2p = 1 µs` — which is *exactly one tick*, i.e. the
+/// result was at the quantization floor and could not distinguish "1 µs of real jitter" from "less
+/// jitter than the ruler can see". Raising the clock 16× is the cheap way to find out which. The
+/// cost is wrap period: ~4.5 minutes instead of ~71.6, which is far longer than any MAC epoch.
+pub const MAC_CLOCK: Frequency = Frequency::F16MHz;
 
 /// Ticks per microsecond at [`MAC_CLOCK`] — the conversion the MAC layer reasons in.
-pub const TICKS_PER_US: u32 = 1;
+pub const TICKS_PER_US: u32 = 16;
+
+/// Nanoseconds per tick at [`MAC_CLOCK`] — the true resolution of every [`HwStamp`].
+pub const TICK_NS: u32 = 1000 / TICKS_PER_US;
 
 /// A hardware-captured instant on the MAC clock: the raw tick count latched by
 /// `TIMER.CC[n].CAPTURE` at a DPPI-routed event edge.
@@ -97,5 +106,115 @@ impl HwStamp {
     /// Ticks elapsed from `earlier` to `self`, correct across a single wrap.
     pub const fn since(self, earlier: HwStamp) -> u32 {
         self.ticks.wrapping_sub(earlier.ticks)
+    }
+}
+
+// ── The hardware capture path ────────────────────────────────────────────────────────────────────
+
+use embassy_nrf::gpio::Pull;
+use embassy_nrf::gpiote::{InputChannel, InputChannelPolarity};
+use embassy_nrf::ppi::Ppi;
+use embassy_nrf::timer::Timer;
+
+use crate::hw::TimingParts;
+
+/// The RX-timestamp path: a DIO edge captured into a timer register **by hardware**, with the CPU
+/// nowhere in the loop.
+///
+/// Holds the DPPI channel and the timer for their whole lifetime on purpose — dropping either
+/// silently disconnects the route, and a silently-disconnected capture returns a stale register
+/// value rather than an error. The result would be plausible-looking timestamps that are simply
+/// wrong, which is the worst failure mode a measurement instrument can have.
+pub struct RxCapture {
+    dio: InputChannel<'static>,
+    timer: Timer<'static>,
+    /// Kept alive to hold the DIO-event → capture-task route open.
+    _route: Ppi<'static, embassy_nrf::peripherals::PPI20_CH0, 1, 1>,
+}
+
+/// CC register holding the **hardware** capture (written by DPPI at the edge).
+const CC_HW: usize = 0;
+/// CC register used for the **software** capture (written by the CPU when the task wakes).
+const CC_SW: usize = 1;
+
+impl RxCapture {
+    /// Wire DIO8's rising edge to `TIMER20.CC[0].CAPTURE` over DPPI and start the clock.
+    ///
+    /// Rising edge because the LR2021 asserts DIO8 high on an interrupt; the line falls again only
+    /// when the IRQ is cleared over SPI, long after the event we care about.
+    pub fn new(parts: TimingParts) -> Self {
+        let dio = InputChannel::new(parts.gpiote, parts.dio, Pull::Down, InputChannelPolarity::LoToHi);
+
+        let timer = Timer::new(parts.timer);
+        timer.set_frequency(MAC_CLOCK); // 1 MHz ⇒ 1 tick = 1 µs
+        timer.start();
+
+        // The whole point: peripheral event → peripheral task, no CPU, no interrupt latency.
+        let mut route = Ppi::new_one_to_one(parts.ppi, dio.event_in(), timer.cc(CC_HW).task_capture());
+        route.enable();
+
+        Self { dio, timer, _route: route }
+    }
+
+    /// Await the next DIO edge. The hardware capture has *already* happened by the time this
+    /// returns — that is the entire idea. Anything slow that follows cannot corrupt the stamp.
+    pub async fn wait_edge(&mut self) {
+        self.dio.wait().await;
+    }
+
+    /// The value DPPI latched at the edge.
+    pub fn hw_stamp(&self) -> HwStamp {
+        HwStamp::from_ticks(self.timer.cc(CC_HW).read())
+    }
+
+    /// Capture *now*, in software, from the **same timer**.
+    ///
+    /// Same clock is what makes the comparison honest: reading a second, independent clock would mix
+    /// the software path's latency with the relative drift of two oscillators, and at these
+    /// magnitudes the drift term is not negligible. One timer, two CC registers, no drift.
+    pub fn sw_stamp(&self) -> HwStamp {
+        HwStamp::from_ticks(self.timer.cc(CC_SW).capture())
+    }
+
+    /// Read the free-running counter without disturbing either capture register.
+    pub fn now(&self) -> HwStamp {
+        HwStamp::from_ticks(self.timer.cc(5).capture())
+    }
+}
+
+/// Running min/max/mean of a µs quantity — enough to report a spread without floating point or
+/// storing samples on a device with no allocator.
+#[derive(Clone, Copy)]
+pub struct Spread {
+    pub n: u32,
+    pub min: u32,
+    pub max: u32,
+    sum: u64,
+}
+
+impl Default for Spread {
+    fn default() -> Self {
+        Self { n: 0, min: u32::MAX, max: 0, sum: 0 }
+    }
+}
+
+impl Spread {
+    /// Fold in one sample.
+    pub fn push(&mut self, v: u32) {
+        self.n += 1;
+        self.min = self.min.min(v);
+        self.max = self.max.max(v);
+        self.sum += v as u64;
+    }
+
+    /// Mean, truncated. Zero before the first sample.
+    pub fn mean(&self) -> u32 {
+        if self.n == 0 { 0 } else { (self.sum / self.n as u64) as u32 }
+    }
+
+    /// Peak-to-peak — **the number that matters for a MAC guard band**, since a guard must cover
+    /// the worst case, not the average.
+    pub fn peak_to_peak(&self) -> u32 {
+        if self.n == 0 { 0 } else { self.max - self.min }
     }
 }

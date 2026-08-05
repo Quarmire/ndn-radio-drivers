@@ -34,25 +34,39 @@
 #![no_main]
 
 use embassy_executor::Spawner;
-use embassy_time::{Duration, Timer};
+use embassy_time::{Duration, Instant, Timer};
 
-use panic_halt as _;
+use defmt_rtt as _;
+use panic_probe as _;
 
 pub mod board;
 pub mod timing;
 
+/// **M1** — prove the flash → run → debug-I/O path end to end.
+///
+/// Deliberately RTT rather than an LED blink: RTT needs no knowledge of the board's pin map, and the
+/// pin map is exactly the thing still unverified ([`board`]). This isolates "can we build, flash and
+/// observe the target" from "is the wiring right", so an M2 failure has only one possible cause.
+///
+/// It also proves the embassy time driver is running: the printed uptime must advance ~1 s per line.
+/// A frozen counter means the clock/time-driver feature is wrong, not the radio.
 #[embassy_executor::main]
 async fn main(_spawner: Spawner) {
     let _p = embassy_nrf::init(Default::default());
 
-    // M1/M2 land here: bring up SPIM on the `board` pins, drive NSS and RESET as GPIO outputs, take
+    defmt::info!("lr2021-nrf54l15-rs M1: target alive, RTT up, embassy time driver running");
+
+    // M2 lands here: bring up SPIM on the `board` pins, drive NSS and RESET as GPIO outputs, take
     // BUSY and DIO as inputs, hand them to `Lr2021::new`, then `reset()` and `get_version()`.
     //
-    // Deliberately not written blind. The pin map in `board` is unverified, and on this rig a
-    // guessed pinout presents as "the radio never answers" — indistinguishable from a dead part, and
-    // that misdiagnosis has cost this project days before. Confirm the wiring, then fill this in.
+    // Not written blind. The pin map in `board` is unverified, and on this rig a guessed pinout
+    // presents as "the radio never answers" — indistinguishable from a dead part, a misdiagnosis
+    // that has cost this project days. Confirm the wiring, then fill this in.
 
+    let mut tick = 0u32;
     loop {
         Timer::after(Duration::from_secs(1)).await;
+        tick += 1;
+        defmt::info!("tick {} uptime {} ms", tick, Instant::now().as_millis());
     }
 }

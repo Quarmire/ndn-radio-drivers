@@ -16,13 +16,21 @@ license = "MIT OR Apache-2.0"
 cortex-m = { version = "0.7", features = ["inline-asm", "critical-section-single-core"] }
 cortex-m-rt = "0.7"
 embassy-executor = { version = "0.9", features = ["arch-cortex-m", "executor-thread"] }
-embassy-time = { version = "0.5" }
-embassy-nrf = { version = "0.11", features = ["nrf54l15-app-s", "time-driver-rtc1", "gpiote"] }
+embassy-time = { version = "0.5", features = ["defmt"] }
+embassy-nrf = { version = "0.11", features = ["nrf54l15-app-s", "time-driver-grtc", "gpiote", "defmt"] }
+# The GRTC time driver runs at 1 MHz; embassy-time-driver's DEFAULT feature also selects
+# tick-hz-32_768, and two tick rates make `TICK_HZ` a duplicate definition. Pulling it in
+# directly with default-features=false leaves GRTC's 1 MHz as the only tick rate — which is
+# also exactly the 1 µs resolution the MAC clock wants (see src/timing.rs).
+embassy-time-driver = { version = "0.2", default-features = false }
 embassy-futures = "0.1"
 embedded-hal-async = "1.0"
 embedded-hal-bus = { version = "0.3", features = ["async"] }
-lr2021 = "0.13"
-panic-halt = "1"
+# Vendored from crates.io 0.13.1 with one local patch — see README "Vendored LR2021 driver".
+lr2021 = { path = "vendor/lr2021", features = ["defmt"] }
+defmt = "1"
+defmt-rtt = "1"
+panic-probe = { version = "1", features = ["print-defmt"] }
 
 [profile.release]
 opt-level = "z"

@@ -2,4 +2,12 @@
 target = "thumbv8m.main-none-eabihf"   # nRF54L15 application core: Cortex-M33 + FPU
 
 [target.thumbv8m.main-none-eabihf]
-rustflags = ["-C", "link-arg=-Tlink.x"]
+rustflags = ["-C", "link-arg=-Tlink.x", "-C", "link-arg=-Tdefmt.x"]
+
+# defmt filters by severity at BUILD time and defaults to `error`, so info!/debug! compile to
+[env]
+# defmt filters by severity at BUILD time, and with DEFMT_LOG unset the default is `error` — so
+# info!/debug! compile to NOTHING and the RTT write offset never advances. That presents exactly
+# like a dead target: flash verifies, the reset handler runs, and no output ever appears. Cost an
+# hour of bisecting on 2026-08-05; pinned here so it cannot recur.
+DEFMT_LOG = "trace"

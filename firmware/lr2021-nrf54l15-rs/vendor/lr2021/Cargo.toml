@@ -1,0 +1,34 @@
+[package]
+name = "lr2021"
+version = "0.13.1"
+edition = "2024"
+license = "MIT"
+description = "Driver for Semtech LR2021"
+repository = "https://github.com/TheClams/lr2021"
+readme = "Readme.md"
+categories = ["embedded", "no-std"]
+keywords = ["driver", "LR2021", "transceiver"]
+
+[features]
+defmt = ["dep:defmt"]
+
+[dependencies]
+
+# LOCAL PATCH (see ../../README.md "Vendored LR2021 driver"): upstream 0.13.1 hard-enables
+# ["defmt", "defmt-timestamp-uptime", "tick-hz-32_768"] here. A driver crate must not pin the
+# application's tick rate: tick-hz-32_768 collides with the 1 MHz GRTC time driver that EVERY
+# nRF54L board uses, so upstream cannot build against the HAL it is most likely paired with.
+# Left bare so the application chooses. Report upstream.
+embassy-time = { version = "0.5.0" }
+embassy-embedded-hal = { version = "0.5.0" }
+
+embedded-hal = "1.0.0"
+embedded-hal-async = "1.0"
+
+defmt = { version = "1.0.1", optional = true }
+
+# Disable test when running all target to avoid issue with rust-analyzer
+[lib]
+test = false
+doctest = false
+bench = false

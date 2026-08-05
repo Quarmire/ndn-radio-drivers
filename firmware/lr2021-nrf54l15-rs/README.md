@@ -19,6 +19,9 @@ This is not just another LoRa node. It is the only hardware in the rig that can 
 
 ## Status
 
+**M7a done — the Tier-0 prefix-set filter is built and its false-positive curve is MEASURED on
+hardware, correcting #91's sizing: k=4, not 6.** Zero false negatives everywhere. See "M7a" below.
+
 **#104/#105 done — and both are negative results worth having.** Stamping on the chip's SYNC event
 gains nothing (the receiver is not the jitter source), the RF-switch pins make no measurable
 difference, and the guard-band figure is **less precise than M5 implied**: see "#104/#105" below.
@@ -59,7 +62,8 @@ handler `0x479`. The memory map in `memory.x` is therefore consistent with the p
 | **M4** | ✅ DPPI+TIMER RX capture, jitter measured | yes | the RX-timestamp floor: **≤62.5 ns**, below instrument resolution |
 | **M5** | ✅ scheduled TX, 1100/1100 slots | yes | guard-band floor **58.9 µs** (vs 100.9 µs software) ⇒ sub-ms base slots for #93 |
 | **M6** | ✅ 7E-A5 bridge on `/dev/ttyACM0` | yes | parity with the Waveshare/Heltec nodes — all five are one fleet |
-| **M7** | Tier-0 prefix-set filter on the FLPR coprocessor | yes | the NDN-NIC architecture in real silicon (#91) |
+| **M7a** | ✅ Tier-0 filter built + FP curve measured | yes | #91's filter works; **k=4 measured, not the predicted 6–7** |
+| **M7b** | run it on the FLPR RISC-V coprocessor | yes | NDN-NIC's "NIC microcontroller" in real silicon — feasible, see below |
 
 ## Toolchain findings (the de-risking, recorded)
 
@@ -139,6 +143,65 @@ Further shield facts for later milestones: `reg-mode = DCDC`, `lf-clk = RC`, `tc
 wakeup 0, `rx-boost-cfg = 7`, `tx-power-offset = 0`, calibration at 470 MHz / 897.5 MHz / 2441 MHz,
 and per-dBm PA tables for both LF and HF paths. Two SMAs: **LF** (150–960 MHz) and **HF** (2.4 GHz +
 S-band).
+
+## M7a — the Tier-0 filter, and a correction to its sizing
+
+`src/tier0.rs` implements #91's in-frame prefix-set Bloom filter: 94 usable bits (96 minus the I/G
+and U/L bits, which must keep their locally-administered/group meaning), every prefix of the name
+inserted, depth capped at 8, keyed so a private group's filter is unlinkable. Hashing is the
+project's existing FNV-1a-64 name hash expanded by double hashing, keeping **one name-hash keyspace**
+shared with the FIB and data plane (#44) rather than adding a second family.
+
+`m7_filter_test` measures it on device, 20 000 trials per point:
+
+```
+M=94 bits, K=4, depth cap 8
+  depth 2: bits_set 12/94 | FP  19/20000 = 0.095% | false negatives 0
+  depth 4: bits_set 19/94 | FP  48/20000 = 0.24%  | false negatives 0
+  depth 6: bits_set 27/94 | FP 160/20000 = 0.80%  | false negatives 0
+  depth 8: bits_set 29/94 | FP 187/20000 = 0.94%  | false negatives 0
+```
+
+**Zero false negatives at every depth** — the property the whole design rests on, checked on every
+iteration rather than sampled. Worst case at the depth cap is **0.94% ⇒ 99.06% zero-parse
+rejection**, against NDN-NIC's 96.30% (which needed 16 KB of receiver table; this is 12 bytes in the
+frame — different jobs, see §8.1 of the design note).
+
+### The correction: k=4, not 6
+
+#91 chose **k=6** from `(M/n)·ln2`, which gives ~7 for these sizes. Measured at the depth cap:
+
+| k | bits set | FP at depth 8 |
+|---|---|---|
+| 3 | 25/94 | 1.99% |
+| **4** | **29/94** | **0.94%** ← measured optimum |
+| 5 | 35/94 | 0.98% |
+| 6 | 42/94 | 1.09% |
+| 8 | 53/94 | 1.50% |
+
+The formula assumes a query's k positions are **independent**. With only 94 bits they are not: k=6
+positions collide *with each other* ~15% of the time, and a query whose 6 positions collapse to 3
+distinct bits has the false-positive rate of k=3. That effect is invisible to the formula and grows
+with k, so the true optimum sits *below* the predicted one. **Small-m Bloom filters are their own
+regime — do not size this one from the asymptotic formula.** Lower k is also cheaper: 4 hash
+positions per prefix instead of 6.
+
+Ruled out along the way: deriving `h1`/`h2` by splitting one FNV output was suspected of correlating
+the positions (FNV's high bits are its weak half). Switching to two **independent** keyed hashes
+measured no better — so the deviation is the small-m effect above, not hash quality. The independent
+pair is kept anyway: it costs one extra FNV over a short prefix and removes a theoretical weakness
+that simply did not bite at these sizes.
+
+### M7b — the FLPR coprocessor is reachable
+
+Not attempted yet, but the path is confirmed rather than assumed: `nrf-pac` ships an
+**`nrf54l15-flpr`** chip, `embassy-nrf` has a **`vpr`** module with a full loader
+(`Vpr::new / load / init / start / stop`, plus `make_secure`) and an `FlprReset` boot option, and
+both **`riscv32imac-`/`riscv32imc-unknown-none-elf`** targets are already installed. `tier0.rs` is
+dependency-free integer code, so it compiles for RISC-V unchanged. What remains is a second crate
+for the FLPR image, a linker script placing it in shared RAM, and a mailbox protocol — that is
+NDN-NIC's "constrained NIC microcontroller" in real silicon, which the paper simulated and never
+built.
 
 ## #104 / #105 — two negative results, and a correction to the M5 number
 

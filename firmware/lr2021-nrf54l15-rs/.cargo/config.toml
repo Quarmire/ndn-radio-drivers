@@ -1,0 +1,5 @@
+[build]
+target = "thumbv8m.main-none-eabihf"   # nRF54L15 application core: Cortex-M33 + FPU
+
+[target.thumbv8m.main-none-eabihf]
+rustflags = ["-C", "link-arg=-Tlink.x"]

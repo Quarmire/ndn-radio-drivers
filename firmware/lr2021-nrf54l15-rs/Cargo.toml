@@ -1,0 +1,31 @@
+# Standalone no_std firmware for the Seeed XIAO nRF54L15 + Semtech LR2021 (LoRa Gen 4 / "LoRa Plus").
+# The MAC validation platform: unlike commodity Wi-Fi this gives us hardware-scheduled TX and hardware
+# RX timestamping (nRF54L15 DPPI + TIMER, no CPU in the loop), full frame control (no 802.11 header),
+# and FLRC at up to 2.6 Mbit/s so slot/lease structure is testable at a realistic timescale.
+# See ndn-face-monitor-wifi/docs/named-filter-mac-redesign.md §8.5. Not in the host workspace.
+[workspace]
+
+[package]
+name = "lr2021-nrf54l15-rs"
+version = "0.1.0"
+edition = "2021"
+description = "Open Rust firmware for the XIAO nRF54L15 + LR2021 named-radio MAC testbed"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+cortex-m = { version = "0.7", features = ["inline-asm", "critical-section-single-core"] }
+cortex-m-rt = "0.7"
+embassy-executor = { version = "0.9", features = ["arch-cortex-m", "executor-thread"] }
+embassy-time = { version = "0.5" }
+embassy-nrf = { version = "0.11", features = ["nrf54l15-app-s", "time-driver-rtc1", "gpiote"] }
+embassy-futures = "0.1"
+embedded-hal-async = "1.0"
+embedded-hal-bus = { version = "0.3", features = ["async"] }
+lr2021 = "0.13"
+panic-halt = "1"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+debug = true

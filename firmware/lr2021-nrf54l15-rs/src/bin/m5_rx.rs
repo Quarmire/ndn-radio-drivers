@@ -52,8 +52,8 @@ async fn main(_spawner: Spawner) {
     radio.reset().await.unwrap();
     Timer::after(Duration::from_millis(50)).await;
     match radio.get_version().await {
-        Ok(mut v) => defmt::info!("m4_rx: LR2021 fw {}.{} ok={}", v.major(), v.minor(), v.status().is_ok()),
-        Err(e) => defmt::panic!("m4_rx: no radio: {}", defmt::Debug2Format(&e)),
+        Ok(mut v) => defmt::info!("m5_rx: LR2021 fw {}.{} ok={}", v.major(), v.minor(), v.status().is_ok()),
+        Err(e) => defmt::panic!("m5_rx: no radio: {}", defmt::Debug2Format(&e)),
     }
 
     flrc_link::configure(&mut radio).await.expect("FLRC configure");
@@ -64,7 +64,7 @@ async fn main(_spawner: Spawner) {
 
     radio.set_rx_continous().await.expect("set_rx_continuous");
     defmt::info!(
-        "m4_rx: FLRC {=u32} Hz — DPPI capture armed (TIMER20 @1MHz, GPIOTE20 rising on DIO8)",
+        "m5_rx: FLRC {=u32} Hz — DPPI capture armed (TIMER20 @1MHz, GPIOTE20 rising on DIO8)",
         flrc_link::FREQ_HZ
     );
 
@@ -87,7 +87,7 @@ async fn main(_spawner: Spawner) {
         let irq = match radio.get_and_clear_irq().await {
             Ok(i) => i,
             Err(e) => {
-                defmt::error!("m4_rx: irq read: {}", defmt::Debug2Format(&e));
+                defmt::error!("m5_rx: irq read: {}", defmt::Debug2Format(&e));
                 continue;
             }
         };
@@ -116,7 +116,7 @@ async fn main(_spawner: Spawner) {
 
         if got % REPORT_EVERY == 0 {
             defmt::info!(
-                "m4_rx n={} | SW-PATH LATENCY (what HW capture removes) min={=u32} mean={=u32} max={=u32} p2p={=u32} ticks @{=u32} ns",
+                "m5_rx n={} | SW-PATH LATENCY (what HW capture removes) min={=u32} mean={=u32} max={=u32} p2p={=u32} ticks @{=u32} ns",
                 latency.n,
                 latency.min,
                 latency.mean(),

@@ -19,6 +19,10 @@ This is not just another LoRa node. It is the only hardware in the rig that can 
 
 ## Status
 
+**M5 PARTIAL — hardware-triggered TX demonstrated, not yet reliable enough to yield the guard-band
+number.** The software-timed baseline *is* measured: **p2p = 1615 ticks = 100.9 µs** over 1698
+consecutive pairs. See "M5 status" below.
+
 **M4 complete — the hardware RX timestamp works, and its resolution floor is below what the
 instrument can measure: 62.5 ns.** See "M4 result" below.
 
@@ -47,7 +51,7 @@ handler `0x479`. The memory map in `memory.x` is therefore consistent with the p
 | **M2** | ✅ SPI up, `get_version()` = fw 1.24 | yes | the `board` pin map, SPI mode and wiring |
 | **M3** | ✅ FLRC link, 125/126 delivered | yes | an on-air link at a usable rate |
 | **M4** | ✅ DPPI+TIMER RX capture, jitter measured | yes | the RX-timestamp floor: **≤62.5 ns**, below instrument resolution |
-| **M5** | DPPI+TIMER scheduled TX, **error measured** | yes | the guard-band floor ⇒ µs or ms base slots for the lease MAC (#93) |
+| **M5** | ⚠ partial — trigger fires, slots drop | yes | software baseline measured (100.9 µs); HW figure blocked on trigger reliability |
 | **M6** | 7E-A5 serial bridge + `ndn-embedded` data plane | yes | parity with the Waveshare/Heltec nodes so all five interoperate |
 | **M7** | Tier-0 prefix-set filter on the FLPR coprocessor | yes | the NDN-NIC architecture in real silicon (#91) |
 
@@ -129,6 +133,49 @@ Further shield facts for later milestones: `reg-mode = DCDC`, `lf-clk = RC`, `tc
 wakeup 0, `rx-boost-cfg = 7`, `tx-power-offset = 0`, calibration at 470 MHz / 897.5 MHz / 2441 MHz,
 and per-dBm PA tables for both LF and HF paths. Two SMAs: **LF** (150–960 MHz) and **HF** (2.4 GHz +
 S-band).
+
+## M5 status — hardware-scheduled TX
+
+**Mechanism confirmed real.** The LR2021 supports *DIO TX/RX triggers* natively (the command spec
+programs default timeouts "to be used for DIO RX/TX triggers" and defines an error for a trigger
+that "could not be executed because chip was busy changing mode"). Wiring:
+
+```
+TIMER20.CC[2] == target ──event──▶ DPPI ──task──▶ GPIOTE OUT sets P1.04
+                                                       │
+                                     LR2021 DIO8 = DioFunc::TxTrigger → transmit starts
+```
+
+No SPI and no CPU between the timer and the transmission. `tx_done` over SPI confirms transmits
+really are being started this way.
+
+**Measured so far**
+
+| transmit scheduling | consecutive-pair spread |
+|---|---|
+| **software** (`Timer::after` + `set_tx()` over SPI — what the Wi-Fi face does today) | **p2p 1615 ticks = 100.9 µs** (n=1698) |
+| **hardware-triggered** | closest pairs land at 320839–320965 ticks against an intended 320000, but `mean` sits near *two* periods — a large share of scheduled slots do not transmit |
+
+**Why the hardware number is not quotable yet.** Roughly a third to a half of armed slots produce no
+transmission. The prime suspect is the chip's own documented condition — a DIO trigger that "could
+not be executed because chip was busy changing mode", i.e. the part has not returned to a
+trigger-ready state from the previous transmit by the time the next edge arrives. Next step is to
+read that error flag per slot and, if confirmed, return the chip to standby between slots.
+Reporting the spread before that is fixed would describe the chip's mode transitions, not the
+scheduler's precision.
+
+### The bug worth carrying into the MAC work
+
+The first version accumulated the next transmit instant (`target += PERIOD`). It transmitted **74
+times and then stopped for good**: one slow iteration pushed the target into the past, and a compare
+armed in the past never matches until the 32-bit counter wraps (~4.5 min at 16 MHz).
+
+That is not a quirk of this binary — **it is exactly the defect a slot scheduler has if it advances
+its slot pointer by addition instead of recomputing the next boundary from the common-view clock.**
+The fix here (re-derive `target` from the clock, and make the sequence number *be* the slot index
+`target / PERIOD`) is the same discipline #84/#85 need. Deriving the sequence from the slot also
+makes "consecutive sequence numbers" and "consecutive slots" the same statement by construction, so
+a skipped slot can never masquerade as transmit jitter.
 
 ## M4 result — the RX-timestamp floor
 

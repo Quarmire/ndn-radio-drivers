@@ -91,6 +91,24 @@ async fn main(_spawner: Spawner) {
         //   [12]    name length
         //   [13..]  "/00nn/...." ASCII, then zero padding to FRAME_LEN
         // Intact ASCII here means the modulation path is sound and only the CRC block was at fault.
+        // ── Is the corruption boundary tied to the TRANSFER or to the DATA? ──────────────────
+        // Read the SAME frame as three 8-byte reads instead of one 24-byte read. If the bytes come
+        // back clean, the fault is in the long SPI transfer (chunking / EasyDMA / clock) and has
+        // nothing to do with the air. If corruption still starts at the same ABSOLUTE offset, the
+        // transfer is innocent and the data really arrives that way.
+        let mut c = [0u8; 24];
+        let mut chunk_ok = true;
+        for k in 0..3 {
+            if radio.rd_rx_fifo_to(&mut c[k * 8..(k + 1) * 8]).await.is_err() {
+                chunk_ok = false;
+            }
+        }
+        if chunk_ok {
+            flrc_link::whiten(&mut c);
+            defmt::info!("  CHUNKED(3x8) {=[u8]:#04x}", c);
+        }
+        let _ = radio.clear_rx_fifo().await;
+
         let mut b = [0u8; 24];
         if radio.rd_rx_fifo_to(&mut b).await.is_ok() {
             // De-whiten before inspecting. Whitening is self-inverse, but it is applied over the

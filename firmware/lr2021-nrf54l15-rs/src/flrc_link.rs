@@ -60,9 +60,23 @@ pub const PULSE_SHAPE: PulseShape = PulseShape::Bt0p5;
 /// 32-bit AGC preamble — Semtech's reference uses `FLRC_PREAMBLE_BITS 32`; this was 16.
 pub const PREAMBLE: AgcPblLen = AgcPblLen::Len32Bits;
 
-/// 32-bit syncword — `0x8624_4E44` = the NDN ethertype `0x8624` followed by ASCII `"ND"`. Chosen to
-/// be recognisable in a capture and unlikely to collide with stock FLRC/BLE traffic.
-pub const SYNCWORD: u32 = 0x8624_4E44;
+/// 32-bit syncword — **Semtech's reference value**, not the aesthetic one this started with.
+///
+/// It was `0x8624_4E44` (the NDN ethertype followed by ASCII `"ND"`): recognisable in a capture, and
+/// chosen with no thought at all to its correlation properties. That is very likely to matter here.
+/// FLRC is GMSK with a **convolutional** code, and convolutional codes are typically *transparent* —
+/// an inverted input decodes to an inverted output — so GMSK's inherent 180° phase ambiguity is not
+/// removed by the FEC. **The syncword is what resolves polarity**, and a syncword that correlates
+/// well against its own complement leaves it unresolved.
+///
+/// That mechanism matches the observed failure exactly: frames sync (`sw_num = 1`) and are correctly
+/// delimited, then the payload arrives as cleanly BIT-INVERTED bytes, at −33 dBm with every chip
+/// error flag clear.
+///
+/// A syncword for this modem is an RF parameter with correlation requirements, not a branding
+/// opportunity. If a recognisable value is wanted later, pick one and *verify* its autocorrelation
+/// and complement-correlation rather than assuming.
+pub const SYNCWORD: u32 = 0xCD05_CAFE;
 
 /// TX power, dBm. The HF PA table in the shield devicetree tops out at **12 dBm**; the two kits sit
 /// on a bench, so start low — a strong link is not the goal and an overloaded receiver produces
@@ -111,7 +125,18 @@ pub const FE_CAL_HF: u16 = 0x8000 | ((FREQ_HZ / 4_000_000) as u16);
 /// to need settling time.
 pub const TCXO_STARTUP: u32 = 0;
 
-/// **PHY CRC mode — currently OFF, deliberately, to split a stubborn failure in two.**
+/// **PHY CRC: 16-bit, matching Semtech's reference (`FLRC_CRC RAL_FLRC_CRC_2_BYTES`).**
+///
+/// This was `Crc24` for the whole bring-up, chosen because the datasheet lists 0/2/3/4-byte CRCs as
+/// valid and 24 bits seemed a reasonable middle. The vendor's own working packet-error-rate example
+/// uses **2 bytes**, and after aligning every other parameter to that example this was the last
+/// remaining difference.
+///
+/// Datasheet §18.2.1 is the reason it matters that TX and RX agree exactly: *"The CRC calculation is
+/// performed on the entire preceding packet, excluding the preamble"* — so the CRC covers the
+/// syncword and header too, and its width changes where the payload ends.
+///
+/// Historical note kept because the technique generalises:
 ///
 /// With `Crc24` the receiver reported `crc_error` on 100% of frames while everything else looked
 /// right: strong signal (−33 dBm), syncword matched (`sw_num = 1`), `len_error = 0`, and `pkt_len`
@@ -127,7 +152,7 @@ pub const TCXO_STARTUP: u32 = 0;
 /// signature, and Tier-0 wants an integrity check it controls anyway. So `CrcOff` plus our own
 /// checksum is a legitimate destination, not only a diagnostic — but that should be a decision made
 /// on evidence, which is what this setting is for.
-pub const CRC_MODE: Crc = Crc::Crc24;
+pub const CRC_MODE: Crc = Crc::Crc16;
 
 /// **Software whitening — XOR the payload with a PRBS so it is DC-balanced on air.**
 ///

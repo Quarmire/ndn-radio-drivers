@@ -96,7 +96,11 @@ async fn main(_spawner: Spawner) {
             // De-whiten before inspecting. Whitening is self-inverse, but it is applied over the
             // whole frame, so a partial read de-whitens correctly only from offset 0 — which this is.
             flrc_link::whiten(&mut b);
-            defmt::info!("  PAYLOAD  filt0={=u8:#04x} name_len={=u8} name={=[u8]:a}", b[0], b[12], &b[13..24]);
+            // Full hex dump. The transmitter's frame is: 12 filter bytes (byte 0 forced to 0x03),
+            // then name_len, then ASCII "/00nn/...", then zero padding. Corruption appearing at a
+            // FIXED OFFSET rather than scattered would mean this is a FIFO/readout fault, not RF —
+            // and no RF parameter changed so far has moved the failure at all.
+            defmt::info!("  RAW[0..24] {=[u8]:#04x}", b);
         }
         let _ = radio.clear_rx_fifo().await;
     }

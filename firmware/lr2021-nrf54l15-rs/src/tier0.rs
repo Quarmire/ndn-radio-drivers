@@ -133,6 +133,37 @@ pub fn for_each_prefix<F: FnMut(&[u8])>(name: &[u8], mut f: F) {
     }
 }
 
+/// Truncate a *registered* prefix to the deepest form a sender would actually have inserted.
+///
+/// ★ Load-bearing. Without it the depth cap produces **true false negatives** — the one failure the
+/// design forbids.
+///
+/// [`for_each_prefix`] stops at the cap, so a sender transmitting `/a/b/c/d/e/f/g/h/i` inserts at
+/// deepest `/a/b/c/d/e/f/g` — **seven** components, not eight. A receiver registered on
+/// `/a/b/c/d/e/f/g/h` would otherwise build a mask over bits the sender never set and drop a frame
+/// that genuinely is under its prefix.
+///
+/// "Zero false negatives at every depth" holds only for registrations within the cap; the on-device
+/// measurement could not see this, because it only queried prefixes that had been inserted, which
+/// makes the property tautological. Clamping restores it: a too-deep registration degrades to its
+/// 7-component ancestor, costing extra false positives and no false negatives, and Tier 1/2 does
+/// the exact match — which only works if the frame survives Tier 0 to reach it.
+///
+/// Found by cross-checking the C port for the AR9271 firmware against this implementation.
+pub fn clamp_prefix(prefix: &[u8]) -> usize {
+    let mut comps = 0;
+    for i in 1..prefix.len() {
+        if prefix[i] == b'/' {
+            comps += 1;
+            // `comps` components precede this slash; the cap admits MAX_DEPTH - 1 of them.
+            if comps >= MAX_DEPTH - 1 {
+                return i;
+            }
+        }
+    }
+    prefix.len()
+}
+
 impl PrefixFilter {
     /// An empty filter (all usable bits clear).
     pub const fn new() -> Self {

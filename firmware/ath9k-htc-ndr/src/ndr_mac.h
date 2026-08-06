@@ -131,4 +131,7 @@ a_uint32_t ndr_quiet_is_armed(void);
  */
 void ndr_quiet_rearm(void);
 
+/* Force the next ndr_quiet_rearm() to re-apply. Called when runtime config changes the shape. */
+void ndr_quiet_disarm(void);
+
 #endif /* _NDR_MAC_H_ */

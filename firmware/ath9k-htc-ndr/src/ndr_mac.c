@@ -5,10 +5,17 @@
 #include "ar5416reg.h"
 #include "ndr_mac.h"
 #include "ndr_filter.h"
+#include "ndr_ctl.h"
 
 static a_uint32_t armed_ok;
 
 struct ndr_mac_state ndr_mac_state = { NDR_MAC_MAGIC, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+
+void ndr_quiet_disarm(void)
+{
+	armed_ok = 0;
+	iowrite32_mac(AR_TIMER_MODE, ioread32_mac(AR_TIMER_MODE) & ~AR_QUIET_TIMER_EN);
+}
 
 void ndr_quiet_rearm(void)
 {
@@ -17,7 +24,9 @@ void ndr_quiet_rearm(void)
 	a_uint32_t duration_tu = NDR_QUIET_DURATION_TU;
 	a_uint32_t next_us;
 
-	if (NDR_QUIET_PERIOD_TU == 0)
+	if (ndr_ctl_quiet_off)
+		return;
+	if (NDR_QUIET_PERIOD_TU == 0 && !ndr_ctl_lease_override)
 		return;
 
 	/*
@@ -67,7 +76,21 @@ void ndr_quiet_rearm(void)
 		 */
 		static const char lease_prefix[] = NDR_LEASE_PREFIX;
 
-		if (sizeof(lease_prefix) > 1) {
+		if (ndr_ctl_lease_override) {
+			/* Runtime lease, pushed over the control path: same maths, host-chosen shape. */
+			a_uint32_t slot_us = ndr_ctl_lease_slot_tu * 1024u;
+			a_uint32_t per_us  = slot_us * ndr_ctl_lease_slots;
+			a_uint32_t epoch   = tsf_lo & ~(per_us - 1u);
+			a_uint32_t open_end = epoch + (ndr_ctl_lease_slot + 1u) * slot_us;
+
+			while (open_end < tsf_lo + NDR_QUIET_MARGIN_US)
+				open_end += per_us;
+
+			ndr_mac_state.lease_slot = ndr_ctl_lease_slot;
+			period_us   = per_us;
+			next_us     = open_end;
+			duration_tu = ndr_ctl_lease_slot_tu * (ndr_ctl_lease_slots - 1u);
+		} else if (sizeof(lease_prefix) > 1) {
 			a_uint32_t slot, epoch, open_end;
 
 			slot = (a_uint32_t)ndr_name_hash(ndr_cfg.key,

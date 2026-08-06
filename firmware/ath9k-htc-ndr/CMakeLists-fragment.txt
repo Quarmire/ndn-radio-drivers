@@ -120,6 +120,7 @@ SET(SOURCES
 	wlan/ndr_filter.c
 	wlan/ndr_mem.c
 	wlan/ndr_mac.c
+	wlan/ndr_ctl.c
 	wlan/if_ath_pci.c
 	magpie_fw_dev/target/wlan/wlan_pci.c
 	wlan/ieee80211_output.c

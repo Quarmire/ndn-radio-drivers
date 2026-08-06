@@ -153,6 +153,44 @@ So report both: the bandwidth/USB-byte win is robust, while the **per-frame wake
 §8.2 actually prizes — is capped by the ambient control-frame fraction**. It is also a concrete
 argument for the custom-PHY/802.11ba direction in §8.5, where our MAC emits no ACKs at all.
 
+## M3b — on-air boundary-placement error, measured with a second radio
+
+Two AR9271s: o5p-1 transmits saturated with the quiet schedule armed (period 100 TU, duration
+50 TU, FW 1.50 verified), minidronesys-05 receives in monitor mode and timestamps every frame with
+`radiotap.mactime` (hardware TSF, ~1 µs).
+
+The **trailing** edge of each quiet window is the observable: the TX queue is already saturated, so
+the MAC transmits the instant it is allowed. The leading edge is not usable — it is quantised by the
+injector's ~1078 µs inter-frame spacing, and the AR9271 caps monitor injection at ~950 frames/s
+regardless of PHY rate (54 Mbit/s is no faster than 1 Mbit/s) or host parallelism (8 processes are
+no faster than 1), so that spacing cannot be reduced.
+
+| | ch1 (168 ambient f/s) | **ch13 (9 ambient f/s)** |
+|---|---|---|
+| boundaries observed | 297 | 297, **all exactly one period apart** |
+| mean interval | 102401.0 µs | **102399.2 µs** (configured 102400) |
+| **mean period error** | +1.0 µs | **−0.8 µs** |
+| per-boundary jitter (sd) | 453 µs | **173 µs** |
+| median deviation | 60.0 µs | **51.8 µs** |
+| p90 / max | 843 / 3396 µs | **225 / 1288 µs** |
+
+**The hardware honours the TSF schedule to under a microsecond** — the mean period error is −0.8 µs
+across a 102.4 ms period, over 297 consecutive windows with none missed or slipped.
+
+**Median boundary error is 52 µs**, which puts this in the same class as the nRF54L15 testbed's
+~40–60 µs scheduled-TX guard, and 20–100× better than the millisecond-scale host-sleep guard §8.5
+describes. The design's "guard bands must be milliseconds" is a property of the *host-side*
+approximation, not of this hardware.
+
+⚠ **52 µs is a ceiling, not the hardware's floor.** The measurement still includes CSMA acquisition:
+after a quiet window ends the MAC must still do DIFS plus a random backoff before its first frame.
+That is also what the ch1→ch13 comparison isolates — the *tail* is contention (p90 843→225 µs) while
+the *median* barely moves (60→52 µs). To measure below this, disable backoff with
+`AR_D_GBL_IFS_MISC.IGNORE_BACKOFF`, which this part already exposes.
+
+Quiet duration reads 52.82 ms against 51.20 configured; the ~1.6 ms excess is the leading edge being
+known only to the last frame before the window (~1078 µs) plus trailing-edge contention.
+
 ## Milestones
 
 - **M0 — DONE (2026-08-06).** Toolchain built; the patched firmware builds for both targets with

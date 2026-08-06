@@ -12,13 +12,28 @@
 use std::ffi::CString;
 use std::time::{Duration, Instant};
 
-/// Minimal radiotap header: version(1) pad(1) len(2) present(4) — no fields present, so the driver
-/// picks its own rate and power. Enough for injection.
-const RADIOTAP: [u8; 8] = [0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00];
+/// Radiotap with an explicit RATE field (present bit 2), value in 500 kbps units.
+///
+/// The rate matters for more than throughput: it sets how finely this injector samples the medium.
+/// At 1 Mbit/s a 96-byte frame plus overhead occupies ~1.1 ms, so a gap edge can only be located to
+/// ±1.1 ms — useless for measuring a microsecond-scale scheduling boundary. At 54 Mbit/s the same
+/// frame is ~14 µs on air, which is the resolution the measurement actually needs.
+fn radiotap(rate_500kbps: u8) -> Vec<u8> {
+    if rate_500kbps == 0 {
+        // No fields present: the driver picks the rate.
+        return vec![0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00];
+    }
+    vec![
+        0x00, 0x00, // version, pad
+        0x09, 0x00, // length = 9
+        0x04, 0x00, 0x00, 0x00, // present = bit 2 (RATE)
+        rate_500kbps,
+    ]
+}
 
-fn build_frame(seq: u16) -> Vec<u8> {
-    let mut f = Vec::with_capacity(8 + 24 + 64);
-    f.extend_from_slice(&RADIOTAP);
+fn build_frame(seq: u16, rate_500kbps: u8) -> Vec<u8> {
+    let mut f = Vec::with_capacity(9 + 24 + 64);
+    f.extend_from_slice(&radiotap(rate_500kbps));
 
     // 802.11 data frame, ToDS=0 FromDS=0. Addresses are locally-administered group, matching the
     // named-radio doctrine (no host identity on the air).
@@ -35,11 +50,13 @@ fn build_frame(seq: u16) -> Vec<u8> {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        eprintln!("usage: {} <monitor-iface> [seconds]", args[0]);
+        eprintln!("usage: {} <monitor-iface> [seconds] [rate_500kbps, e.g. 108 = 54M]", args[0]);
         std::process::exit(1);
     }
     let ifname = &args[1];
     let secs: u64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(10);
+    // Third arg: PHY rate in 500 kbps units (108 = 54 Mbit/s). 0 = let the driver choose.
+    let rate: u8 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(0);
 
     unsafe {
         // AF_PACKET/SOCK_RAW so the radiotap header is passed straight through to the driver.
@@ -76,7 +93,7 @@ fn main() {
         let start = Instant::now();
 
         while Instant::now() < deadline {
-            let frame = build_frame(seq);
+            let frame = build_frame(seq, rate);
             seq = seq.wrapping_add(1);
             let n = libc::send(fd, frame.as_ptr() as *const libc::c_void, frame.len(), 0);
             if n < 0 {

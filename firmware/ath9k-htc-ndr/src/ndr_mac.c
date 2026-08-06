@@ -4,6 +4,7 @@
 
 #include "ar5416reg.h"
 #include "ndr_mac.h"
+#include "ndr_filter.h"
 
 static a_uint32_t armed_ok;
 
@@ -12,6 +13,9 @@ struct ndr_mac_state ndr_mac_state = { NDR_MAC_MAGIC, 0, 0, 0, 0, 0, 0, 0, 0, 0,
 void ndr_quiet_rearm(void)
 {
 	a_uint32_t q1, q2, tsf_lo, tsf_hi;
+	a_uint32_t period_us = (a_uint32_t)NDR_QUIET_PERIOD_TU * 1024u;
+	a_uint32_t duration_tu = NDR_QUIET_DURATION_TU;
+	a_uint32_t next_us;
 
 	if (NDR_QUIET_PERIOD_TU == 0)
 		return;
@@ -52,11 +56,42 @@ void ndr_quiet_rearm(void)
 	 */
 	tsf_hi = ioread32_mac(AR_TSF_U32);
 	tsf_lo = ioread32_mac(AR_TSF_L32);
+	next_us = tsf_lo + NDR_QUIET_MARGIN_US;
 
-	q1 = (((tsf_lo >> 10) + 2) & AR_QUIET1_NEXT_QUIET_M) | AR_QUIET1_QUIET_ENABLE;
+	{
+		/*
+		 * Name-keyed lease: own one slot per period, be quiet for the rest. Both the slot
+		 * index and the period alignment are pure functions of the name and the clock, so
+		 * two nodes need to exchange nothing to avoid each other -- they only need a common
+		 * view of time.
+		 */
+		static const char lease_prefix[] = NDR_LEASE_PREFIX;
+
+		if (sizeof(lease_prefix) > 1) {
+			a_uint32_t slot, epoch, open_end;
+
+			slot = (a_uint32_t)ndr_name_hash(ndr_cfg.key,
+							 (const a_uint8_t *)lease_prefix,
+							 (a_uint32_t)(sizeof(lease_prefix) - 1))
+			       & NDR_LEASE_SLOT_MASK;
+			ndr_mac_state.lease_slot = slot;
+
+			/* Mask, not modulo -- see the DIV32 note in ndr_mac.h. */
+			epoch = tsf_lo & ~NDR_LEASE_PERIOD_MASK;
+			open_end = epoch + (slot + 1u) * NDR_LEASE_SLOT_US;
+			/* Quiet begins when our slot ends; skip ahead if that moment already passed. */
+			while (open_end < tsf_lo + NDR_QUIET_MARGIN_US)
+				open_end += NDR_LEASE_PERIOD_US;
+
+			period_us = NDR_LEASE_PERIOD_US;
+			next_us = open_end;
+			duration_tu = NDR_LEASE_SLOT_TU * (NDR_LEASE_SLOTS - 1);
+		}
+	}
+
+	q1 = (((next_us >> 10) + 0) & AR_QUIET1_NEXT_QUIET_M) | AR_QUIET1_QUIET_ENABLE;
 	q2 = ((a_uint32_t)NDR_QUIET_PERIOD_TU & AR_QUIET2_QUIET_PERIOD_M) |
-	     (((a_uint32_t)NDR_QUIET_DURATION_TU << AR_QUIET2_QUIET_DURATION_S) &
-	      AR_QUIET2_QUIET_DURATION);
+	     ((duration_tu << AR_QUIET2_QUIET_DURATION_S) & AR_QUIET2_QUIET_DURATION);
 
 	/* Duration before enable, so the window is fully described the instant it goes live. */
 	iowrite32_mac(AR_QUIET2, q2);
@@ -75,8 +110,8 @@ void ndr_quiet_rearm(void)
 	 * which is also why they matter beyond just working: TU granularity (1024 us) cannot express
 	 * the sub-millisecond base slots the design wants, and these can.
 	 */
-	iowrite32_mac(AR_NEXT_QUIET_TIMER, tsf_lo + NDR_QUIET_MARGIN_US);
-	iowrite32_mac(AR_QUIET_PERIOD, (a_uint32_t)NDR_QUIET_PERIOD_TU * 1024u);
+	iowrite32_mac(AR_NEXT_QUIET_TIMER, next_us);
+	iowrite32_mac(AR_QUIET_PERIOD, period_us);
 	iowrite32_mac(AR_TIMER_MODE, ioread32_mac(AR_TIMER_MODE) | AR_QUIET_TIMER_EN);
 
 	/*

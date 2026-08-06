@@ -48,6 +48,41 @@
 #define NDR_QUIET_MARGIN_US 4096
 #endif
 
+/*
+ * ── The named airtime lease ──────────────────────────────────────────────────
+ *
+ * The design's actual claim: a transmit grant is a lease of base slots held by a NAME, computed as
+ * f(name, clock) with no negotiation. Everything above this point demonstrates the *mechanism*
+ * (the MAC will gate TX against its TSF); this is the mechanism keyed on a name.
+ *
+ *   slot   = H(registered prefix) mod NDR_LEASE_SLOTS
+ *   period = NDR_LEASE_SLOTS * NDR_LEASE_SLOT_TU        (the node owns 1 slot in every period)
+ *   quiet  = the whole period EXCEPT this node's slot
+ *
+ * Reserved lanes are implicit and never announced — every node computes the same schedule from the
+ * same name, which is the property that makes coexistence work without a coordinator.
+ *
+ * ⚠ **Power-of-two geometry is mandatory, not stylistic.** MAGPIE is configured with
+ * XCHAL_HAVE_DIV32 = 0 and this firmware links no libgcc, so `%` on a u32 would emit an undefined
+ * reference to __umodsi3. Every modulo here is a mask, which requires the slot count and the period
+ * in microseconds to both be powers of two. Defaults: 4 slots x 8 TU = 32768 us exactly.
+ */
+#ifndef NDR_LEASE_SLOTS
+#define NDR_LEASE_SLOTS 4              /* power of two */
+#endif
+#ifndef NDR_LEASE_SLOT_TU
+#define NDR_LEASE_SLOT_TU 8            /* 8 TU = 8192 us, so period = 32768 us = 2^15 */
+#endif
+#define NDR_LEASE_SLOT_US   ((a_uint32_t)NDR_LEASE_SLOT_TU * 1024u)
+#define NDR_LEASE_PERIOD_US (NDR_LEASE_SLOT_US * NDR_LEASE_SLOTS)
+#define NDR_LEASE_SLOT_MASK (NDR_LEASE_SLOTS - 1u)
+#define NDR_LEASE_PERIOD_MASK (NDR_LEASE_PERIOD_US - 1u)
+
+/* The prefix whose lease this node holds. Empty = lease disabled, fall back to the fixed schedule. */
+#ifndef NDR_LEASE_PREFIX
+#define NDR_LEASE_PREFIX ""
+#endif
+
 /* Build-time lease shape, in TU. Zero period disables the whole mechanism. */
 #ifndef NDR_QUIET_PERIOD_TU
 #define NDR_QUIET_PERIOD_TU 0
@@ -69,6 +104,7 @@ struct ndr_mac_state {
 	a_uint32_t tsf_lo;       /* TSF sampled at the last arm — proves the clock runs */
 	a_uint32_t tsf_hi;
 	a_uint32_t ifs_misc_rb;  /* AR_D_GBL_IFS_MISC read back (backoff-disable measurement mode) */
+	a_uint32_t lease_slot;   /* slot index this node computed from its prefix */
 	a_uint32_t timer_mode_rb; /* AR_TIMER_MODE read back — the enable that actually matters */
 };
 

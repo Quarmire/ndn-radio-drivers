@@ -247,6 +247,42 @@ the *median* barely moves (60→52 µs). To measure below this, disable backoff 
 Quiet duration reads 52.82 ms against 51.20 configured; the ~1.6 ms excess is the leading edge being
 known only to the last frame before the window (~1078 µs) plus trailing-edge contention.
 
+## The named airtime lease — two nodes, name-derived slots
+
+The lease is `f(name, clock)`: `slot = H(prefix) & (SLOTS-1)`, the node owns that slot each period
+and is quiet for the rest. Nothing is announced; every node computes the same schedule.
+
+⚠ **Power-of-two geometry is mandatory.** MAGPIE has `XCHAL_HAVE_DIV32 = 0` and this firmware links
+no libgcc, so `%` on a u32 emits an undefined `__umodsi3`. Every modulo is a mask, which forces the
+slot count and the period-in-µs to be powers of two. Default: 4 slots × 8 TU = 32768 µs exactly.
+
+**Single node, measured against the AR9271 observer's hardware TSF** (`/ndn/mds/d` → slot 0):
+
+- duty **23.7%** (213 f/s vs ~900 unrestricted) — one slot in four
+- **98% of transmissions inside a 6700 µs window**, narrower than the 8192 µs slot
+
+The window straddles a slot boundary in *observer* time because the two TSF epochs are unaligned;
+the width is the meaningful quantity, and it is one slot.
+
+**Two nodes** — o5p-1 `/ndn/mds/d` → slot 0, C4 `/ndn/mds/b` → slot 2, observed on a third radio:
+
+| | s0 | s1 | s2 | s3 |
+|---|---|---|---|---|
+| node A | 0.0% | 0.0% | 34.4% | 65.6% |
+| node B | 0.0% | 73.8% | 26.2% | 0.0% |
+
+Each node confines itself to one contiguous ~1-slot window derived from its name — **the lease
+mechanism works on two independent nodes**. But the windows overlap **26.2%** rather than separating
+cleanly, because the two TSFs are free-running and unaligned: the schedule is `f(name, clock)` and
+these nodes do not share a clock.
+
+**That is the honest result: name-derived leases confine each node, but collision-freedom is gated
+on a common-view clock (#41), not on the lease mechanism.** It is not a defect in the lease — it is
+the dependency the design already names, now with a number on it.
+
+(The observer here is an MT7612U, which exports no `radiotap.mactime`, so this table is host-clock
+and coarser than the single-node measurement. Only the AR9271 gave hardware TSF.)
+
 ## Milestones
 
 - **M0 — DONE (2026-08-06).** Toolchain built; the patched firmware builds for both targets with

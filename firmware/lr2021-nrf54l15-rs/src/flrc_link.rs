@@ -412,8 +412,18 @@ where
     // datasheet marks both **RFU** — so this is right by value, not by name.
     let _ = radio.set_regulator_mode(true).await;
 
+    // ── Semtech's own order, from `ralf_lr20xx_setup_flrc()` in Lora-net/usp ────────────────────
+    //   set_pkt_type -> set_rf_freq -> set_tx_cfg(power, freq) -> set_flrc_mod_params
+    //   -> set_flrc_pkt_params -> set_flrc_crc_params -> set_flrc_sync_word
+    // Two differences from what we had: the FREQUENCY is set second (not last), and the SYNCWORD is
+    // set LAST (not before the packet params). Order is not obviously load-bearing for every one of
+    // these, but the reference implementation is the only ordering anyone has validated.
+    //
+    // (`set_flrc_crc_params` is deliberately absent: `ral_lr20xx_set_flrc_crc_params` returns early
+    // when seed and polynomial are both 0 — "keep the default CRC params as is" — which is exactly
+    // what the PER example passes. So it is a no-op for us, not a missing call.)
     radio.set_packet_type(PacketType::Flrc).await?;
-    radio.set_flrc_modulation(BITRATE, CODING, PULSE_SHAPE).await?;
+    radio.set_rf(FREQ_HZ).await?;
 
     // One syncword, and RX matches only that one: this is a two-node experiment, and accepting
     // other syncwords would let stray traffic masquerade as our packets.
@@ -424,10 +434,12 @@ where
     // one while the packet params still declare `Sw32b`. Both ends misconfigure identically, so they
     // still sync (`sw_num = 1`) and the length still decodes — and every frame fails CRC, because
     // the frame is delimited differently from the region the CRC covers.
-    radio.set_flrc_syncword(1, SYNCWORD, false).await?;
 
     // Defaults to the RX role; a transmitter MUST call `set_payload_len` with the real frame size.
+    radio.set_flrc_modulation(BITRATE, CODING, PULSE_SHAPE).await?;
+    dcdc_workaround(radio).await;
     radio.set_flrc_packet(&pkt_params(MAX_PAYLOAD)).await?;
+    radio.set_flrc_syncword(1, SYNCWORD, false).await?;
 
     // HF front end for the 2.4 GHz port: PA on the HF path, RX on the HF path with full boost
     // (rx-boost-cfg = 7 in the shield devicetree).
@@ -515,7 +527,7 @@ where
         _ => RxBoost::Off,
     };
     radio.set_rx_path(path, boost).await?;
-    radio.set_rf(FREQ_HZ).await?;
+    dcdc_workaround(radio).await;
 
     // Route interrupts out on **DIO8**, which the shield wires to the MCU's P1.04.
     //
@@ -527,4 +539,51 @@ where
     radio.set_dio_irq(DioNum::Dio8, Intr::new_txrx()).await?;
 
     Ok(())
+}
+
+/// **DCDC switcher workaround — `lr20xx_workarounds_dcdc_configure()` from Semtech's driver.**
+///
+/// Not in the datasheet; it exists only in `lr20xx_workarounds.c` in Lora-net/usp, and the driver
+/// calls it automatically at the end of **every** `set_*_modulation_params` and after
+/// `set_rx_path`, via `LR20XX_WORKAROUNDS_CONDITIONAL_APPLY_AUTOMATIC_DCDC_CONFIGURE`.
+///
+/// It is required whenever the DCDC regulator is in use — which, since we now enable SIMO_NORMAL,
+/// includes us. Enabling DCDC without it would have been a regression on the LF path, which works.
+///
+/// The header's prose says "sub GHz operations are intended", but the implementation branches on
+/// `is_rx_hf` and programs both cases, so it applies to the HF path too:
+///
+/// ```text
+///   ana_dec  = (reg 0x00F40200 >> 8) & 0x7
+///   is_rx_hf = (reg 0x00F40430 & 0x3) == 1
+///   if !is_rx_hf && (ana_dec == 1 || ana_dec == 2)  -> switcher rise 11, fall 13
+///   else                                           -> switcher rise 15, fall 15
+/// ```
+///
+/// Errors are swallowed: this is a best-effort register poke on an undocumented address, and a
+/// failure here must not take down a link that otherwise works.
+async fn dcdc_workaround<O, SPI, M>(radio: &mut Lr2021<O, SPI, M>)
+where
+    O: OutputPin,
+    SPI: SpiBus<u8>,
+    M: BusyPin,
+{
+    const ADC_CTRL: u32 = 0x00F4_0200;
+    const RX_PATH: u32 = 0x00F4_0430;
+    const SWITCHER: u32 = 0x00F2_0024;
+    const RISE_MASK: u32 = 0xF << 20;
+    const FALL_MASK: u32 = 0xF << 16;
+
+    let ana_dec = match radio.rd_reg(ADC_CTRL).await {
+        Ok(v) => (v >> 8) & 0x7,
+        Err(_) => return,
+    };
+    let is_rx_hf = match radio.rd_reg(RX_PATH).await {
+        Ok(v) => (v & 0x3) == 1,
+        Err(_) => return,
+    };
+
+    let (rise, fall) = if !is_rx_hf && (ana_dec == 1 || ana_dec == 2) { (11u32, 13u32) } else { (15u32, 15u32) };
+    let _ = radio.wr_reg_mask(SWITCHER, RISE_MASK, rise << 20).await;
+    let _ = radio.wr_reg_mask(SWITCHER, FALL_MASK, fall << 16).await;
 }

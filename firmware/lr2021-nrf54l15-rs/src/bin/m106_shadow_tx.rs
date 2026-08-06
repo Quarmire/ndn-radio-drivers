@@ -68,13 +68,16 @@ async fn main(_spawner: Spawner) {
         let mut f = PrefixFilter::new();
         f.insert_name(KEY, &nb[..n]);
 
-        let mut frame = [0u8; 13 + 64];
+        // Fixed-size frames: pad to FRAME_LEN. The name length still travels in byte 12, so the
+        // receiver knows how much of the padding to ignore.
+        let mut frame = [0u8; flrc_link::FRAME_LEN as usize];
         frame[..12].copy_from_slice(&f.to_wire());
         frame[12] = n as u8;
         frame[13..13 + n].copy_from_slice(&nb[..n]);
 
+        // pld_len is the TRANSMIT length in this role — see flrc_link::set_payload_len.
         let _ = radio.clear_tx_fifo().await;
-        if radio.wr_tx_fifo_from(&frame[..13 + n]).await.is_ok() {
+        if radio.wr_tx_fifo_from(&frame).await.is_ok() {
             let _ = radio.set_tx(0).await;
         }
         if seq % 500 == 0 {

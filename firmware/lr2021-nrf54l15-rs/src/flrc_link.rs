@@ -43,9 +43,22 @@ pub const FREQ_HZ: u32 = 2_477_000_000;
 /// 2.6 Mbit/s — the whole point of using FLRC. See module docs.
 pub const BITRATE: FlrcBitrate = FlrcBitrate::Br2600;
 
-/// No FEC. The MAC experiments want to see the *raw* link, so loss is not silently repaired
-/// underneath the measurement; coding is a named-data-layer decision here, not a PHY default.
-pub const CODING: FlrcCr = FlrcCr::None;
+/// **CR 3/4 — matching Semtech's own reference**, not the `None` this started with.
+///
+/// The original rationale was "the MAC experiments want to see the raw link, so loss is not
+/// silently repaired underneath the measurement". That reasoning is sound and the choice was still
+/// wrong: Semtech's own FLRC packet-error-rate example
+/// (`examples/main_examples/packet_error_rate_flrc_example` in Lora-net/usp) ships `FLRC_CR
+/// RAL_FLRC_CR_3_4`, and a configuration the vendor does not exercise is not a baseline — it is an
+/// untested corner. Get the link working against the reference first; revisit coding as a
+/// *measured* variable afterwards.
+pub const CODING: FlrcCr = FlrcCr::Cr34;
+
+/// BT 0.5 — Semtech's reference uses `RAL_FLRC_PULSE_SHAPE_BT_05`; this was BT 1.0.
+pub const PULSE_SHAPE: PulseShape = PulseShape::Bt0p5;
+
+/// 32-bit AGC preamble — Semtech's reference uses `FLRC_PREAMBLE_BITS 32`; this was 16.
+pub const PREAMBLE: AgcPblLen = AgcPblLen::Len32Bits;
 
 /// 32-bit syncword — `0x8624_4E44` = the NDN ethertype `0x8624` followed by ASCII `"ND"`. Chosen to
 /// be recognisable in a capture and unlikely to collide with stock FLRC/BLE traffic.
@@ -56,8 +69,65 @@ pub const SYNCWORD: u32 = 0x8624_4E44;
 /// garbage timing. Raise deliberately, never by default.
 pub const TX_POWER_DBM: i8 = 0;
 
-/// Largest payload the link carries in these tests.
-pub const MAX_PAYLOAD: u16 = 255;
+/// **Fixed frame size, both roles.**
+///
+/// Variable-length (`PktFormat::Dynamic`) was tried first and framing became correct — `pkt_len`
+/// tracked the real payload — but **every packet still failed CRC** while `len_error` stayed 0 and
+/// the signal sat at −33 dBm. The remaining explanation is that the receiver validates CRC over its
+/// own `pld_len`, not over the length carried in the header, so a receiver configured for a maximum
+/// can never check a shorter frame. With one `pld_len` register serving both roles, variable-length
+/// + CRC needs the receiver to already know each frame's size — which it cannot.
+///
+/// Fixed size is also what a slot MAC actually wants: **constant airtime per slot** makes the base
+/// slot a constant rather than something re-derived per frame, which is exactly the property the
+/// lease design (#93) assumes.
+pub const FRAME_LEN: u16 = 48;
+
+/// Kept as the name other modules use; now the fixed frame size.
+pub const MAX_PAYLOAD: u16 = FRAME_LEN;
+
+/// FLRC packet parameters, rebuilt with a given payload length.
+///
+/// Split out because **`pld_len` means different things in the two roles**, which is the single
+/// thing this driver's flat API hides and which cost the most here. Semtech's own stack keeps them
+/// as separate fields (`radio_params.flrc.tx_size` vs `.max_rx_size`) precisely because one register
+/// serves both:
+///
+/// - **TX: `pld_len` is the number of bytes actually transmitted.** Leave it at a large "maximum"
+///   and the radio transmits that many bytes, underrunning a FIFO that holds fewer — so the CRC it
+///   appends does not describe the frame, and **every** packet fails CRC at the receiver.
+/// - **RX: `pld_len` is the maximum accepted length.** In variable-length mode an over-long packet
+///   raises `LEN_ERROR` and the device stays in RX.
+///
+/// The symptom of getting this wrong is brutal to diagnose from the outside: strong signal
+/// (−33 dBm), syncword matched, `len_error = 0`, and 100% `crc_error`, with the first bytes of each
+/// frame intact — so a receiver that does not check CRC sees a working link.
+fn pkt_params(pld_len: u16) -> FlrcPacketParams {
+    FlrcPacketParams::new(
+        PREAMBLE,
+        SwLen::Sw32b,
+        SwTx::Sw1,
+        SwMatch::Match1,
+        PktFormat::Fixed,
+        Crc::Crc24,
+        pld_len,
+    )
+}
+
+/// Set the payload length. With [`PktFormat::Fixed`] both roles use [`FRAME_LEN`], so this is
+/// normally only called by `configure`; it stays public for length experiments (#108).
+pub async fn set_payload_len<O, SPI, M>(
+    radio: &mut Lr2021<O, SPI, M>,
+    len: u16,
+) -> Result<(), Lr2021Error>
+where
+    O: OutputPin,
+    SPI: SpiBus<u8>,
+    M: BusyPin,
+{
+    // Spec: valid range is [6..511]; below 6 the command is rejected and the frame never goes out.
+    radio.set_flrc_packet(&pkt_params(len.max(6))).await
+}
 
 /// Bring a reset LR2021 up as an FLRC node on [`FREQ_HZ`].
 ///
@@ -71,22 +141,14 @@ where
     M: BusyPin,
 {
     radio.set_packet_type(PacketType::Flrc).await?;
-    radio.set_flrc_modulation(BITRATE, CODING, PulseShape::Bt1p0).await?;
+    radio.set_flrc_modulation(BITRATE, CODING, PULSE_SHAPE).await?;
 
     // One syncword, and RX matches only that one: this is a two-node experiment, and accepting
     // other syncwords would let stray traffic masquerade as our packets.
     radio.set_flrc_syncword(1, SYNCWORD, true).await?;
 
-    let pkt = FlrcPacketParams::new(
-        AgcPblLen::Len16Bits,
-        SwLen::Sw32b,
-        SwTx::Sw1,
-        SwMatch::Match1,
-        PktFormat::Dynamic, // length travels in the header — payload size can vary per test
-        Crc::Crc24,         // so a corrupt frame is *reported* as corrupt rather than counted as good
-        MAX_PAYLOAD,
-    );
-    radio.set_flrc_packet(&pkt).await?;
+    // Defaults to the RX role; a transmitter MUST call `set_payload_len` with the real frame size.
+    radio.set_flrc_packet(&pkt_params(MAX_PAYLOAD)).await?;
 
     // HF front end for the 2.4 GHz port: PA on the HF path, RX on the HF path with full boost
     // (rx-boost-cfg = 7 in the shield devicetree).

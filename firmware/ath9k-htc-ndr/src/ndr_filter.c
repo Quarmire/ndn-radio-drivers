@@ -8,6 +8,7 @@
  */
 
 #include "ndr_filter.h"
+#include "ndr_mac.h"
 
 /*
  * Build-time defaults, overridable with -D so an A/B measurement builds two images from identical
@@ -48,6 +49,19 @@ a_int32_t ndr_rx_accept(const a_uint8_t *data, a_uint32_t len)
 	 * them, and no amount of filter logic will ever matter. If the frames stop, the hook is
 	 * live and any failure to filter is in the logic below.
 	 */
+	/*
+	 * Probe arm: drop everything IFF the quiet-time registers accepted the write. Turns an
+	 * unreadable readback into the frames-arriving oracle M1 already validated. 0 frames means
+	 * the write stuck; normal traffic means it did not.
+	 */
+#ifdef NDR_QUIET_PROBE
+	if (ndr_quiet_is_armed()) {
+		ndr_stats.dropped_filter++;
+		return 0;
+	}
+	return 1;
+#endif
+
 #ifdef NDR_DROP_ALL
 	(void)data;
 	(void)len;

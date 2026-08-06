@@ -53,6 +53,17 @@ ADD_DEFINITIONS(
 )
 # NDR A/B measurement: both arms build from identical source, the filter is switched on here.
 # Set NDR_FILTER_ON=1 in the environment before ./configure (cmake reads it at configure time).
+# M3: hardware-scheduled TX. Quiet period/duration in TU (1 TU = 1024 us).
+IF(DEFINED ENV{NDR_QUIET})
+	ADD_DEFINITIONS(-DNDR_QUIET_PERIOD_TU=$ENV{NDR_QUIET_PERIOD} -DNDR_QUIET_DURATION_TU=$ENV{NDR_QUIET_DURATION})
+	MESSAGE(STATUS "NDR: quiet-time armed, period=$ENV{NDR_QUIET_PERIOD} TU duration=$ENV{NDR_QUIET_DURATION} TU")
+ENDIF()
+
+IF(DEFINED ENV{NDR_QUIET_PROBE})
+	ADD_DEFINITIONS(-DNDR_DEFAULT_ENABLED=1 -DNDR_QUIET_PROBE=1)
+	MESSAGE(STATUS "NDR: quiet-arm PROBE build")
+ENDIF()
+
 IF(DEFINED ENV{NDR_DROP_ALL})
 	ADD_DEFINITIONS(-DNDR_DEFAULT_ENABLED=1 -DNDR_DROP_ALL=1)
 	MESSAGE(STATUS "NDR: DIAGNOSTIC build -- reject every frame")
@@ -97,6 +108,7 @@ SET(SOURCES
 	wlan/ndr_tier0.c
 	wlan/ndr_filter.c
 	wlan/ndr_mem.c
+	wlan/ndr_mac.c
 	wlan/if_ath_pci.c
 	magpie_fw_dev/target/wlan/wlan_pci.c
 	wlan/ieee80211_output.c

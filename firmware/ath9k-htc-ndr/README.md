@@ -131,6 +131,28 @@ No NixOS rebuild needed. To revert, delete the file and rebind — the loader fa
 image in the nix store. Confirm which image actually loaded by md5, not by assuming: the driver logs
 `Transferred FW: ..., size: N`, and stock and ours differ.
 
+## ★ What caps Tier-0, and why ACK/CTS survive it
+
+The frames that get through Tier-0 are the **neighbours'** 802.11 handshake, not ours — in a
+capture our injector's address appears zero times and the RAs are other (MAC-randomised) clients.
+Every unicast data frame is ACKed, and RTS/CTS + CTS-to-self is 11g/n protection.
+
+They survive **structurally**: an ACK/CTS is 14 bytes carrying exactly one address (`RA:`), while
+Tier-0 lives in `addr1‖addr2` and needs 16. So they hit the `len < 16` rule, which passes on
+purpose — dropping what cannot be evaluated is how a false-positive-only filter acquires false
+negatives.
+
+That puts a ceiling on the headline. M1's channel was management-heavy (2262 frames: 1306 beacons,
+507 probe responses, 232 control), all long and filterable. On a channel carrying real **data**,
+every unaggregated data frame is followed by an ACK, so control frames approach ~50% of all frames
+and Tier-0's **frame** rejection falls toward ~50%. A-MPDU/Block-Ack softens this (one BA per
+aggregate). **Byte rejection stays ~99% either way**, since an ACK is 14 B against data frames up
+to 1500 B.
+
+So report both: the bandwidth/USB-byte win is robust, while the **per-frame wakeup win — the one
+§8.2 actually prizes — is capped by the ambient control-frame fraction**. It is also a concrete
+argument for the custom-PHY/802.11ba direction in §8.5, where our MAC emits no ACKs at all.
+
 ## Milestones
 
 - **M0 — DONE (2026-08-06).** Toolchain built; the patched firmware builds for both targets with
@@ -151,7 +173,24 @@ image in the nix store. Confirm which image actually loaded by md5, not by assum
   runs with no replug**. Addresses come from the linker (`xtensa-elf-nm build/k2/fw.elf | grep
   ndr_`), never hardcoded.
 
-- **M3** — hardware-scheduled TX: arm `AR_QUIET1/2` off the TSF. Compare the achievable guard band
-  against the ~40–60 µs measured on the nRF54L15 testbed and the milliseconds we need today.
+- **M3 — DONE (2026-08-06).** Hardware-scheduled TX, measured: `noquiet 879 f/s → quiet armed
+  20 f/s → noquiet 898 f/s`. **97.7% of transmit opportunity removed by the MAC itself**, no host in
+  the loop, fully restored when disarmed. §8.5's "biggest loss" answered on real hardware.
+
+  The mechanism is the **generic-timer block, not `AR_QUIET1/2`** (which are inert here — bit 16 of
+  `AR_QUIET1` never reads back, and their field defines are `#if 0`'d upstream, which was the hint):
+
+  ```
+  duration -> AR_QUIET2            period -> AR_QUIET_PERIOD      (0x8238)
+  start    -> AR_NEXT_QUIET_TIMER (0x8218)
+  enable   -> AR_TIMER_MODE (0x8240) bit AR_QUIET_TIMER_EN (0x40)
+  ```
+
+  These are full 32-bit TSF/µs registers rather than 16-bit TU fields — which is also what makes
+  sub-millisecond base slots expressible at all (1 TU = 1024 µs is not).
+
+  ⚠ **Not calibrated.** A 50% duty was requested and ~98% gating observed, so the duration field's
+  units are not what was assumed. Mechanism proven, calibration open — do not quote a duty cycle.
+
 - **M4** — NAV. Write the lease into Duration/ID and read `AR_NAV` on a second radio. This is §7
   item 4, it is a one-afternoon measurement, and it gates a design choice — do it early.

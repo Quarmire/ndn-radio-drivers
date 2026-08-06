@@ -71,7 +71,18 @@ pub const FREQ_HZ: u32 = match option_env!("PHY_HF") {
     // bench already uses. #108 is invariant under every HF-side parameter we can reach — bitrate,
     // coding rate, carrier offset, packet format, CRC, syncword, payload whitening — and the LF/HF
     // path is the one axis the vendor's validated configuration differs from ours on.
-    Some(_) => 2_477_000_000,
+    // `PHY_MHZ` picks a coarse HF centre frequency. The +/-60 kHz sweep (m110) only ever probed
+    // tuning error; it could not distinguish a broken path from a CONGESTED one. This bench's
+    // 2.4 GHz is already documented as contended (the 8812au "loss at 3 ft" was contention, and
+    // ch14 was the clean room), and 2477 MHz sits on Wi-Fi ch13.
+    Some(_) => match option_env!("PHY_MHZ") {
+        Some(m) if matches!(m.as_bytes(), b"2405") => 2_405_000_000,
+        Some(m) if matches!(m.as_bytes(), b"2425") => 2_425_000_000,
+        Some(m) if matches!(m.as_bytes(), b"2445") => 2_445_000_000,
+        Some(m) if matches!(m.as_bytes(), b"2465") => 2_465_000_000,
+        Some(m) if matches!(m.as_bytes(), b"2480") => 2_480_000_000,
+        _ => 2_477_000_000,
+    },
     None => 915_000_000,
 };
 
@@ -139,7 +150,19 @@ pub const SYNCWORD: u32 = match option_env!("PHY_VENDOR") {
 /// TX power, dBm. The HF PA table in the shield devicetree tops out at **12 dBm**; the two kits sit
 /// on a bench, so start low — a strong link is not the goal and an overloaded receiver produces
 /// garbage timing. Raise deliberately, never by default.
-pub const TX_POWER_DBM: i8 = 0;
+/// TX power. **Note the unit: `set_tx_params` takes HALF-dB steps** (HF range −39..24 ⇒ −19.5 to
+/// +12 dBm), so this constant's name is a half-truth inherited from the first draft. `PHY_PWR`
+/// sweeps it — power is the one HF transmit knob #108 never varied (the PA *duty cycle* was swept,
+/// which is a different register).
+pub const TX_POWER_DBM: i8 = match option_env!("PHY_PWR") {
+    Some(v) if matches!(v.as_bytes(), b"n30") => -30,
+    Some(v) if matches!(v.as_bytes(), b"n16") => -16,
+    Some(v) if matches!(v.as_bytes(), b"p12") => 12,
+    Some(v) if matches!(v.as_bytes(), b"p24") => 24,
+    // Default +6 dBm, raised from 0. The LF power sweep showed the link is CLEAN at +6 and +12 dBm
+    // and receives NOTHING at −8 dBm, so 0 dBm was sitting far closer to the cliff than intended.
+    _ => 12,
+};
 
 /// **Fixed frame size, both roles.**
 ///
@@ -188,6 +211,16 @@ pub const MAX_PAYLOAD: u16 = FRAME_LEN;
 /// frame intact — so a receiver that does not check CRC sees a working link.
 /// Front-end calibration point: 4 MHz steps, MSB set to select the **HF** path.
 /// `0x8000 | (2477 MHz / 4)`.
+/// Three front-end calibration points, all on the path in use — see the call site in [`configure`].
+///
+/// HF brackets the 2.4 GHz ISM band (2400 / 2440 / 2480 MHz); LF brackets the 902-928 ISM band.
+/// The shield devicetree's own calibration list (470 / 897.5 / 2441 MHz) is the same idea: several
+/// points, spanning the band actually used.
+pub const CAL_POINTS: [u16; 3] = match option_env!("PHY_HF") {
+    Some(_) => [0x8000 | 600, 0x8000 | 610, 0x8000 | 620],
+    None => [225, 228, 232],
+};
+
 pub const FE_CAL: u16 = match option_env!("PHY_HF") {
     // The MSB selects the HF path; on LF it must be clear, and the step is still 4 MHz.
     Some(_) => 0x8000 | ((FREQ_HZ / 4_000_000) as u16),
@@ -358,7 +391,19 @@ where
     // enables something and does the opposite — that silent no-op was committed once already as a
     // fix, and it should not be re-introduced.
 
-    radio.calib_fe(&[FE_CAL]).await?;
+    // **All THREE calibration points must be supplied, and each carries its own path bit.**
+    //
+    // `CalibFe` declares freq1/freq2/freq3 as `optional: false`, and the MSB of each selects the
+    // path (0 = LF, 1 = HF). Passing a single frequency leaves the crate to fill freq2/freq3 with
+    // ZERO — which does not mean "unused", it encodes *LF path, 0 MHz*. On the LF path that is
+    // merely redundant. On HF it hands the front end one HF point and two LF-path zeros, i.e. a
+    // MIXED-PATH calibration of the ADC offset, PPF and image blocks.
+    //
+    // That is HF-specific, uniform across the band, and invisible to every modem parameter — which
+    // is the exact signature #108 has: identical failure at 2405/2425/2445/2465/2477 MHz, unchanged
+    // by bitrate, coding rate, packet format, CRC, syncword, whitening, the RF switch, and every
+    // pa_hf_duty_cycle from 4 to 31.
+    radio.calib_fe(&CAL_POINTS).await?;
 
     radio.set_packet_type(PacketType::Flrc).await?;
     radio.set_flrc_modulation(BITRATE, CODING, PULSE_SHAPE).await?;
@@ -384,7 +429,37 @@ where
         // explicit form. Duty cycle / slices copied from the HF helper's own defaults (6, 7).
         radio.set_pa_lf(PaLfMode::LfPaFsm, 6, 7).await?;
     } else {
-        radio.set_pa_hf().await?;
+        // **The crate's `set_pa_hf()` never sets `pa_hf_duty_cycle`.** It calls the 4-byte
+        // `set_pa_config_cmd(HfPa, LfPaFsm, 6, 7)` — all three of those are the *LF* fields — while
+        // the spec defines a 5th byte, `pa_hf_duty_cycle` (5 bits, default 16), described as
+        // controlling "the duty cycle and maximum output power of the PA in HF mode". The crate even
+        // has `set_pa_config_adv_cmd` for the 5-byte form and simply does not use it here.
+        //
+        // This is the only HF-specific knob our code has never touched, and #108 is now known to be
+        // HF-path-specific: uniform failure at 2405/2425/2445/2465/2477 MHz (so not congestion),
+        // unchanged with the RF switch driven or floating, and immune to every modem parameter.
+        // `PHY_PAHF` sweeps it so the value is measured rather than defaulted-into.
+        let hf_duty: u8 = match option_env!("PHY_PAHF") {
+            Some(v) if matches!(v.as_bytes(), b"4") => 4,
+            Some(v) if matches!(v.as_bytes(), b"8") => 8,
+            Some(v) if matches!(v.as_bytes(), b"12") => 12,
+            Some(v) if matches!(v.as_bytes(), b"16") => 16,
+            Some(v) if matches!(v.as_bytes(), b"20") => 20,
+            Some(v) if matches!(v.as_bytes(), b"24") => 24,
+            Some(v) if matches!(v.as_bytes(), b"31") => 31,
+            _ => 0xff,
+        };
+        if hf_duty == 0xff {
+            radio.set_pa_hf().await?;
+        } else {
+            let mut cmd = [0u8; 5];
+            cmd[0] = 0x02;
+            cmd[1] = 0x02;
+            cmd[2] = (1 << 7) | (6 << 4); // pa_sel = HF_PA, pa_lf_duty_cycle = 6, pa_lf_mode = 0
+            cmd[3] = 7; // pa_lf_slices
+            cmd[4] = hf_duty & 0x1f;
+            radio.cmd_wr(&cmd).await?;
+        }
     }
     // **Ramp2u, not Ramp16u** (#104 lever 3). The PA ramp sits between the TX trigger and the first
     // on-air symbol, so its duration is pure transmit-instant offset — and any variation in it is
@@ -407,7 +482,16 @@ where
     //
     // Boost is a link-budget decision, not a constant. Raise it when the link is weak.
     let path = if option_env!("PHY_HF").is_some() { RxPath::HfPath } else { RxPath::LfPath };
-    radio.set_rx_path(path, RxBoost::Off).await?;
+    // `PHY_BOOST` sweeps the LNA boost. RxBoost::Off is the only change that ever improved #108
+    // (leading run 7 → 15, RSSI −33 → −46), so its neighbourhood is worth mapping rather than
+    // assuming the endpoint is optimal.
+    let boost = match option_env!("PHY_BOOST") {
+        Some(v) if matches!(v.as_bytes(), b"3") => RxBoost::B3,
+        Some(v) if matches!(v.as_bytes(), b"5") => RxBoost::B5,
+        Some(v) if matches!(v.as_bytes(), b"7") => RxBoost::Max,
+        _ => RxBoost::Off,
+    };
+    radio.set_rx_path(path, boost).await?;
     radio.set_rf(FREQ_HZ).await?;
 
     // Route interrupts out on **DIO8**, which the shield wires to the MCU's P1.04.

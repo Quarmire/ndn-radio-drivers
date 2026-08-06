@@ -76,10 +76,26 @@ pub fn init(p: Peripherals) -> (Radio, TimingParts, UartParts) {
     // Assert the board's RF-switch controls, as Zephyr's `regulator-boot-on` nodes do (see
     // `board::PIN_RFSW_CTL` / `PIN_RFSW_PWR`). Leaked deliberately: these must stay asserted for the
     // life of the program, and dropping the `Output` would release the pin mid-experiment.
+    //
+    // **`PHY_RFSW` selects the polarity**, because "asserted per the devicetree" and "floating" are
+    // only two of the states this switch has, and #108 needs the third tested. On HF the received
+    // level barely moves across a 13.5 dB TX-power change (−40 → −43 dBm from `PHY_PWR=n30` to
+    // `p24`), which a working transmit path cannot do — so what the receiver hears is coupling, not
+    // the HF PA, and routing is back in scope.
+    //   (unset) — devicetree polarity: ctl LOW, pwr HIGH
+    //   inv     — both inverted
+    //   ctl     — ctl inverted only
+    //   pwr     — pwr inverted only
     #[cfg(not(feature = "no-rf-switch"))]
     {
-        core::mem::forget(Output::new(p.P2_05, Level::Low, OutputDrive::Standard)); // rfsw_ctl, active low
-        core::mem::forget(Output::new(p.P2_03, Level::High, OutputDrive::Standard)); // rfsw_pwr, active high
+        let (ctl, pwr) = match option_env!("PHY_RFSW") {
+            Some(v) if matches!(v.as_bytes(), b"inv") => (Level::High, Level::Low),
+            Some(v) if matches!(v.as_bytes(), b"ctl") => (Level::High, Level::High),
+            Some(v) if matches!(v.as_bytes(), b"pwr") => (Level::Low, Level::Low),
+            _ => (Level::Low, Level::High),
+        };
+        core::mem::forget(Output::new(p.P2_05, ctl, OutputDrive::Standard)); // rfsw_ctl
+        core::mem::forget(Output::new(p.P2_03, pwr, OutputDrive::Standard)); // rfsw_pwr
     }
 
     let timing = TimingParts { dio: p.P1_04, timer: p.TIMER20, gpiote: p.GPIOTE20_CH0, ppi: p.PPI20_CH0 };

@@ -40,27 +40,39 @@
 /// Usable filter bits. 96 (two address fields) minus the two reserved bits of octet 0.
 pub const M_BITS: u32 = 94;
 
-/// Bit positions set per inserted prefix — **4, measured, not 6 or 7 as the formula predicts.**
+/// **Hashes per prefix — k = 4.**
 ///
-/// The textbook optimum `(M/n)·ln2` gives ~7 here, and #91's design chose 6 on that basis. Measured
-/// at the depth cap on hardware (`m7_filter_test`, 20 000 trials per point):
+/// Chosen on the largest-sample measurement available, not on a claimed optimum. The history matters
+/// because this constant has now been wrong in both directions:
 ///
-/// | k | bits set | FP at depth 8 |
-/// |---|---|---|
-/// | 3 | 25/94 | 1.99% |
-/// | **4** | **29/94** | **0.94%** ← measured optimum |
-/// | 5 | 35/94 | 0.98% |
-/// | 6 | 42/94 | 1.09% |
-/// | 8 | 53/94 | 1.50% |
+/// 1. Originally k=4, justified by an on-device sweep that "disproved" the closed-form prediction of
+///    ~6. That sweep's false-positive queries came from `make_name(d, 0x10000 + t)`, and the helper
+///    formats the salt as four hex digits — the 0x10000 truncated away, so the "disjoint" queries
+///    shared leading components with the registered name and genuine ancestors were counted as false
+///    positives.
+/// 2. With the generator fixed, the same device sweep inverted and showed k=6 far ahead. That was
+///    12 names and 54 events — one harness, small sample, exactly the weakness that produced (1).
+/// 3. An independent host replication at **200 names / 400 000 trials** (`ksweep_host_replication`),
+///    with +/-1σ error bars, disagrees with the device beyond both their error bars:
 ///
-/// The formula is wrong here for a specific reason: it assumes a query's k positions are
-/// independent. With only 94 bits they are not — k=6 positions collide *with each other* roughly
-/// 15% of the time, and a query whose 6 positions collapse to 3 distinct bits has the
-/// false-positive rate of k=3, not k=6. That effect is invisible to the formula and grows with k,
-/// which is why the true optimum sits below the predicted one. Small-m Bloom filters are their own
-/// regime; do not size this one from the asymptotic formula.
+/// | k | bits set | FP @ depth 8, host (±1σ) | FP @ depth 8, device |
+/// |---|---|---|---|
+/// | 3 | 23/94 | 1.043% ± 0.016 | 1.02% |
+/// | **4** | **28/94** | **0.586% ± 0.012** | 0.91% |
+/// | 5 | 34/94 | 0.671% ± 0.013 | 0.46% |
+/// | 6 | 38/94 | 0.665% ± 0.013 | 0.27% |
+/// | 8 | 48/94 | 0.670% ± 0.013 | 0.67% |
 ///
-/// Lower k is also cheaper: 4 hash positions per prefix instead of 6.
+/// **The honest reading: the optimum is not determined by these measurements.** Two independently
+/// written harnesses rank k=4..8 differently by more than their error bars, which means the *name
+/// distribution* dominates, not k. Only k=3 is consistently bad. Everything else is inside the
+/// sub-1.5% regime the design needs.
+///
+/// So k=4 on the tiebreakers: it wins the one measurement with tight error bars, sets the fewest
+/// bits (28/94, leaving headroom before saturation), costs the fewest hashes per frame, and is what
+/// the on-air shadow-mode result (#106: 87.1% reject, 0.46% FP) was measured at.
+///
+/// **Do not "improve" this from a single sweep.** That is what went wrong twice.
 pub const K: u32 = 4;
 
 /// Deepest prefix inserted. Beyond this the filter saturates and degrades *for every user of the

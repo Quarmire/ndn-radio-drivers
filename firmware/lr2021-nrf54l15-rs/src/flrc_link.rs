@@ -228,6 +228,20 @@ pub const MAX_PAYLOAD: u16 = FRAME_LEN;
 /// HF brackets the 2.4 GHz ISM band (2400 / 2440 / 2480 MHz); LF brackets the 902-928 ISM band.
 /// The shield devicetree's own calibration list (470 / 897.5 / 2441 MHz) is the same idea: several
 /// points, spanning the band actually used.
+/// PA ramp time. **`PHY_RAMP` overrides it**, because Ramp2u — the shortest the part offers — was
+/// chosen for M5 timing precision and is now a suspect: the SDR shows the HF carrier still settling
+/// ~90 kHz over the first 194 us of a burst, and a 2 us ramp gives the synthesizer essentially no
+/// time between keying the PA and putting data on the air.
+fn ramp_time() -> RampTime {
+    match option_env!("PHY_RAMP") {
+        Some(v) if matches!(v.as_bytes(), b"16") => RampTime::Ramp16u,
+        Some(v) if matches!(v.as_bytes(), b"48") => RampTime::Ramp48u,
+        Some(v) if matches!(v.as_bytes(), b"96") => RampTime::Ramp96u,
+        Some(v) if matches!(v.as_bytes(), b"192") => RampTime::Ramp192u,
+        _ => RampTime::Ramp2u,
+    }
+}
+
 pub const CAL_POINTS: [u16; 3] = match option_env!("PHY_HF") {
     // **4 MHz grid.** `CalibFe` takes frequencies in 4 MHz steps, so a calibration point can only
     // ever land on a multiple of 4 MHz. `GetErrors` reports `RXFREQ_NO_FE_CAL` ("front end
@@ -502,14 +516,14 @@ where
         cmd[3] = 7;
         cmd[4] = hf_duty & 0x1f;
         radio.cmd_wr(&cmd).await?;
-        radio.set_tx_params(hf_tx_pow, RampTime::Ramp2u).await?;
+        radio.set_tx_params(hf_tx_pow, ramp_time()).await?;
     }
     // **Ramp2u, not Ramp16u** (#104 lever 3). The PA ramp sits between the TX trigger and the first
     // on-air symbol, so its duration is pure transmit-instant offset — and any variation in it is
     // transmit-instant jitter, which is exactly the residual M5 left unexplained. 16 µs was an
     // arbitrary bring-up default; the shortest ramp is the right default for a slot MAC.
     if option_env!("PHY_HF").is_none() {
-        radio.set_tx_params(TX_POWER_DBM, RampTime::Ramp2u).await?;
+        radio.set_tx_params(TX_POWER_DBM, ramp_time()).await?;
     }
     // **RX boost OFF, not Max.**
     //
@@ -622,4 +636,43 @@ where
     let (rise, fall) = if !is_rx_hf && (ana_dec == 1 || ana_dec == 2) { (11u32, 13u32) } else { (15u32, 15u32) };
     let _ = radio.wr_reg_mask(SWITCHER, RISE_MASK, rise << 20).await;
     let _ = radio.wr_reg_mask(SWITCHER, FALL_MASK, fall << 16).await;
+}
+
+/// **Settle the synthesizer before keying the PA. Call this before every `set_tx`.**
+///
+/// #108's root cause, measured with a B210 at 2477 MHz: going straight from Standby to TX left the
+/// PLL still converging while data was already on the air. Per-eighth mean carrier frequency across
+/// a 194 µs burst, all-zeros payload:
+///
+/// ```text
+///   straight to TX:   +104  +42  +31  +24  +21  +18  +17  +15  kHz   (27 kHz of drift under the payload)
+///   FS settle first:   +66  +11  +10   +8   +9   +9  +10   +9  kHz   ( 2 kHz — flat after the preamble)
+/// ```
+///
+/// The receiver locks phase off the syncword at the start of the frame; a carrier that then slides
+/// 27 kHz out from under it produces a progressive constellation rotation, which is exactly the
+/// payload-independent `00 -> 55 -> ff -> aa -> 00` walk the HF dumps showed. On the LF path the
+/// same transient is small enough for the tracking loop to hold, which is why 915 MHz was always
+/// clean and 2.4 GHz never was — and why every modem-side parameter (bitrate, coding rate, packet
+/// format, CRC, syncword, whitening, RX boost, TX power, static LO offset) was irrelevant.
+///
+/// A longer `RampTime` fixes it too, but this way keeps `Ramp2u`: the ramp sits between the TX
+/// trigger and the first symbol, so it is pure transmit-instant offset and the slot MAC (#93, and
+/// M5's guard band) wants it as short as possible. Settling in FS costs time *before* the trigger,
+/// where it is free.
+///
+/// Build with `PHY_NO_FS=1` to skip it — for reproducing the fault, not for operation.
+pub async fn settle_before_tx<O, SPI, M>(radio: &mut Lr2021<O, SPI, M>)
+where
+    O: OutputPin,
+    SPI: SpiBus<u8>,
+    M: BusyPin,
+{
+    if option_env!("PHY_NO_FS").is_some() {
+        return;
+    }
+    let _ = radio.set_chip_mode(ChipMode::Fs).await;
+    // 500 µs is generous: the capture shows the carrier flat by the end of the first eighth of a
+    // 194 µs burst (~24 µs). Measured margin, not a guess — tighten only against another capture.
+    embassy_time::Timer::after(embassy_time::Duration::from_micros(500)).await;
 }

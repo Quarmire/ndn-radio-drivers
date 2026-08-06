@@ -70,7 +70,14 @@ async fn main(_spawner: Spawner) {
         flrc_link::FRAME_LEN
     );
 
+    // **`PHY_FS=1`: settle the synthesizer in FS mode before every transmission.**
+    //
+    // The SDR capture shows the carrier starting ~105 kHz high and decaying ~90 kHz over a 194 us
+    // burst — the PLL is still converging while data goes out, which is exactly the progressive
+    // constellation rotation the receiver sees. Going Standby -> FS -> (settle) -> TX gives the
+    // synthesizer time to lock before the PA keys, instead of going straight to TX.
     loop {
+        flrc_link::settle_before_tx(&mut radio).await;
         let _ = radio.clear_tx_fifo().await;
         if radio.wr_tx_fifo_from(&frame).await.is_ok() {
             let _ = radio.set_tx(0).await;

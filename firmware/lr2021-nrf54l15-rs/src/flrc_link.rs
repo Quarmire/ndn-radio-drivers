@@ -33,7 +33,7 @@ use embedded_hal_async::spi::SpiBus;
 
 use lr2021::flrc::{AgcPblLen, Crc, FlrcBitrate, FlrcCr, FlrcPacketParams, PktFormat, SwLen, SwMatch, SwTx};
 use lr2021::radio::{PacketType, PaLfMode, RampTime, RxBoost, RxPath};
-use lr2021::system::{ChipMode, DioNum, TcxoVoltage};
+use lr2021::system::{ChipMode, DioNum};
 use lr2021::status::Intr;
 use lr2021::{BusyPin, Lr2021, Lr2021Error, PulseShape};
 
@@ -403,7 +403,14 @@ where
     // is the exact signature #108 has: identical failure at 2405/2425/2445/2465/2477 MHz, unchanged
     // by bitrate, coding rate, packet format, CRC, syncword, whitening, the RF switch, and every
     // pa_hf_duty_cycle from 4 to 31.
-    radio.calib_fe(&CAL_POINTS).await?;
+    // **§6.3.18: `SetRegMode` defaults to SIMO_OFF (LDO) and must be issued in Standby RC.**
+    // The shield devicetree specifies `reg-mode = DCDC`, and every PA figure in the datasheet is
+    // characterised at "3.3 V SIMO". We had never called this at all.
+    radio.set_chip_mode(ChipMode::StandbyRc).await?;
+    // `set_regulator_mode(true)` emits `SimoUsage::Auto` == 2 == the datasheet's **SIMO_NORMAL**.
+    // The crate's enum names do not match Table 6-26 — it calls 1 `All` and 3 `Vdcc` where the
+    // datasheet marks both **RFU** — so this is right by value, not by name.
+    let _ = radio.set_regulator_mode(true).await;
 
     radio.set_packet_type(PacketType::Flrc).await?;
     radio.set_flrc_modulation(BITRATE, CODING, PULSE_SHAPE).await?;
@@ -435,37 +442,46 @@ where
         // controlling "the duty cycle and maximum output power of the PA in HF mode". The crate even
         // has `set_pa_config_adv_cmd` for the 5-byte form and simply does not use it here.
         //
-        // This is the only HF-specific knob our code has never touched, and #108 is now known to be
-        // HF-path-specific: uniform failure at 2405/2425/2445/2465/2477 MHz (so not congestion),
-        // unchanged with the RF switch driven or floating, and immune to every modem parameter.
-        // `PHY_PAHF` sweeps it so the value is measured rather than defaulted-into.
-        let hf_duty: u8 = match option_env!("PHY_PAHF") {
-            Some(v) if matches!(v.as_bytes(), b"4") => 4,
-            Some(v) if matches!(v.as_bytes(), b"8") => 8,
-            Some(v) if matches!(v.as_bytes(), b"12") => 12,
-            Some(v) if matches!(v.as_bytes(), b"16") => 16,
-            Some(v) if matches!(v.as_bytes(), b"20") => 20,
-            Some(v) if matches!(v.as_bytes(), b"24") => 24,
-            Some(v) if matches!(v.as_bytes(), b"31") => 31,
-            _ => 0xff,
+        // **Configured per datasheet Table 7-18, not by sweeping.** Three things it makes clear
+        // that #108 had wrong:
+        //
+        // 1. §7.4.1: "**Only values from 16-31 are authorized** to avoid risk of aging the power
+        //    amplifier", and non-optimized PA parameters risk "incorrect output power, excessive
+        //    current consumption, **PA damage**, regulatory non-compliance". The earlier sweep of
+        //    this field went down to 4 and 8 — outside that range. Do not repeat that.
+        // 2. §1.5.2 + Table 7-18: `tx_power` and `pa_hf_duty_cycle` are a **matched pair**, not two
+        //    independent knobs. Sweeping them separately never lands on a valid combination, which
+        //    is why every earlier HF experiment was configured wrongly no matter what it varied.
+        // 3. §7.4.3: `tx_power` is in **0.5 dB steps** (PA_HF −39..24 ⇒ −19.5..+12 dBm), so the
+        //    register is 2x the dBm figure printed in Table 7-18.
+        //
+        // Rows used, from Table 7-18 (2445 MHz Semtech reference design):
+        //   +12 dBm -> tx_power 12 dBm (reg 24), duty 16
+        //    +6 dBm -> tx_power  8 dBm (reg 16), duty 30
+        //     0 dBm -> tx_power  2 dBm (reg  4), duty 30
+        let (hf_tx_pow, hf_duty): (i8, u8) = match option_env!("PHY_PWR") {
+            Some(v) if matches!(v.as_bytes(), b"0") => (4, 30),
+            Some(v) if matches!(v.as_bytes(), b"6") => (16, 30),
+            _ => (24, 16),
         };
-        if hf_duty == 0xff {
-            radio.set_pa_hf().await?;
-        } else {
-            let mut cmd = [0u8; 5];
-            cmd[0] = 0x02;
-            cmd[1] = 0x02;
-            cmd[2] = (1 << 7) | (6 << 4); // pa_sel = HF_PA, pa_lf_duty_cycle = 6, pa_lf_mode = 0
-            cmd[3] = 7; // pa_lf_slices
-            cmd[4] = hf_duty & 0x1f;
-            radio.cmd_wr(&cmd).await?;
-        }
+        let mut cmd = [0u8; 5];
+        cmd[0] = 0x02;
+        cmd[1] = 0x02;
+        // pa_sel = 1 (HF), pa_lf_mode = 0, pa_lf_duty_cycle = 6, pa_lf_slices = 7 — the datasheet's
+        // stated values for "LF PA not used".
+        cmd[2] = (1 << 7) | (6 << 4);
+        cmd[3] = 7;
+        cmd[4] = hf_duty & 0x1f;
+        radio.cmd_wr(&cmd).await?;
+        radio.set_tx_params(hf_tx_pow, RampTime::Ramp2u).await?;
     }
     // **Ramp2u, not Ramp16u** (#104 lever 3). The PA ramp sits between the TX trigger and the first
     // on-air symbol, so its duration is pure transmit-instant offset — and any variation in it is
     // transmit-instant jitter, which is exactly the residual M5 left unexplained. 16 µs was an
     // arbitrary bring-up default; the shortest ramp is the right default for a slot MAC.
-    radio.set_tx_params(TX_POWER_DBM, RampTime::Ramp2u).await?;
+    if option_env!("PHY_HF").is_none() {
+        radio.set_tx_params(TX_POWER_DBM, RampTime::Ramp2u).await?;
+    }
     // **RX boost OFF, not Max.**
     //
     // The shield devicetree says `rx-boost-cfg = 7` and that was copied without asking what it is
@@ -486,9 +502,16 @@ where
     // (leading run 7 → 15, RSSI −33 → −46), so its neighbourhood is worth mapping rather than
     // assuming the endpoint is optimal.
     let boost = match option_env!("PHY_BOOST") {
+        Some(v) if matches!(v.as_bytes(), b"0") => RxBoost::Off,
+        Some(v) if matches!(v.as_bytes(), b"4") => RxBoost::B4,
         Some(v) if matches!(v.as_bytes(), b"3") => RxBoost::B3,
         Some(v) if matches!(v.as_bytes(), b"5") => RxBoost::B5,
         Some(v) if matches!(v.as_bytes(), b"7") => RxBoost::Max,
+        // **§7.3.2: "The recommended default values are: 0: In LF, 4: In HF."**
+        // We had `Off` on both. That is right for LF and wrong for HF — and when the original
+        // RxBoost::Max was found to be overloading the front end, the fix went straight to 0,
+        // sailing past the recommended 4 without ever landing on it.
+        _ if option_env!("PHY_HF").is_some() => RxBoost::B4,
         _ => RxBoost::Off,
     };
     radio.set_rx_path(path, boost).await?;

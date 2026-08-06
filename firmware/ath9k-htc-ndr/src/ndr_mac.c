@@ -5,6 +5,8 @@
 #include "ar5416reg.h"
 #include "ndr_mac.h"
 
+static a_uint32_t armed_ok;
+
 struct ndr_mac_state ndr_mac_state = { NDR_MAC_MAGIC, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
 
 void ndr_quiet_rearm(void)
@@ -15,7 +17,23 @@ void ndr_quiet_rearm(void)
 		return;
 
 	/*
-	 * Deliberately NO "already armed?" early-return here.
+	 * Arm once, then only re-arm if the hardware lost it (a MAC reset on channel change).
+	 *
+	 * The unconditional version was wrong in a way that looked like a hardware property: this
+	 * runs from the receive path, ~100x/s on a busy channel, and each call reset
+	 * AR_NEXT_QUIET_TIMER to "now + margin", continually restarting the quiet window. Measured
+	 * effect: ~98% gating when 50% was configured. It is the software, not the duration field.
+	 *
+	 * The guard is on AR_TIMER_MODE, which is measured to read back reliably, plus a software
+	 * flag so the very first arm always happens. Guarding on AR_QUIET1 bit 16 does NOT work —
+	 * that register never reads back on this part, which is what made the first attempt skip
+	 * the write entirely.
+	 */
+	if (armed_ok && (ioread32_mac(AR_TIMER_MODE) & AR_QUIET_TIMER_EN))
+		return;
+
+	/*
+	 * (No guard on AR_QUIET1 here.)
 	 *
 	 * The first version guarded on `ioread32_mac(AR_QUIET1) & AR_QUIET1_QUIET_ENABLE`, which is
 	 * self-defeating: if that register reads back as anything with bit 16 set — including the
@@ -61,6 +79,7 @@ void ndr_quiet_rearm(void)
 	iowrite32_mac(AR_QUIET_PERIOD, (a_uint32_t)NDR_QUIET_PERIOD_TU * 1024u);
 	iowrite32_mac(AR_TIMER_MODE, ioread32_mac(AR_TIMER_MODE) | AR_QUIET_TIMER_EN);
 	ndr_mac_state.timer_mode_rb = ioread32_mac(AR_TIMER_MODE);
+	armed_ok = 1;
 
 	ndr_mac_state.arm_count++;
 	ndr_mac_state.quiet1 = q1;

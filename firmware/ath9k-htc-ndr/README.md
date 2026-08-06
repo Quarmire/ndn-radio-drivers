@@ -189,8 +189,32 @@ argument for the custom-PHY/802.11ba direction in §8.5, where our MAC emits no 
   These are full 32-bit TSF/µs registers rather than 16-bit TU fields — which is also what makes
   sub-millisecond base slots expressible at all (1 TU = 1024 µs is not).
 
-  ⚠ **Not calibrated.** A 50% duty was requested and ~98% gating observed, so the duration field's
-  units are not what was assumed. Mechanism proven, calibration open — do not quote a duty cycle.
+  **Calibrated (2026-08-06).** Period fixed at 100 TU, duration swept, injection rate measured:
+
+  | duration | frames/s | rate / baseline | ideal `1 − d/100` |
+  |---|---|---|---|
+  | 0 (control) | 809 / 868 | 1.000 | 1.00 |
+  | 10 TU | 771 | 0.919 | 0.90 |
+  | 25 TU | 662 | 0.789 | 0.75 |
+  | 50 TU | 436 | 0.520 | 0.50 |
+  | 75 TU | 239 | 0.285 | 0.25 |
+  | 90 TU | 94 | 0.112 | 0.10 |
+
+  Linear, slope **−8.27 f/s per TU** against an ideal −8.39: **one configured TU of quiet removes
+  0.986 TU of airtime.** So the **duration field is in TU (1024 µs), exactly as `ar5416reg.h`
+  documents** — the earlier "~98% when 50% was asked for" was entirely a software bug of mine
+  (re-arming from the receive path restarted the window ~100×/s), not a hardware property.
+
+  **Mixed units, and the asymmetry matters.** `AR_NEXT_QUIET_TIMER` and `AR_QUIET_PERIOD` are 32-bit
+  and **microsecond**-granular (writing `period_TU × 1024` there produces a 102.4 ms period);
+  `AR_QUIET2`'s duration is **TU**-granular. So a lease *boundary* can be placed to the microsecond
+  while its *length* quantises to ~1 ms. For the design that means start times can be slot-accurate
+  today, and only the lease length is coarse.
+
+  The residual (measured duty runs 1–3.5 points under configured) is consistent with a frame already
+  in flight completing across the quiet boundary — at ~1.2 ms/frame that is ≤1.2% of the period —
+  and is within the baseline's own ±3.5% spread. **Not resolvable below ~1 TU with this method**,
+  since a 1 TU duty is ~1% against that noise.
 
 - **M4** — NAV. Write the lease into Duration/ID and read `AR_NAV` on a second radio. This is §7
   item 4, it is a one-afternoon measurement, and it gates a design choice — do it early.

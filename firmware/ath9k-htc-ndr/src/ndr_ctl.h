@@ -49,7 +49,7 @@ enum {
 	NDR_OP_NOP        = 0x00,
 	NDR_OP_ENABLE     = 0x01, /* u8 enabled */
 	NDR_OP_DROP_FOREIGN = 0x02, /* u8 */
-	NDR_OP_KEY        = 0x03, /* u64 name-hash key */
+	NDR_OP_KEY        = 0x03, /* 16-byte group key */
 	NDR_OP_NMASKS     = 0x04, /* u8 count */
 	NDR_OP_MASK       = 0x05, /* u8 index, then 12 mask bytes */
 	NDR_OP_CLEAR_STATS = 0x06,

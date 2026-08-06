@@ -46,19 +46,14 @@ typedef int32_t  a_int32_t;
 /* Usable filter bits: 96 (two address fields) minus the two reserved bits of octet 0. */
 #define NDR_M_BITS      94
 
-/*
- * Bit positions set per inserted prefix -- 4, MEASURED, not the 6 the formula predicts.
- *
- * The textbook optimum (M/n)*ln2 gives ~7 here. Measured at the depth cap on an nRF54L15
- * (20 000 trials per point) the optimum is k=4 (0.94% FP at depth 8, vs 1.09% at k=6). The formula
- * assumes a query's k positions are independent; at 94 bits they are not -- k=6 positions collide
- * with each other ~15% of the time, and a query whose 6 collapse to 3 distinct bits has the FP of
- * k=3. Small-m Bloom filters are their own regime. Do not "fix" this to match the formula.
- */
+/* Hashes per prefix. Must equal `K` in the normative lr2021-nrf54l15-rs/src/tier0.rs. */
 #define NDR_K           4
 
 /* Deepest prefix inserted. Beyond this the filter saturates for every user of the frame. */
 #define NDR_MAX_DEPTH   8
+
+/* Group key width. The key IS the trust context (addressing doctrine §8). */
+#define NDR_KEY_LEN     16
 
 /* The two bits of octet 0 that must not be used by the filter (I/G and U/L). */
 #define NDR_RESERVED_MASK0  0x03
@@ -69,10 +64,21 @@ typedef struct {
 } ndr_filter_t;
 
 /*
- * FNV-1a 64, keyed -- the same name-hash family the on-device LoRa data plane already uses, so the
- * filter shares one keyspace with the FIB and dedup rather than adding a second (open task #44).
+ * SipHash-2-4 -- the one agreed name-hash (addressing doctrine §8, task #44).
+ *
+ * This replaced keyed FNV-1a-64. FNV is not a PRF and XOR-ing a key into its init state is
+ * invertible from observed output, so an outsider could recover a private group's key and then
+ * compute -- or deliberately collide with -- its pre-parse filter. That is exactly the guarantee
+ * the group key is supposed to provide.
+ *
+ * ⚠ **Both implementations must agree bit-for-bit or they cannot share a group.** A filter built
+ * under one hash will not match masks built under another: no partial interop, no degradation, no
+ * error -- names simply stop matching. `tools/ndr_tier0_selftest.c` is what makes that impossible
+ * to do by accident; run it after touching anything here.
  */
-a_uint64_t ndr_name_hash(a_uint64_t key, const a_uint8_t *name, a_uint32_t len);
+a_uint64_t ndr_siphash24(const a_uint8_t key[NDR_KEY_LEN], const a_uint8_t *data, a_uint32_t len);
+
+a_uint64_t ndr_name_hash(const a_uint8_t key[NDR_KEY_LEN], const a_uint8_t *name, a_uint32_t len);
 
 /* Could this frame's filter be under the prefix that `mask` was built from? */
 a_int32_t ndr_may_match(const ndr_filter_t *f, const ndr_filter_t *mask);
@@ -85,7 +91,8 @@ a_int32_t ndr_may_match(const ndr_filter_t *f, const ndr_filter_t *mask);
 a_uint32_t ndr_clamp_prefix(const a_uint8_t *prefix, a_uint32_t len);
 
 /* The mask a receiver precomputes once per registered prefix. */
-void ndr_mask_for(ndr_filter_t *out, a_uint64_t key, const a_uint8_t *prefix, a_uint32_t len);
+void ndr_mask_for(ndr_filter_t *out, const a_uint8_t key[NDR_KEY_LEN],
+		  const a_uint8_t *prefix, a_uint32_t len);
 
 /* Number of usable filter bits set. */
 a_uint32_t ndr_popcount(const ndr_filter_t *f);

@@ -41,7 +41,7 @@ struct ndr_cfg {
 	a_uint32_t   enabled;      /* 0 = stock behaviour: every frame goes to the host */
 	a_uint32_t   drop_foreign; /* drop frames whose addr1 is not locally-administered group */
 	a_uint32_t   n_masks;
-	a_uint64_t   key;          /* keyed name hash; must match the sender's */
+	a_uint8_t    key[NDR_KEY_LEN]; /* group key = the trust context; must match the sender's */
 	ndr_filter_t masks[NDR_MAX_MASKS];
 };
 

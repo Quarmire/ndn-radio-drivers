@@ -8,48 +8,117 @@
 #include "ndr_tier0.h"
 
 /*
- * FNV-1a 64.
+ * SipHash-2-4, a faithful transcription of the reference and of the Rust copy in
+ * `lr2021-nrf54l15-rs/src/tier0.rs`. See ndr_tier0.h for why FNV had to go.
  *
- * The multiply is written as shift-and-add rather than `h * 0x100000001b3` deliberately. The
- * firmware links against no libgcc, so a 64-bit multiply on a 32-bit Xtensa target would emit an
- * undefined reference to __muldi3. The FNV prime factors exactly:
- *
- *     0x100000001b3 = 2^40 + 435,  435 = 2^8 + 2^7 + 2^5 + 2^4 + 2^1 + 2^0
- *
- * so the product mod 2^64 is a sum of constant shifts, which gcc inlines. This is arithmetically
- * identical to the Rust `wrapping_mul` -- it is the same value, not an approximation of it.
+ * Every shift and rotate below is by a CONSTANT. That is deliberate: this firmware links no libgcc,
+ * so a variable 64-bit shift would emit an undefined reference to __ashldi3. The same constraint
+ * killed the plain 64-bit multiply in the FNV version. SipHash needs no multiply at all, so the
+ * only trap is the tail assembly -- which is why the remainder is gathered into a byte array and
+ * folded in with constant shifts rather than `b << (8 * i)`.
  */
-a_uint64_t ndr_name_hash(a_uint64_t key, const a_uint8_t *name, a_uint32_t len)
+#define ROTL64(x, n) (((x) << (n)) | ((x) >> (64 - (n))))
+
+#define SIPROUND()                                     \
+	do {                                           \
+		v0 += v1;                              \
+		v1 = ROTL64(v1, 13);                   \
+		v1 ^= v0;                              \
+		v0 = ROTL64(v0, 32);                   \
+		v2 += v3;                              \
+		v3 = ROTL64(v3, 16);                   \
+		v3 ^= v2;                              \
+		v0 += v3;                              \
+		v3 = ROTL64(v3, 21);                   \
+		v3 ^= v0;                              \
+		v2 += v1;                              \
+		v1 = ROTL64(v1, 17);                   \
+		v1 ^= v2;                              \
+		v2 = ROTL64(v2, 32);                   \
+	} while (0)
+
+static a_uint64_t rd_le64(const a_uint8_t *p)
 {
-	a_uint64_t h = ((a_uint64_t)0xcbf29ce484222325ULL) ^ key;
-	a_uint32_t i;
-
-	for (i = 0; i < len; i++) {
-		h ^= (a_uint64_t)name[i];
-		h = (h << 40) + (h << 8) + (h << 7) + (h << 5) + (h << 4) + (h << 1) + h;
-	}
-
-	return h;
+	return (a_uint64_t)p[0] | ((a_uint64_t)p[1] << 8) | ((a_uint64_t)p[2] << 16) |
+	       ((a_uint64_t)p[3] << 24) | ((a_uint64_t)p[4] << 32) | ((a_uint64_t)p[5] << 40) |
+	       ((a_uint64_t)p[6] << 48) | ((a_uint64_t)p[7] << 56);
 }
 
-/* Second-hash key derivation constant (golden ratio). */
-#define NDR_KEY2_MIX  ((a_uint64_t)0x9E3779B97F4A7C15ULL)
+a_uint64_t ndr_siphash24(const a_uint8_t key[NDR_KEY_LEN], const a_uint8_t *data, a_uint32_t len)
+{
+	a_uint64_t k0 = rd_le64(key);
+	a_uint64_t k1 = rd_le64(key + 8);
+	a_uint64_t v0 = 0x736f6d6570736575ULL ^ k0;
+	a_uint64_t v1 = 0x646f72616e646f6dULL ^ k1;
+	a_uint64_t v2 = 0x6c7967656e657261ULL ^ k0;
+	a_uint64_t v3 = 0x7465646279746573ULL ^ k1;
+	a_uint64_t m, last;
+	a_uint8_t tail[8];
+	a_uint32_t i, whole = len & ~7u, rem = len & 7u;
+
+	for (i = 0; i < whole; i += 8) {
+		m = rd_le64(data + i);
+		v3 ^= m;
+		SIPROUND();
+		SIPROUND();
+		v0 ^= m;
+	}
+
+	for (i = 0; i < 8; i++)
+		tail[i] = 0;
+	for (i = 0; i < rem; i++)
+		tail[i] = data[whole + i];
+
+	/* Length byte in the top octet; at most 7 remainder bytes below it, folded with constant
+	 * shifts so no __ashldi3 is needed. */
+	last = ((a_uint64_t)(len & 0xff) << 56) | (a_uint64_t)tail[0] |
+	       ((a_uint64_t)tail[1] << 8) | ((a_uint64_t)tail[2] << 16) |
+	       ((a_uint64_t)tail[3] << 24) | ((a_uint64_t)tail[4] << 32) |
+	       ((a_uint64_t)tail[5] << 40) | ((a_uint64_t)tail[6] << 48);
+
+	v3 ^= last;
+	SIPROUND();
+	SIPROUND();
+	v0 ^= last;
+
+	v2 ^= 0xff;
+	SIPROUND();
+	SIPROUND();
+	SIPROUND();
+	SIPROUND();
+
+	return v0 ^ v1 ^ v2 ^ v3;
+}
+
+a_uint64_t ndr_name_hash(const a_uint8_t key[NDR_KEY_LEN], const a_uint8_t *name, a_uint32_t len)
+{
+	return ndr_siphash24(key, name, len);
+}
+
+/* Domain separator for the second hash, so h1 and h2 are independent PRF evaluations under
+ * different keys rather than two halves of one output. Must match KEY2_DOMAIN in tier0.rs. */
+static const a_uint8_t NDR_KEY2_DOMAIN[NDR_KEY_LEN] = {
+	'n', 'd', 'n', '/', 't', 'i', 'e', 'r', '0', '-', 'h', '2', 0, 0, 0, 0
+};
 
 /*
  * The K bit positions one prefix occupies.
  *
- * h1 and h2 are two INDEPENDENT keyed hashes, not the two halves of one. Splitting a single
- * FNV-1a output measured 1.3-3.4x worse at depths 4-8: FNV's high bits are its weak half, so using
- * them as the double-hashing stride correlates the K positions. A second pass over a short prefix
- * costs a few cycles and buys back the model.
+ * h1 and h2 are two INDEPENDENT keyed hashes, not the two halves of one -- splitting a single
+ * output correlates the K positions and measured materially worse.
  */
-static void ndr_positions(a_uint8_t out[NDR_K], a_uint64_t key,
+static void ndr_positions(a_uint8_t out[NDR_K], const a_uint8_t key[NDR_KEY_LEN],
 			  const a_uint8_t *prefix, a_uint32_t len)
 {
-	a_uint32_t h1 = (a_uint32_t)ndr_name_hash(key, prefix, len);
+	a_uint8_t key2[NDR_KEY_LEN];
+	a_uint32_t h1, h2, i;
+
+	for (i = 0; i < NDR_KEY_LEN; i++)
+		key2[i] = key[i] ^ NDR_KEY2_DOMAIN[i];
+
+	h1 = (a_uint32_t)ndr_name_hash(key, prefix, len);
 	/* `| 1` keeps the stride odd, so the K positions cannot collapse onto one bit. */
-	a_uint32_t h2 = ((a_uint32_t)ndr_name_hash(key ^ NDR_KEY2_MIX, prefix, len)) | 1;
-	a_uint32_t i;
+	h2 = ((a_uint32_t)ndr_name_hash(key2, prefix, len)) | 1u;
 
 	for (i = 0; i < NDR_K; i++)
 		out[i] = (a_uint8_t)((h1 + i * h2) % NDR_M_BITS);
@@ -100,7 +169,8 @@ a_uint32_t ndr_clamp_prefix(const a_uint8_t *prefix, a_uint32_t len)
 	return len;
 }
 
-void ndr_mask_for(ndr_filter_t *out, a_uint64_t key, const a_uint8_t *prefix, a_uint32_t len)
+void ndr_mask_for(ndr_filter_t *out, const a_uint8_t key[NDR_KEY_LEN],
+		  const a_uint8_t *prefix, a_uint32_t len)
 {
 	a_uint8_t pos[NDR_K];
 	a_uint32_t i;

@@ -57,12 +57,10 @@ a_int32_t ndr_ctl_intercept(const a_uint8_t *data, a_uint32_t len)
 		break;
 
 	case NDR_OP_KEY:
-		if (oplen >= 8) {
-			a_uint64_t k = 0;
+		if (oplen >= NDR_KEY_LEN) {
 			a_uint32_t i;
-			for (i = 0; i < 8; i++)
-				k = (k << 8) | (a_uint64_t)b[i];
-			ndr_cfg.key = k;
+			for (i = 0; i < NDR_KEY_LEN; i++)
+				ndr_cfg.key[i] = b[i];
 		}
 		break;
 

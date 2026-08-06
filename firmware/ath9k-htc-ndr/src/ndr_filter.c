@@ -27,7 +27,7 @@ struct ndr_cfg ndr_cfg = {
 	NDR_DEFAULT_ENABLED,
 	NDR_DEFAULT_DROP_FOREIGN,
 	0,          /* n_masks */
-	0,          /* key */
+	{ 0 },      /* key: all-zero = the open group */
 	{ { { 0 } } },
 };
 

@@ -21,7 +21,7 @@
  * exercises ndr_name_hash() and the shift-and-add multiply, which is the part most likely to be
  * subtly wrong.
  */
-static void insert_name(ndr_filter_t *f, unsigned long long key, const char *name)
+static void insert_name(ndr_filter_t *f, const unsigned char *key, const char *name)
 {
 	size_t len = strlen(name);
 	size_t i, start;
@@ -77,6 +77,25 @@ int main(void)
 {
 	int i, fails = 0;
 
+	/* Pin SipHash itself before pinning anything built on it: if the primitive is wrong every
+	 * filter below is wrong in the same way and the vectors would still agree with each other. */
+	{
+		unsigned char k[16], msg[15];
+		int n;
+		for (n = 0; n < 16; n++)
+			k[n] = (unsigned char)n;
+		for (n = 0; n < 15; n++)
+			msg[n] = (unsigned char)n;
+		if (ndr_siphash24(k, msg, 15) != NDR_SIPHASH_REF) {
+			printf("FAIL SipHash-2-4 reference vector: got %016llx want %016llx\n",
+			       (unsigned long long)ndr_siphash24(k, msg, 15),
+			       (unsigned long long)NDR_SIPHASH_REF);
+			fails++;
+		} else {
+			printf("SipHash-2-4 reference vector OK\n");
+		}
+	}
+
 	for (i = 0; i < NDR_NVECTORS; i++) {
 		const struct ndr_vec *v = &NDR_VECTORS[i];
 		ndr_filter_t f, m;
@@ -89,13 +108,13 @@ int main(void)
 			     (a_uint32_t)strlen(v->name));
 
 		if (!cmp12(f.b, v->filter)) {
-			printf("FAIL filter  key=%llu name=%s\n", v->key, v->name);
+			printf("FAIL filter  name=%s\n", v->name);
 			dump("rust", v->filter);
 			dump("c", f.b);
 			fails++;
 		}
 		if (!cmp12(m.b, v->mask)) {
-			printf("FAIL mask    key=%llu name=%s\n", v->key, v->name);
+			printf("FAIL mask    name=%s\n", v->name);
 			dump("rust", v->mask);
 			dump("c", m.b);
 			fails++;
@@ -117,8 +136,8 @@ int main(void)
 					continue;
 				ndr_mask_for(&pm, v->key, (const a_uint8_t *)v->name, (a_uint32_t)j);
 				if (!ndr_may_match(&frame, &pm)) {
-					printf("FAIL FALSE NEGATIVE key=%llu name=%s prefix=%.*s\n",
-					       v->key, v->name, (int)j, v->name);
+					printf("FAIL FALSE NEGATIVE name=%s prefix=%.*s\n",
+					       v->name, (int)j, v->name);
 					fails++;
 				}
 			}

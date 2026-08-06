@@ -31,15 +31,31 @@ fn radiotap(rate_500kbps: u8) -> Vec<u8> {
     ]
 }
 
-fn build_frame(seq: u16, rate_500kbps: u8) -> Vec<u8> {
+/// A bare 802.11 ACK: FC(2) + Duration(2) + RA(6) = 10 bytes, 14 on air once the hardware appends
+/// the FCS. This is the frame Tier-0 structurally cannot filter — it carries one address, where the
+/// filter needs 16 bytes of addr1||addr2. Synthesising it lets the ACK fraction of a channel be set
+/// exactly, which is better than hoping a real station ACKs at the ratio you want.
+fn build_ack(rate_500kbps: u8, ra: [u8; 6]) -> Vec<u8> {
+    let mut f = Vec::new();
+    f.extend_from_slice(&radiotap(rate_500kbps));
+    f.extend_from_slice(&[0xd4, 0x00]); // FC: control / ACK
+    f.extend_from_slice(&[0x00, 0x00]); // duration
+    f.extend_from_slice(&ra);
+    f
+}
+
+fn build_frame(seq: u16, rate_500kbps: u8, addr1: [u8; 6], dur: u16) -> Vec<u8> {
     let mut f = Vec::with_capacity(9 + 24 + 64);
     f.extend_from_slice(&radiotap(rate_500kbps));
 
-    // 802.11 data frame, ToDS=0 FromDS=0. Addresses are locally-administered group, matching the
-    // named-radio doctrine (no host identity on the air).
+    // 802.11 data frame, ToDS=0 FromDS=0. addr2/addr3 stay locally-administered group, matching the
+    // named-radio doctrine (no host identity on the air). addr1 is overridable: a UNICAST addr1
+    // makes the addressed station hardware-ACK, which is how a data+ACK channel is synthesised
+    // using only radios we own. `dur` writes the Duration/ID field, which is the NAV announcement
+    // §5 proposes to carry the airtime lease.
     f.extend_from_slice(&[0x08, 0x00]); // frame control: data
-    f.extend_from_slice(&[0x00, 0x00]); // duration
-    f.extend_from_slice(&[0x03, 0x11, 0x22, 0x33, 0x44, 0x55]); // addr1
+    f.extend_from_slice(&dur.to_le_bytes()); // duration / NAV
+    f.extend_from_slice(&addr1);
     f.extend_from_slice(&[0x03, 0x66, 0x77, 0x88, 0x99, 0xaa]); // addr2
     f.extend_from_slice(&[0x03, 0xbb, 0xcc, 0xdd, 0xee, 0xff]); // addr3
     f.extend_from_slice(&(seq << 4).to_le_bytes()); // sequence control
@@ -50,13 +66,32 @@ fn build_frame(seq: u16, rate_500kbps: u8) -> Vec<u8> {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        eprintln!("usage: {} <monitor-iface> [seconds] [rate_500kbps, e.g. 108 = 54M]", args[0]);
+        eprintln!(
+            "usage: {} <iface> [secs] [rate_500kbps] [dest-mac] [duration_us] [ack_pct] [gap_us]",
+            args[0]
+        );
         std::process::exit(1);
     }
     let ifname = &args[1];
     let secs: u64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(10);
     // Third arg: PHY rate in 500 kbps units (108 = 54 Mbit/s). 0 = let the driver choose.
     let rate: u8 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(0);
+    // Fourth arg: destination MAC "aa:bb:.." (unicast => the peer ACKs). Default = group address.
+    let addr1: [u8; 6] = args
+        .get(4)
+        .and_then(|s| {
+            let v: Vec<u8> = s.split(':').filter_map(|b| u8::from_str_radix(b, 16).ok()).collect();
+            if v.len() == 6 { Some([v[0], v[1], v[2], v[3], v[4], v[5]]) } else { None }
+        })
+        .unwrap_or([0x03, 0x11, 0x22, 0x33, 0x44, 0x55]);
+    // Fifth arg: Duration/ID in microseconds (NAV announcement). Default 0.
+    let dur: u16 = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(0);
+    // Sixth arg: percentage of emitted frames that are bare ACKs (0-100).
+    let ack_pct: u32 = args.get(6).and_then(|s| s.parse().ok()).unwrap_or(0);
+    // Seventh arg: microseconds to sleep between frames. A NAV test needs LOW channel occupancy
+    // with HIGH NAV coverage -- sparse frames carrying a long Duration. Without this the NAV-setter
+    // simply hogs the medium by carrier sense and the result says nothing about NAV.
+    let gap_us: u64 = args.get(7).and_then(|s| s.parse().ok()).unwrap_or(0);
 
     unsafe {
         // AF_PACKET/SOCK_RAW so the radiotap header is passed straight through to the driver.
@@ -93,7 +128,12 @@ fn main() {
         let start = Instant::now();
 
         while Instant::now() < deadline {
-            let frame = build_frame(seq, rate);
+            let is_ack = ack_pct > 0 && (seq as u32 % 100) < ack_pct;
+            let frame = if is_ack {
+                build_ack(rate, addr1)
+            } else {
+                build_frame(seq, rate, addr1, dur)
+            };
             seq = seq.wrapping_add(1);
             let n = libc::send(fd, frame.as_ptr() as *const libc::c_void, frame.len(), 0);
             if n < 0 {
@@ -110,6 +150,9 @@ fn main() {
                 }
             } else {
                 sent += 1;
+            }
+            if gap_us > 0 {
+                std::thread::sleep(Duration::from_micros(gap_us));
             }
         }
 

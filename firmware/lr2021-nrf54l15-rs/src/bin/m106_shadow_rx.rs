@@ -108,6 +108,12 @@ async fn main(_spawner: Spawner) {
             if !read_ok || n < 14 {
                 continue;
             }
+            // **De-whiten.** The transmitter whitens the whole frame and this side never undid it,
+            // so every field — filter, length, name — was read through the LFSR mask. That is a
+            // straight TX/RX mismatch, and it would have made the filter look catastrophically
+            // broken while nothing was wrong with the filter at all. The mask is XORed, so applying
+            // the same function again recovers the frame.
+            flrc_link::whiten(&mut buf[..n]);
             let name_len = buf[12] as usize;
             if 13 + name_len > n {
                 continue;
@@ -152,11 +158,16 @@ async fn main(_spawner: Spawner) {
 
             if seen % 250 == 0 {
                 let reject_ppm = (t_rej as u64 * 1_000_000) / seen as u64;
-                let fp_ppm = if t_acc > 0 {
-                    (false_pos as u64 * 1_000_000) / t_acc as u64
-                } else {
-                    0
-                };
+                // **Two FP denominators, because they answer different questions.**
+                //   over ACCEPTED   — operational: what fraction of the parse work is wasted.
+                //   over IRRELEVANT — the Bloom filter's actual false-positive rate, and the ONLY
+                //                     one comparable to the bench curve in #91 (0.24% at depth 4,
+                //                     0.94% at the depth-8 cap). Reporting only the first would look
+                //                     ~7x worse than the design and invite a chase after nothing.
+                let irrelevant = seen - true_acc;
+                let fp_ppm = if t_acc > 0 { (false_pos as u64 * 1_000_000) / t_acc as u64 } else { 0 };
+                let fp_of_irrelevant_ppm =
+                    if irrelevant > 0 { (false_pos as u64 * 1_000_000) / irrelevant as u64 } else { 0 };
                 defmt::info!(
                     "m106 seen={=u32} | REJECT RATIO {=u64} ppm ({=u32} frames never parsed) | wanted {=u32}",
                     seen,
@@ -165,7 +176,13 @@ async fn main(_spawner: Spawner) {
                     true_acc
                 );
                 defmt::info!(
-                    "     | on-air FP {=u64} ppm ({=u32}/{=u32} accepted were irrelevant) | FALSE NEGATIVES {=u32}",
+                    "     | FP over irrelevant {=u64} ppm ({=u32}/{=u32}) <- compare to the bench curve",
+                    fp_of_irrelevant_ppm,
+                    false_pos,
+                    irrelevant
+                );
+                defmt::info!(
+                    "     | FP over accepted {=u64} ppm ({=u32}/{=u32} parses wasted) | FALSE NEGATIVES {=u32}",
                     fp_ppm,
                     false_pos,
                     t_acc,

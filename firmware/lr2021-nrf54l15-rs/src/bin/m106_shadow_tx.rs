@@ -79,6 +79,9 @@ async fn main(_spawner: Spawner) {
         // Whiten last, over the WHOLE frame including the sparse filter and the zero padding —
         // those are precisely the parts that starve the demodulator of transitions.
         flrc_link::whiten(&mut frame);
+        // #108: settle the synthesizer before keying the PA, or the carrier drifts ~27 kHz under
+        // the payload and the receiver decodes a rotating constellation instead of a name.
+        flrc_link::settle_before_tx(&mut radio).await;
         let _ = radio.clear_tx_fifo().await;
         if radio.wr_tx_fifo_from(&frame).await.is_ok() {
             let _ = radio.set_tx(0).await;

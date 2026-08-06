@@ -182,7 +182,39 @@ across a 102.4 ms period, over 297 consecutive windows with none missed or slipp
 describes. The design's "guard bands must be milliseconds" is a property of the *host-side*
 approximation, not of this hardware.
 
-⚠ **52 µs is a ceiling, not the hardware's floor.** The measurement still includes CSMA acquisition:
+### With backoff removed: ~1 µs
+
+Disabling the random backoff (`AR_D_GBL_IFS_MISC.IGNORE_BACKOFF`, build flag `NDR_NO_BACKOFF`)
+removes the CSMA component and exposes the hardware:
+
+| | with backoff (FW 1.50) | **no backoff (FW 1.55)** |
+|---|---|---|
+| mean period error | −0.8 µs | **+0.1 µs** |
+| **median deviation** | 51.8 µs | **1.1 µs** |
+| p90 | 224.8 µs | **3.1 µs** |
+| p99 / max | 1218 / 1288 µs | 1001 / 1002 µs |
+| duration sd | 0.510 ms | **0.192 ms** |
+
+**The AR9271 places its transmit boundary within ~1 µs of the TSF schedule.** `radiotap.mactime`
+has 1 µs granularity, so at a 1.1 µs median this measurement is now **resolution-limited, not
+hardware-limited** — the true figure may be sub-microsecond and this method cannot say.
+
+The residual ~1 ms p99 is the remaining ambient traffic: `IGNORE_BACKOFF` removes the random
+backoff but **not carrier sense**, so a neighbour's frame already on air at the boundary still
+defers us. At 9 ambient frames/s that hits ~1% of boundaries.
+
+**What this means for the design.** §8.5 treats sub-millisecond base slots as unreachable on
+commodity Wi-Fi. They are not, on this part: slot *boundaries* place to the microsecond, and only
+slot *lengths* quantise to 1 TU (the duration field). A named airtime lease with millisecond-scale
+base slots is implementable on hardware costing about £15 — the "guards must be milliseconds"
+constraint was always the host-side sleep, never the radio.
+
+⚠ `IGNORE_BACKOFF` is a **measurement mode**, not a deployment default — a node ignoring backoff is
+antisocial on a shared channel. Though note the lease design makes it less reckless than it sounds:
+*inside* a granted lease the node is meant to own the medium, so backoff is precisely the thing the
+lease replaces.
+
+⚠ **52 µs (with backoff) is a ceiling, not the hardware's floor.** The measurement still includes CSMA acquisition:
 after a quiet window ends the MAC must still do DIFS plus a random backoff before its first frame.
 That is also what the ch1→ch13 comparison isolates — the *tail* is contention (p90 843→225 µs) while
 the *median* barely moves (60→52 µs). To measure below this, disable backoff with

@@ -68,6 +68,7 @@ struct ndr_mac_state {
 				  * rejected the write" from "the register reads as garbage" */
 	a_uint32_t tsf_lo;       /* TSF sampled at the last arm — proves the clock runs */
 	a_uint32_t tsf_hi;
+	a_uint32_t ifs_misc_rb;  /* AR_D_GBL_IFS_MISC read back (backoff-disable measurement mode) */
 	a_uint32_t timer_mode_rb; /* AR_TIMER_MODE read back — the enable that actually matters */
 };
 

@@ -7,7 +7,7 @@
 
 static a_uint32_t armed_ok;
 
-struct ndr_mac_state ndr_mac_state = { NDR_MAC_MAGIC, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+struct ndr_mac_state ndr_mac_state = { NDR_MAC_MAGIC, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
 
 void ndr_quiet_rearm(void)
 {
@@ -78,6 +78,25 @@ void ndr_quiet_rearm(void)
 	iowrite32_mac(AR_NEXT_QUIET_TIMER, tsf_lo + NDR_QUIET_MARGIN_US);
 	iowrite32_mac(AR_QUIET_PERIOD, (a_uint32_t)NDR_QUIET_PERIOD_TU * 1024u);
 	iowrite32_mac(AR_TIMER_MODE, ioread32_mac(AR_TIMER_MODE) | AR_QUIET_TIMER_EN);
+
+	/*
+	 * Optionally drop the random backoff.
+	 *
+	 * The on-air measurement of the quiet->transmit boundary bottoms out at ~52 us median, and
+	 * that floor is CSMA, not the scheduler: when a quiet window ends the MAC still owes DIFS
+	 * plus a random backoff before its first frame. Removing the backoff isolates how much of
+	 * the residual is the hardware's own boundary placement.
+	 *
+	 * This is a MEASUREMENT mode, not a deployment setting -- a node that ignores backoff is
+	 * antisocial on a shared channel. It belongs behind a build flag and behind a quiet channel.
+	 * (Note the named airtime lease makes this less reckless than it sounds: inside a granted
+	 * lease the node is supposed to own the medium, so backoff is the thing being replaced.)
+	 */
+#ifdef NDR_NO_BACKOFF
+	iowrite32_mac(AR_D_GBL_IFS_MISC,
+		      ioread32_mac(AR_D_GBL_IFS_MISC) | AR_D_GBL_IFS_MISC_IGNORE_BACKOFF);
+	ndr_mac_state.ifs_misc_rb = ioread32_mac(AR_D_GBL_IFS_MISC);
+#endif
 	ndr_mac_state.timer_mode_rb = ioread32_mac(AR_TIMER_MODE);
 	armed_ok = 1;
 

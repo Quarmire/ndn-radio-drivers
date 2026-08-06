@@ -14,6 +14,21 @@
  * more than a handful. */
 #define NDR_MAX_MASKS   8
 
+/*
+ * Most usable bits a LEGITIMATE sender can set: one position per hash, per inserted prefix.
+ *
+ * A sender inserts at most NDR_MAX_DEPTH prefixes at NDR_K positions each, so popcount <= K*D = 32
+ * (measured 29 at the cap, because positions collide). Anything denser was not produced by our
+ * Tier-0 insert, so rejecting it has **zero false negatives** — the bound is exact, not heuristic.
+ *
+ * This matters more than it looks. A Bloom test asks "are all the mask's bits set?", which the
+ * all-ones broadcast address ff:ff:ff:ff:ff:ff satisfies for EVERY mask. Without this check every
+ * beacon, ARP and multicast frame on the channel is a guaranteed Tier-0 false positive, and on a
+ * real channel that is a large share of the traffic. The published 99.06% rejection figure was
+ * measured against random names, not against the degenerate address patterns actually on air.
+ */
+#define NDR_MAX_SET_BITS  (NDR_K * NDR_MAX_DEPTH)
+
 #define NDR_CFG_MAGIC   0x4E445230  /* "NDR0" -- lets the host locate/verify this struct */
 
 /*
@@ -39,6 +54,7 @@ struct ndr_stats {
 	a_uint32_t dropped_filter;
 	a_uint32_t dropped_foreign;
 	a_uint32_t short_frame;
+	a_uint32_t dropped_popcount;
 };
 
 extern struct ndr_cfg   ndr_cfg;

@@ -136,6 +136,20 @@ a_int32_t ndr_may_match(const ndr_filter_t *f, const ndr_filter_t *mask)
 	return 1;
 }
 
+a_uint32_t ndr_popcount(const ndr_filter_t *f)
+{
+	a_uint32_t i, n = 0;
+
+	for (i = 0; i < NDR_M_BITS; i++) {
+		a_uint32_t p = i + 2; /* skip the two reserved bits of octet 0 */
+
+		if (f->b[p / 8] & (1 << (p % 8)))
+			n++;
+	}
+
+	return n;
+}
+
 /*
  * 802.11 header: fc(2) dur(2) addr1(6) addr2(6) ... -- the filter is addr1 || addr2, so it starts
  * at offset 4 and runs 12 bytes. The caller must have checked the frame is at least 16 bytes.

@@ -9,16 +9,28 @@
 
 #include "ndr_filter.h"
 
+/*
+ * Build-time defaults, overridable with -D so an A/B measurement builds two images from identical
+ * source. Editing this file between builds would put the two arms at different commits, and the
+ * whole point of the comparison is that nothing differs except the filter.
+ */
+#ifndef NDR_DEFAULT_ENABLED
+#define NDR_DEFAULT_ENABLED 0
+#endif
+#ifndef NDR_DEFAULT_DROP_FOREIGN
+#define NDR_DEFAULT_DROP_FOREIGN 0
+#endif
+
 struct ndr_cfg ndr_cfg = {
 	NDR_CFG_MAGIC,
-	0,          /* enabled      -- off until explicitly turned on */
-	0,          /* drop_foreign -- off; see the note in ndr_rx_accept() */
+	NDR_DEFAULT_ENABLED,
+	NDR_DEFAULT_DROP_FOREIGN,
 	0,          /* n_masks */
 	0,          /* key */
 	{ { { 0 } } },
 };
 
-struct ndr_stats ndr_stats = { 0, 0, 0, 0, 0 };
+struct ndr_stats ndr_stats = { 0, 0, 0, 0, 0, 0 };
 
 /* fc(2) dur(2) addr1(6) addr2(6) -- the filter ends at offset 16. */
 #define NDR_MIN_HDR  16
@@ -29,6 +41,21 @@ a_int32_t ndr_rx_accept(const a_uint8_t *data, a_uint32_t len)
 	a_uint32_t i;
 
 	ndr_stats.seen++;
+
+	/*
+	 * Diagnostic arm: reject unconditionally. Not a feature -- a bisect. If the host still
+	 * receives frames with this built in, then this function is not on the path that delivers
+	 * them, and no amount of filter logic will ever matter. If the frames stop, the hook is
+	 * live and any failure to filter is in the logic below.
+	 */
+#ifdef NDR_DROP_ALL
+	(void)data;
+	(void)len;
+	(void)f;
+	(void)i;
+	ndr_stats.dropped_filter++;
+	return 0;
+#endif
 
 	if (!ndr_cfg.enabled) {
 		ndr_stats.passed++;
@@ -61,6 +88,16 @@ a_int32_t ndr_rx_accept(const a_uint8_t *data, a_uint32_t len)
 	if (ndr_cfg.drop_foreign &&
 	    (f.b[0] & NDR_RESERVED_MASK0) != NDR_RESERVED_MASK0) {
 		ndr_stats.dropped_foreign++;
+		return 0;
+	}
+
+	/*
+	 * Density bound. Exact, not heuristic: our insert cannot set more than NDR_MAX_SET_BITS, so
+	 * a denser field was not produced by a Tier-0 sender. This is what rejects the all-ones
+	 * broadcast address, which would otherwise satisfy every mask by construction.
+	 */
+	if (ndr_popcount(&f) > NDR_MAX_SET_BITS) {
+		ndr_stats.dropped_popcount++;
 		return 0;
 	}
 

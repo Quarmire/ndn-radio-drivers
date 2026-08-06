@@ -87,6 +87,9 @@ a_uint32_t ndr_clamp_prefix(const a_uint8_t *prefix, a_uint32_t len);
 /* The mask a receiver precomputes once per registered prefix. */
 void ndr_mask_for(ndr_filter_t *out, a_uint64_t key, const a_uint8_t *prefix, a_uint32_t len);
 
+/* Number of usable filter bits set. */
+a_uint32_t ndr_popcount(const ndr_filter_t *f);
+
 /* Lift the 94-bit filter out of a received 802.11 header's addr1||addr2. */
 void ndr_filter_from_hdr(ndr_filter_t *out, const a_uint8_t *wh);
 

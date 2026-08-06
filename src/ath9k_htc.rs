@@ -199,6 +199,10 @@ pub struct NdrStats {
     pub dropped_filter: u32,
     pub dropped_foreign: u32,
     pub short_frame: u32,
+    /// Frames rejected because `addr1||addr2` had more bits set than any legitimate Tier-0 sender
+    /// could produce (> K*D = 32). Exact, not heuristic — and it is what rejects the all-ones
+    /// broadcast address, which satisfies every Bloom mask by construction.
+    pub dropped_popcount: u32,
 }
 
 /// Largest echo payload whose *reply* fits one register-pipe packet:
@@ -731,13 +735,14 @@ impl Ath9kHtcBackend {
     /// xtensa-elf-nm build/k2/fw.elf | grep ndr_stats
     /// ```
     pub fn read_ndr_stats(&mut self, addr: u32) -> Result<NdrStats, FaceError> {
-        let w = self.read_target_u32s(addr, 5)?;
+        let w = self.read_target_u32s(addr, 6)?;
         Ok(NdrStats {
             seen: w[0],
             passed: w[1],
             dropped_filter: w[2],
             dropped_foreign: w[3],
             short_frame: w[4],
+            dropped_popcount: w[5],
         })
     }
 }

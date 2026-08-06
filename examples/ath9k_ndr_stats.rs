@@ -99,7 +99,7 @@ fn main() -> ExitCode {
     // also what a read of the wrong address, or of nothing at all, would look like. Prove the path
     // by writing a sentinel and reading it back. `short_frame` is inert while nothing is being
     // received, and it is restored immediately afterwards.
-    let sentinel_addr = addr + 16; // ndr_stats.short_frame
+    let sentinel_addr = addr + 16; // ndr_stats.short_frame (inert while not receiving)
     const SENTINEL: u32 = 0xDEAD_BEEF;
     match dev.write_target_u32s(sentinel_addr, &[SENTINEL]) {
         Ok(_) => match dev.read_target_u32s(sentinel_addr, 1) {
@@ -132,6 +132,7 @@ fn main() -> ExitCode {
             println!("  dropped_filter  {}", s.dropped_filter);
             println!("  dropped_foreign {}", s.dropped_foreign);
             println!("  short_frame     {}", s.short_frame);
+            println!("  dropped_popcount {}", s.dropped_popcount);
             ExitCode::SUCCESS
         }
         Err(e) => {

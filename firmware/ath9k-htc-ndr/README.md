@@ -203,11 +203,35 @@ The residual ~1 ms p99 is the remaining ambient traffic: `IGNORE_BACKOFF` remove
 backoff but **not carrier sense**, so a neighbour's frame already on air at the boundary still
 defers us. At 9 ambient frames/s that hits ~1% of boundaries.
 
-**What this means for the design.** §8.5 treats sub-millisecond base slots as unreachable on
-commodity Wi-Fi. They are not, on this part: slot *boundaries* place to the microsecond, and only
-slot *lengths* quantise to 1 TU (the duration field). A named airtime lease with millisecond-scale
-base slots is implementable on hardware costing about £15 — the "guards must be milliseconds"
-constraint was always the host-side sleep, never the radio.
+**What this means for the design — narrowly.**
+
+What is demonstrated: the AR5416-lineage MAC *silicon* can gate transmission against its TSF to
+microsecond accuracy. Slot boundaries place to the microsecond (`AR_NEXT_QUIET_TIMER` is µs);
+only slot lengths quantise to 1 TU.
+
+What is **not** demonstrated, and an earlier revision of this file wrongly implied: that
+sub-millisecond slotting is reachable on commodity Wi-Fi *generally*. It is not. Getting here
+required all of:
+
+- a part with **open firmware** — the AR9271/AR7010 are close to unique in this, and the reason
+  this whole effort targets a 2009 chipset rather than anything modern;
+- an out-of-tree **Xtensa toolchain built from source** (nixpkgs does not package it), plus two
+  NixOS-specific build fixes;
+- **reverse engineering**: the documented `AR_QUIET1/2` path is vestigial on this part and its
+  field defines are `#if 0`'d out; the live generic-timer block was found by bisection against a
+  frames-arriving oracle, not from any datasheet;
+- fixing an **upstream firmware bug** (`handle_echo_command`) that wedges the target.
+
+And mainline `ath9k` has **no `ath9k_hw_set_quiet`** — checked. So this is not a driver-exposed
+knob even within the same vendor family; it is reachable only by replacing firmware.
+
+On closed-firmware parts — Realtek, MediaTek, Broadcom, Intel — this is a multi-week reverse-
+engineering project, which this project has already measured the cost of elsewhere (the MM6108
+firmware RE, the RTL8733B port). **§8.5's practical claim, that no commodity part delivers
+hardware-scheduled TX, stands.** What the measurement refutes is only the stronger reading that the
+silicon is incapable, and hence that millisecond guard bands are inherent. They are a property of
+the host-side sleep — but removing them costs firmware access, which is exactly what commodity
+hardware does not give you.
 
 ⚠ `IGNORE_BACKOFF` is a **measurement mode**, not a deployment default — a node ignoring backoff is
 antisocial on a shared channel. Though note the lease design makes it less reckless than it sounds:

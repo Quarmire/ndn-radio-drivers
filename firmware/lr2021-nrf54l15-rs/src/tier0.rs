@@ -163,7 +163,11 @@ impl PrefixFilter {
     }
 
     /// The mask a receiver precomputes once per registered prefix.
+    ///
+    /// The prefix is clamped by [`clamp_prefix`] first — without that, a registration deeper than
+    /// the cap produces a **true false negative**.
     pub fn mask_for(key: u64, prefix: &[u8]) -> Self {
+        let prefix = &prefix[..clamp_prefix(prefix)];
         let mut m = Self::new();
         for &p in positions(key, prefix).iter() {
             m.set_bit(p);

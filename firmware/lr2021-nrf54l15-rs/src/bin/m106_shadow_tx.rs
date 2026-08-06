@@ -76,6 +76,9 @@ async fn main(_spawner: Spawner) {
         frame[13..13 + n].copy_from_slice(&nb[..n]);
 
         // pld_len is the TRANSMIT length in this role — see flrc_link::set_payload_len.
+        // Whiten last, over the WHOLE frame including the sparse filter and the zero padding —
+        // those are precisely the parts that starve the demodulator of transitions.
+        flrc_link::whiten(&mut frame);
         let _ = radio.clear_tx_fifo().await;
         if radio.wr_tx_fifo_from(&frame).await.is_ok() {
             let _ = radio.set_tx(0).await;

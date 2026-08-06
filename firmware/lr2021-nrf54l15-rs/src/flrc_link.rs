@@ -33,7 +33,7 @@ use embedded_hal_async::spi::SpiBus;
 
 use lr2021::flrc::{AgcPblLen, Crc, FlrcBitrate, FlrcCr, FlrcPacketParams, PktFormat, SwLen, SwMatch, SwTx};
 use lr2021::radio::{PacketType, RampTime, RxBoost, RxPath};
-use lr2021::system::DioNum;
+use lr2021::system::{DioNum, TcxoVoltage};
 use lr2021::status::Intr;
 use lr2021::{BusyPin, Lr2021, Lr2021Error, PulseShape};
 
@@ -102,6 +102,64 @@ pub const MAX_PAYLOAD: u16 = FRAME_LEN;
 /// The symptom of getting this wrong is brutal to diagnose from the outside: strong signal
 /// (−33 dBm), syncword matched, `len_error = 0`, and 100% `crc_error`, with the first bytes of each
 /// frame intact — so a receiver that does not check CRC sees a working link.
+/// Front-end calibration point: 4 MHz steps, MSB set to select the **HF** path.
+/// `0x8000 | (2477 MHz / 4)`.
+pub const FE_CAL_HF: u16 = 0x8000 | ((FREQ_HZ / 4_000_000) as u16);
+
+/// TCXO start-up delay, in the chip's tick units. The shield devicetree specifies
+/// `tcxo-wakeup-time = <0>`; kept as a named constant so it is easy to sweep if the reference proves
+/// to need settling time.
+pub const TCXO_STARTUP: u32 = 0;
+
+/// **PHY CRC mode — currently OFF, deliberately, to split a stubborn failure in two.**
+///
+/// With `Crc24` the receiver reported `crc_error` on 100% of frames while everything else looked
+/// right: strong signal (−33 dBm), syncword matched (`sw_num = 1`), `len_error = 0`, and `pkt_len`
+/// tracking the real payload. Knob-by-knob guessing (length semantics, fixed vs variable framing,
+/// Semtech's exact modulation, syncword width) moved none of it.
+///
+/// Turning the CRC off asks the one question that partitions the problem: **do the payload bytes
+/// arrive intact?**
+///   - bytes intact ⇒ the modulation/framing path is sound and only the CRC block is at fault
+///   - bytes corrupt ⇒ it is alignment or modulation, and CRC was merely the messenger
+///
+/// Note a named-data MAC does not actually need the PHY's CRC: integrity is decided by the NDN
+/// signature, and Tier-0 wants an integrity check it controls anyway. So `CrcOff` plus our own
+/// checksum is a legitimate destination, not only a diagnostic — but that should be a decision made
+/// on evidence, which is what this setting is for.
+pub const CRC_MODE: Crc = Crc::Crc24;
+
+/// **Software whitening — XOR the payload with a PRBS so it is DC-balanced on air.**
+///
+/// FLRC has **no whitening command** on this chip: `SetFskWhiteningParams`, `SetOokWhiteningParams`
+/// and BLE's whitening init all exist, and there is no FLRC equivalent. So a DC-balanced payload is
+/// the caller's responsibility, and ours was the opposite of balanced: the Tier-0 filter is sparse
+/// (~29 of 94 bits set, so mostly `0x00` bytes) and frames are zero-padded to a fixed size.
+///
+/// The evidence that this is the fault, obtained by turning the PHY CRC off and looking at the
+/// bytes: frames arrive **correctly delimited** — our forced `0x03` group bits, a plausible name
+/// length, a leading `/` — and then degrade into **systematically BIT-INVERTED ASCII**
+/// (`0xd0` = `~'/'`, `0xcf` = `~'0'`). Inversion rather than noise is a GMSK **polarity slip**: with
+/// no transitions to track, clock and polarity recovery drift mid-frame. Random errors would look
+/// random; these do not.
+///
+/// The LFSR is the classic 9-bit `x⁹ + x⁵ + 1` used by the SX12xx family, reset per frame, so the
+/// function is **self-inverse**: apply on TX before writing the FIFO, apply again on RX after
+/// reading, and payload content can no longer starve the demodulator of transitions.
+pub fn whiten(buf: &mut [u8]) {
+    let mut lfsr: u16 = 0x01FF; // all-ones seed, as in the SX12xx whitening sequence
+    for b in buf.iter_mut() {
+        let mut mask = 0u8;
+        for bit in 0..8 {
+            mask |= ((lfsr & 1) as u8) << bit;
+            // x^9 + x^5 + 1: taps at bit 0 and bit 4 of the 9-bit register.
+            let fb = ((lfsr ^ (lfsr >> 4)) & 1) << 8;
+            lfsr = (lfsr >> 1) | fb;
+        }
+        *b ^= mask;
+    }
+}
+
 fn pkt_params(pld_len: u16) -> FlrcPacketParams {
     FlrcPacketParams::new(
         PREAMBLE,
@@ -109,7 +167,7 @@ fn pkt_params(pld_len: u16) -> FlrcPacketParams {
         SwTx::Sw1,
         SwMatch::Match1,
         PktFormat::Fixed,
-        Crc::Crc24,
+        CRC_MODE,
         pld_len,
     )
 }
@@ -140,12 +198,42 @@ where
     SPI: SpiBus<u8>,
     M: BusyPin,
 {
+    // **Enable the TCXO first.** The shield devicetree declares `tcxo-voltage = 1.8 V` with
+    // `tcxo-wakeup-time = 0`, i.e. this board has a TCXO rather than a plain crystal — and nothing
+    // in this firmware ever enabled it. The chip's own error description says so plainly:
+    // "lf_xosc did not start correctly ... or there is a TCXO instead which must be enabled through
+    // SetTcxoMode command."
+    //
+    // Running the radio off an un-started reference is consistent with the whole failure signature:
+    // syncword matches (wide capture), length decodes, signal is strong at −33 dBm, and the payload
+    // arrives cleanly BIT-INVERTED partway through — a mid-frame polarity/clock slip, which is what
+    // a frequency-erroneous reference produces. Must precede any modulation or RF configuration.
+    radio.set_tcxo(TcxoVoltage::Tcxo1v8, TCXO_STARTUP).await?;
+
+    // **Front-end calibration at our operating frequency.** `GetErrors` reported
+    // `rxfreq_no_fe_cal = true`: "Front End (Image rejection, PPF, ADC offset) calibration was not
+    // available for rx operation with specified rf frequency." The shield devicetree even lists
+    // `calibration-freqs = <470000000 897500000 2441000000>` — the board expects this to be run, and
+    // this firmware never did, so the receiver has been demodulating with an uncalibrated front end.
+    //
+    // Units are **4 MHz steps with the MSB selecting the path** — `MSB = 1` for HF, which is the
+    // 2.4 GHz port we use. Getting that bit wrong calibrates the wrong front end and reports success.
+    // Must run before entering RX/TX ("will not work if device is in Rx or Tx mode").
+    radio.calib_fe(&[FE_CAL_HF]).await?;
+
     radio.set_packet_type(PacketType::Flrc).await?;
     radio.set_flrc_modulation(BITRATE, CODING, PULSE_SHAPE).await?;
 
     // One syncword, and RX matches only that one: this is a two-node experiment, and accepting
     // other syncwords would let stray traffic masquerade as our packets.
-    radio.set_flrc_syncword(1, SYNCWORD, true).await?;
+    // `is_16b = FALSE`. This is a footgun and the crate's own doc example gets it wrong
+    // (`set_flrc_syncword(1, 0xCD05CAFE, true)` alongside `SwLen::Sw32b`), which is where the bug
+    // was copied from. With `true` the driver does `syncword << 16` — DISCARDING the high half —
+    // and truncates the command to two syncword bytes, so a 32-bit value silently becomes a 16-bit
+    // one while the packet params still declare `Sw32b`. Both ends misconfigure identically, so they
+    // still sync (`sw_num = 1`) and the length still decodes — and every frame fails CRC, because
+    // the frame is delimited differently from the region the CRC covers.
+    radio.set_flrc_syncword(1, SYNCWORD, false).await?;
 
     // Defaults to the RX role; a transmitter MUST call `set_payload_len` with the real frame size.
     radio.set_flrc_packet(&pkt_params(MAX_PAYLOAD)).await?;

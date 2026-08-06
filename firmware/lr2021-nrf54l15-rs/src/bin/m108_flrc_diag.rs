@@ -50,6 +50,18 @@ async fn main(_spawner: Spawner) {
         flrc_link::FREQ_HZ
     );
 
+    // Dump EVERY error flag once at start-up. The earlier probe read GetErrors but only looked at
+    // chip_busy and pll_lock — and `lf_xosc_start` is precisely the flag that says "there is a TCXO
+    // here and you never enabled it". Reading a status word and inspecting two of its bits is how a
+    // diagnostic misses the answer it already fetched.
+    if let Ok(e) = radio.get_errors().await {
+        defmt::info!(
+            "  ERRORS  hf_xosc={} lf_xosc={} pll_lock={} lf_rc_cal={} hf_rc_cal={} pll_cal={} aaf_cal={} img_cal={} chip_busy={} rxfreq_no_fe_cal={}",
+            e.hf_xosc_start(), e.lf_xosc_start(), e.pll_lock(), e.lf_rc_calib(), e.hf_rc_calib(),
+            e.pll_calib(), e.aaf_calib(), e.img_calib(), e.chip_busy(), e.rxfreq_no_fe_cal()
+        );
+    }
+
     loop {
         Timer::after(Duration::from_secs(3)).await;
 
@@ -74,8 +86,18 @@ async fn main(_spawner: Spawner) {
             Err(e) => defmt::error!("  pkt_status: {}", defmt::Debug2Format(&e)),
         }
 
-        // The generic command the earlier binaries used, for comparison — expected to disagree.
-        let generic = radio.get_rx_pkt_len().await.unwrap_or(0xffff);
-        defmt::info!("  generic get_rx_pkt_len={=u16}  (what m3/m4/m5/m106 used)", generic);
+        // With the PHY CRC off, dump the bytes and compare against what m106_shadow_tx builds:
+        //   [0..12] Tier-0 filter (byte 0 low bits forced to 0b11 = locally-administered group)
+        //   [12]    name length
+        //   [13..]  "/00nn/...." ASCII, then zero padding to FRAME_LEN
+        // Intact ASCII here means the modulation path is sound and only the CRC block was at fault.
+        let mut b = [0u8; 24];
+        if radio.rd_rx_fifo_to(&mut b).await.is_ok() {
+            // De-whiten before inspecting. Whitening is self-inverse, but it is applied over the
+            // whole frame, so a partial read de-whitens correctly only from offset 0 — which this is.
+            flrc_link::whiten(&mut b);
+            defmt::info!("  PAYLOAD  filt0={=u8:#04x} name_len={=u8} name={=[u8]:a}", b[0], b[12], &b[13..24]);
+        }
+        let _ = radio.clear_rx_fifo().await;
     }
 }

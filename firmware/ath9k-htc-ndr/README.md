@@ -131,6 +131,34 @@ No NixOS rebuild needed. To revert, delete the file and rebind — the loader fa
 image in the nix store. Confirm which image actually loaded by md5, not by assuming: the driver logs
 `Transferred FW: ..., size: N`, and stock and ours differ.
 
+## ★ Power: filtering before USB saves no radio energy
+
+Measured with an FNIRSI FNB58 inline between the AR9271 and its host, three 15 s runs per arm. Both
+arms are builds from identical source differing only in `ndr_cfg`'s initialiser bytes.
+
+| arm | power | frames delivered |
+|---|---|---|
+| filter OFF | 355.32 / 355.67 / 356.12 mW | 1701 / 1787 / 2016 |
+| filter ON | 355.59 / 355.46 / 355.66 mW | 88 / 126 / 222 |
+
+**~92% of frames dropped in firmware, before the USB transfer, moves the dongle's power by 0.13 mW**
+— inside the 0.8 mW run-to-run spread. Idle (interface down) is 146 mW against 355 mW while
+receiving, so receiving costs ~209 mW and filtering 92% of it saves under 0.8 mW: **less than
+6.8 µJ per avoided frame.**
+
+**This is the design's own prediction, confirmed.** §8.2 says Tier 0 "buys host CPU … and buys
+**nothing in energy at the radio**". That is now measured — and measured in the strongest available
+case, where the drop happens in our own firmware rather than in host software. The filter runs after
+the RF front end and PHY have already received and demodulated the frame; skipping the USB transfer
+and the host wakeup cannot un-spend the receive energy.
+
+It also refines addressing-doctrine §3.1's "same wake-filter power profile as MAC filtering". That
+holds for **host** power — task #43 measured 8.9% → 1.4% host CPU on the 8812au — but not for
+**radio** power. The radio-side win requires filtering *before demodulation*: doctrine §6 row 3
+(SDR / preamble-CAM, "the power win AP buffering never had") or an 802.11ba wake-up radio (§8.5). A
+firmware-resident filter is row 2, and row 2 does not buy radio energy. Report host CPU and radio
+power as separate quantities.
+
 ## ★ What caps Tier-0, and why ACK/CTS survive it
 
 The frames that get through Tier-0 are the **neighbours'** 802.11 handshake, not ours — in a

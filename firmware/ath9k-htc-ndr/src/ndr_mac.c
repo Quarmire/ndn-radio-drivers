@@ -9,7 +9,34 @@
 
 static a_uint32_t armed_ok;
 
-struct ndr_mac_state ndr_mac_state = { NDR_MAC_MAGIC, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+/* log2 of a power of two. 32-bit shifts are native on Xtensa; only 64-bit variable shifts would
+ * need a libgcc helper this firmware does not link. */
+static a_uint32_t ndr_log2(a_uint32_t v)
+{
+	a_uint32_t n = 0;
+
+	while (v > 1u) {
+		v >>= 1;
+		n++;
+	}
+	return n;
+}
+
+/* Has the epoch rotated us into a different slot than the one currently armed? */
+static a_int32_t ndr_lease_slot_changed(void)
+{
+	a_uint32_t slots = ndr_ctl_lease_override ? ndr_ctl_lease_slots : NDR_LEASE_SLOTS;
+	a_uint32_t slot_tu = ndr_ctl_lease_override ? ndr_ctl_lease_slot_tu : NDR_LEASE_SLOT_TU;
+	a_uint32_t per_us = slot_tu * 1024u * slots;
+	a_uint32_t epoch_idx;
+
+	if (!slots)
+		return 0;
+	epoch_idx = ioread32_mac(AR_TSF_L32) >> ndr_log2(per_us);
+	return epoch_idx != ndr_mac_state.lease_epoch;
+}
+
+struct ndr_mac_state ndr_mac_state = { NDR_MAC_MAGIC, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
 
 void ndr_quiet_disarm(void)
 {
@@ -42,7 +69,17 @@ void ndr_quiet_rearm(void)
 	 * that register never reads back on this part, which is what made the first attempt skip
 	 * the write entirely.
 	 */
-	if (armed_ok && (ioread32_mac(AR_TIMER_MODE) & AR_QUIET_TIMER_EN))
+	/*
+	 * Re-arm when the hardware lost the schedule OR when the epoch has rotated our slot.
+	 *
+	 * The quiet timer repeats at a FIXED phase, so it cannot express a slot that moves each
+	 * period — the firmware has to re-arm once per epoch. This runs from the receive and
+	 * transmit paths, which is what a node with traffic has; a node that is completely silent
+	 * will not rotate until it next sends or hears something. The clean fix is an interrupt off
+	 * the generic-timer block rather than piggybacking on traffic.
+	 */
+	if (armed_ok && (ioread32_mac(AR_TIMER_MODE) & AR_QUIET_TIMER_EN) &&
+	    !ndr_lease_slot_changed())
 		return;
 
 	/*
@@ -69,46 +106,94 @@ void ndr_quiet_rearm(void)
 
 	{
 		/*
-		 * Name-keyed lease: own one slot per period, be quiet for the rest. Both the slot
-		 * index and the period alignment are pure functions of the name and the clock, so
-		 * two nodes need to exchange nothing to avoid each other -- they only need a common
-		 * view of time.
+		 * Name-keyed lease with the epoch term:
+		 *
+		 *     owner(t) = ( H(name-group) + epoch(t) )  mod N          [time-slice-mac.md]
+		 *
+		 * The base slot is a pure function of the name; the epoch term rotates every node's
+		 * slot by one per period. Both are computed, never announced.
+		 *
+		 * ⚠ Rotation is about FAIRNESS, not collision avoidance. Adding the same epoch to
+		 * every name preserves their relative offsets, so two names that hash to the same
+		 * slot still collide — for that they need different hashes, or the within-slot CCLF
+		 * election. What rotation buys is that no name is permanently stuck in a particular
+		 * slot, which matters because slots are not interchangeable: §5 of the filter/MAC
+		 * redesign reserves every R-th slot, and a fixed assignment would permanently
+		 * advantage or starve whoever landed there.
 		 */
 		static const char lease_prefix[] = NDR_LEASE_PREFIX;
+		a_uint32_t base = 0, slots = 0, slot_us = 0, per_us = 0;
 
 		if (ndr_ctl_lease_override) {
-			/* Runtime lease, pushed over the control path: same maths, host-chosen shape. */
-			a_uint32_t slot_us = ndr_ctl_lease_slot_tu * 1024u;
-			a_uint32_t per_us  = slot_us * ndr_ctl_lease_slots;
-			a_uint32_t epoch   = tsf_lo & ~(per_us - 1u);
-			a_uint32_t open_end = epoch + (ndr_ctl_lease_slot + 1u) * slot_us;
-
-			while (open_end < tsf_lo + NDR_QUIET_MARGIN_US)
-				open_end += per_us;
-
-			ndr_mac_state.lease_slot = ndr_ctl_lease_slot;
-			period_us   = per_us;
-			next_us     = open_end;
-			duration_tu = ndr_ctl_lease_slot_tu * (ndr_ctl_lease_slots - 1u);
+			/* Runtime lease over the control path: the host supplies the BASE slot (what
+			 * the name would hash to); the epoch term is still applied here so both nodes
+			 * rotate identically. */
+			base    = ndr_ctl_lease_slot;
+			slots   = ndr_ctl_lease_slots;
+			slot_us = ndr_ctl_lease_slot_tu * 1024u;
 		} else if (sizeof(lease_prefix) > 1) {
-			a_uint32_t slot, epoch, open_end;
-
-			slot = (a_uint32_t)ndr_name_hash(ndr_cfg.key,
+			base = (a_uint32_t)ndr_name_hash(ndr_cfg.key,
 							 (const a_uint8_t *)lease_prefix,
 							 (a_uint32_t)(sizeof(lease_prefix) - 1))
 			       & NDR_LEASE_SLOT_MASK;
-			ndr_mac_state.lease_slot = slot;
+			slots   = NDR_LEASE_SLOTS;
+			slot_us = NDR_LEASE_SLOT_US;
+		}
 
-			/* Mask, not modulo -- see the DIV32 note in ndr_mac.h. */
-			epoch = tsf_lo & ~NDR_LEASE_PERIOD_MASK;
-			open_end = epoch + (slot + 1u) * NDR_LEASE_SLOT_US;
-			/* Quiet begins when our slot ends; skip ahead if that moment already passed. */
-			while (open_end < tsf_lo + NDR_QUIET_MARGIN_US)
-				open_end += NDR_LEASE_PERIOD_US;
+		if (slots) {
+			a_uint32_t epoch_idx, slot, next_slot, slot_start, slot_end, next_start;
 
-			period_us = NDR_LEASE_PERIOD_US;
-			next_us = open_end;
-			duration_tu = NDR_LEASE_SLOT_TU * (NDR_LEASE_SLOTS - 1);
+			per_us = slot_us * slots;
+			/* Period is a power of two by construction, so the epoch INDEX is a shift and
+			 * the alignment is a mask -- no 32-bit divide (MAGPIE has no DIV32). */
+			epoch_idx  = tsf_lo >> ndr_log2(per_us);
+			slot       = (base + epoch_idx) & (slots - 1u);
+			next_slot  = (base + epoch_idx + 1u) & (slots - 1u);
+			slot_start = (epoch_idx * per_us) + slot * slot_us;
+			slot_end   = slot_start + slot_us;
+			next_start = ((epoch_idx + 1u) * per_us) + next_slot * slot_us;
+
+			/*
+			 * ★ Only re-arm while inside our OWN slot.
+			 *
+			 * Writing AR_NEXT_QUIET_TIMER clears whatever quiet window is in progress. Doing
+			 * that at the epoch boundary — where the rotation is detected — ends the quiet
+			 * period early and hands the node every slot up to its new one. Measured: duty
+			 * 40% against a configured 25%. Re-arming inside our own slot is free, because
+			 * we are entitled to transmit then anyway; and the TX path naturally runs there,
+			 * since that is the only time this node can send.
+			 */
+			if (tsf_lo < slot_start || tsf_lo >= slot_end)
+				return;
+
+			ndr_mac_state.lease_slot  = slot;
+			ndr_mac_state.lease_base  = base;
+			ndr_mac_state.lease_epoch = epoch_idx;
+
+			/*
+			 * Quiet runs from the end of our slot to the start of the next one. With the
+			 * epoch term that gap is a whole period normally, and ZERO on the wrap
+			 * (slot N-1 -> slot 0 are adjacent in time), where the node simply transmits two
+			 * slots back to back. One slot per epoch either way, so the duty is unchanged.
+			 */
+			if (next_start <= slot_end) {
+				ndr_quiet_disarm();
+				return;
+			}
+
+			/*
+			 * Quiet for (next_start - slot_end), repeating every per_us + slot_us.
+			 *
+			 * That period is the TRUE recurrence of a rotating slot: our window advances by
+			 * one slot each epoch, so successive slot starts are per_us + slot_us apart. Set
+			 * it and the hardware sustains the rotation on its own between re-arms; set it to
+			 * per_us instead and the quiet window (which is a whole period long) repeats
+			 * immediately, gating the node ~100% -- measured as a collapse to ~5% duty.
+			 * The per-epoch re-arm then only has to handle the wrap.
+			 */
+			period_us   = per_us + slot_us;
+			next_us     = slot_end;
+			duration_tu = (next_start - slot_end) / 1024u;
 		}
 	}
 

@@ -43,9 +43,24 @@
 #define AR_QUIET2_QUIET_PERIOD_M 0x0000ffff  /* periodicity (TU) */
 #endif
 
-/* How far ahead of "now" to place the first quiet window, in microseconds. */
+/* How far ahead of "now" to place the first quiet window, in microseconds. Used by the fixed
+ * (non-lease) schedule, which is armed once and then repeats in hardware. */
 #ifndef NDR_QUIET_MARGIN_US
 #define NDR_QUIET_MARGIN_US 4096
+#endif
+
+/*
+ * Arming margin for the LEASE schedule, which is re-armed every epoch so the slot can rotate.
+ *
+ * This must be small. The margin exists only to avoid arming a boundary that the TSF has already
+ * passed; anything larger makes the "already passed, take the next period" rule skip the current
+ * epoch's quiet window entirely. Measured with the 4096 us margin inherited from the fixed
+ * schedule: duty came out 41% instead of the configured 25%, because roughly one epoch in three
+ * was being skipped. At 256 us the skip only happens if the boundary lands inside the arming
+ * write itself.
+ */
+#ifndef NDR_LEASE_ARM_MARGIN_US
+#define NDR_LEASE_ARM_MARGIN_US 256
 #endif
 
 /*
@@ -55,7 +70,7 @@
  * f(name, clock) with no negotiation. Everything above this point demonstrates the *mechanism*
  * (the MAC will gate TX against its TSF); this is the mechanism keyed on a name.
  *
- *   slot   = H(registered prefix) mod NDR_LEASE_SLOTS
+ *   slot   = ( H(registered prefix) + epoch(t) ) mod NDR_LEASE_SLOTS
  *   period = NDR_LEASE_SLOTS * NDR_LEASE_SLOT_TU        (the node owns 1 slot in every period)
  *   quiet  = the whole period EXCEPT this node's slot
  *
@@ -104,7 +119,9 @@ struct ndr_mac_state {
 	a_uint32_t tsf_lo;       /* TSF sampled at the last arm — proves the clock runs */
 	a_uint32_t tsf_hi;
 	a_uint32_t ifs_misc_rb;  /* AR_D_GBL_IFS_MISC read back (backoff-disable measurement mode) */
-	a_uint32_t lease_slot;   /* slot index this node computed from its prefix */
+	a_uint32_t lease_slot;   /* slot currently armed = (base + epoch) mod N */
+	a_uint32_t lease_base;   /* H(prefix) mod N -- the name's slot before rotation */
+	a_uint32_t lease_epoch;  /* epoch index the armed slot was computed for */
 	a_uint32_t timer_mode_rb; /* AR_TIMER_MODE read back — the enable that actually matters */
 };
 

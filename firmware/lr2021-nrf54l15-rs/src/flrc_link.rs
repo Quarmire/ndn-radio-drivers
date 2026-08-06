@@ -81,6 +81,7 @@ pub const FREQ_HZ: u32 = match option_env!("PHY_HF") {
         Some(m) if matches!(m.as_bytes(), b"2445") => 2_445_000_000,
         Some(m) if matches!(m.as_bytes(), b"2465") => 2_465_000_000,
         Some(m) if matches!(m.as_bytes(), b"2480") => 2_480_000_000,
+        Some(m) if matches!(m.as_bytes(), b"2464") => 2_464_000_000,
         _ => 2_477_000_000,
     },
     None => 915_000_000,
@@ -217,7 +218,12 @@ pub const MAX_PAYLOAD: u16 = FRAME_LEN;
 /// The shield devicetree's own calibration list (470 / 897.5 / 2441 MHz) is the same idea: several
 /// points, spanning the band actually used.
 pub const CAL_POINTS: [u16; 3] = match option_env!("PHY_HF") {
-    Some(_) => [0x8000 | 600, 0x8000 | 610, 0x8000 | 620],
+    // **4 MHz grid.** `CalibFe` takes frequencies in 4 MHz steps, so a calibration point can only
+    // ever land on a multiple of 4 MHz. `GetErrors` reports `RXFREQ_NO_FE_CAL` ("front end
+    // calibration was not available for Rx operation with specified RF frequency") on BOTH paths at
+    // our original 2477 / 915 MHz — neither of which is a multiple of 4. LF survived it only because
+    // 915 MHz is exactly where §6.4 says the chip self-calibrates at boot; HF had no such luck.
+    Some(_) => [0x8000 | 612, 0x8000 | 616, 0x8000 | 620], // 2448 / 2464 / 2480 MHz
     None => [225, 228, 232],
 };
 
@@ -528,6 +534,25 @@ where
     };
     radio.set_rx_path(path, boost).await?;
     dcdc_workaround(radio).await;
+
+    // ── Calibration, LAST and from Standby RC ───────────────────────────────────────────────────
+    //
+    // §6.4: the chip boots with image rejection calibrated **at 915 MHz**, and "if operating at
+    // another frequency the image calibration procedure must be restarted using command Calibrate
+    // ... necessary if there is a frequency change > 10MHz". §6.4.1 adds PLL and AAF for changes
+    // > 50MHz. We move 1562 MHz on HF.
+    //
+    // Both commands take no frequency and calibrate for the *current* configuration, so they run
+    // last — after the frequency, the modulation params (the AAF is sized by bandwidth) and the RX
+    // path. `Calibrate` cannot be issued in Rx or Tx, and `CalibFe` "does not work if device is in
+    // Rx or Tx mode", so drop to Standby RC first rather than assuming which mode we are in.
+    //
+    // **Verified by `m113_errors`:** with this sequence `GetErrors` is clean through configure, TX
+    // and RX entry. Without it the chip reports `RXFREQ_NO_FE_CAL` — "front end calibration was not
+    // available for Rx operation with specified RF frequency" — on entering RX.
+    radio.set_chip_mode(ChipMode::StandbyRc).await?;
+    radio.calibrate(true, true, true, true, false, false).await?; // PA_OFF, MU, AAF, PLL
+    radio.calib_fe(&CAL_POINTS).await?;
 
     // Route interrupts out on **DIO8**, which the shield wires to the MCU's P1.04.
     //

@@ -33,7 +33,7 @@ use panic_probe as _;
 use lr2021_nrf54l15_rs::tier0::PrefixFilter;
 use lr2021_nrf54l15_rs::{flrc_link, hw};
 
-const KEY: u64 = 0x8624_4E44_5F4B_4559;
+const KEY: [u8; 16] = *b"ndn/tier0-group!";
 
 /// The prefixes this node registers — its "FIB". Two of the transmitter's sixteen namespaces, so
 /// ~1/8 of traffic is genuinely wanted and the rest is exactly what Tier-0 exists to discard.
@@ -58,7 +58,7 @@ async fn main(_spawner: Spawner) {
     // Masks are precomputed once — the receiver-side cost per frame is then two u64 AND-compares
     // per registered prefix, which is the whole point of doing this before the parse.
     let masks: [PrefixFilter; REGISTERED.len()] =
-        core::array::from_fn(|i| PrefixFilter::mask_for(KEY, REGISTERED[i]));
+        core::array::from_fn(|i| PrefixFilter::mask_for(&KEY, REGISTERED[i]));
 
     defmt::info!(
         "m106_shadow_rx: SHADOW MODE — {} registered prefixes, filter evaluated but NOT acted on",

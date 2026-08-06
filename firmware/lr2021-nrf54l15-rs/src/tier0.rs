@@ -80,20 +80,79 @@ impl Default for PrefixFilter {
     }
 }
 
-/// FNV-1a 64, keyed — the same name-hash family the on-device data plane already uses, so the
-/// filter shares one keyspace with the FIB and dedup rather than adding a second (#44).
-pub fn name_hash(key: u64, name: &[u8]) -> u64 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325 ^ key;
-    for &b in name {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+/// **SipHash-2-4** — vendored verbatim from `ndn-rs/crates/core/ndn-frame-io/src/frame.rs`.
+///
+/// Copied rather than depended on because this module must stay `no_std` and dependency-free so it
+/// compiles for the FLPR RISC-V coprocessor unchanged. It is pure integer code, so the copy is
+/// exact; [`tests::siphash24_reference_vector`] pins it to the published Aumasson & Bernstein vector
+/// so the two copies cannot drift silently.
+pub fn siphash24(key: &[u8; 16], data: &[u8]) -> u64 {
+    let k0 = u64::from_le_bytes(match key[0..8].try_into() { Ok(v) => v, Err(_) => [0; 8] });
+    let k1 = u64::from_le_bytes(match key[8..16].try_into() { Ok(v) => v, Err(_) => [0; 8] });
+    let mut v0 = 0x736f_6d65_7073_6575 ^ k0;
+    let mut v1 = 0x646f_7261_6e64_6f6d ^ k1;
+    let mut v2 = 0x6c79_6765_6e65_7261 ^ k0;
+    let mut v3 = 0x7465_6462_7974_6573 ^ k1;
+    macro_rules! round {
+        () => {{
+            v0 = v0.wrapping_add(v1);
+            v1 = v1.rotate_left(13);
+            v1 ^= v0;
+            v0 = v0.rotate_left(32);
+            v2 = v2.wrapping_add(v3);
+            v3 = v3.rotate_left(16);
+            v3 ^= v2;
+            v0 = v0.wrapping_add(v3);
+            v3 = v3.rotate_left(21);
+            v3 ^= v0;
+            v2 = v2.wrapping_add(v1);
+            v1 = v1.rotate_left(17);
+            v1 ^= v2;
+            v2 = v2.rotate_left(32);
+        }};
     }
-    h
+    let mut chunks = data.chunks_exact(8);
+    for c in &mut chunks {
+        let m = u64::from_le_bytes(match c.try_into() { Ok(v) => v, Err(_) => [0; 8] });
+        v3 ^= m;
+        round!();
+        round!();
+        v0 ^= m;
+    }
+    let mut last = (data.len() as u64 & 0xff) << 56;
+    for (i, &b) in chunks.remainder().iter().enumerate() {
+        last |= (b as u64) << (8 * i);
+    }
+    v3 ^= last;
+    round!();
+    round!();
+    v0 ^= last;
+    v2 ^= 0xff;
+    round!();
+    round!();
+    round!();
+    round!();
+    v0 ^ v1 ^ v2 ^ v3
 }
 
-/// Second-hash key derivation constant (golden ratio), so `h2` comes from an **independent** FNV
-/// pass rather than the high half of `h1`.
-const KEY2_MIX: u64 = 0x9E37_79B9_7F4A_7C15;
+/// **The one agreed name-hash for Tier-0: SipHash-2-4 under the full 16-byte group key.**
+///
+/// This was keyed FNV-1a-64. FNV is not a PRF and XOR-ing the key into its init state is invertible
+/// from observed output, so an outsider could recover a private group's key and then compute — or
+/// deliberately collide with — its pre-parse filter. That is exactly the guarantee the addressing
+/// doctrine (§8) assigns to the group key.
+///
+/// **Both copies of this module must agree or they cannot share a group**, so this changed in
+/// lockstep with `ndn-ext/crates/faces/ndn-face-monitor-wifi/src/tier0.rs`. A filter built under one
+/// hash will not match masks built under the other — there is no partial interop, no graceful
+/// degradation, and no error message: names simply stop matching.
+pub fn name_hash(key: &[u8; 16], name: &[u8]) -> u64 {
+    siphash24(key, name)
+}
+
+/// Domain separator for the second hash, so `h1` and `h2` are independent PRF evaluations under
+/// different keys rather than two halves of one output.
+const KEY2_DOMAIN: [u8; 16] = *b"ndn/tier0-h2\0\0\0\0";
 
 /// The [`K`] bit positions one prefix occupies.
 ///
@@ -102,10 +161,16 @@ const KEY2_MIX: u64 = 0x9E37_79B9_7F4A_7C15;
 /// hash model at depths 4–8 (and far worse in relative terms at low occupancy) — FNV's high bits are
 /// its weak half, so using them as the double-hashing stride correlates the K positions. A second
 /// pass over a short prefix costs a few cycles and buys back the model.
-pub fn positions(key: u64, prefix: &[u8]) -> [u8; K as usize] {
+pub fn positions(key: &[u8; 16], prefix: &[u8]) -> [u8; K as usize] {
+    let mut key2 = *key;
+    let mut i = 0;
+    while i < 16 {
+        key2[i] ^= KEY2_DOMAIN[i];
+        i += 1;
+    }
     let h1 = name_hash(key, prefix) as u32;
     // `| 1` keeps the stride odd, so the K positions cannot collapse onto one bit.
-    let h2 = (name_hash(key ^ KEY2_MIX, prefix) as u32) | 1;
+    let h2 = (name_hash(&key2, prefix) as u32) | 1;
     let mut out = [0u8; K as usize];
     for (i, o) in out.iter_mut().enumerate() {
         *o = (h1.wrapping_add((i as u32).wrapping_mul(h2)) % M_BITS) as u8;
@@ -183,7 +248,7 @@ impl PrefixFilter {
     }
 
     /// Insert every prefix of `name`.
-    pub fn insert_name(&mut self, key: u64, name: &[u8]) {
+    pub fn insert_name(&mut self, key: &[u8; 16], name: &[u8]) {
         let mut tmp = *self;
         for_each_prefix(name, |pfx| {
             for &p in positions(key, pfx).iter() {
@@ -197,7 +262,7 @@ impl PrefixFilter {
     ///
     /// The prefix is clamped by [`clamp_prefix`] first — without that, a registration deeper than
     /// the cap produces a **true false negative**.
-    pub fn mask_for(key: u64, prefix: &[u8]) -> Self {
+    pub fn mask_for(key: &[u8; 16], prefix: &[u8]) -> Self {
         let prefix = &prefix[..clamp_prefix(prefix)];
         let mut m = Self::new();
         for &p in positions(key, prefix).iter() {

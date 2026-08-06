@@ -22,7 +22,7 @@ use lr2021_nrf54l15_rs::tier0::PrefixFilter;
 use lr2021_nrf54l15_rs::{flrc_link, hw};
 
 /// Shared group key — receiver must use the same one.
-pub const KEY: u64 = 0x8624_4E44_5F4B_4559;
+pub const KEY: [u8; 16] = *b"ndn/tier0-group!";
 /// Distinct top-level namespaces in the traffic mix.
 pub const NAMESPACES: u32 = 16;
 
@@ -66,7 +66,7 @@ async fn main(_spawner: Spawner) {
         let n = make_name(&mut nb, ns, seq);
 
         let mut f = PrefixFilter::new();
-        f.insert_name(KEY, &nb[..n]);
+        f.insert_name(&KEY, &nb[..n]);
 
         // Fixed-size frames: pad to FRAME_LEN. The name length still travels in byte 12, so the
         // receiver knows how much of the padding to ignore.

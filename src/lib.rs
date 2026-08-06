@@ -21,6 +21,14 @@ pub use libusb_rtl88xx::{
     CHIP_ID_8822E, ChannelBw, FwVersion, LibUsbRtl88xxBackend, REALTEK_VID, REG_SYS_CFG,
     RTL88XX_PIDS, RfPath,
 };
+// AR9271 (ath9k_htc) — the one Wi-Fi part whose FIRMWARE is ours, so Tier-0 can reject a frame
+// before it crosses USB (design §8.2) and TX can be scheduled off the hardware TSF (§8.5).
+// L1: USB transport + firmware download + HTC handshake + WMI. Does not yet replace ath9k_htc.
+mod ath9k_htc;
+pub use ath9k_htc::{
+    AR9271_FIRMWARE, AR9271_FIRMWARE_TEXT, AR9271_IDS, ATHEROS_VID, Ath9kHtcBackend, FW_NAME,
+    HtcService, NDR_MEM_MAX_TUPLES, NdrStats, WmiCmd,
+};
 mod rtl8821c;
 pub use rtl8821c::{RTL8821CU_PIDS, Rtl8821cuBackend};
 mod mt7612;

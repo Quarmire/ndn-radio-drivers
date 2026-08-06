@@ -271,7 +271,22 @@ where
     // transmit-instant jitter, which is exactly the residual M5 left unexplained. 16 µs was an
     // arbitrary bring-up default; the shortest ramp is the right default for a slot MAC.
     radio.set_tx_params(TX_POWER_DBM, RampTime::Ramp2u).await?;
-    radio.set_rx_path(RxPath::HfPath, RxBoost::Max).await?;
+    // **RX boost OFF, not Max.**
+    //
+    // The shield devicetree says `rx-boost-cfg = 7` and that was copied without asking what it is
+    // for. The datasheet uses `rx_boost=7` for its SENSITIVITY figures — weak-signal conditions,
+    // e.g. −100.5 dBm at BR 2600/CR 3/4. Our two boards sit two feet apart at **−33 dBm**, roughly
+    // 67 dB above that, and running maximum LNA boost into a signal that strong overloads the front
+    // end. The receiver then syncs fine (plenty of energy) and the demodulator distorts *during the
+    // packet*, which is exactly the observed failure: alternating runs of correct and bit-inverted
+    // bytes inside a single frame.
+    //
+    // This is the same trap the Wi-Fi work already documented — a point-blank link producing garbage
+    // RX that looks like everything except what it is — and it explains why a dozen RF parameter
+    // changes moved nothing: none of them touched the receiver's GAIN.
+    //
+    // Boost is a link-budget decision, not a constant. Raise it when the link is weak.
+    radio.set_rx_path(RxPath::HfPath, RxBoost::Off).await?;
     radio.set_rf(FREQ_HZ).await?;
 
     // Route interrupts out on **DIO8**, which the shield wires to the MCU's P1.04.

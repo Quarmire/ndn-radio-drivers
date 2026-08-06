@@ -28,7 +28,9 @@ async fn main(_spawner: Spawner) {
         defmt::panic!("m109_tx: no radio");
     }
     flrc_link::configure(&mut radio).await.expect("configure");
-    flrc_link::set_crc_off(&mut radio).await.expect("crc off");
+    if option_env!("PHY_CRC_ON").is_none() {
+        flrc_link::set_crc_off(&mut radio).await.expect("crc off");
+    }
 
     let mut frame = [0u8; flrc_link::FRAME_LEN as usize];
     for (i, b) in frame.iter_mut().enumerate() {

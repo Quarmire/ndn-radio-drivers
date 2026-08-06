@@ -41,7 +41,9 @@ async fn main(_spawner: Spawner) {
         defmt::panic!("m109_rx: no radio");
     }
     flrc_link::configure(&mut radio).await.expect("configure");
-    flrc_link::set_crc_off(&mut radio).await.expect("crc off");
+    if option_env!("PHY_CRC_ON").is_none() {
+        flrc_link::set_crc_off(&mut radio).await.expect("crc off");
+    }
     radio.set_rx_continous().await.expect("rx");
 
     defmt::info!("m109_pattern_rx: expecting 00 01 02 .. 2f verbatim");

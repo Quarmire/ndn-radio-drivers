@@ -32,13 +32,48 @@ use embedded_hal::digital::OutputPin;
 use embedded_hal_async::spi::SpiBus;
 
 use lr2021::flrc::{AgcPblLen, Crc, FlrcBitrate, FlrcCr, FlrcPacketParams, PktFormat, SwLen, SwMatch, SwTx};
-use lr2021::radio::{PacketType, RampTime, RxBoost, RxPath};
+use lr2021::radio::{PacketType, PaLfMode, RampTime, RxBoost, RxPath};
 use lr2021::system::{ChipMode, DioNum, TcxoVoltage};
 use lr2021::status::Intr;
 use lr2021::{BusyPin, Lr2021, Lr2021Error, PulseShape};
 
 /// Centre frequency, Hz — the quiet corner above US Wi-Fi ch11 and below BLE 2480. See module docs.
-pub const FREQ_HZ: u32 = 2_477_000_000;
+/// **#108 ROOT CAUSE, MEASURED 2026-08-06: the 2.4 GHz HF path is the fault. LF works perfectly.**
+///
+/// Same firmware, same modem settings, same two boards, one line changed:
+///
+/// | path | 48-byte frame | 96-byte frame, CRC on |
+/// |---|---|---|
+/// | HF, 2477 MHz | first ~8-15 bytes correct, rest polarity-inverted runs | every packet fails CRC |
+/// | **LF, 915 MHz** | **48/48, every frame** | **96/96, every frame** |
+///
+/// Eight mechanisms were proposed and disproved before this — DC imbalance, polarity-ambiguous
+/// syncword, front-end overload, FIFO transfer, missing TCXO, carrier frequency offset, demod
+/// margin, CDR starvation — and a fix was built for each. The reason none of them moved the result
+/// is that **the modem was never the problem**: the failure was invariant under bitrate (8x range),
+/// coding rate, carrier offset (+/-60 kHz), packet format, CRC mode, syncword and payload whitening
+/// precisely because every one of those is a modem parameter and the fault is in the RF path.
+///
+/// The lead came from reading Semtech's own PER example rather than theorising again: it validates
+/// FLRC at `RF_FREQ_IN_HZ 866500000` — the LF path. The board has two SMA ports (LF 150-960 MHz,
+/// HF 2.4 GHz), and the most likely physical cause is simply that **the antenna is on the LF port**,
+/// so HF was transmitting into an unterminated output and the receiver was hearing near-field
+/// leakage: strong enough to sync at bench range (-46 dBm), far too distorted to decode. Worth
+/// confirming by eye before trusting HF again.
+///
+/// **Band-sharing caveat:** 915 MHz co-bands with the LoRa dongles and the HaLow radios on this same
+/// bench, and FLRC at Br2600 occupies ~2.7 MHz. Expect mutual interference in a way 2.4 GHz avoided;
+/// schedule against them or move to a band edge, as the LoRa/HaLow work already had to.
+
+pub const FREQ_HZ: u32 = match option_env!("PHY_HF") {
+    // **`PHY_HF=1` selects the 2.4 GHz HF path, which is BROKEN on this board — see below.**, which is where Semtech's own PER example
+    // validates it (`RF_FREQ_IN_HZ 866500000`). 915 MHz keeps us in the US ISM band the rest of this
+    // bench already uses. #108 is invariant under every HF-side parameter we can reach — bitrate,
+    // coding rate, carrier offset, packet format, CRC, syncword, payload whitening — and the LF/HF
+    // path is the one axis the vendor's validated configuration differs from ours on.
+    Some(_) => 2_477_000_000,
+    None => 915_000_000,
+};
 
 /// 2.6 Mbit/s — the whole point of using FLRC. See module docs.
 ///
@@ -93,7 +128,13 @@ pub const PREAMBLE: AgcPblLen = AgcPblLen::Len32Bits;
 /// A syncword for this modem is an RF parameter with correlation requirements, not a branding
 /// opportunity. If a recognisable value is wanted later, pick one and *verify* its autocorrelation
 /// and complement-correlation rather than assuming.
-pub const SYNCWORD: u32 = 0xCD05_CAFE;
+pub const SYNCWORD: u32 = match option_env!("PHY_VENDOR") {
+    // Semtech's own PER example ships `default_syncword[4] = {0x90,0x56,0x34,0x12}`. Selected by
+    // `PHY_VENDOR=1` together with the rest of that example's packet config, so the vendor-validated
+    // combination can be tested as a unit rather than one guessed parameter at a time.
+    Some(_) => 0x1234_5690,
+    None => 0xCD05_CAFE,
+};
 
 /// TX power, dBm. The HF PA table in the shield devicetree tops out at **12 dBm**; the two kits sit
 /// on a bench, so start low — a strong link is not the goal and an overloaded receiver produces
@@ -147,7 +188,11 @@ pub const MAX_PAYLOAD: u16 = FRAME_LEN;
 /// frame intact — so a receiver that does not check CRC sees a working link.
 /// Front-end calibration point: 4 MHz steps, MSB set to select the **HF** path.
 /// `0x8000 | (2477 MHz / 4)`.
-pub const FE_CAL_HF: u16 = 0x8000 | ((FREQ_HZ / 4_000_000) as u16);
+pub const FE_CAL: u16 = match option_env!("PHY_HF") {
+    // The MSB selects the HF path; on LF it must be clear, and the step is still 4 MHz.
+    Some(_) => 0x8000 | ((FREQ_HZ / 4_000_000) as u16),
+    None => (FREQ_HZ / 4_000_000) as u16,
+};
 
 /// TCXO start-up timeout, **in 32 MHz clock periods** — 5 ms.
 ///
@@ -235,7 +280,18 @@ fn pkt_params(pld_len: u16) -> FlrcPacketParams {
 }
 
 fn pkt_params_crc(pld_len: u16, crc: Crc) -> FlrcPacketParams {
-    FlrcPacketParams::new(PREAMBLE, SwLen::Sw32b, SwTx::Sw1, SwMatch::Match1, PktFormat::Fixed, crc, pld_len)
+    // `PHY_VENDOR=1` reproduces Semtech's PER example exactly: `FLRC_PLD_IS_FIX false` (DYNAMIC) and
+    // `FLRC_CRC RAL_FLRC_CRC_2_BYTES`.
+    //
+    // We moved to FIXED + CRC-off because DYNAMIC + CRC failed every packet — but that was diagnosed
+    // with the receiver front end overloaded (RxBoost Max, RSSI −33 dBm), the one condition since
+    // shown to actually matter (leading run 7 → 15 once it was turned off). A conclusion drawn under
+    // a condition later proven wrong has to be re-tested, not inherited.
+    let (fmt, crc) = match option_env!("PHY_VENDOR") {
+        Some(_) => (PktFormat::Dynamic, Crc::Crc16),
+        None => (PktFormat::Fixed, crc),
+    };
+    FlrcPacketParams::new(PREAMBLE, SwLen::Sw32b, SwTx::Sw1, SwMatch::Match1, fmt, crc, pld_len)
 }
 
 /// Disable the PHY CRC for a raw byte-in/byte-out experiment (#108).
@@ -302,7 +358,7 @@ where
     // enables something and does the opposite — that silent no-op was committed once already as a
     // fix, and it should not be re-introduced.
 
-    radio.calib_fe(&[FE_CAL_HF]).await?;
+    radio.calib_fe(&[FE_CAL]).await?;
 
     radio.set_packet_type(PacketType::Flrc).await?;
     radio.set_flrc_modulation(BITRATE, CODING, PULSE_SHAPE).await?;
@@ -323,7 +379,13 @@ where
 
     // HF front end for the 2.4 GHz port: PA on the HF path, RX on the HF path with full boost
     // (rx-boost-cfg = 7 in the shield devicetree).
-    radio.set_pa_hf().await?;
+    if option_env!("PHY_HF").is_none() {
+        // LF PA: the crate's HF helper hard-codes the HF PA selection, so the sub-GHz path needs the
+        // explicit form. Duty cycle / slices copied from the HF helper's own defaults (6, 7).
+        radio.set_pa_lf(PaLfMode::LfPaFsm, 6, 7).await?;
+    } else {
+        radio.set_pa_hf().await?;
+    }
     // **Ramp2u, not Ramp16u** (#104 lever 3). The PA ramp sits between the TX trigger and the first
     // on-air symbol, so its duration is pure transmit-instant offset — and any variation in it is
     // transmit-instant jitter, which is exactly the residual M5 left unexplained. 16 µs was an
@@ -344,7 +406,8 @@ where
     // changes moved nothing: none of them touched the receiver's GAIN.
     //
     // Boost is a link-budget decision, not a constant. Raise it when the link is weak.
-    radio.set_rx_path(RxPath::HfPath, RxBoost::Off).await?;
+    let path = if option_env!("PHY_HF").is_some() { RxPath::HfPath } else { RxPath::LfPath };
+    radio.set_rx_path(path, RxBoost::Off).await?;
     radio.set_rf(FREQ_HZ).await?;
 
     // Route interrupts out on **DIO8**, which the shield wires to the MCU's P1.04.

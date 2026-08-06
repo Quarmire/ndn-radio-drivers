@@ -33,7 +33,7 @@ use embedded_hal_async::spi::SpiBus;
 
 use lr2021::flrc::{AgcPblLen, Crc, FlrcBitrate, FlrcCr, FlrcPacketParams, PktFormat, SwLen, SwMatch, SwTx};
 use lr2021::radio::{PacketType, RampTime, RxBoost, RxPath};
-use lr2021::system::{DioNum, TcxoVoltage};
+use lr2021::system::{ChipMode, DioNum, TcxoVoltage};
 use lr2021::status::Intr;
 use lr2021::{BusyPin, Lr2021, Lr2021Error, PulseShape};
 
@@ -120,10 +120,26 @@ pub const MAX_PAYLOAD: u16 = FRAME_LEN;
 /// `0x8000 | (2477 MHz / 4)`.
 pub const FE_CAL_HF: u16 = 0x8000 | ((FREQ_HZ / 4_000_000) as u16);
 
-/// TCXO start-up delay, in the chip's tick units. The shield devicetree specifies
-/// `tcxo-wakeup-time = <0>`; kept as a named constant so it is easy to sweep if the reference proves
-/// to need settling time.
-pub const TCXO_STARTUP: u32 = 0;
+/// TCXO start-up timeout, **in 32 MHz clock periods** — 5 ms.
+///
+/// This was `0`, copied from the shield devicetree's `tcxo-wakeup-time = <0>` as though that were
+/// the chip's units. It is not, and the datasheet is explicit (§6.11.3): *"start_time indicates the
+/// maximum duration for the 32MHz oscillator to start and stabilize … measured in 32MHz clock
+/// periods. **0: (Default) disables TCXO mode**"*.
+///
+/// So the earlier "TCXO enabled" change was a **no-op** — it disabled the very mode it claimed to
+/// turn on, and was committed as a fix. The radio has been running on the plain XOSC path
+/// throughout, which is consistent with the measured symptom: the received ramp arrives intact at
+/// the correct byte offsets but with **runs of bit-inverted bytes**, alternating every ~5–10 bytes.
+/// At 1.95 Mbit/s effective that is a polarity flip roughly every ~33 µs ⇒ ~15 kHz flip rate ⇒ a
+/// frequency offset of order **7.5 kHz (~3 ppm)** between the two boards. That is ordinary crystal
+/// tolerance, and it sits *inside* the ±150 kHz figure in Table 18-3 — because that number is the
+/// acquisition tolerance, not a promise of phase coherence across a packet.
+///
+/// 5 ms is a conservative settling allowance for a TCXO; it is a *timeout*, not a fixed delay, so
+/// over-provisioning costs nothing once the oscillator is detected. Failure to detect raises
+/// `HF_XOSC_START_ERR`, which `m108_flrc_diag` already prints.
+pub const TCXO_STARTUP: u32 = 160_000;
 
 /// **PHY CRC: 16-bit, matching Semtech's reference (`FLRC_CRC RAL_FLRC_CRC_2_BYTES`).**
 ///
@@ -186,15 +202,26 @@ pub fn whiten(buf: &mut [u8]) {
 }
 
 fn pkt_params(pld_len: u16) -> FlrcPacketParams {
-    FlrcPacketParams::new(
-        PREAMBLE,
-        SwLen::Sw32b,
-        SwTx::Sw1,
-        SwMatch::Match1,
-        PktFormat::Fixed,
-        CRC_MODE,
-        pld_len,
-    )
+    pkt_params_crc(pld_len, CRC_MODE)
+}
+
+fn pkt_params_crc(pld_len: u16, crc: Crc) -> FlrcPacketParams {
+    FlrcPacketParams::new(PREAMBLE, SwLen::Sw32b, SwTx::Sw1, SwMatch::Match1, PktFormat::Fixed, crc, pld_len)
+}
+
+/// Disable the PHY CRC for a raw byte-in/byte-out experiment (#108).
+///
+/// Every diagnostic so far has read the received bytes through at least two layers of our own
+/// encoding — a sparse Bloom filter, an ASCII name, a whitening LFSR — and the interpretation of
+/// "corrupt" kept shifting as those layers changed. With CRC off and a known constant payload there
+/// is exactly one question left: which bytes went in, which came out.
+pub async fn set_crc_off<O, SPI, M>(radio: &mut Lr2021<O, SPI, M>) -> Result<(), Lr2021Error>
+where
+    O: OutputPin,
+    SPI: SpiBus<u8>,
+    M: BusyPin,
+{
+    radio.set_flrc_packet(&pkt_params_crc(FRAME_LEN, Crc::CrcOff)).await
 }
 
 /// Set the payload length. With [`PktFormat::Fixed`] both roles use [`FRAME_LEN`], so this is
@@ -233,17 +260,19 @@ where
     // syncword matches (wide capture), length decodes, signal is strong at −33 dBm, and the payload
     // arrives cleanly BIT-INVERTED partway through — a mid-frame polarity/clock slip, which is what
     // a frequency-erroneous reference produces. Must precede any modulation or RF configuration.
-    radio.set_tcxo(TcxoVoltage::Tcxo1v8, TCXO_STARTUP).await?;
-
-    // **Front-end calibration at our operating frequency.** `GetErrors` reported
-    // `rxfreq_no_fe_cal = true`: "Front End (Image rejection, PPF, ADC offset) calibration was not
-    // available for rx operation with specified rf frequency." The shield devicetree even lists
-    // `calibration-freqs = <470000000 897500000 2441000000>` — the board expects this to be run, and
-    // this firmware never did, so the receiver has been demodulating with an uncalibrated front end.
+    // **NO TCXO ON THIS BOARD — do not enable TCXO mode.** Proven, not assumed:
+    // `SetTcxoMode` with a real (non-zero) start_time returns **CmdFail**, even from Standby RC,
+    // which §6.11.3 names as the command's only valid mode. A non-zero start_time is a *timeout* for
+    // detecting the 32 MHz oscillator, so failing it means no TCXO clock appeared.
     //
-    // Units are **4 MHz steps with the MSB selecting the path** — `MSB = 1` for HF, which is the
-    // 2.4 GHz port we use. Getting that bit wrong calibrates the wrong front end and reports success.
-    // Must run before entering RX/TX ("will not work if device is in Rx or Tx mode").
+    // The shield devicetree lists `tcxo-voltage = 1.8V` alongside `tcxo-wakeup-time = <0>`, and the
+    // zero is the operative half: it means "do not enable TCXO mode", exactly as the chip's own
+    // `start_time = 0` does. Reading the voltage as evidence of a fitted TCXO was the error.
+    //
+    // Kept as a comment rather than a disabled call because a `set_tcxo(.., 0)` reads like it
+    // enables something and does the opposite — that silent no-op was committed once already as a
+    // fix, and it should not be re-introduced.
+
     radio.calib_fe(&[FE_CAL_HF]).await?;
 
     radio.set_packet_type(PacketType::Flrc).await?;

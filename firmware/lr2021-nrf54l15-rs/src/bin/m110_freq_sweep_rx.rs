@@ -38,13 +38,19 @@ use lr2021_nrf54l15_rs::{flrc_link, hw};
 
 /// Offsets to try, in kHz, applied to the RX centre frequency.
 ///
-/// Range chosen from the m109 estimate (~7 kHz implied by a ~37 µs flip half-period) with generous
-/// margin either side, so a peak has curve on both flanks rather than sitting at an endpoint.
-const OFFSETS_KHZ: [i32; 13] = [-60, -40, -30, -20, -12, -6, 0, 6, 12, 20, 30, 40, 60];
+/// **Widened to +/-800 kHz.** The original +/-60 kHz came from the m109 flip-period estimate, which
+/// turned out to be causally irrelevant, and it was far too narrow to answer the question that
+/// actually matters: Table 18-3 gives +/-150 kHz *acquisition* tolerance at Br2600, so an offset
+/// anywhere beyond that would still let the syncword correlate occasionally while making phase
+/// TRACKING diverge a few tens of microseconds later — which is exactly what the dumps show (first
+/// ~9 bytes always correct, ~37 us at 1.95 Mbit/s, then alternating polarity runs).
+///
+/// A sweep that stops at 60 kHz cannot see an offset of 200-500 kHz. This one can.
+const OFFSETS_KHZ: [i32; 15] = [-40, -32, -25, -18, -12, -6, -3, 0, 3, 6, 12, 18, 25, 32, 40];
 
 /// Frames scored per step. Enough to average out per-frame noise without making the sweep so long
 /// that oscillator drift becomes a confound within a single pass.
-const N_PER_STEP: u32 = 24;
+const N_PER_STEP: u32 = 48;
 
 /// Give up on a step that is receiving nothing, so one dead offset cannot stall the whole sweep.
 const STEP_TIMEOUT_MS: u64 = 4000;
@@ -114,8 +120,21 @@ async fn main(_spawner: Spawner) {
                 continue;
             }
 
-            let lead = b.iter().enumerate().take_while(|(i, v)| **v == *i as u8).count() as u32;
-            let hits = b.iter().enumerate().filter(|(i, v)| **v == *i as u8).count() as u32;
+            // With `PHY_PAT` the payload is constant, so "correct" is that constant rather than the
+            // ramp. An all-zeros frame turns the HF fault into a clean readout: any carrier offset
+            // rotates the constellation and the output walks 00 -> 55 -> ff -> aa -> 00, so the
+            // count of exactly-correct bytes is a direct measure of how long phase is held.
+            let expect = |i: usize| -> u8 {
+                match option_env!("PHY_PAT") {
+                    Some(v) if matches!(v.as_bytes(), b"00") => 0x00,
+                    Some(v) if matches!(v.as_bytes(), b"ff") => 0xff,
+                    Some(v) if matches!(v.as_bytes(), b"55") => 0x55,
+                    Some(v) if matches!(v.as_bytes(), b"aa") => 0xaa,
+                    _ => i as u8,
+                }
+            };
+            let lead = b.iter().enumerate().take_while(|(i, v)| **v == expect(*i)).count() as u32;
+            let hits = b.iter().enumerate().filter(|(i, v)| **v == expect(*i)).count() as u32;
             n += 1;
             lead_sum += lead;
             lead_max = lead_max.max(lead);

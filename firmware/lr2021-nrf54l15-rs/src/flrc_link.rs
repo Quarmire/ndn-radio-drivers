@@ -115,6 +115,17 @@ pub const BITRATE: FlrcBitrate = match option_env!("PHY_BR") {
 pub const CODING: FlrcCr = match option_env!("PHY_CR") {
     Some(s) if matches!(s.as_bytes(), b"12") => FlrcCr::Cr12,
     Some(s) if matches!(s.as_bytes(), b"23") => FlrcCr::Cr23,
+    // **`none` = FEC OFF, and it is the sharpest discriminator left for #108.** The HF dumps show
+    // runs of correctly-decoded bytes alternating with runs of the same bytes BIT-INVERTED, at
+    // constant length in *bytes* across an 8x rate change. That is what a Viterbi decoder does when
+    // it slides between the true trellis path and its complement — convolutional codes are
+    // transparent, so an unresolved polarity survives decoding, and the run length is the traceback
+    // depth (a fixed number of bits ~ 4-8 bytes).
+    //
+    // With CR = None there is no trellis and no complementary path. So:
+    //   clean (or uniformly inverted) => the raw demod is fine and the FEC decoder is the problem
+    //   still garbage                 => the demodulator itself is wrong, and FEC was never involved
+    Some(s) if matches!(s.as_bytes(), b"none") => FlrcCr::None,
     _ => FlrcCr::Cr34,
 };
 

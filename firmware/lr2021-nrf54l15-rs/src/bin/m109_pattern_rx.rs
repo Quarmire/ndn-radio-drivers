@@ -86,7 +86,16 @@ async fn main(_spawner: Spawner) {
                     off = end;
                 }
                 // How many leading bytes match the expected ramp?
-                let good = b.iter().enumerate().take_while(|(i, v)| **v == *i as u8).count();
+                let expect = |i: usize| -> u8 {
+                    match option_env!("PHY_PAT") {
+                        Some(v) if matches!(v.as_bytes(), b"00") => 0x00,
+                        Some(v) if matches!(v.as_bytes(), b"ff") => 0xff,
+                        Some(v) if matches!(v.as_bytes(), b"55") => 0x55,
+                        Some(v) if matches!(v.as_bytes(), b"aa") => 0xaa,
+                        _ => i as u8,
+                    }
+                };
+                let good = b.iter().enumerate().take_while(|(i, v)| **v == expect(*i)).count();
                 defmt::info!("   leading bytes matching 00,01,02,...: {=usize}", good);
             }
         }

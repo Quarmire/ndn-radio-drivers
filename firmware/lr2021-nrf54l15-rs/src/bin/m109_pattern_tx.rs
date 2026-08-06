@@ -47,6 +47,19 @@ async fn main(_spawner: Spawner) {
     //
     // Whitening is the standard fix for precisely this, so it doubles as the test: same frame, same
     // length, same PHY, only the transition density changes.
+    // **`PHY_PAT` replaces the ramp with a constant payload.** With FEC off the HF corruption is
+    // data-dependent and lands at the SAME byte indices frame after frame, so the useful next step
+    // is to vary the data and watch the indices move. A constant payload has constant spectral
+    // content, so if the flips are driven by the symbol pattern they should change character
+    // entirely; if they stay put, the trigger is positional rather than data-driven.
+    match option_env!("PHY_PAT") {
+        Some(v) if matches!(v.as_bytes(), b"00") => frame.fill(0x00),
+        Some(v) if matches!(v.as_bytes(), b"ff") => frame.fill(0xff),
+        Some(v) if matches!(v.as_bytes(), b"55") => frame.fill(0x55),
+        Some(v) if matches!(v.as_bytes(), b"aa") => frame.fill(0xaa),
+        _ => {}
+    }
+
     if option_env!("PHY_WHITEN").is_some() {
         flrc_link::whiten(&mut frame);
         defmt::info!("m109_pattern_tx: payload WHITENED (transition-density test)");

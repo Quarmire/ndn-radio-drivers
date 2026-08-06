@@ -59,6 +59,12 @@ async fn main(_spawner: Spawner) {
             if !ok {
                 continue;
             }
+            // Undo the transmitter's whitening when testing with `PHY_WHITEN=1`: the LFSR mask is
+            // XORed, so applying it a second time recovers the plain ramp and every score below
+            // stays directly comparable to the un-whitened runs.
+            if option_env!("PHY_WHITEN").is_some() {
+                flrc_link::whiten(&mut b);
+            }
             n += 1;
             if n <= 6 {
                 let plen = radio.get_flrc_packet_status().await.map(|mut s| s.pkt_len()).unwrap_or(0);
@@ -68,9 +74,15 @@ async fn main(_spawner: Spawner) {
                     .map(|mut s| dbm(s.rssi_sync()))
                     .unwrap_or(0);
                 defmt::info!("rx#{=u32} pkt_len={=u16} rssi={=i16}dBm", n, plen, rssi);
-                defmt::info!("   [00..16] {=[u8]:#04x}", b[..16]);
-                defmt::info!("   [16..32] {=[u8]:#04x}", b[16..32]);
-                defmt::info!("   [32..48] {=[u8]:#04x}", b[32..48]);
+                // Chunked with saturating bounds: a fixed 16-byte slice panics for any frame
+                // shorter than 16, which silently killed the short-length rungs of the #108 length
+                // sweep — the run printed one header line and died looking like "no frames".
+                let mut off = 0usize;
+                while off < b.len() {
+                    let end = (off + 16).min(b.len());
+                    defmt::info!("   [{=usize}..{=usize}] {=[u8]:#04x}", off, end, b[off..end]);
+                    off = end;
+                }
                 // How many leading bytes match the expected ramp?
                 let good = b.iter().enumerate().take_while(|(i, v)| **v == *i as u8).count();
                 defmt::info!("   leading bytes matching 00,01,02,...: {=usize}", good);

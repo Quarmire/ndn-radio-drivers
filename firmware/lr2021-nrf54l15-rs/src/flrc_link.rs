@@ -41,7 +41,18 @@ use lr2021::{BusyPin, Lr2021, Lr2021Error, PulseShape};
 pub const FREQ_HZ: u32 = 2_477_000_000;
 
 /// 2.6 Mbit/s — the whole point of using FLRC. See module docs.
-pub const BITRATE: FlrcBitrate = FlrcBitrate::Br2600;
+///
+/// **Overridable at build time** via `PHY_BR` (`2600`/`1300`/`0650`/`0325`) so the rate ladder can
+/// be swept as a *measured variable* across both roles at once. #108's XOR-mask readout
+/// (`m111_xor_mask_rx`) showed polarity slips at random positions, ragged at the edges the way a
+/// Viterbi decoder smears a transition — a demod **margin** signature rather than a configuration
+/// one. Margin is tested by walking the rate down, not by argument.
+pub const BITRATE: FlrcBitrate = match option_env!("PHY_BR") {
+    Some(s) if matches!(s.as_bytes(), b"1300") => FlrcBitrate::Br1300,
+    Some(s) if matches!(s.as_bytes(), b"0650") => FlrcBitrate::Br0650,
+    Some(s) if matches!(s.as_bytes(), b"0325") => FlrcBitrate::Br0325,
+    _ => FlrcBitrate::Br2600,
+};
 
 /// **CR 3/4 — matching Semtech's own reference**, not the `None` this started with.
 ///
@@ -52,7 +63,13 @@ pub const BITRATE: FlrcBitrate = FlrcBitrate::Br2600;
 /// RAL_FLRC_CR_3_4`, and a configuration the vendor does not exercise is not a baseline — it is an
 /// untested corner. Get the link working against the reference first; revisit coding as a
 /// *measured* variable afterwards.
-pub const CODING: FlrcCr = FlrcCr::Cr34;
+/// Overridable at build time via `PHY_CR` (`12`/`23`/`34`) — see [`BITRATE`] on why the PHY is
+/// swept rather than reasoned about.
+pub const CODING: FlrcCr = match option_env!("PHY_CR") {
+    Some(s) if matches!(s.as_bytes(), b"12") => FlrcCr::Cr12,
+    Some(s) if matches!(s.as_bytes(), b"23") => FlrcCr::Cr23,
+    _ => FlrcCr::Cr34,
+};
 
 /// BT 0.5 — Semtech's reference uses `RAL_FLRC_PULSE_SHAPE_BT_05`; this was BT 1.0.
 pub const PULSE_SHAPE: PulseShape = PulseShape::Bt0p5;
@@ -95,7 +112,19 @@ pub const TX_POWER_DBM: i8 = 0;
 /// Fixed size is also what a slot MAC actually wants: **constant airtime per slot** makes the base
 /// slot a constant rather than something re-derived per frame, which is exactly the property the
 /// lease design (#93) assumes.
-pub const FRAME_LEN: u16 = 48;
+///
+/// **Overridable at build time via `PHY_LEN`** so the break point can be mapped against frame
+/// length. #108's role-swap test showed the corruption is byte-for-byte REPRODUCIBLE and symmetric
+/// between the two boards — which a channel cannot do — so the remaining question is what structural
+/// boundary the first ~8-14 good bytes end at. A length sweep answers that directly: a break at a
+/// FIXED index means a boundary, one that SCALES means a proportional (coding/interleaver) fault.
+pub const FRAME_LEN: u16 = match option_env!("PHY_LEN") {
+    Some(s) if matches!(s.as_bytes(), b"8") => 8,
+    Some(s) if matches!(s.as_bytes(), b"16") => 16,
+    Some(s) if matches!(s.as_bytes(), b"24") => 24,
+    Some(s) if matches!(s.as_bytes(), b"96") => 96,
+    _ => 48,
+};
 
 /// Kept as the name other modules use; now the fixed frame size.
 pub const MAX_PAYLOAD: u16 = FRAME_LEN;

@@ -34,6 +34,21 @@ async fn main(_spawner: Spawner) {
     for (i, b) in frame.iter_mut().enumerate() {
         *b = i as u8;
     }
+    // **#108 CDR test.** Build with `PHY_WHITEN=1` to whiten the ramp before transmitting.
+    //
+    // The raw ramp is very nearly the worst possible payload for clock recovery: `0x00` is eight
+    // consecutive zero bits, `0x01`/`0x02`/`0x04` seven each, and the whole low end of the sequence
+    // is transition-starved. The length sweep showed 8-byte frames arrive PERFECT while anything
+    // longer breaks around byte 9-15 — consistent with the receiver coasting through the preamble's
+    // timing estimate and then slipping once the data stops providing edges. A slipped CDR in GMSK
+    // shows up as exactly the polarity inversion the XOR-mask readout found.
+    //
+    // Whitening is the standard fix for precisely this, so it doubles as the test: same frame, same
+    // length, same PHY, only the transition density changes.
+    if option_env!("PHY_WHITEN").is_some() {
+        flrc_link::whiten(&mut frame);
+        defmt::info!("m109_pattern_tx: payload WHITENED (transition-density test)");
+    }
     defmt::info!(
         "m109_pattern_tx: sending 0x00..0x{=u8:02x} ({} bytes), NO whitening, NO CRC",
         (flrc_link::FRAME_LEN - 1) as u8,

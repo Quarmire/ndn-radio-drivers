@@ -42,7 +42,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(p) => u16::from_str_radix(p.trim_start_matches("0x"), 16)?,
         None => 0xa81a,
     };
-    let d = ndn_radio_drivers::open_named_radio(pid, ch)?;
+    // #78: `open_named_radio` now returns a full `OpenRadio` (io + knobs + time +
+    // profile). This probe only sends and receives, so it takes the data plane explicitly —
+    // making the narrowing visible rather than having the opener silently do it for everyone.
+    let d = ndn_radio_drivers::open_named_radio(pid, ch)?.io;
     let src = [0x02, b'M', b'D', b'R', node, 0x01];
     println!("slot3 node={node} slot={my_slot}/{N} mode={} ch{ch} secs={secs}",
         if slotted { "slotted" } else { "contention" });
@@ -90,7 +93,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             payload.push(my_tag);
             payload.push(node);
             payload.extend_from_slice(&pad);
-            let _ = d.inject(InjectFrame { payload: payload.into(), tx: TxIntent::CONSERVATIVE, dst: BROADCAST, src }).await;
+            let _ = d.inject(InjectFrame { payload: payload.into(), tx: TxIntent::CONSERVATIVE, dst: BROADCAST, src, addr3: None }).await;
             sent.fetch_add(1, Ordering::Relaxed);
             tokio::task::yield_now().await;
         } else {

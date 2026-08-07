@@ -697,6 +697,7 @@ fn handle_event(
                 payload: ndn.to_vec().into(),
                 addr: None,
                 group: None,
+                addr3: None,
                 rssi_dbm: Some(rssi.clamp(i8::MIN as i16, i8::MAX as i16) as i8),
                 mcs_index: None,
                 stamp: Some(host_stamp()),

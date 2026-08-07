@@ -786,13 +786,14 @@ impl LibUsbRtl88xxBackend {
         Ok((ch, busy))
     }
 
-    /// **DCNLA name-group hardware RX filter** — "the name is the address, in
-    /// silicon." Program the MAC to accept only frames whose BSSID (addr3)
-    /// equals `group_mac` (a name/namespace hash from [`frame::name_group_mac`],
-    /// which our TX path also writes into addr1 *and* addr3). Frames for other
+    /// **Name-group hardware RX filter** — "the name is the address, in silicon."
+    /// Program the MAC to accept only frames whose BSSID (addr3) equals `group_mac`,
+    /// a flat 6-byte name-derived address the caller supplies. Frames for other
     /// name-groups are dropped **in hardware**, before they ever reach the host —
-    /// content-centric filtering by the chip's address matcher, replacing
-    /// host-side "hear everything, filter in software" promiscuous monitor.
+    /// content-centric filtering by the chip's address matcher, replacing host-side
+    /// "hear everything, filter in software" promiscuous monitor. This is an
+    /// exact-match filter (one address); the Tier-0 prefix-set filter is a
+    /// software mask-scan and is not expressible in this hardware matcher.
     ///
     /// Mechanism (8822E): write `REG_BSSID` (0x618), then switch RCR out of
     /// accept-all-promiscuous (clear AAP, bit 0) into accept-multicast +
@@ -802,7 +803,6 @@ impl LibUsbRtl88xxBackend {
     /// (all multicast buckets), so the exact filtering is the BSSID match.
     /// [`clear_name_group_filter`] restores promiscuous monitor.
     ///
-    /// [`frame::name_group_mac`]: crate::frame::name_group_mac
     /// [`clear_name_group_filter`]: Self::clear_name_group_filter
     pub fn set_name_group_filter(&self, group_mac: [u8; 6]) -> Result<(), FaceError> {
         const REG_BSSID: u16 = 0x0618;
@@ -4885,6 +4885,7 @@ impl LibUsbRtl88xxBackend {
             tx: crate::TxIntent::CONSERVATIVE,
             dst,
             src,
+            addr3: None,
         };
         let buf = self.build_tx_body(&frame, mcs, None, Some(body))?;
         let handle = self.handle.clone();
@@ -4925,6 +4926,7 @@ impl LibUsbRtl88xxBackend {
             tx: crate::TxIntent::CONSERVATIVE,
             dst,
             src,
+            addr3: None,
         };
         let mut buf = Vec::new();
         for (i, msdus) in mpdus.iter().enumerate() {
@@ -5024,9 +5026,11 @@ impl LibUsbRtl88xxBackend {
         let mut out = Vec::with_capacity(24 + 8 + frame.payload.len());
         out.extend_from_slice(&[0x08, 0x00]); // FC: type=Data, subtype=0
         out.extend_from_slice(&[0x00, 0x00]); // Duration
-        out.extend_from_slice(&frame.dst); // addr1 (RA/DA)
-        out.extend_from_slice(&frame.src); // addr2 (TA/SA)
-        out.extend_from_slice(&frame.dst); // addr3 (BSSID)
+        out.extend_from_slice(&frame.dst); // addr1 (RA/DA) = group / Tier-0 filter hi
+        out.extend_from_slice(&frame.src); // addr2 (TA/SA) = source / filter lo
+        // addr3: the ephemeral nonce under the Tier-0 layout (addr1‖addr2 = filter), else the
+        // legacy BSSID copy of dst. Matches `frame::build_dot11`.
+        out.extend_from_slice(&frame.addr3.unwrap_or(frame.dst)); // addr3 (BSSID / nonce)
         out.extend_from_slice(&(seq << 4).to_le_bytes()); // SeqCtrl (frag 0)
         out.extend_from_slice(&LLC_SNAP_PREFIX);
         out.extend_from_slice(&ethertype.to_be_bytes());
@@ -5158,6 +5162,13 @@ impl LibUsbRtl88xxBackend {
             let mut addr2 = [0u8; 6]; // TA/SA @10
             addr1.copy_from_slice(&frame[4..10]);
             addr2.copy_from_slice(&frame[10..16]);
+            // addr3 @16 (BSSID slot): the sender's ephemeral nonce under the Tier-0 layout,
+            // where addr1‖addr2 is the prefix-set filter and cannot also be the source.
+            let addr3 = frame.get(16..22).map(|s| {
+                let mut a = [0u8; 6];
+                a.copy_from_slice(s);
+                a
+            });
 
             // A-MSDU: QoS data with A-MSDU-Present (QoS Ctrl byte 0 bit 7) →
             // de-aggregate `[DA(6) SA(6) Len(2 BE) | LLC/SNAP+payload]` subframes,
@@ -5184,6 +5195,7 @@ impl LibUsbRtl88xxBackend {
                             payload: bytes::Bytes::copy_from_slice(&msdu[8..]),
                             addr: Some(sa),
                             group: Some(da),
+                            addr3, // outer-header nonce, shared by all A-MSDU subframes
                             rssi_dbm,
                             mcs_index,
                             stamp,
@@ -5206,6 +5218,7 @@ impl LibUsbRtl88xxBackend {
                 payload: bytes::Bytes::copy_from_slice(&frame[hdr + 8..]),
                 addr: Some(addr2),
                 group: Some(addr1),
+                addr3,
                 rssi_dbm,
                 mcs_index,
                 stamp,

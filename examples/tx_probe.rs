@@ -26,7 +26,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(p) => u16::from_str_radix(p.trim_start_matches("0x"), 16)?,
         None => 0xa81a,
     };
-    let d = ndn_radio_drivers::open_named_radio(pid, ch)?;
+    // #78: `open_named_radio` now returns a full `OpenRadio` (io + knobs + time +
+    // profile). This probe only sends and receives, so it takes the data plane explicitly —
+    // making the narrowing visible rather than having the opener silently do it for everyone.
+    let d = ndn_radio_drivers::open_named_radio(pid, ch)?.io;
     let deadline = Instant::now() + Duration::from_secs(secs);
     println!("tx_probe role={role} pid=0x{pid:04x} ch{ch} secs={secs} tag={tag}");
 
@@ -66,7 +69,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 payload.push(tag);
                 payload.extend_from_slice(&pad);
                 match tokio::time::timeout(Duration::from_millis(200),
-                    d.inject(InjectFrame { payload: payload.into(), tx: TxIntent::CONSERVATIVE, dst: BROADCAST, src })).await {
+                    d.inject(InjectFrame { payload: payload.into(), tx: TxIntent::CONSERVATIVE, dst: BROADCAST, src, addr3: None })).await {
                     Ok(_) => sent += 1,
                     Err(_) => {}
                 }

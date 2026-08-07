@@ -9,8 +9,14 @@
 pub use ndn_frame_io::{
     frame, radiotap, BROADCAST, CapturedFrame, DEFAULT_SRC, FaceError, FaceId, FrameFormat,
     FrameIo, InjectFrame, MAX_RELIABLE_MCS, McsDescriptor, McsPolicy, Reach, Reliability,
-    TxIntent, WifiRadio, mcs_for_rssi, mcs_phy_rate_bps, name_group_mac, name_group_uni,
+    TxIntent, WifiRadio, mcs_for_rssi, mcs_phy_rate_bps,
 };
+// #78: the capability traits `OpenRadio` hands out. Re-exported so a caller of `open_named_radio`
+// needs exactly one import to use everything the opener returns.
+// #78: `OpenRadio` and the capability traits it carries live in the HAL, beside the traits they
+// aggregate — a driver crate builds one and a face crate consumes one, so neither should need a
+// dependency on the other to name it.
+pub use ndn_radio_hal::{OpenRadio, RadioKnobs, RadioProfile, RadioTime};
 
 mod libusb_rtl88xx;
 /// Shared Realtek RX-descriptor field decode (RSSI/MCS/timestamp) used by the USB backends.
@@ -83,10 +89,7 @@ pub fn rx_raw_frames() -> u64 {
 /// Chip family from the PID: `0xa81a`/`0xa811`/`0x8814` = **RTL8822E** (chip 0x17, the 88xx backend);
 /// everything else in the 8812au PID set (`0x8812`/`0x881a`/…, chip 0x04) = **RTL8812AU**. (The 8812au
 /// backend opens the first matching device; for multiple 8812au on one host it takes the first.)
-pub fn open_named_radio(
-    pid: u16,
-    channel: u8,
-) -> Result<std::sync::Arc<dyn FrameIo>, FaceError> {
+pub fn open_named_radio(pid: u16, channel: u8) -> Result<OpenRadio, FaceError> {
     use std::sync::Arc;
     let fmt = FrameFormat::RawNdn { ethertype: NDN_ETHERTYPE };
     let radio: Arc<dyn FrameIo> = if matches!(pid, 0xa81a | 0xa811 | 0x8814) {
@@ -99,7 +102,12 @@ pub fn open_named_radio(
             let _ = d.set_tx_power(p);
         }
         start_pump(&d); // async (NDN_ASYNC_PUMP) or sync pump, lives for the process
-        d
+        return Ok(OpenRadio {
+            io: d.clone(),
+            knobs: Some(d.clone()),
+            time: Some(d.clone()),
+            profile: Some(d),
+        });
     } else {
         // RTL8812AU: force the canonical format (its own default is Raw80211 for the NAN path), then
         // bring up monitor (MAC/BB/RF + IQK/LCK) on the channel. `NDN_USB_INDEX` selects which adapter
@@ -114,7 +122,14 @@ pub fn open_named_radio(
             if std::env::var_os("NDN_CCA_OFF").is_some() {
                 let _ = d.set_cca_ignore(true);
             }
-            return Ok(d);
+            // Same full handle on the no-pump path — a TX-only node still has knobs, a clock and a
+            // profile, and the earlier code silently returned a bare FrameIo here too.
+            return Ok(OpenRadio {
+                io: d.clone(),
+                knobs: Some(d.clone()),
+                time: Some(d.clone()),
+                profile: Some(d),
+            });
         }
         // `bring_up_monitor` sets TXAGC to full 0x3f; on a USB-power-limited host a full-power 2-chain
         // TX can brown the PA out so the FIFO never drains. `NDN_TX_PWR=<0..63>` overrides the index.
@@ -128,9 +143,13 @@ pub fn open_named_radio(
             let _ = d.set_cca_ignore(true);
         }
         start_pump(&d);
-        d
+        return Ok(OpenRadio {
+            io: d.clone(),
+            knobs: Some(d.clone()),
+            time: Some(d.clone()),
+            profile: Some(d),
+        });
     };
-    Ok(radio)
 }
 
 /// RX-pump reader-thread / transfer-pool count. Default 8; `NDN_RX_PUMP_DEPTH` overrides.

@@ -5576,6 +5576,13 @@ impl Rtl8812auBackend {
         Self::set_desc_bits(&mut d, 16, 17, 1, 1); // RETRY_LIMIT_ENABLE
         Self::set_desc_bits(&mut d, 16, 18, 6, 0); // DATA_RETRY_LIMIT = 0
         Self::set_desc_bits(&mut d, 32, 15, 1, 1); // HWSEQ_EN (HW sequence #)
+        // #96 measurement gate: NAVUSEHDR (DWORD3 bit15) tells the MAC to take the
+        // NAV/Duration from the MPDU header instead of computing its own. Off by
+        // default (the MAC overwrites Duration — measured); set NDN_NAVUSEHDR=1 to
+        // A/B whether the injected Duration then survives onto the air.
+        if std::env::var_os("NDN_NAVUSEHDR").is_some() {
+            Self::set_desc_bits(&mut d, 12, 15, 1, 1); // NAV_USE_HDR
+        }
         let mut csum: u16 = 0;
         for i in 0..16 {
             csum ^= u16::from_le_bytes([d[i * 2], d[i * 2 + 1]]);
@@ -6283,10 +6290,16 @@ impl Rtl8812auBackend {
                         ta.copy_from_slice(&body[10..16]);
                         let mut group = [0u8; 6];
                         group.copy_from_slice(&body[4..10]);
+                        let addr3 = body.get(16..22).map(|s| {
+                            let mut a = [0u8; 6];
+                            a.copy_from_slice(s);
+                            a
+                        });
                         q.push(CapturedFrame {
                             payload: Bytes::copy_from_slice(body),
                             addr: Some(ta),
                             group: Some(group),
+                            addr3,
                             rssi_dbm,
                             mcs_index,
                             stamp,

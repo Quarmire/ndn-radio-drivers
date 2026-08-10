@@ -67,6 +67,17 @@ ENDIF()
 
 # Bisect aid: compile ndr_ctl.c but never call it from the TX path.
 # Prove the lease tick: remove the RX/TX re-arms so ONLY the timer interrupt can rotate the slot.
+# TimeToken: publish the hardware TX timestamp of the previous frame in the next one.
+IF(DEFINED ENV{NDR_TT_PROBE})
+	ADD_DEFINITIONS(-DNDR_DEFAULT_ENABLED=1 -DNDR_TIMETOKEN=1 -DNDR_TT_PROBE=1)
+	MESSAGE(STATUS "NDR: TimeToken PROBE — frames pass only after a TX timestamp is reported")
+ENDIF()
+
+IF(DEFINED ENV{NDR_TIMETOKEN})
+	ADD_DEFINITIONS(-DNDR_TIMETOKEN=1)
+	MESSAGE(STATUS "NDR: TimeToken enabled (per-frame TX TSF, two-step)")
+ENDIF()
+
 IF(DEFINED ENV{NDR_TICK_PROBE})
 	ADD_DEFINITIONS(-DNDR_DEFAULT_ENABLED=1 -DNDR_TICK_PROBE=1)
 	MESSAGE(STATUS "NDR: tick PROBE — frames pass only after the tick interrupt fires")
@@ -138,6 +149,7 @@ SET(SOURCES
 	wlan/ndr_mem.c
 	wlan/ndr_mac.c
 	wlan/ndr_ctl.c
+	wlan/ndr_time.c
 	wlan/if_ath_pci.c
 	magpie_fw_dev/target/wlan/wlan_pci.c
 	wlan/ieee80211_output.c

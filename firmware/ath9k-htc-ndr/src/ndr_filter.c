@@ -9,6 +9,7 @@
 
 #include "ndr_filter.h"
 #include "ndr_mac.h"
+#include "ndr_time.h"
 
 /*
  * Build-time defaults, overridable with -D so an A/B measurement builds two images from identical
@@ -59,6 +60,19 @@ a_int32_t ndr_rx_accept(const a_uint8_t *data, a_uint32_t len)
 	 * the ISR hook live?" into the frames-arriving oracle, which is the only signal observable
 	 * while ath9k_htc owns the device.
 	 */
+	/*
+	 * Probe arm: pass frames only once a TX completion has actually reported a hardware
+	 * timestamp. Turns "does AR_SendTimestamp reach us?" into the frames-arriving oracle — the
+	 * only signal observable while ath9k_htc owns the device.
+	 */
+#ifdef NDR_TT_PROBE
+	if (!ndr_time_plausible()) {
+		ndr_stats.dropped_filter++;
+		return 0;
+	}
+	return 1;
+#endif
+
 #ifdef NDR_TICK_PROBE
 	if (ndr_mac_state.tick_count == 0) {
 		ndr_stats.dropped_filter++;

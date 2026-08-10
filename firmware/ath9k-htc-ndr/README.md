@@ -275,6 +275,27 @@ the *median* barely moves (60→52 µs). To measure below this, disable backoff 
 Quiet duration reads 52.82 ms against 51.20 configured; the ~1.6 ms excess is the leading edge being
 known only to the last frame before the window (~1078 µs) plus trailing-edge contention.
 
+## Epoch rotation, confirmed on air
+
+`owner(t) = (H(name-group) + epoch(t)) mod N`. Verified with the second AR9271 as a TSF-timestamping
+observer, transmitting under a `/ndn/mds/d` lease (N=4, 8 TU slots):
+
+| signature | count |
+|---|---|
+| single-slot bursts (median 6.47 ms) | 214 |
+| double-slot bursts (median 15.02 ms ≈ 2 slots) | 108 |
+| intervals @ **40960 µs** = `per_us + slot_us`, rotated one slot | 214 |
+| intervals @ **49152 µs**, after a merged wrap burst | 106 |
+| intervals @ 32768 µs — the **fixed-slot** signature | **0** |
+
+Per four-epoch cycle there are four slots, and the wrap pair — slot N−1 then slot 0 — is *adjacent
+in time*, so the node transmits them back to back as one double burst. That gives 2 singles + 1
+double, ratio **2.00 predicted against 1.98 measured**, with the interval ratio agreeing
+independently at 2.02. The complete absence of 32768 µs intervals is what rules out a fixed slot.
+
+Duty is 21.5% against 25% nominal; the shortfall is the unused tail of each slot, since a frame must
+fit entirely before the boundary (~1.5 frame-times at 1.1 ms/frame).
+
 ## The named airtime lease — two nodes, name-derived slots
 
 The lease is `f(name, clock)`: `slot = H(prefix) & (SLOTS-1)`, the node owns that slot each period

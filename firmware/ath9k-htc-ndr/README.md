@@ -374,6 +374,40 @@ the dependency the design already names, now with a number on it.
 (The observer here is an MT7612U, which exports no `radiotap.mactime`, so this table is host-clock
 and coarser than the single-node measurement. Only the AR9271 gave hardware TSF.)
 
+## The TimeToken — measured end to end
+
+`timing-rides-named-data.md`'s common-view clock, built here because **this is the "different
+silicon with a TX-descriptor timestamp" that document names**: `AR_SendTimestamp` reaches
+`ds_txstat.ts_tstamp` (`ar5416_hw.c:758`) for *every* frame, where the RTL8822E can only insert from
+its beacon engine. Explicitly not an AP beacon — no timekeeper role, no dedicated frame, no host
+identity; the token is a clock reading and the sender stays keyed to its ephemeral nonce.
+
+**Working**, from a capture on the second node:
+
+| | |
+|---|---|
+| tokens emitted and parsed | 8733 / 8733 |
+| distinct TX timestamps | **8703**, stepping ~1.1 ms = the frame interval |
+| change between consecutive residuals | **~60 µs median** |
+
+So the silicon reports a live per-frame TX TSF, the firmware publishes it, the far node receives it,
+and the clock relationship between the two nodes is visible.
+
+**Not working: the correlator.** `ts_seqnum` reads **0** — the hardware assigns no sequence number,
+`EN_HWSEQ` being deliberately clear — so a token cannot say *which* transmission its timestamp
+belongs to. Completions are batched, so the reference lag varies per frame, and a lag scan over
+L = 0…6 finds no tight fit: best residual sd **1550 µs**, about one frame interval, against a
+per-sample change of ~60 µs.
+
+**Fix:** a firmware-side TX counter instead of the 802.11 sequence — tag the outgoing frame, carry
+the counter in the token, and record it against `ts_tstamp` at completion (a field on `ath_tx_buf`,
+set in `ath_tgt_tx_prepare`, read in `owltgt_tx_processq`).
+
+⚠ Three parser traps, for whoever writes the next analysis: radiotap TSFT is **8-byte aligned** to
+the header start after any extended present words (misaligning gave ~9.5e16 "µs"); never
+first-difference a **sorted** list (that yields the sorted gaps, not jitter); and count *distinct*
+values before calling a counter frozen — the head of a capture can genuinely repeat one value.
+
 ## Milestones
 
 - **M0 — DONE (2026-08-06).** Toolchain built; the patched firmware builds for both targets with

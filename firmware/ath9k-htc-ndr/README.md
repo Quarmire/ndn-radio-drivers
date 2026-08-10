@@ -362,17 +362,11 @@ the width is the meaningful quantity, and it is one slot.
 | node A | 0.0% | 0.0% | 34.4% | 65.6% |
 | node B | 0.0% | 73.8% | 26.2% | 0.0% |
 
-Each node confines itself to one contiguous ~1-slot window derived from its name — **the lease
-mechanism works on two independent nodes**. But the windows overlap **26.2%** rather than separating
-cleanly, because the two TSFs are free-running and unaligned: the schedule is `f(name, clock)` and
-these nodes do not share a clock.
+Each node confined itself to one contiguous ~1-slot window derived from its name, but the windows
+overlapped **26.2%** rather than separating: the schedule is `f(name, clock)` and two free-running
+TSFs are not one clock. That gated the result on a common-view clock (#41) rather than on the lease.
 
-**That is the honest result: name-derived leases confine each node, but collision-freedom is gated
-on a common-view clock (#41), not on the lease mechanism.** It is not a defect in the lease — it is
-the dependency the design already names, now with a number on it.
-
-(The observer here is an MT7612U, which exports no `radiotap.mactime`, so this table is host-clock
-and coarser than the single-node measurement. Only the AR9271 gave hardware TSF.)
+**Now closed — see "Two nodes, one clock" below**, once the TimeToken supplied the shared clock.
 
 ## The TimeToken — measured end to end
 
@@ -487,3 +481,37 @@ values before calling a counter frozen — the head of a capture can genuinely r
 
 - **M4** — NAV. Write the lease into Duration/ID and read `AR_NAV` on a second radio. This is §7
   item 4, it is a one-afternoon measurement, and it gates a design choice — do it early.
+
+## Two nodes, one clock — the lease separates
+
+With the common clock merged (below), both nodes key their lease on `local TSF + offset` instead of
+the raw TSF. o5p-1 takes base slot 0, C4 base slot 2, 4 slots x 8 TU, ~50 frames/s each for 30 s.
+
+The clocks converge in about **7.5 s** and then hold to **~10 µs over the following 22 s** (≈0.4 ppm
+residual, no corrections applied inside the deadband). Restricting to that settled window, and
+comparing both nodes' transmit events on the shared timeline:
+
+| nearest opposite-node send | observed | expected under random alignment |
+|---|---|---|
+| within 1000 µs | **0.00%** | 6.67% |
+| within 4096 µs (half a slot) | **2.01%** | 24.27% |
+| within 8192 µs (a full slot) | **5.25%** | 43.26% |
+
+Zero of node A's 648 sends land within a millisecond of any of node B's; median separation is
+**16.2 ms**. The null is a permutation test — slide one node's timeline by a random offset inside the
+rotation cycle, 400 draws — and the observed alignment is beaten by 1 draw in 400 at the half-slot
+threshold. **Name-derived leases on a merged clock put two nodes in disjoint airtime.**
+
+⚠ **Measure this modulus-free.** The slot rotates by one every epoch, so a histogram modulo the lease
+period shows a *correctly working* lease as uniform BY CONSTRUCTION. That artefact produced a
+confident "98% overlap" against firmware that was simultaneously measuring 25.2% duty (910 -> 229
+frames/s) — the schedule was never broken, the ruler was. Nearest-neighbour separation needs no
+modulus; `tools/lease_separation.py` does it.
+
+⚠ **The merge rule matters more than the mechanism.** "Adopt whoever is ahead", the IBSS rule, is
+measured **unstable** on a 32-bit counter: two nodes ~2.02e9 µs apart — just under 2^31 — leapfrogged
+each other 2-3 times per 30 s run, each jumping forward by that same amount, because at a separation
+near half the counter range adopting *re-creates* the separation. It is an attractor, not merely the
+ambiguity it is usually described as. Halving the difference has no such fixed point and needs no
+leader; a 1 TU deadband stops it steering on the ~20 µs RX-latency bias, which would otherwise walk
+every clock backwards at ~1000 µs/s.

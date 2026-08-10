@@ -6,6 +6,7 @@
 #include "ndr_mac.h"
 #include "ndr_filter.h"
 #include "ndr_ctl.h"
+#include "ndr_time.h"
 
 static a_uint32_t armed_ok;
 
@@ -32,11 +33,14 @@ static a_int32_t ndr_lease_slot_changed(void)
 
 	if (!slots)
 		return 0;
-	epoch_idx = ioread32_mac(AR_TSF_L32) >> ndr_log2(per_us);
+	/* COMMON time, not AR_TSF_L32: the schedule is f(name, clock), and two free-running TSFs are
+	 * not one clock. See ndr_time.h -- this single substitution is what turns a per-node schedule
+	 * into a shared one. */
+	epoch_idx = ndr_time_now() >> ndr_log2(per_us);
 	return epoch_idx != ndr_mac_state.lease_epoch;
 }
 
-struct ndr_mac_state ndr_mac_state = { NDR_MAC_MAGIC, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+struct ndr_mac_state ndr_mac_state = { NDR_MAC_MAGIC, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
 
 void ndr_quiet_disarm(void)
 {
@@ -102,7 +106,14 @@ void ndr_quiet_rearm(void)
 	 * TSF counts microseconds; the quiet fields count TU (1024 µs), hence the >> 10.
 	 */
 	tsf_hi = ioread32_mac(AR_TSF_U32);
-	tsf_lo = ioread32_mac(AR_TSF_L32);
+	/*
+	 * Everything from here to the register writes is in COMMON time (local TSF + the merged
+	 * offset), so that every node computes the same boundaries for the same name. The hardware
+	 * timers count the local TSF, so the offset is subtracted back out at the point of writing --
+	 * and only there. Mixing the two domains is the easy mistake: a boundary computed in common
+	 * time and written raw is wrong by exactly the offset, which is unbounded.
+	 */
+	tsf_lo = ioread32_mac(AR_TSF_L32) + (a_uint32_t)ndr_time_offset;
 	next_us = tsf_lo + NDR_QUIET_MARGIN_US;
 
 	{
@@ -207,6 +218,9 @@ void ndr_quiet_rearm(void)
 		}
 	}
 
+	/* Back to the local TSF domain for the hardware. */
+	next_us -= (a_uint32_t)ndr_time_offset;
+
 	q1 = (((next_us >> 10) + 0) & AR_QUIET1_NEXT_QUIET_M) | AR_QUIET1_QUIET_ENABLE;
 	q2 = ((a_uint32_t)NDR_QUIET_PERIOD_TU & AR_QUIET2_QUIET_PERIOD_M) |
 	     ((duration_tu << AR_QUIET2_QUIET_DURATION_S) & AR_QUIET2_QUIET_DURATION);
@@ -273,6 +287,7 @@ void ndr_quiet_rearm(void)
 	ndr_mac_state.quiet1_rb = ioread32_mac(AR_QUIET1);
 	ndr_mac_state.quiet2_rb = ioread32_mac(AR_QUIET2);
 	ndr_mac_state.tsf_lo = tsf_lo;
+	ndr_mac_state.time_offset = ndr_time_offset;
 	ndr_mac_state.tsf_hi = tsf_hi;
 }
 

@@ -171,6 +171,7 @@ struct ndr_mac_state {
 	a_uint32_t tick_armed;   /* times the lease tick has been armed */
 	a_uint32_t tick_count;   /* lease-tick interrupts serviced */
 	a_uint32_t timer_mode_rb; /* AR_TIMER_MODE read back — the enable that actually matters */
+	a_int32_t  time_offset;   /* the common-time offset the armed schedule was computed with */
 };
 
 #define NDR_MAC_MAGIC 0x4E445231  /* "NDR1" */

@@ -133,6 +133,25 @@ image in the nix store. Confirm which image actually loaded by md5, not by assum
 
 ## ★ Power: filtering before USB saves no radio energy
 
+**Repeated with runtime config** (2026-08-10) — one firmware image, one enumeration, filter toggled
+over the control path, arms interleaved OFF/ON/OFF/ON/OFF at 15 s each:
+
+| arm | power | frames | bytes |
+|---|---|---|---|
+| OFF | 353.34 / 354.08 / 354.76 mW | 2610 / 1892 / 2065 | ~498 kB |
+| ON | 354.52 / 354.60 mW | 207 / 81 | ~7.2 kB |
+
+**93.4% of frames and 98.6% of bytes rejected; power moves +0.50 mW — the wrong way, and by 0.14%.**
+
+The interleaving is what earns this over the earlier compile-time version: the OFF arms drift
+monotonically upward (353.34 → 354.08 → 354.76, +1.42 mW over the run, almost certainly thermal), so
+a two-arm design cannot tell drift from effect. Pairing each ON against the OFF arms bracketing it
+gives +0.81 and +0.18 mW, mean **+0.50 mW**. A slight *increase* is physically sensible: the
+firmware now runs the filter on every frame, and the USB transfer it avoids costs the dongle almost
+nothing. Bound either way: **< 7.3 µJ per avoided frame.**
+
+
+
 Measured with an FNIRSI FNB58 inline between the AR9271 and its host, three 15 s runs per arm. Both
 arms are builds from identical source differing only in `ndr_cfg`'s initialiser bytes.
 

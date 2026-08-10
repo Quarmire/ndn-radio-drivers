@@ -44,6 +44,7 @@ use ndn_transport::FaceError;
 use crate::frame::{self, LLC_SNAP_PREFIX};
 use crate::realtek_rx;
 use crate::{CapturedFrame, FrameFormat, FrameIo, InjectFrame};
+use ndn_radio_hal::{Band, RadioCapability, RadioProfile};
 use ndn_frame_io::ClockDomainId;
 
 mod coex;
@@ -1384,6 +1385,38 @@ impl FrameIo for Rtl8821cuBackend {
 }
 
 // Marker only: `inject_at` is the derived HAL default (`set_rate` + `inject`).
+/// **What this radio is** (#79/#83) — declared, so a planner stops believing the caller's guess.
+///
+/// The module header states it: RTL8821CU, **1×1 dual-band 802.11ac**. `wifi_monitor_5ghz_1ss`
+/// already encodes exactly that shape (1 stream, VHT MCS0-8, up to 80 MHz); only the band list needs
+/// widening, since this part does 2.4 GHz too.
+///
+/// Deliberately narrow: `RadioKnobs` and `RadioTime` stay unimplemented. This backend's bring-up is
+/// staged and explicitly incomplete (the module header lists `TODO(hw)` gaps against the golden
+/// trace), **and no 8821c is currently attached to either OPi** — `lsusb` on both shows none. A
+/// knob that cannot be exercised on hardware is an assertion, and this codebase has enough of those;
+/// capability is a static fact about the part, which is why it is safe to declare from the datasheet
+/// while a control knob is not.
+impl Rtl8821cuBackend {
+    /// The part's capability as a free function — see [`Mt7612uBackend::declared_capability`] for
+    /// why this is not behind `&self`. It matters more here: no 8821c is attached to either OPi, so
+    /// a hardware-only assertion would be entirely unchecked.
+    pub fn declared_capability() -> RadioCapability {
+        RadioCapability {
+            bands: vec![Band::Band2_4GHz, Band::Band5GHz],
+            ..RadioCapability::wifi_monitor_5ghz_1ss(vec![
+                1, 6, 11, 36, 40, 44, 48, 149, 153, 157, 161,
+            ])
+        }
+    }
+}
+
+impl RadioProfile for Rtl8821cuBackend {
+    fn capability(&self) -> RadioCapability {
+        Self::declared_capability()
+    }
+}
+
 impl crate::WifiRadio for Rtl8821cuBackend {}
 
 impl Rtl8821cuBackend {

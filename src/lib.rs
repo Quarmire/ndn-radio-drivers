@@ -249,3 +249,54 @@ mod radio_knobs {
         }
     }
 }
+
+#[cfg(test)]
+mod capability_declarations {
+    use ndn_radio_hal::{Band, RateCapability};
+
+    /// **A declared capability must be non-degenerate and match the part.** #79's trait matrix
+    /// exists to show which backends can describe themselves; a backend that implements
+    /// `RadioProfile` but returns an empty or default-shaped capability would fill the matrix while
+    /// telling a planner nothing — the decided-but-unactuated defect wearing a completeness badge.
+    ///
+    /// Written against the free `declared_capability()` rather than the trait method precisely so it
+    /// runs with no dongle attached; an assertion only checkable on hardware is one nothing checks.
+    #[test]
+    fn mt7612_and_8821c_declare_something_true() {
+        let mt = crate::Mt7612uBackend::declared_capability();
+        assert!(
+            mt.bands.contains(&Band::Band2_4GHz) && mt.bands.contains(&Band::Band5GHz),
+            "the MT7612U is dual-band, as its own module header says: {:?}",
+            mt.bands
+        );
+        assert!(!mt.channels.is_empty(), "a channel list nothing can tune is not a capability");
+        match mt.rate {
+            // 2x2 11ac: the driver's captured tune streams include 5 GHz ch36 VHT80.
+            RateCapability::Wifi { max_nss, max_bw, .. } => {
+                assert_eq!(max_nss, 2, "MT7612U is a 2x2 part");
+                assert_eq!(max_bw, 2, "and reaches VHT80 on the ch36 path");
+            }
+            other => panic!("a Wi-Fi part must declare a Wi-Fi rate capability, got {other:?}"),
+        }
+
+        let rtl = crate::Rtl8821cuBackend::declared_capability();
+        assert!(
+            rtl.bands.contains(&Band::Band2_4GHz) && rtl.bands.contains(&Band::Band5GHz),
+            "the RTL8821CU is dual-band: {:?}",
+            rtl.bands
+        );
+        match rtl.rate {
+            // 1x1 11ac — the distinction from the MT7612U that a planner needs.
+            RateCapability::Wifi { max_nss, .. } => {
+                assert_eq!(max_nss, 1, "RTL8821CU is a 1x1 part")
+            }
+            other => panic!("expected a Wi-Fi rate capability, got {other:?}"),
+        }
+
+        assert_ne!(
+            mt, rtl,
+            "two different parts must not declare the same capability — that would mean the \
+             declaration carries no information"
+        );
+    }
+}

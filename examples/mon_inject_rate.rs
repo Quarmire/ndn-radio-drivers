@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 /// At 1 Mbit/s a 96-byte frame plus overhead occupies ~1.1 ms, so a gap edge can only be located to
 /// ±1.1 ms — useless for measuring a microsecond-scale scheduling boundary. At 54 Mbit/s the same
 /// frame is ~14 µs on air, which is the resolution the measurement actually needs.
+#[cfg(target_os = "linux")]
 fn radiotap(rate_500kbps: u8) -> Vec<u8> {
     if rate_500kbps == 0 {
         // No fields present: the driver picks the rate.
@@ -35,6 +36,7 @@ fn radiotap(rate_500kbps: u8) -> Vec<u8> {
 /// the FCS. This is the frame Tier-0 structurally cannot filter — it carries one address, where the
 /// filter needs 16 bytes of addr1||addr2. Synthesising it lets the ACK fraction of a channel be set
 /// exactly, which is better than hoping a real station ACKs at the ratio you want.
+#[cfg(target_os = "linux")]
 fn build_ack(rate_500kbps: u8, ra: [u8; 6]) -> Vec<u8> {
     let mut f = Vec::new();
     f.extend_from_slice(&radiotap(rate_500kbps));
@@ -44,6 +46,7 @@ fn build_ack(rate_500kbps: u8, ra: [u8; 6]) -> Vec<u8> {
     f
 }
 
+#[cfg(target_os = "linux")]
 fn build_frame(seq: u16, rate_500kbps: u8, addr1: [u8; 6], dur: u16) -> Vec<u8> {
     let mut f = Vec::with_capacity(9 + 24 + 64);
     f.extend_from_slice(&radiotap(rate_500kbps));
@@ -63,6 +66,7 @@ fn build_frame(seq: u16, rate_500kbps: u8, addr1: [u8; 6], dur: u16) -> Vec<u8> 
     f
 }
 
+#[cfg(target_os = "linux")]
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
@@ -163,4 +167,12 @@ fn main() {
         );
         libc::close(fd);
     }
+}
+
+// Raw AF_PACKET + `sockaddr_ll` are Linux-only, and `libc` defines neither elsewhere. Without this
+// stub the example failed to compile on macOS, which broke `cargo build --all-targets` and with it
+// `cargo test -p ndn-radio-drivers` — so this crate's tests never ran at all.
+#[cfg(not(target_os = "linux"))]
+fn main() {
+    eprintln!("mon_inject_rate uses raw AF_PACKET monitor injection — run it on Linux");
 }

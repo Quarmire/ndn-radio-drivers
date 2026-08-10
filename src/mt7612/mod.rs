@@ -58,6 +58,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use ndn_transport::FaceError;
 use crate::{CapturedFrame, FrameFormat, FrameIo, InjectFrame, McsDescriptor};
+use ndn_radio_hal::{Band, RadioCapability, RadioProfile, RateCapability};
 
 /// Async USB TX ring (libusb URBs) — the TX-pipelining path. Linux-only.
 #[cfg(target_os = "linux")]
@@ -1563,6 +1564,46 @@ impl FrameIo for Mt7612uBackend {
             }
             // else: timeout, or not a frame in our format (beacon/other) — keep reading
         }
+    }
+}
+
+/// **What this radio is** (#79/#83) — a 2×2 dual-band part, declared rather than assumed.
+///
+/// Until now the mt7612 implemented only `FrameIo`, so a caller had to hand-write a
+/// `RadioCapability` for it and the planner believed whatever it was told. `RadioBearer::effective_cap`
+/// prefers this over the caller's assertion, so what a control plane registers is now the chip's own
+/// account of itself.
+///
+/// The numbers come from the driver's own tune streams: 2 spatial streams, 11ac VHT, and the 5 GHz
+/// ch36 **VHT80** path (`max_bw = 2`) that `set_channel_ch36_vht80` drives — the throughput path this
+/// backend exists for. 2.4 GHz ch6 is supported too and listed here; the driver's captured op-streams
+/// are exactly these two channels, so the list is what it can actually tune, not the band's full span.
+///
+/// **`RadioTime` is deliberately NOT implemented.** This backend passes `None` for the per-frame
+/// stamp — it reads no TSF — so an impl would declare zero clock sources and answer `None` to every
+/// read. That would complete the trait matrix while delivering nothing, which is precisely the
+/// decided-but-unactuated defect the matrix exists to expose. It needs a real MT76 TSF read first
+/// (#74-class work).
+impl Mt7612uBackend {
+    /// The part's capability, as a free function: a static fact about the silicon, not about any
+    /// open handle. Stated this way so it is checkable without the dongle plugged in — a capability
+    /// only assertable on hardware is one nothing verifies.
+    pub fn declared_capability() -> RadioCapability {
+        RadioCapability {
+            bands: vec![Band::Band2_4GHz, Band::Band5GHz],
+            rate: RateCapability::Wifi {
+                max_mcs: 9,
+                max_nss: 2,
+                max_bw: 2,
+            },
+            ..RadioCapability::wifi_monitor_5ghz(vec![6, 36])
+        }
+    }
+}
+
+impl RadioProfile for Mt7612uBackend {
+    fn capability(&self) -> RadioCapability {
+        Self::declared_capability()
     }
 }
 

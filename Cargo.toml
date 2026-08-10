@@ -51,6 +51,13 @@ required-features = ["bw16"]
 name = "lora_link"
 required-features = ["lora"]
 
+# Same `lora` gate as lora_link above — it imports `LoraSerialBackend`, which the feature gates.
+# Without this entry cargo built it unconditionally, so `cargo test -p ndn-radio-drivers` failed to
+# compile and the crate's tests never ran at all.
+[[example]]
+name = "lora_contention"
+required-features = ["lora"]
+
 [[example]]
 name = "lora_cognition"
 required-features = ["lora"]

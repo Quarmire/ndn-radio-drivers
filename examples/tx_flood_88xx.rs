@@ -12,7 +12,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     rt.block_on(async move {
         let d = LibUsbRtl88xxBackend::open_monitor_pid(pid, ch)?;
         println!("88xx flood ch{ch} pid {pid:04x} for {secs}s (rate via NDN_RADIO_TX_RATE)");
-        let frame = InjectFrame { payload: Bytes::from(vec![0x42u8; 300]), tx: TxIntent::ROBUST, dst: BROADCAST, src: DEFAULT_SRC };
+        // addr3: None = the legacy layout (no Tier-0 filter in addr1‖addr2, so no displaced nonce).
+        let frame = InjectFrame { payload: Bytes::from(vec![0x42u8; 300]), tx: TxIntent::ROBUST, dst: BROADCAST, src: DEFAULT_SRC, addr3: None };
         let end = Instant::now() + Duration::from_secs(secs);
         let mut n = 0u64;
         while Instant::now() < end { let _ = d.inject(frame.clone()).await; n += 1; }

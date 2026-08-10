@@ -275,6 +275,29 @@ the *median* barely moves (60→52 µs). To measure below this, disable backoff 
 Quiet duration reads 52.82 ms against 51.20 configured; the ~1.6 ms excess is the leading edge being
 known only to the last frame before the window (~1078 µs) plus trailing-edge contention.
 
+## The lease tick — rotation driven by the generic-timer interrupt
+
+Rotation used to ride on RX/TX activity, so a silent node never rotated. A spare timer of the same
+block (DTIM = generic timer index 5, unused in monitor mode) is armed to fire inside the node's next
+slot and rotate the lease.
+
+⚠ **The interrupt is not on `AR_ISR_S2`/`BCNMISC`.** Wiring it there is the obvious reading — the
+header calls BCNMISC the OR of the DTIM bits — and it is dead: a probe build that passes frames only
+after the tick fires returned **0 frames in 10 s**. These eight timers *are* the generic timers
+(`AR_GEN_TIMERS(i) = 0x8200 + 4i`), and their interrupts arrive as **`AR_ISR_GENTMR`**, read via the
+shadow **`AR_ISR_S5_S` (0xd8)**, gated by `(1<<5)` in `AR_IMR_S5` plus `AR_IMR_GENTMR`. Same probe
+there: **1241 frames.**
+
+**A purely timer-driven design cannot work.** A MAC reset — the host does one per channel change —
+clears `AR_TIMER_MODE`, `AR_IMR_S5` and `AR_IMR`, and a timer the hardware has forgotten cannot
+re-arm itself. Measured: with the activity path removed there was no gating at all (928 f/s, full
+rate). So **the tick rotates and activity only recovers** (`ndr_quiet_recover()`, two register reads
+in the common case).
+
+Confirmed on air with the tick as the sole rotation trigger: 185 intervals at 40960 µs (rotated), 88
+at 49152 µs (post-wrap), **1 of 273** at 32768 µs (the fixed-slot signature); ratios 2.11 and 2.10
+against a predicted 2.00; airtime 20.8%. That matches the activity-driven run below.
+
 ## Epoch rotation, confirmed on air
 
 `owner(t) = (H(name-group) + epoch(t)) mod N`. Verified with the second AR9271 as a TSF-timestamping

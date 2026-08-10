@@ -36,7 +36,7 @@ static a_int32_t ndr_lease_slot_changed(void)
 	return epoch_idx != ndr_mac_state.lease_epoch;
 }
 
-struct ndr_mac_state ndr_mac_state = { NDR_MAC_MAGIC, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+struct ndr_mac_state ndr_mac_state = { NDR_MAC_MAGIC, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
 
 void ndr_quiet_disarm(void)
 {
@@ -48,6 +48,7 @@ void ndr_quiet_rearm(void)
 {
 	a_uint32_t q1, q2, tsf_lo, tsf_hi;
 	a_uint32_t period_us = (a_uint32_t)NDR_QUIET_PERIOD_TU * 1024u;
+	a_uint32_t slot_tick_us = 1024u;
 	a_uint32_t duration_tu = NDR_QUIET_DURATION_TU;
 	a_uint32_t next_us;
 
@@ -163,7 +164,15 @@ void ndr_quiet_rearm(void)
 			 * we are entitled to transmit then anyway; and the TX path naturally runs there,
 			 * since that is the only time this node can send.
 			 */
-			if (tsf_lo < slot_start || tsf_lo >= slot_end)
+			/*
+			 * Enforced only once we are armed. The FIRST arm has to happen wherever we
+			 * happen to be, or nothing ever arms the quiet window or the tick that drives
+			 * every later rotation — and with the activity-driven re-arms removed that is a
+			 * deadlock: measured as no gating at all (936 f/s, full rate). Arming from an
+			 * arbitrary phase is harmless because nothing is gated yet; the first tick
+			 * corrects it.
+			 */
+			if (armed_ok && (tsf_lo < slot_start || tsf_lo >= slot_end))
 				return;
 
 			ndr_mac_state.lease_slot  = slot;
@@ -191,6 +200,7 @@ void ndr_quiet_rearm(void)
 			 * immediately, gating the node ~100% -- measured as a collapse to ~5% duty.
 			 * The per-epoch re-arm then only has to handle the wrap.
 			 */
+			slot_tick_us = slot_us;
 			period_us   = per_us + slot_us;
 			next_us     = slot_end;
 			duration_tu = (next_start - slot_end) / 1024u;
@@ -221,6 +231,20 @@ void ndr_quiet_rearm(void)
 	iowrite32_mac(AR_NEXT_QUIET_TIMER, next_us);
 	iowrite32_mac(AR_QUIET_PERIOD, period_us);
 	iowrite32_mac(AR_TIMER_MODE, ioread32_mac(AR_TIMER_MODE) | AR_QUIET_TIMER_EN);
+
+	/*
+	 * Arm the lease tick a little INTO our next slot, so the re-arm it triggers happens while we
+	 * are entitled to transmit -- which is the condition ndr_quiet_rearm() requires, and the
+	 * reason writing AR_NEXT_QUIET_TIMER there costs nothing.
+	 */
+	if (period_us > NDR_QUIET_MARGIN_US) {
+		iowrite32_mac(AR_NEXT_DTIM, next_us + duration_tu * 1024u + (slot_tick_us / 4u));
+		iowrite32_mac(AR_DTIM_PERIOD, period_us);
+		iowrite32_mac(AR_TIMER_MODE, ioread32_mac(AR_TIMER_MODE) | AR_DTIM_TIMER_EN);
+		iowrite32_mac(AR_IMR_S5, ioread32_mac(AR_IMR_S5) | NDR_TICK_TRIG_BIT);
+		iowrite32_mac(AR_IMR, ioread32_mac(AR_IMR) | AR_IMR_GENTMR);
+		ndr_mac_state.tick_armed++;
+	}
 
 	/*
 	 * Optionally drop the random backoff.
@@ -256,4 +280,28 @@ a_uint32_t ndr_quiet_is_armed(void)
 {
 	/* The generic-timer enable is the one that means anything on this part. */
 	return (ndr_mac_state.timer_mode_rb & AR_QUIET_TIMER_EN) ? 1 : 0;
+}
+
+void ndr_lease_tick(void)
+{
+	ndr_mac_state.tick_count++;
+	ndr_quiet_rearm();
+}
+
+/*
+ * Recovery path, called from RX/TX. NOT the rotation trigger -- that is the tick.
+ *
+ * A MAC reset (the host does one on every channel change) clears AR_TIMER_MODE, AR_IMR_S5 and
+ * AR_IMR, which takes the lease tick with it. A timer cannot re-arm itself once the hardware has
+ * forgotten it, so something outside the timer has to notice; traffic is what is available. This is
+ * two register reads in the common case.
+ */
+void ndr_quiet_recover(void)
+{
+	if (armed_ok && (ioread32_mac(AR_TIMER_MODE) & AR_QUIET_TIMER_EN))
+		return;
+
+	/* Lost it. Arm from wherever we are -- nothing is gated, so the phase is free. */
+	armed_ok = 0;
+	ndr_quiet_rearm();
 }

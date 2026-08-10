@@ -54,6 +54,19 @@ a_int32_t ndr_rx_accept(const a_uint8_t *data, a_uint32_t len)
 	 * unreadable readback into the frames-arriving oracle M1 already validated. 0 frames means
 	 * the write stuck; normal traffic means it did not.
 	 */
+	/*
+	 * Probe arm: pass frames only once the lease-tick interrupt has actually fired. Turns "is
+	 * the ISR hook live?" into the frames-arriving oracle, which is the only signal observable
+	 * while ath9k_htc owns the device.
+	 */
+#ifdef NDR_TICK_PROBE
+	if (ndr_mac_state.tick_count == 0) {
+		ndr_stats.dropped_filter++;
+		return 0;
+	}
+	return 1;
+#endif
+
 #ifdef NDR_QUIET_PROBE
 	if (ndr_quiet_is_armed()) {
 		ndr_stats.dropped_filter++;

@@ -66,6 +66,17 @@ IF(DEFINED ENV{NDR_LEASE_PREFIX})
 ENDIF()
 
 # Bisect aid: compile ndr_ctl.c but never call it from the TX path.
+# Prove the lease tick: remove the RX/TX re-arms so ONLY the timer interrupt can rotate the slot.
+IF(DEFINED ENV{NDR_TICK_PROBE})
+	ADD_DEFINITIONS(-DNDR_DEFAULT_ENABLED=1 -DNDR_TICK_PROBE=1)
+	MESSAGE(STATUS "NDR: tick PROBE — frames pass only after the tick interrupt fires")
+ENDIF()
+
+IF(DEFINED ENV{NDR_TICK_ONLY})
+	ADD_DEFINITIONS(-DNDR_TICK_ONLY=1)
+	MESSAGE(STATUS "NDR: rotation driven ONLY by the lease-tick interrupt")
+ENDIF()
+
 IF(DEFINED ENV{NDR_NO_TXHOOK})
 	ADD_DEFINITIONS(-DNDR_NO_TXHOOK=1)
 	MESSAGE(STATUS "NDR: TX hook DISABLED (bisect)")

@@ -43,6 +43,52 @@
 #define AR_QUIET2_QUIET_PERIOD_M 0x0000ffff  /* periodicity (TU) */
 #endif
 
+/*
+ * ── The lease tick ───────────────────────────────────────────────────────────
+ *
+ * The quiet timer has no interrupt of its own, so the re-arm used to ride on RX/TX activity: a
+ * silent node never rotated. The same timer block carries seven other timers, and the DTIM one is
+ * unused in monitor mode (no beaconing), so it is co-opted as a periodic tick:
+ *
+ *   AR_NEXT_DTIM 0x8214  when the next tick fires (µs, TSF)
+ *   AR_DTIM_PERIOD 0x8234  how often (µs)
+ *   AR_TIMER_MODE  AR_DTIM_TIMER_EN (0x20)  turns it on
+ * ⚠ The interrupt does NOT arrive via AR_ISR_S2/BCNMISC. Wiring it that way was tried and measured
+ * dead — the probe build passed zero frames, meaning the handler never ran. These eight timers ARE
+ * the generic timers (`AR_GEN_TIMERS(i) = 0x8200 + 4i`, so DTIM is index 5), and their interrupts
+ * land in AR_ISR_S5, OR-ed into the primary status as AR_ISR_GENTMR:
+ *
+ *   trigger bit (1 << 5) in AR_ISR_S5, read via the shadow AR_ISR_S5_S
+ *   gated by (1 << 5) in AR_IMR_S5 AND AR_IMR_GENTMR in the primary mask
+ *
+ * Nothing else in this firmware touches AR_IMR_S5 or AR_IMR_GENTMR, and the HAL rewrites AR_IMR
+ * whenever interrupts are re-set, so both are re-applied on every arm.
+ *
+ * ⚠ This co-opts a beacon timer. Safe in monitor mode, which is what named-data radio runs; a node
+ * that also wanted to beacon would need a different timer (TIM and NDP are equally free here).
+ */
+#ifndef AR_NEXT_DTIM
+#define AR_NEXT_DTIM        0x8214
+#endif
+#ifndef AR_DTIM_PERIOD
+#define AR_DTIM_PERIOD      0x8234
+#endif
+#ifndef AR_DTIM_TIMER_EN
+#define AR_DTIM_TIMER_EN    0x00000020
+#endif
+/* DTIM is generic timer index 5 (AR_GEN_TIMERS(5) == AR_NEXT_DTIM == 0x8214). */
+#define NDR_TICK_TIMER_IDX  5
+#define NDR_TICK_TRIG_BIT   (1u << NDR_TICK_TIMER_IDX)
+
+/* Shadow secondary status 5. The header documents RAC=0xc0, S0_S=0xc4, S1_S=0xc8, S2_S=0xcc, so
+ * the fifth is 0xd8. The shadow must be used, not AR_ISR_S5: AR_ISR_RAC is read-and-clear. */
+#ifndef AR_ISR_S5_S
+#define AR_ISR_S5_S         0x00d8
+#endif
+#ifndef AR_IMR_GENTMR
+#define AR_IMR_GENTMR       0x10000000
+#endif
+
 /* How far ahead of "now" to place the first quiet window, in microseconds. Used by the fixed
  * (non-lease) schedule, which is armed once and then repeats in hardware. */
 #ifndef NDR_QUIET_MARGIN_US
@@ -122,6 +168,8 @@ struct ndr_mac_state {
 	a_uint32_t lease_slot;   /* slot currently armed = (base + epoch) mod N */
 	a_uint32_t lease_base;   /* H(prefix) mod N -- the name's slot before rotation */
 	a_uint32_t lease_epoch;  /* epoch index the armed slot was computed for */
+	a_uint32_t tick_armed;   /* times the lease tick has been armed */
+	a_uint32_t tick_count;   /* lease-tick interrupts serviced */
 	a_uint32_t timer_mode_rb; /* AR_TIMER_MODE read back — the enable that actually matters */
 };
 
@@ -150,5 +198,14 @@ void ndr_quiet_rearm(void);
 
 /* Force the next ndr_quiet_rearm() to re-apply. Called when runtime config changes the shape. */
 void ndr_quiet_disarm(void);
+
+/*
+ * Called from the interrupt path when the lease tick fires. Rotating the slot is the whole job, so
+ * this is just ndr_quiet_rearm() under a name that documents where it comes from.
+ */
+void ndr_lease_tick(void);
+
+/* Recovery only: re-arms if a MAC reset has wiped the schedule. Rotation is the tick's job. */
+void ndr_quiet_recover(void);
 
 #endif /* _NDR_MAC_H_ */

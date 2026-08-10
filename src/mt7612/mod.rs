@@ -225,12 +225,10 @@ pub struct Mt7612uBackend {
     seq: std::sync::atomic::AtomicU16,
     /// RX-pump queue: background reader threads de-aggregate bulk-IN bursts into
     /// `CapturedFrame`s here; `recv_frame` drains it. Full-rate capture without a
-    /// blocking read per call. Empty unless [`spawn_rx_pump`](Self::spawn_rx_pump).
-    rx_pending: std::sync::Mutex<std::collections::VecDeque<CapturedFrame>>,
-    /// True once `spawn_rx_pump` is running, so `recv_frame` drains the queue.
-    rx_pumped: std::sync::atomic::AtomicBool,
-    /// Wakes `recv_frame` when a pump thread enqueues a frame.
-    rx_notify: tokio::sync::Notify,
+    /// The shared RX pipeline (#80) — queue + wake + pumped flag, the same
+    /// [`RxPumpState`](crate::rx_pump::RxPumpState) the Realtek backends use. This was three
+    /// hand-rolled fields; unifying them is what let the pump itself be shared.
+    rx: crate::rx_pump::RxPumpState,
     /// TX pump: `inject` hands pre-built USB bulks to a dedicated thread that does
     /// `write_bulk` in a tight loop — no per-frame `spawn_blocking` task dispatch
     /// (that capped TX at ~2000 frames/s). Set by [`spawn_tx_pump`](Self::spawn_tx_pump).
@@ -353,9 +351,7 @@ impl Mt7612uBackend {
             drain_pause: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             format: FrameFormat::default(),
             seq: std::sync::atomic::AtomicU16::new(0),
-            rx_pending: std::sync::Mutex::new(std::collections::VecDeque::new()),
-            rx_pumped: std::sync::atomic::AtomicBool::new(false),
-            rx_notify: tokio::sync::Notify::new(),
+            rx: crate::rx_pump::RxPumpState::new(),
             tx_sender: std::sync::Mutex::new(None),
             tx_bytes: std::sync::atomic::AtomicU64::new(0),
             tx_count: std::sync::atomic::AtomicU64::new(0),
@@ -1427,34 +1423,24 @@ impl Mt7612uBackend {
         .map_err(|e| init_err(format!("mt7612u TX: join {e}")))?
     }
 
-    /// Spawn `depth` background threads that continuously read the data bulk-IN
-    /// endpoint and enqueue decoded frames into `rx_pending` (keeping RX buffers
-    /// outstanding so the RX FIFO never stalls — full-rate capture). `recv_frame`
-    /// then drains the queue instead of doing its own blocking read. The mt76 USB
-    /// continuous-URB analogue; pause the init RX-drain first.
+    /// Keep `depth` bulk-IN reads outstanding so the RX FIFO never stalls; `recv_frame` then drains
+    /// the queue instead of doing its own blocking read. The mt76 USB continuous-URB analogue.
+    ///
+    /// Delegates to the shared [`spawn_rx_pump`](crate::rx_pump::spawn_rx_pump) (#80). The
+    /// hand-rolled copy this replaces had two defects the shared pump does not:
+    ///
+    /// * **It leaked the backend.** Each thread captured a strong `Arc<Self>` and looped forever
+    ///   with no exit, so the backend could never be dropped, the USB handle never released, and the
+    ///   threads never joined — live on the NDN path, since [`bringup_ndn`](Self::bringup_ndn) calls
+    ///   this. The shared pump holds a `Weak` and breaks when the backend goes away.
+    /// * **A 16 KB read buffer.** The shared pump uses 32 KB precisely because a USB-aggregated
+    ///   bulk-IN transfer can exceed 16 KB, and a short buffer truncates it.
+    ///
+    /// It also brings `NDN_RX_AGG_DBG`, which reports average bytes per transfer — the instrument
+    /// for the still-open question below.
     pub fn spawn_rx_pump(self: &std::sync::Arc<Self>, depth: usize) -> Vec<std::thread::JoinHandle<()>> {
-        use std::sync::atomic::Ordering;
         self.pause_drain(true);
-        self.rx_pumped.store(true, Ordering::Relaxed);
-        (0..depth.max(1))
-            .map(|_| {
-                let me = self.clone();
-                std::thread::spawn(move || {
-                    let mut buf = vec![0u8; 16384];
-                    loop {
-                        match me.handle.read_bulk(me.ep_in, &mut buf, Duration::from_millis(200)) {
-                            Ok(n) if n > 0 => {
-                                if let Some(cap) = me.decode_rx(&buf[..n]) {
-                                    me.rx_pending.lock().unwrap().push_back(cap);
-                                    me.rx_notify.notify_one();
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                })
-            })
-            .collect()
+        crate::rx_pump::spawn_rx_pump(self, depth)
     }
 
     /// On-air-verified maximum single-MPDU 802.11 payload for this chip: plain DATA
@@ -1527,20 +1513,9 @@ impl FrameIo for Mt7612uBackend {
     }
 
     async fn recv_frame(&self) -> Result<CapturedFrame, FaceError> {
-        use std::sync::atomic::Ordering;
-        // Pumped mode: background threads (spawn_rx_pump) fill rx_pending; just
-        // drain it, waking on the notify. Full-rate, no per-call blocking read.
-        if self.rx_pumped.load(Ordering::Relaxed) {
-            loop {
-                if let Some(cap) = self.rx_pending.lock().unwrap().pop_front() {
-                    return Ok(cap);
-                }
-                let notified = self.rx_notify.notified();
-                if let Some(cap) = self.rx_pending.lock().unwrap().pop_front() {
-                    return Ok(cap);
-                }
-                let _ = tokio::time::timeout(Duration::from_millis(200), notified).await;
-            }
+        // Pumped mode: background threads fill the shared queue; just drain it.
+        if self.rx.is_pumped() {
+            return Ok(self.rx.recv().await);
         }
         loop {
             let handle = self.handle.clone();
@@ -1598,6 +1573,42 @@ impl Mt7612uBackend {
             },
             ..RadioCapability::wifi_monitor_5ghz(vec![6, 36])
         }
+    }
+}
+
+/// The mt76 side of the shared RX pump (#80).
+///
+/// **`parse_transfer` returns at most one frame, and that is a preserved limitation, not a design.**
+/// The trait returns a `Vec` because a chip may pack several RX units into one bulk-IN transfer;
+/// `decode_rx` instead treats the whole transfer as a single unit — it slices
+/// `[MT76_RXD_LEN .. len-4]` and ignores the MT_RX_INFO length field in the first 4 bytes. If mt76
+/// USB RX does aggregate, this drops every unit after the first *and* mis-parses the concatenation.
+///
+/// That is deliberately **not** changed here. This port is otherwise behaviour-identical, and the
+/// aggregation question needs the wire answered on silicon, not guessed: run with `NDN_RX_AGG_DBG=1`
+/// and compare average bytes/transfer against single-frame sizes. Reading the length field would be
+/// the fix if it aggregates — but a "fix" written blind against a format nobody measured is how this
+/// codebase accumulated the defects the surrounding work has been removing.
+///
+/// **Unvalidated on silicon.** No MT7612U is attached to either OPi; the MediaTek part on o5p-1 is
+/// an MT7610U (`0e8d:7610`, bound to `mt76x0u`) — a different, 1×1 chip this backend's PID list does
+/// not even match. The leak and buffer-size fixes above are provable by inspection; the RX path
+/// itself has not been exercised.
+impl crate::rx_pump::Pumpable for Mt7612uBackend {
+    fn pump_handle(&self) -> Arc<DeviceHandle<Context>> {
+        self.handle.clone()
+    }
+
+    fn pump_bulk_in(&self) -> u8 {
+        self.ep_in
+    }
+
+    fn parse_transfer(&self, buf: &[u8]) -> Vec<CapturedFrame> {
+        self.decode_rx(buf).into_iter().collect()
+    }
+
+    fn pump_state(&self) -> &crate::rx_pump::RxPumpState {
+        &self.rx
     }
 }
 

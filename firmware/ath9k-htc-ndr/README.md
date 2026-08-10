@@ -382,26 +382,40 @@ silicon with a TX-descriptor timestamp" that document names**: `AR_SendTimestamp
 its beacon engine. Explicitly not an AP beacon — no timekeeper role, no dedicated frame, no host
 identity; the token is a clock reading and the sender stays keyed to its ephemeral nonce.
 
-**Working**, from a capture on the second node:
+**Working, both halves.** A first capture proved the silicon reports a live per-frame TX TSF (8733
+tokens parsed, 8703 distinct timestamps stepping ~1.1 ms = the frame interval) but could not say
+*which* transmission each timestamp belonged to: `ts_seqnum` reads **0**, `EN_HWSEQ` being
+deliberately clear. Completions are batched, so the reference lag varied per frame and a lag scan
+over L = 0…6 found no tight fit — best residual sd **1550 µs**, about one frame interval.
+
+The fix is a firmware-side TX counter rather than the 802.11 sequence: each frame carries its own
+`my_idx`, that index rides on `ath_tx_buf.ndr_tx_idx` from `tgt_HTCRecvMessageHandler` to
+`owltgt_tx_processq`, and the completion records (`my_idx`, `ts_tstamp`). A receiver builds
+`my_idx → its own RX TSF` from every frame it overhears and pairs `ref_idx` exactly.
+
+**Measured** — o5p-1 transmitting, C4 observing, both AR9271, ch13, 20 s, 17869 frames at ~890/s:
 
 | | |
 |---|---|
-| tokens emitted and parsed | 8733 / 8733 |
-| distinct TX timestamps | **8703**, stepping ~1.1 ms = the frame interval |
-| change between consecutive residuals | **~60 µs median** |
+| frames overheard | 17267 / 17869 = **96.6%** |
+| exact `ref_idx` pairings | **16699** |
+| relative clock rate | **+0.98 ppm** |
+| residual after removing that rate | **sd 1.05 µs, max 3.5 µs** |
 
-So the silicon reports a live per-frame TX TSF, the firmware publishes it, the far node receives it,
-and the clock relationship between the two nodes is visible.
+Microsecond common view between two independent radios, carried entirely by ordinary named data,
+with no beacon and zero extra airtime.
 
-**Not working: the correlator.** `ts_seqnum` reads **0** — the hardware assigns no sequence number,
-`EN_HWSEQ` being deliberately clear — so a token cannot say *which* transmission its timestamp
-belongs to. Completions are batched, so the reference lag varies per frame, and a lag scan over
-L = 0…6 finds no tight fit: best residual sd **1550 µs**, about one frame interval, against a
-per-sample change of ~60 µs.
+The control that makes this a result rather than an arithmetic coincidence: shifting `ref_idx` by
+one in either direction collapses the fit.
 
-**Fix:** a firmware-side TX counter instead of the 802.11 sequence — tag the outgoing frame, carry
-the counter in the token, and record it against `ts_tstamp` at completion (a field on `ath_tx_buf`,
-set in `ath_tgt_tx_prepare`, read in `owltgt_tx_processq`).
+| `ref_idx` shift | −3 | −2 | −1 | **0** | +1 | +2 | +3 |
+|---|---|---|---|---|---|---|---|
+| residual sd (µs) | 1052 | 885 | 623 | **1.05** | 3125 | 2872 | 2914 |
+
+⚠ Bootstrap subtlety, and it cost a whole capture round: stamping is gated on having seen a
+completion, and the first frame out is necessarily unstamped. `ndr_time_note_tx()` must therefore
+*count* an `idx == 0` completion while refusing to make it the reference. Gating the note itself on
+a non-zero index deadlocks the mechanism — measured on air as **zero tokens emitted**.
 
 ⚠ Three parser traps, for whoever writes the next analysis: radiotap TSFT is **8-byte aligned** to
 the header start after any extended present words (misaligning gave ~9.5e16 "µs"); never

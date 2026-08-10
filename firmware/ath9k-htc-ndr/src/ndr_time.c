@@ -5,7 +5,7 @@
 #include "ar5416reg.h"
 #include "ndr_time.h"
 
-struct ndr_time_state ndr_time_state = { NDR_TIME_MAGIC, 0, 0, 0, 0, 0 };
+struct ndr_time_state ndr_time_state = { NDR_TIME_MAGIC, 0, 0, 0, 0, 0, 0 };
 
 static void wr_be32(a_uint8_t *p, a_uint32_t v)
 {
@@ -15,30 +15,44 @@ static void wr_be32(a_uint8_t *p, a_uint32_t v)
 	p[3] = (a_uint8_t)v;
 }
 
-void ndr_time_note_tx(a_uint32_t seq, a_uint32_t tsf)
+void ndr_time_note_tx(a_uint32_t idx, a_uint32_t tsf)
 {
 	if (ndr_time_state.noted && tsf != ndr_time_state.last_tsf)
 		ndr_time_state.advanced++;
-	ndr_time_state.last_seq = seq;
-	ndr_time_state.last_tsf = tsf;
 	ndr_time_state.noted++;
+
+	/*
+	 * idx == 0 means the frame carried no token, so its send time is unattributable and must not
+	 * become the reference -- but it still counts as a completion. That distinction is what
+	 * bootstraps the whole thing: stamping is gated on having seen a completion, and the first
+	 * frame out is necessarily unstamped, so a note path that ignored idx == 0 would never let
+	 * the first stamp happen and no frame would ever carry a token.
+	 */
+	if (idx == 0)
+		return;
+
+	ndr_time_state.last_idx = idx;
+	ndr_time_state.last_tsf = tsf;
 }
 
-void ndr_time_stamp_frame(a_uint8_t *data, a_uint32_t len)
+a_uint32_t ndr_time_stamp_frame(a_uint8_t *data, a_uint32_t len)
 {
+	a_uint32_t idx;
+
 	if (len < NDR_TT_OFF + NDR_TT_LEN)
-		return;
+		return 0;
 	/* Nothing to report yet: leave the frame untouched rather than publish a zero reading. */
 	if (ndr_time_state.noted == 0)
-		return;
+		return 0;
 
-	wr_be32(data + NDR_TT_OFF, NDR_TT_MAGIC);
-	data[NDR_TT_OFF + 4] = (a_uint8_t)(ndr_time_state.last_seq >> 8);
-	data[NDR_TT_OFF + 5] = (a_uint8_t)ndr_time_state.last_seq;
-	data[NDR_TT_OFF + 6] = 0;
-	data[NDR_TT_OFF + 7] = 0;
-	wr_be32(data + NDR_TT_OFF + 8, ndr_time_state.last_tsf);
+	idx = ++ndr_time_state.next_idx; /* 0 means "not stamped", so start at 1 */
+
+	wr_be32(data + NDR_TT_OFF,      NDR_TT_MAGIC);
+	wr_be32(data + NDR_TT_OFF + 4,  idx);                    /* this frame */
+	wr_be32(data + NDR_TT_OFF + 8,  ndr_time_state.last_idx); /* the frame the TSF belongs to */
+	wr_be32(data + NDR_TT_OFF + 12, ndr_time_state.last_tsf);
 	ndr_time_state.stamped++;
+	return idx;
 }
 
 /*

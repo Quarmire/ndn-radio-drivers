@@ -26,11 +26,33 @@
  *
  * ## Wire format, at body offset NDR_TT_OFF
  *
- *   u32 magic 'NDTT' | u16 ref_seq | u16 pad | u32 tx_tsf
+ *   u32 magic 'NDTT' | u32 my_idx | u32 ref_idx | u32 ref_tsf
  *
- * Big-endian, like the rest of this firmware's host protocol. `ref_seq` is the 802.11 sequence the
- * hardware actually transmitted (`ts_seqnum`), not the one the host asked for — the MAC may assign
- * its own, and the receiver reads the transmitted value.
+ * Big-endian. The correlator is a FIRMWARE-side counter, not the 802.11 sequence: `ts_seqnum` reads
+ * 0 on this path because `EN_HWSEQ` is deliberately clear, so the hardware assigns no sequence and
+ * a token had no way to say which transmission its timestamp belonged to. Measured consequence —
+ * completions are batched, the reference lag varied per frame, and a lag scan found no tight fit
+ * (best residual sd 1550 µs, about one frame interval, against a per-sample change of ~60 µs).
+ *
+ * Each outgoing frame therefore carries its own `my_idx`, and the index travels on the tx buffer so
+ * that the completion path can record (`my_idx`, `ts_tstamp`). A receiver builds `my_idx -> its own
+ * RX TSF` from every frame it hears and pairs `ref_idx` exactly, with no lag to guess at.
+ *
+ * ## Measured, two nodes, ch13, 20 s, 17869 frames at ~890/s
+ *
+ * 16699 exact pairings (96.6% of frames overheard). The two TSFs differ by +0.98 ppm; removing that
+ * linear rate leaves a residual of **sd 1.05 us, max 3.5 us** — microsecond common view between two
+ * independent radios, carried entirely by ordinary data frames, with no beacon and no extra airtime.
+ *
+ * The counter is doing the work, not the arithmetic: shifting `ref_idx` by one in either direction
+ * takes the residual from 1.05 us to 623 us / 3125 us. That cliff is the control, and it is also why
+ * the earlier `ts_seqnum` version failed — with every sequence reading 0 there was nothing to pair
+ * on, and the best lag-scan fit was sd 1550 us, about one frame interval.
+ *
+ * ⚠ Bootstrap subtlety: stamping is gated on having seen a completion, and the first frame out is
+ * necessarily unstamped. So `ndr_time_note_tx()` must count an `idx == 0` completion even though it
+ * refuses to make it the reference. Gating the note itself on a non-zero index deadlocks the whole
+ * mechanism — measured as zero tokens on air.
  *
  * ⚠ The token is a clock reading, not a name or an address. It says "my TSF was X", nothing about
  * who "I" am; the transmitter stays keyed only by its ephemeral source nonce.
@@ -43,17 +65,19 @@
 
 #define NDR_TT_MAGIC 0x4e445454u /* 'NDTT' */
 #define NDR_TT_OFF   24          /* body offset: just past the 802.11 MAC header */
-#define NDR_TT_LEN   12
+#define NDR_TT_LEN   16
 
 /* Record what the hardware reported for a completed transmission. */
-void ndr_time_note_tx(a_uint32_t seq, a_uint32_t tsf);
+void ndr_time_note_tx(a_uint32_t idx, a_uint32_t tsf);
 
 /* Stamp an outgoing frame with the most recent completed transmission's (seq, TSF). */
-void ndr_time_stamp_frame(a_uint8_t *data, a_uint32_t len);
+/* Stamps the frame and returns the index assigned to it (0 if it was not stamped). */
+a_uint32_t ndr_time_stamp_frame(a_uint8_t *data, a_uint32_t len);
 
 struct ndr_time_state {
 	a_uint32_t magic;
-	a_uint32_t last_seq;
+	a_uint32_t next_idx;  /* counter handed to the next outgoing frame */
+	a_uint32_t last_idx;  /* index of the most recent completion */
 	a_uint32_t last_tsf;
 	a_uint32_t noted;    /* completions observed */
 	a_uint32_t stamped;  /* frames stamped */

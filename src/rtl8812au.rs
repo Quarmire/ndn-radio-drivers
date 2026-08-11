@@ -6435,7 +6435,6 @@ impl FrameIo for Rtl8812auBackend {
 // Marker only: this backend injects whole-frame legacy 6 Mbps (NAN management
 // frames), so the exact HT/VHT rate does not apply — `set_rate` (the FrameIo default
 // no-op) and the derived `inject_at` both just inject.
-impl crate::WifiRadio for Rtl8812auBackend {}
 
 /// Exposes the always-on free-run per-frame RX-stamp clock (RXTSFL) now latched onto every
 /// received management frame. No read-now port TSF here, so `read_clock` stays the default `None`.

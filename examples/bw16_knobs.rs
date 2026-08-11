@@ -13,7 +13,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     use bytes::Bytes;
-    use ndn_frame_io::{FrameFormat, FrameIo, InjectFrame, McsDescriptor, TxIntent, WifiRadio};
+    use ndn_frame_io::{FrameFormat, FrameIo, InjectFrame, McsDescriptor, TxIntent};
     use ndn_radio_drivers::{Bw16SerialBackend, LibUsbRtl88xxBackend};
     use std::collections::BTreeMap;
     use std::sync::Arc;

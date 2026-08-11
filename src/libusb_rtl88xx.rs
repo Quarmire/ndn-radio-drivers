@@ -5344,10 +5344,9 @@ impl RadioProfile for LibUsbRtl88xxBackend {
     }
 }
 
-// `WifiRadio` is now a marker (a `dyn WifiRadio` still names this as a Wi-Fi radio);
+// `WifiRadio` is now a marker (a `dyn FrameIo` still names this as a Wi-Fi radio);
 // `inject_at` is the derived HAL default (`set_rate` + `inject`), so the driver holds
 // rate as state and no longer implements a per-frame exact-rate path.
-impl crate::WifiRadio for LibUsbRtl88xxBackend {}
 
 impl LibUsbRtl88xxBackend {
     /// The rate to transmit `frame` at: the control-plane-set MCS (state) if present,

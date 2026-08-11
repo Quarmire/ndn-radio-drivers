@@ -9,7 +9,7 @@
 pub use ndn_frame_io::{
     frame, radiotap, BROADCAST, CapturedFrame, DEFAULT_SRC, FaceError, FaceId, FrameFormat,
     FrameIo, InjectFrame, MAX_RELIABLE_MCS, McsDescriptor, McsPolicy, Reach, Reliability,
-    TxIntent, WifiRadio, mcs_for_rssi, mcs_phy_rate_bps,
+    TxIntent, mcs_for_rssi, mcs_phy_rate_bps,
 };
 // #78: the capability traits `OpenRadio` hands out. Re-exported so a caller of `open_named_radio`
 // needs exactly one import to use everything the opener returns.

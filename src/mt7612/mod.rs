@@ -1619,7 +1619,6 @@ impl RadioProfile for Mt7612uBackend {
 }
 
 // Marker only: `inject_at` is the derived HAL default (`set_rate` + `inject`).
-impl crate::WifiRadio for Mt7612uBackend {}
 
 impl Mt7612uBackend {
     /// The rate to transmit `frame` at: the control-plane-set MCS (state) if present,

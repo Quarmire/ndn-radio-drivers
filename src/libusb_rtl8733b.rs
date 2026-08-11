@@ -37,8 +37,7 @@ use ndn_frame_io::{
 use crate::realtek_rx;
 use ndn_radio_hal::{
     Band, Bandwidth, McsDescriptor, RadioCapability, RadioKnobs, RadioProfile, RadioTime,
-    RadioTimeSource, TxDiscipline, WifiRadio,
-};
+    RadioTimeSource, TxDiscipline, };
 use ndn_transport::FaceError;
 use rusb::{Context, Device, DeviceHandle, Direction, TransferType, UsbContext};
 
@@ -3130,7 +3129,6 @@ impl FrameIo for Rtl8733buBackend {
 
 // Marker only: `inject_at` is the derived HAL default (`set_rate` + `inject`); rate
 // lives in `tx_rate`/`tx_flags`, which `inject` already uses.
-impl WifiRadio for Rtl8733buBackend {}
 
 impl RadioKnobs for Rtl8733buBackend {
     fn set_channel(&self, channel: u8, bw: Bandwidth) -> Result<(), FaceError> {

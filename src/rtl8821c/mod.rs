@@ -1417,7 +1417,6 @@ impl RadioProfile for Rtl8821cuBackend {
     }
 }
 
-impl crate::WifiRadio for Rtl8821cuBackend {}
 
 impl Rtl8821cuBackend {
     /// The rate to transmit `frame` at: the control-plane-set MCS (state) if present,

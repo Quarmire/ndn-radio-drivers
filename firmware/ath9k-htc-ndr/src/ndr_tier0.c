@@ -193,6 +193,11 @@ a_int32_t ndr_may_match(const ndr_filter_t *f, const ndr_filter_t *mask)
 {
 	a_uint32_t i;
 
+	/* Fill cap before any mask test — the mask test is a pure AND and an
+	 * over-full filter passes every one of them. See NDR_FILL_CAP. */
+	if (ndr_popcount(f) > NDR_FILL_CAP)
+		return 0;
+
 	for (i = 0; i < 12; i++) {
 		a_uint8_t want = mask->b[i];
 

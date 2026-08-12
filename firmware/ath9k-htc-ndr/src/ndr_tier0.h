@@ -52,6 +52,23 @@ typedef int32_t  a_int32_t;
 /* Deepest prefix inserted. Beyond this the filter saturates for every user of the frame. */
 #define NDR_MAX_DEPTH   8
 
+/*
+ * Admission fill cap: the most set bits a RECEIVED filter may carry and still be
+ * tested against a local mask.
+ *
+ * ndr_may_match is a pure AND, so an all-ones filter matches every registered
+ * mask at every node — a one-frame universal wake, and once the scheduler keys
+ * on this field, a one-frame network-wide claim suppression (every slot reads
+ * busy, presence forged for every owner). A legitimate filter at NDR_MAX_DEPTH
+ * sets 30 bits; 48 leaves headroom for future class tokens and bounds a
+ * just-under-cap adversary to ~(48/94)^4 per targeted prefix.
+ *
+ * SHARED WIRE PARAMETER. Must equal FILL_CAP in the Rust copies
+ * (ndn-face-monitor-wifi/src/tier0.rs, lr2021-nrf54l15-rs/src/tier0.rs) or the
+ * implementations disagree about which frames are admissible.
+ */
+#define NDR_FILL_CAP    48
+
 /* Group key width. The key IS the trust context (addressing doctrine §8). */
 #define NDR_KEY_LEN     16
 

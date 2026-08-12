@@ -79,6 +79,31 @@ pub const K: u32 = 4;
 /// frame*, so the tail is bounded here and deeper matching is left to the software tier.
 pub const MAX_DEPTH: usize = 8;
 
+/// **Admission fill cap** — the maximum number of set bits a *received* filter may carry and still
+/// be tested against any local mask.
+///
+/// Without it, [`PrefixFilter::may_match`] is a pure AND: a frame with all 94 bits set matches every
+/// registered mask at every node, for free, computed once. That is a one-frame universal wake — and
+/// once the scheduler keys on this field it becomes worse than a wake, because the same frame
+/// matches every slot owner's mask: every slot reads busy, presence is forged for every owner
+/// including departed ones, and claims are suppressed network-wide for a full presence window per
+/// frame.
+///
+/// **Sizing.** A legitimate filter at the depth cap sets 30 bits (measured, `MAX_DEPTH` = 8,
+/// `K` = 4 — see the depth/popcount table in the tests). 48 leaves headroom for future class tokens
+/// while bounding a just-under-cap adversary to roughly `(48/94)^4` ≈ 7% per targeted prefix rather
+/// than 100%.
+///
+/// **Scope, honestly.** This removes the *amplified* attack — one frame forging presence for every
+/// group at once. It does not stop an adversary forging presence for a single group it knows the
+/// name of; that is inherent to unauthenticated MAC-level evidence and is not a property any
+/// arrangement of these 94 bits can provide.
+///
+/// Coupled to `MAX_DEPTH`, `K` and any future class tokens, so it is a **shared wire parameter**:
+/// every implementation must use the same value or they disagree about which frames are admissible.
+pub const FILL_CAP: u32 = 48;
+
+
 /// The two bits of octet 0 that must not be used by the filter (I/G and U/L).
 const RESERVED_MASK0: u8 = 0b0000_0011;
 
@@ -288,6 +313,11 @@ impl PrefixFilter {
     /// `false` is **exact** — the name is definitely not under it. `true` means *probably*, and the
     /// software tier decides.
     pub fn may_match(&self, mask: &Self) -> bool {
+        // Fill cap first — see FILL_CAP. Must match the host copy exactly or the two disagree about
+        // which frames are admissible, which is a silent interop split.
+        if self.popcount() > FILL_CAP {
+            return false;
+        }
         for i in 0..12 {
             let want = mask.0[i] & !if i == 0 { RESERVED_MASK0 } else { 0 };
             if self.0[i] & want != want {

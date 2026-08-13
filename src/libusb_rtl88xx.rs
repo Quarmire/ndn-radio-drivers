@@ -3466,6 +3466,14 @@ impl LibUsbRtl88xxBackend {
         self.bb_write(0x41e8, 0x0001_fc00, idx)?; // OFDM ref, path B
         self.bb_write(0x18a0, 0x007f_0000, idx)?; // CCK ref, path A
         self.bb_write(0x41a0, 0x007f_0000, idx)?; // CCK ref, path B
+        // **Anchor the watchdog to the requested power, or it undoes this within ~2 s.**
+        // `thermal_track` (spawn_watchdog, every ~2 s) rewrites these same reference registers
+        // from `tx_ref_base` + the thermal delta — so a set_tx_power that only wrote the registers
+        // was silently reverted at the next tick. That is exactly what the 2026-08-13 on-air sweep
+        // measured: five indices commanded, Ok returned every time, zero RF effect. Storing the
+        // base here makes the watchdog PRESERVE the request (thermally compensated around it,
+        // which is the correct semantics for a user-set index) instead of fighting it.
+        self.tx_ref_base.store(idx.min(0x3f) as u8, Ordering::Relaxed);
         Ok(())
     }
 

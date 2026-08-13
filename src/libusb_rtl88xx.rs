@@ -403,25 +403,35 @@ impl LibUsbRtl88xxBackend {
     }
 
     /// Open a *specific* RTL88xx dongle by product id — for a host with more than one attached
-    /// (e.g. an on-air 2-node test with two radios inches apart). Claims the first device whose
-    /// `product_id` equals `want_pid`.
+    /// (e.g. an on-air 2-node test with two radios inches apart). Claims the **first** device whose
+    /// `product_id` equals `want_pid`. When several identical dongles share the host (e.g. two
+    /// `0bda:a81a`, one on the kernel mesh and one spare), use [`open_pid_select`](Self::open_pid_select)
+    /// to pin a specific one by index or USB bus:port.
     pub fn open_pid(want_pid: u16) -> Result<Self, FaceError> {
-        let context = Context::new().map_err(usb_err)?;
-        for device in context.devices().map_err(usb_err)?.iter() {
-            let desc = device.device_descriptor().map_err(usb_err)?;
-            if desc.vendor_id() == REALTEK_VID && desc.product_id() == want_pid {
-                return Self::claim(device);
-            }
-        }
-        Err(FaceError::Io(io::Error::new(
-            io::ErrorKind::NotFound,
-            format!("no Realtek 0bda:{want_pid:04x} found"),
-        )))
+        Self::open_pid_select(want_pid, &crate::DeviceSelect::First)
+    }
+
+    /// Open the RTL88xx dongle with `want_pid` chosen by `sel` (first / Nth / a `"<bus>-<port>"`
+    /// address) — the selector two identical dongles need so the named-radio face can take the
+    /// **spare** while the kernel keeps the live mesh on the other. Warns (or, with
+    /// `NDN_GUARD_LIVE_LINK=1`, refuses) if the chosen device currently carries an UP kernel netdev.
+    pub fn open_pid_select(want_pid: u16, sel: &crate::DeviceSelect) -> Result<Self, FaceError> {
+        let device = crate::usb_select::select_device(&[want_pid], REALTEK_VID, sel, "RTL88xx")?;
+        Self::claim(device)
     }
 
     /// [`open_pid`](Self::open_pid) + bring up 5 GHz monitor mode on `channel`.
     pub fn open_monitor_pid(want_pid: u16, channel: u8) -> Result<Self, FaceError> {
-        let backend = Self::open_pid(want_pid)?;
+        Self::open_monitor_pid_select(want_pid, &crate::DeviceSelect::First, channel)
+    }
+
+    /// [`open_pid_select`](Self::open_pid_select) + bring up 5 GHz monitor mode on `channel`.
+    pub fn open_monitor_pid_select(
+        want_pid: u16,
+        sel: &crate::DeviceSelect,
+        channel: u8,
+    ) -> Result<Self, FaceError> {
+        let backend = Self::open_pid_select(want_pid, sel)?;
         backend.bring_up(channel)?;
         Ok(backend)
     }

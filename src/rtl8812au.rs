@@ -58,7 +58,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use rusb::{Context, Device, DeviceHandle, Direction, TransferType, UsbContext};
+use rusb::{Context, Device, DeviceHandle, Direction, TransferType};
 
 use crate::realtek_rx;
 use ndn_frame_io::{frame, CapturedFrame, ClockDomainId, FrameFormat, FrameIo, InjectFrame};
@@ -4267,30 +4267,19 @@ impl Rtl8812auBackend {
     /// Open the **nth** (0-based) matching RTL8812AU-family adapter in USB-enumeration order.
     /// A host can carry several identical 8812au dongles (e.g. two `0bda:8812` on one OPi); `open()`
     /// always grabs the first, which is useless when that one is wedged and a fresh one sits behind it.
-    /// This is the device selector the standardized open needs — `open_named_radio` drives it from
-    /// `NDN_USB_INDEX`. Logs bus:addr of every candidate so the caller can see what it picked.
+    /// Index is not stable across reboots/hotplug — [`open_select`](Self::open_select) also takes a
+    /// stable `"<bus>-<port>"` USB address.
     pub fn open_nth(index: usize) -> Result<Self, FaceError> {
-        let context = Context::new().map_err(usb_err)?;
-        let mut seen = 0usize;
-        for device in context.devices().map_err(usb_err)?.iter() {
-            let desc = device.device_descriptor().map_err(usb_err)?;
-            if desc.vendor_id() == REALTEK_VID && RTL8812AU_PIDS.contains(&desc.product_id()) {
-                tracing::info!(
-                    target: "named_radio",
-                    candidate = seen, bus = device.bus_number(), addr = device.address(),
-                    pid = format_args!("0x{:04x}", desc.product_id()), want = index,
-                    "8812au candidate"
-                );
-                if seen == index {
-                    return Self::claim(device, desc.product_id());
-                }
-                seen += 1;
-            }
-        }
-        Err(FaceError::Io(io::Error::new(
-            io::ErrorKind::NotFound,
-            format!("no RTL8812AU at index {index} ({seen} found; 0bda:{{8812,881a,881b,881c,8813}})"),
-        )))
+        Self::open_select(&crate::DeviceSelect::Index(index))
+    }
+
+    /// Open the RTL8812AU-family adapter chosen by `sel` (first / Nth / a `"<bus>-<port>"` address).
+    /// Warns (or, with `NDN_GUARD_LIVE_LINK=1`, refuses) if the chosen device currently carries an UP
+    /// kernel netdev, so a named-radio face never silently grabs the host's live Wi-Fi link.
+    pub fn open_select(sel: &crate::DeviceSelect) -> Result<Self, FaceError> {
+        let device = crate::usb_select::select_device(&RTL8812AU_PIDS, REALTEK_VID, sel, "RTL8812AU")?;
+        let pid = device.device_descriptor().map_err(usb_err)?.product_id();
+        Self::claim(device, pid)
     }
 
     fn claim(device: Device<Context>, pid: u16) -> Result<Self, FaceError> {

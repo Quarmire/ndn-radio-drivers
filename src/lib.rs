@@ -18,6 +18,11 @@ pub use ndn_frame_io::{
 // dependency on the other to name it.
 pub use ndn_radio_hal::{OpenRadio, RadioKnobs, RadioProfile, RadioTime};
 
+/// Selecting one dongle among several identical ones (by index or USB bus:port) + a guard against
+/// claiming the device that currently carries a live kernel link. Shared by the Realtek backends.
+pub mod usb_select;
+pub use usb_select::{DeviceSelect, usb_addr};
+
 mod libusb_rtl88xx;
 /// Shared Realtek RX-descriptor field decode (RSSI/MCS/timestamp) used by the USB backends.
 mod realtek_rx;
@@ -30,6 +35,7 @@ pub use libusb_rtl88xx::{
 // AR9271 (ath9k_htc) — the one Wi-Fi part whose FIRMWARE is ours, so Tier-0 can reject a frame
 // before it crosses USB (design §8.2) and TX can be scheduled off the hardware TSF (§8.5).
 // L1: USB transport + firmware download + HTC handshake + WMI. Does not yet replace ath9k_htc.
+pub mod coverage;
 mod ath9k_htc;
 pub use ath9k_htc::{
     AR9271_FIRMWARE, AR9271_FIRMWARE_TEXT, AR9271_IDS, ATHEROS_VID, Ath9kHtcBackend, FW_NAME,
@@ -92,10 +98,14 @@ pub fn rx_raw_frames() -> u64 {
 pub fn open_named_radio(pid: u16, channel: u8) -> Result<OpenRadio, FaceError> {
     use std::sync::Arc;
     let fmt = FrameFormat::RawNdn { ethertype: NDN_ETHERTYPE };
+    // Which dongle to claim when several identical ones share the host — `NDN_USB_ADDR="<bus>-<port>"`
+    // (stable) or `NDN_USB_INDEX=<n>` (enumeration order). Both branches honour it, so a node with two
+    // `0bda:a81a` can pin the spare and leave the kernel mesh on the other (see the multi-radio note).
+    let sel = crate::DeviceSelect::from_env();
     let radio: Arc<dyn FrameIo> = if matches!(pid, 0xa81a | 0xa811 | 0x8814) {
-        // RTL8822E: `open_monitor_pid` claims + BB/RF-inits + monitors + channel in one call, and its
-        // default format is already the canonical RawNdn(0x8624).
-        let d = Arc::new(LibUsbRtl88xxBackend::open_monitor_pid(pid, channel)?);
+        // RTL8822E: `open_monitor_pid_select` claims the selected device + BB/RF-inits + monitors +
+        // channel in one call, and its default format is already the canonical RawNdn(0x8624).
+        let d = Arc::new(LibUsbRtl88xxBackend::open_monitor_pid_select(pid, &sel, channel)?);
         // `NDN_TX_PWR=<idx>` lowers this radio's TX power (e.g. to dial an RX peer out of front-end
         // overload for a clean-RSSI measurement); the 88xx set_tx_power is a per-rate TXAGC index.
         if let Some(p) = std::env::var("NDN_TX_PWR").ok().and_then(|s| s.parse::<u32>().ok()) {
@@ -110,10 +120,9 @@ pub fn open_named_radio(pid: u16, channel: u8) -> Result<OpenRadio, FaceError> {
         });
     } else {
         // RTL8812AU: force the canonical format (its own default is Raw80211 for the NAN path), then
-        // bring up monitor (MAC/BB/RF + IQK/LCK) on the channel. `NDN_USB_INDEX` selects which adapter
-        // when several identical 8812au dongles share the host (0 = first enumerated).
-        let index = std::env::var("NDN_USB_INDEX").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
-        let d = Arc::new(Rtl8812auBackend::open_nth(index)?.with_format(fmt));
+        // bring up monitor (MAC/BB/RF + IQK/LCK) on the channel. `sel` (NDN_USB_ADDR / NDN_USB_INDEX)
+        // selects which adapter when several identical 8812au dongles share the host.
+        let d = Arc::new(Rtl8812auBackend::open_select(&sel)?.with_format(fmt));
         d.bring_up_monitor(channel)?;
         // `NDN_NO_PUMP=1` skips the RX pump — a pure TX-blast node needs no RX, and the pump's bulk-IN
         // threads otherwise contend with inject for USB bandwidth on a busy channel (measured: an 8812au

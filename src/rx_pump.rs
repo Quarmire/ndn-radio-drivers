@@ -11,7 +11,7 @@
 use crate::CapturedFrame;
 use rusb::{Context, DeviceHandle};
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -22,6 +22,12 @@ pub struct RxPumpState {
     pending: Mutex<VecDeque<CapturedFrame>>,
     notify: tokio::sync::Notify,
     pumped: AtomicBool,
+    /// Non-timeout bulk-IN errors since start (stall/pipe/other) — the wedge-approach signal. A
+    /// healthy pump reports 0; a climbing count is a dongle going bad BEFORE the xhci gives up on
+    /// it (both 8812au-family parts hit resets→disconnect under sustained campaign RX, 2026-08-13).
+    rx_errors: AtomicU64,
+    /// Endpoint stalls we cleared (clear_halt succeeded) — recoverable; distinct from fatal.
+    rx_stalls_cleared: AtomicU64,
 }
 
 impl Default for RxPumpState {
@@ -37,12 +43,20 @@ impl RxPumpState {
             pending: Mutex::new(VecDeque::new()),
             notify: tokio::sync::Notify::new(),
             pumped: AtomicBool::new(false),
+            rx_errors: AtomicU64::new(0),
+            rx_stalls_cleared: AtomicU64::new(0),
         }
     }
 
     /// Whether a background pump is filling the queue (vs. `recv_frame` doing its own one-shot read).
     pub fn is_pumped(&self) -> bool {
         self.pumped.load(Ordering::Relaxed)
+    }
+
+    /// `(non-timeout errors, stalls cleared)` — the pump-health counters. Poll during a run to
+    /// see a dongle degrading before the host controller disconnects it.
+    pub fn rx_health(&self) -> (u64, u64) {
+        (self.rx_errors.load(Ordering::Relaxed), self.rx_stalls_cleared.load(Ordering::Relaxed))
     }
 
     /// Buffer decoded frames and wake one waiting [`recv`](Self::recv).
@@ -108,10 +122,16 @@ pub fn spawn_rx_pump<B: Pumpable>(backend: &Arc<B>, depth: usize) -> Vec<JoinHan
                 let mut buf = vec![0u8; 32768];
                 let dbg = std::env::var_os("NDN_RX_AGG_DBG").is_some();
                 let (mut reads, mut bytes) = (0u64, 0u64);
+                // Consecutive hard errors → the endpoint is not coming back; stop hammering it.
+                // A tight busy-loop re-submitting to a NAKing/stalled endpoint is a plausible
+                // accelerant of the xhci reset→disconnect wedge (2026-08-13); this backs off and
+                // records, instead of spinning.
+                let mut consec_err = 0u32;
                 loop {
                     let Some(b) = weak.upgrade() else { break };
                     match handle.read_bulk(ep, &mut buf, Duration::from_millis(200)) {
                         Ok(n) if n > 0 => {
+                            consec_err = 0;
                             if dbg {
                                 reads += 1;
                                 bytes += n as u64;
@@ -121,7 +141,40 @@ pub fn spawn_rx_pump<B: Pumpable>(backend: &Arc<B>, depth: usize) -> Vec<JoinHan
                             }
                             b.pump_state().push(b.parse_transfer(&buf[..n]))
                         }
-                        _ => {} // timeout / empty / error: re-submit the read
+                        // Benign: no frame arrived in the window. Re-submit immediately — this is
+                        // the overwhelmingly common non-data case and must not back off.
+                        Ok(_) | Err(rusb::Error::Timeout) => consec_err = 0,
+                        // The device is gone (unplug / the wedge already happened): exit the thread
+                        // cleanly rather than spin on a dead handle.
+                        Err(rusb::Error::NoDevice) | Err(rusb::Error::NotFound) => break,
+                        // A stalled endpoint is sometimes recoverable: clear the halt and continue.
+                        Err(rusb::Error::Pipe) => {
+                            let n = b.pump_state().rx_errors.fetch_add(1, Ordering::Relaxed) + 1;
+                            if handle.clear_halt(ep).is_ok() {
+                                b.pump_state().rx_stalls_cleared.fetch_add(1, Ordering::Relaxed);
+                            }
+                            consec_err += 1;
+                            if n == 1 || n % 100 == 0 {
+                                eprintln!("PUMP HEALTH: ep {ep:#04x} stall (clear_halt), {n} rx errors total — dongle degrading");
+                            }
+                            std::thread::sleep(Duration::from_millis(2));
+                        }
+                        // Any other error (I/O, overflow, busy): count and back off briefly so a
+                        // failing endpoint is not hammered at CPU speed.
+                        Err(e) => {
+                            let n = b.pump_state().rx_errors.fetch_add(1, Ordering::Relaxed) + 1;
+                            consec_err += 1;
+                            if n == 1 || n % 100 == 0 {
+                                eprintln!("PUMP HEALTH: ep {ep:#04x} err {e:?}, {n} rx errors total — dongle degrading");
+                            }
+                            std::thread::sleep(Duration::from_millis(2));
+                        }
+                    }
+                    // ~1 s of solid errors: the endpoint is not recovering. Stop the thread; a
+                    // dead pump is visible (rx_health), a busy-looping one wedges the bus.
+                    if consec_err > 500 {
+                        eprintln!("PUMP HEALTH: ep {ep:#04x} — 500 consecutive errors, stopping reader (endpoint dead; a busy-loop here is what wedges the xhci bus)");
+                        break;
                     }
                 }
             })

@@ -3459,6 +3459,14 @@ impl LibUsbRtl88xxBackend {
     /// index (higher = more TX power). Per-rate diffs in the `0x3a00` table are
     /// left at 0, so every rate transmits at this reference power.
     pub fn set_tx_power(&self, idx: u32) -> Result<(), FaceError> {
+        // **B210-measured transfer curve (2026-08-13, ch149, legacy 6M, certified instrument —
+        // linearity 0.98–0.99 dB/dB):** the radiated response to this reference is monotone ONLY
+        // over idx 20..=63, spanning ~9.6 dB (~0.22 dB/step; 63 = calibrated top, 20 ≈ −9.6 dB).
+        // Below ~20 the analog gain chain UNDERFLOWS into a max-gain state ~11 dB ABOVE the
+        // calibrated maximum — a flat −7.3 dBFS plateau at idx 0/8/12/16, replicated across three
+        // scrambled passes at ±0.1 dB. A caller asking for "very low power" with a small index
+        // would radiate the loudest signal this chip can make; clamp into the sane region instead.
+        let idx = idx.clamp(20, 63);
         if self.bb_read(0x1c90, 1 << 15)? != 0 {
             self.bb_write(0x1c90, 1 << 15, 0)?; // enable TXAGC table writes
         }

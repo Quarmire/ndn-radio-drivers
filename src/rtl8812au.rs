@@ -4256,6 +4256,26 @@ pub struct Rtl8812auBackend {
     edca_saved: std::sync::atomic::AtomicU32,
 }
 
+impl Drop for Rtl8812auBackend {
+    /// **Leave the device in a clean, re-openable state on a normal exit** — the fix for the
+    /// "hears zero on the next open" state that a prior run's leftovers cause.
+    ///
+    /// Two things, both best-effort (a SIGKILL'd process skips Drop — the test harness handles that
+    /// with a pre-run `pkill` + `timeout`, so a run can never outlive its window and hold the
+    /// device): re-PAUSE RX DMA so the chip is not left streaming into a dead endpoint (set
+    /// `RW_RELEASE_EN`, `REG_RXPKT_NUM[18]` — the inverse of `start_rx_dma`'s final step), and
+    /// release the claimed interface so the kernel/next-open sees a free device. The pump threads
+    /// hold a `Weak` and exit on their own once this backend's `Arc` is gone.
+    fn drop(&mut self) {
+        // Re-pause RX DMA (RW_RELEASE_EN = REG_RXPKT_NUM[18]); ignore errors on a dying device.
+        if let Ok(v) = self.read32(0x0284) {
+            let _ = self.write32(0x0284, v | (1 << 18));
+        }
+        let _ = self.handle.release_interface(0);
+    }
+}
+
+
 impl Rtl8812auBackend {
     /// Find and claim the RTL8812AU (a product id in [`RTL8812AU_PIDS`]), taking
     /// it from any kernel driver. Never matches the 8812EU (`0xa81a`), so a

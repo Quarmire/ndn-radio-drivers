@@ -5,10 +5,10 @@
 //! everything and wants a small fraction, and the *size of that fraction* is what sets how much work
 //! Tier-0 can save. Sending one namespace would make the reject ratio a tautology.
 //!
-//! Frame layout: `[filter 12][name_len 1][name…]`. The filter is carried explicitly here because
-//! this PHY has no 802.11 header to hide it in — on Wi-Fi it rides `addr1‖addr2`, which are
-//! transmitted regardless. The name travels too, only so the receiver can compute **ground truth**;
-//! in production Tier-0 runs before the name is parsed at all.
+//! Frame layout: `[filter 16][name_len 1][name…]`. The filter is carried explicitly here because
+//! this PHY has no 802.11 header to hide it in — on Wi-Fi the 126-bit Blur rides
+//! `addr1‖addr2‖addr3[0..4]`, which are transmitted regardless. The name travels too, only so the
+//! receiver can compute **ground truth**; in production Tier-0 runs before the name is parsed at all.
 
 #![no_std]
 #![no_main]
@@ -68,12 +68,12 @@ async fn main(_spawner: Spawner) {
         let mut f = PrefixFilter::new();
         f.insert_name(&KEY, &nb[..n]);
 
-        // Fixed-size frames: pad to FRAME_LEN. The name length still travels in byte 12, so the
-        // receiver knows how much of the padding to ignore.
+        // Fixed-size frames: pad to FRAME_LEN. The name length travels in byte 16 (just past the
+        // 16-byte filter), so the receiver knows how much of the padding to ignore.
         let mut frame = [0u8; flrc_link::FRAME_LEN as usize];
-        frame[..12].copy_from_slice(&f.to_wire());
-        frame[12] = n as u8;
-        frame[13..13 + n].copy_from_slice(&nb[..n]);
+        frame[..16].copy_from_slice(&f.to_wire());
+        frame[16] = n as u8;
+        frame[17..17 + n].copy_from_slice(&nb[..n]);
 
         // pld_len is the TRANSMIT length in this role — see flrc_link::set_payload_len.
         // Whiten last, over the WHOLE frame including the sparse filter and the zero padding —

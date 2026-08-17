@@ -39,7 +39,7 @@ const KEY: [u8; 16] = *b"ndn/tier0-group!";
 /// ~1/8 of traffic is genuinely wanted and the rest is exactly what Tier-0 exists to discard.
 const REGISTERED: [&[u8]; 2] = [b"/0003", b"/000a"];
 
-/// Largest frame the transmitter sends: 12 filter + 1 length + up to 30 name bytes.
+/// Largest frame the transmitter sends: 16 filter + 1 length + up to 30 name bytes.
 const MAX_FRAME: usize = 48;
 
 #[embassy_executor::main]
@@ -105,7 +105,7 @@ async fn main(_spawner: Spawner) {
             // fixed-length binaries survived this only by accident of alignment. Exactly the RX twin
             // of the M5 TX-FIFO bug: it presents as a matching failure while being a buffer one.
             let _ = radio.clear_rx_fifo().await;
-            if !read_ok || n < 14 {
+            if !read_ok || n < 18 {
                 continue;
             }
             // **De-whiten.** The transmitter whitens the whole frame and this side never undid it,
@@ -114,15 +114,15 @@ async fn main(_spawner: Spawner) {
             // broken while nothing was wrong with the filter at all. The mask is XORed, so applying
             // the same function again recovers the frame.
             flrc_link::whiten(&mut buf[..n]);
-            let name_len = buf[12] as usize;
-            if 13 + name_len > n {
+            let name_len = buf[16] as usize;
+            if 17 + name_len > n {
                 continue;
             }
-            let name = &buf[13..13 + name_len];
+            let name = &buf[17..17 + name_len];
 
-            // ── Tier-0: the only input is the 12 bytes. No parse. ──────────────────────────────
+            // ── Tier-0: the only input is the 16 filter bytes. No parse. ───────────────────────
             let mut frame_filter = PrefixFilter::new();
-            frame_filter.0.copy_from_slice(&buf[..12]);
+            frame_filter.0.copy_from_slice(&buf[..16]);
             let t0_accept = masks.iter().any(|m| frame_filter.may_match(m));
 
             // ── Ground truth: real prefix match on the name (the oracle, not available in prod) ─

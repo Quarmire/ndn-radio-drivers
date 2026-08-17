@@ -60,20 +60,23 @@ pub const M_BITS: u32 = 126;
 /// 3. An independent host replication at **200 names / 400 000 trials** (`ksweep_host_replication`),
 ///    with +/-1σ error bars, disagrees with the device beyond both their error bars:
 ///
-/// | k | bits set | FP @ depth 8, host (±1σ) |
-/// |---|---|---|
-/// | 3 | 25/126 | 1.025% ± 0.016 |
-/// | **4** | **33/126** | **0.559% ± 0.012** |
-/// | 5 | 40/126 | 0.855% ± 0.015 |
-/// | 6 | 47/126 | 0.881% ± 0.015 |
-/// | 8 | 60/126 | 0.907% ± 0.015 |
+/// | k | bits set | FP @ depth 8, host 200n/400k (±1σ) | FP @ depth 8, device 12n/20k |
+/// |---|---|---|---|
+/// | 3 | 25/126 | 1.025% ± 0.016 | 0.67% |
+/// | **4** | **33/126** | **0.559% ± 0.012** | **0.45%** |
+/// | 5 | 40/126 | 0.855% ± 0.015 | 0.28% |
+/// | 6 | 47/126 | 0.881% ± 0.015 | 0.22% |
+/// | 8 | 60/126 | 0.907% ± 0.015 | 0.30% |
 ///
-/// **At m=126 the optimum is unambiguous: k=4 wins by more than the error bars.** (Re-measured after
-/// the 94→126 repack; the earlier m=94 table had two independent harnesses disagreeing on the k=4..8
-/// ordering — the *name distribution* dominated, and widening the filter separated the candidates.)
-/// k=4 minimizes FP at 0.56%, ~half of k=3 and clearly under k=5/6/8, with **zero false negatives** at
-/// every k. This module runs byte-identical code to the host (golden-vector cross-verified), so the
-/// host sweep IS the firmware's; confirm on-device via `m7_filter_test`.
+/// **The lesson survived the repack.** The 200-name/400k host sweep says k=4 wins; the 12-name/20k
+/// on-device sweep (`m7_filter_test`, re-run at m=126 on the XIAO 2026-08-17) says FP keeps falling
+/// through k=6 — the two harnesses STILL disagree on the k≥5 ordering, exactly as at m=94, because the
+/// *name distribution* dominates and 12 names is too small a sample. k=4 agrees between them (host
+/// 0.56% ≈ device 0.45%); k≥5 is where the small harness wanders. So k=4 is anchored on the
+/// large-sample host measurement, not the device. **Zero false negatives on every device line, at
+/// every depth and every k** — the safety invariant confirmed on real silicon. Golden vectors
+/// cross-verify the host/device/ath9k code is byte-identical, so this is a sampling difference, not a
+/// code difference.
 ///
 /// So k=4 on the tiebreakers too: fewest bits set (33/126, most saturation headroom), fewest hashes
 /// per frame, and it is what the on-air shadow-mode result was measured at — #106 at m=94 gave 87.1%

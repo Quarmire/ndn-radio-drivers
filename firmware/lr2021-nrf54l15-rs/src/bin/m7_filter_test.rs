@@ -44,7 +44,7 @@ mod vk {
         k
     }
 
-    pub fn set_bits(bits: &mut [u8; 12], key: &[u8; 16], prefix: &[u8], k: u32) {
+    pub fn set_bits(bits: &mut [u8; 16], key: &[u8; 16], prefix: &[u8], k: u32) {
         let h1 = name_hash(key, prefix) as u32;
         let h2 = (name_hash(&key2(key), prefix) as u32) | 1;
         for i in 0..k {
@@ -53,7 +53,7 @@ mod vk {
         }
     }
 
-    pub fn contains(bits: &[u8; 12], key: &[u8; 16], prefix: &[u8], k: u32) -> bool {
+    pub fn contains(bits: &[u8; 16], key: &[u8; 16], prefix: &[u8], k: u32) -> bool {
         let h1 = name_hash(key, prefix) as u32;
         let h2 = (name_hash(&key2(key), prefix) as u32) | 1;
         for i in 0..k {
@@ -65,7 +65,7 @@ mod vk {
         true
     }
 
-    pub fn popcount(bits: &[u8; 12]) -> u32 {
+    pub fn popcount(bits: &[u8; 16]) -> u32 {
         let mut n = 0;
         for p in 0..M_BITS as usize {
             let q = p + 2;
@@ -228,7 +228,7 @@ async fn main(_spawner: Spawner) {
         for r in 0..R {
             let n = make_name(&mut nb, tier0::MAX_DEPTH, 0x1000 + r * 0x111);
             let name = &nb[..n];
-            let mut bits = [0u8; 12];
+            let mut bits = [0u8; 16];
             tier0::for_each_prefix(name, |pfx| vk::set_bits(&mut bits, &KEY, pfx, k));
             bits_tot += vk::popcount(&bits);
 

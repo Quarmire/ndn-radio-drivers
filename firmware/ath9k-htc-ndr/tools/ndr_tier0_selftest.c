@@ -31,7 +31,7 @@ static void insert_name(ndr_filter_t *f, const unsigned char *key, const char *n
 	{
 		ndr_filter_t m;
 		ndr_mask_for(&m, key, (const a_uint8_t *)"/", 1);
-		for (i = 0; i < 12; i++)
+		for (i = 0; i < 16; i++)
 			f->b[i] |= m.b[i];
 	}
 
@@ -41,7 +41,7 @@ static void insert_name(ndr_filter_t *f, const unsigned char *key, const char *n
 			if (++depth >= NDR_MAX_DEPTH)
 				return;
 			ndr_mask_for(&m, key, (const a_uint8_t *)name, (a_uint32_t)start);
-			for (i = 0; i < 12; i++)
+			for (i = 0; i < 16; i++)
 				f->b[i] |= m.b[i];
 		}
 	}
@@ -49,7 +49,7 @@ static void insert_name(ndr_filter_t *f, const unsigned char *key, const char *n
 	if (len > 0 && depth < NDR_MAX_DEPTH) {
 		ndr_filter_t m;
 		ndr_mask_for(&m, key, (const a_uint8_t *)name, (a_uint32_t)len);
-		for (i = 0; i < 12; i++)
+		for (i = 0; i < 16; i++)
 			f->b[i] |= m.b[i];
 	}
 }
@@ -61,14 +61,14 @@ static void to_wire(ndr_filter_t *f)
 
 static int cmp12(const unsigned char *a, const unsigned char *b)
 {
-	return memcmp(a, b, 12) == 0;
+	return memcmp(a, b, 16) == 0;
 }
 
 static void dump(const char *tag, const unsigned char *b)
 {
 	int i;
 	printf("    %-8s", tag);
-	for (i = 0; i < 12; i++)
+	for (i = 0; i < 16; i++)
 		printf("%02x", b[i]);
 	printf("\n");
 }
@@ -129,7 +129,7 @@ int main(void)
 			ndr_filter_t frame, pm;
 			size_t len = strlen(v->name), j;
 
-			memcpy(&frame, v->filter, 12);
+			memcpy(&frame, v->filter, 16);
 
 			for (j = 1; j <= len; j++) {
 				if (j != len && v->name[j] != '/')

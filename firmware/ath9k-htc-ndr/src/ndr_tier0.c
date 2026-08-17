@@ -177,7 +177,7 @@ void ndr_mask_for(ndr_filter_t *out, const a_uint8_t key[NDR_KEY_LEN],
 
 	len = ndr_clamp_prefix(prefix, len);
 
-	for (i = 0; i < 12; i++)
+	for (i = 0; i < 16; i++)
 		out->b[i] = 0;
 
 	ndr_positions(pos, key, prefix, len);
@@ -198,7 +198,7 @@ a_int32_t ndr_may_match(const ndr_filter_t *f, const ndr_filter_t *mask)
 	if (ndr_popcount(f) > NDR_FILL_CAP)
 		return 0;
 
-	for (i = 0; i < 12; i++) {
+	for (i = 0; i < 16; i++) {
 		a_uint8_t want = mask->b[i];
 
 		if (i == 0)
@@ -233,6 +233,6 @@ void ndr_filter_from_hdr(ndr_filter_t *out, const a_uint8_t *wh)
 {
 	a_uint32_t i;
 
-	for (i = 0; i < 12; i++)
+	for (i = 0; i < 16; i++)
 		out->b[i] = wh[4 + i];
 }

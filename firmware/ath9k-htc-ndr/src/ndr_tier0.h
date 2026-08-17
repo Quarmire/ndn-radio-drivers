@@ -44,7 +44,7 @@ typedef int32_t  a_int32_t;
 #endif
 
 /* Usable filter bits: 96 (two address fields) minus the two reserved bits of octet 0. */
-#define NDR_M_BITS      94
+#define NDR_M_BITS      126
 
 /* Hashes per prefix. Must equal `K` in the normative lr2021-nrf54l15-rs/src/tier0.rs. */
 #define NDR_K           4
@@ -67,7 +67,7 @@ typedef int32_t  a_int32_t;
  * (ndn-face-monitor-wifi/src/tier0.rs, lr2021-nrf54l15-rs/src/tier0.rs) or the
  * implementations disagree about which frames are admissible.
  */
-#define NDR_FILL_CAP    48
+#define NDR_FILL_CAP    64
 
 /* Group key width. The key IS the trust context (addressing doctrine §8). */
 #define NDR_KEY_LEN     16
@@ -77,7 +77,7 @@ typedef int32_t  a_int32_t;
 
 /* A 96-bit in-frame filter: 94 usable bits plus the two reserved address bits. */
 typedef struct {
-	a_uint8_t b[12];
+	a_uint8_t b[16];
 } ndr_filter_t;
 
 /*

@@ -38,7 +38,7 @@
 //! unlinkable by an observer who does not hold the key.
 
 /// Usable filter bits. 96 (two address fields) minus the two reserved bits of octet 0.
-pub const M_BITS: u32 = 94;
+pub const M_BITS: u32 = 126;
 
 /// **Hashes per prefix — k = 4.**
 ///
@@ -101,7 +101,7 @@ pub const MAX_DEPTH: usize = 8;
 ///
 /// Coupled to `MAX_DEPTH`, `K` and any future class tokens, so it is a **shared wire parameter**:
 /// every implementation must use the same value or they disagree about which frames are admissible.
-pub const FILL_CAP: u32 = 48;
+pub const FILL_CAP: u32 = 64;
 
 
 /// The two bits of octet 0 that must not be used by the filter (I/G and U/L).
@@ -109,7 +109,7 @@ const RESERVED_MASK0: u8 = 0b0000_0011;
 
 /// A 96-bit in-frame filter: 94 usable bits plus the two reserved address bits.
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub struct PrefixFilter(pub [u8; 12]);
+pub struct PrefixFilter(pub [u8; 16]);
 
 impl Default for PrefixFilter {
     fn default() -> Self {
@@ -269,7 +269,7 @@ pub fn clamp_prefix(prefix: &[u8]) -> usize {
 impl PrefixFilter {
     /// An empty filter (all usable bits clear).
     pub const fn new() -> Self {
-        Self([0; 12])
+        Self([0; 16])
     }
 
     /// Set one bit, skipping the two reserved positions by construction.
@@ -318,7 +318,7 @@ impl PrefixFilter {
         if self.popcount() > FILL_CAP {
             return false;
         }
-        for i in 0..12 {
+        for i in 0..16 {
             let want = mask.0[i] & !if i == 0 { RESERVED_MASK0 } else { 0 };
             if self.0[i] & want != want {
                 return false;
@@ -342,7 +342,7 @@ impl PrefixFilter {
     ///
     /// Applied at the boundary rather than trusted from the caller: a filter whose bit pattern
     /// happens to clear these would put a globally-unique unicast address on the air.
-    pub fn to_wire(&self) -> [u8; 12] {
+    pub fn to_wire(&self) -> [u8; 16] {
         let mut w = self.0;
         w[0] = (w[0] & !RESERVED_MASK0) | 0b0000_0011; // I/G = group, U/L = local
         w

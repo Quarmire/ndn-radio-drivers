@@ -18,16 +18,21 @@
 //!
 //! ## Sizing, and why the source paper's k does not transfer
 //!
-//! NDN-NIC uses k=2, which is optimal for *its* regime — ~10⁵ keys in 65536 bits. Ours is the
-//! opposite: **n ≈ name depth (4–8) in [`M_BITS`] = 94 bits**, where optimal k is far higher.
-//! Copying k=2 would cost roughly two orders of magnitude of false-positive rate. See [`K`].
+//! NDN-NIC uses k=2, optimal for *its* regime (~10⁵ keys in 65536 bits — a *low* bits-per-key
+//! loading, where few hashes are optimal). Ours is the opposite loading: **n ≈ one name's prefix
+//! chain (4–8) in [`M_BITS`] = 126 bits**, ~16–31 bits-per-key. There the textbook optimum
+//! `(M/n)·ln2` predicts ~11 (deepest names), but that formula assumes a query's k positions are
+//! independent; in only 126 bits they are not (double-hashed positions collide), so the marginal FP
+//! gain saturates far below the prediction. Measured optimum is [`K`] = 4 — see the table below.
 //!
-//! ## Why 94 and not 96
+//! ## Why 126 bits
 //!
-//! The filter rides in the two 48-bit address fields of the frame. The **I/G and U/L bits of the
-//! first octet must keep their locally-administered/group meaning**, or we begin emitting frames
-//! that look like real devices' unicast traffic — a doctrine violation, and one that would make our
-//! traffic indistinguishable from an ordinary station's to anything listening.
+//! The filter rides in the frame's address octets: `addr1 ‖ addr2 ‖ addr3[0..4]` = 128 bits, of which
+//! the **I/G and U/L bits of the first octet must keep their locally-administered/group meaning**, or
+//! we begin emitting frames that look like real devices' unicast traffic — a doctrine violation, and
+//! one that would make our traffic indistinguishable from an ordinary station's to anything listening.
+//! 128 − 2 = 126 usable. The last two octets of addr3 carry the 8-bit ephemeral id and the flags byte
+//! (the 128:8 partition).
 //!
 //! ## Hashing
 //!
@@ -37,7 +42,7 @@
 //! of introducing a second, incompatible hash family. Keyed so a private group's filter is
 //! unlinkable by an observer who does not hold the key.
 
-/// Usable filter bits. 96 (two address fields) minus the two reserved bits of octet 0.
+/// Usable filter bits. 128 (addr1 ‖ addr2 ‖ addr3[0..4]) minus the two reserved bits of octet 0.
 pub const M_BITS: u32 = 126;
 
 /// **Hashes per prefix — k = 4.**
@@ -55,22 +60,25 @@ pub const M_BITS: u32 = 126;
 /// 3. An independent host replication at **200 names / 400 000 trials** (`ksweep_host_replication`),
 ///    with +/-1σ error bars, disagrees with the device beyond both their error bars:
 ///
-/// | k | bits set | FP @ depth 8, host (±1σ) | FP @ depth 8, device |
-/// |---|---|---|---|
-/// | 3 | 23/94 | 1.043% ± 0.016 | 1.02% |
-/// | **4** | **28/94** | **0.586% ± 0.012** | 0.91% |
-/// | 5 | 34/94 | 0.671% ± 0.013 | 0.46% |
-/// | 6 | 38/94 | 0.665% ± 0.013 | 0.27% |
-/// | 8 | 48/94 | 0.670% ± 0.013 | 0.67% |
+/// | k | bits set | FP @ depth 8, host (±1σ) |
+/// |---|---|---|
+/// | 3 | 25/126 | 1.025% ± 0.016 |
+/// | **4** | **33/126** | **0.559% ± 0.012** |
+/// | 5 | 40/126 | 0.855% ± 0.015 |
+/// | 6 | 47/126 | 0.881% ± 0.015 |
+/// | 8 | 60/126 | 0.907% ± 0.015 |
 ///
-/// **The honest reading: the optimum is not determined by these measurements.** Two independently
-/// written harnesses rank k=4..8 differently by more than their error bars, which means the *name
-/// distribution* dominates, not k. Only k=3 is consistently bad. Everything else is inside the
-/// sub-1.5% regime the design needs.
+/// **At m=126 the optimum is unambiguous: k=4 wins by more than the error bars.** (Re-measured after
+/// the 94→126 repack; the earlier m=94 table had two independent harnesses disagreeing on the k=4..8
+/// ordering — the *name distribution* dominated, and widening the filter separated the candidates.)
+/// k=4 minimizes FP at 0.56%, ~half of k=3 and clearly under k=5/6/8, with **zero false negatives** at
+/// every k. This module runs byte-identical code to the host (golden-vector cross-verified), so the
+/// host sweep IS the firmware's; confirm on-device via `m7_filter_test`.
 ///
-/// So k=4 on the tiebreakers: it wins the one measurement with tight error bars, sets the fewest
-/// bits (28/94, leaving headroom before saturation), costs the fewest hashes per frame, and is what
-/// the on-air shadow-mode result (#106: 87.1% reject, 0.46% FP) was measured at.
+/// So k=4 on the tiebreakers too: fewest bits set (33/126, most saturation headroom), fewest hashes
+/// per frame, and it is what the on-air shadow-mode result was measured at — #106 at m=94 gave 87.1%
+/// reject / 0.46% FP, and the m=126 re-run (2026-08-17) gave 87.4% reject / ~0.12% FP over 5000 frames,
+/// zero false negatives, the wider filter cutting on-air FP ~4×.
 ///
 /// **Do not "improve" this from a single sweep.** That is what went wrong twice.
 pub const K: u32 = 4;
@@ -82,22 +90,22 @@ pub const MAX_DEPTH: usize = 8;
 /// **Admission fill cap** — the maximum number of set bits a *received* filter may carry and still
 /// be tested against any local mask.
 ///
-/// Without it, [`PrefixFilter::may_match`] is a pure AND: a frame with all 94 bits set matches every
+/// Without it, [`PrefixFilter::may_match`] is a pure AND: a frame with all 126 bits set matches every
 /// registered mask at every node, for free, computed once. That is a one-frame universal wake — and
 /// once the scheduler keys on this field it becomes worse than a wake, because the same frame
 /// matches every slot owner's mask: every slot reads busy, presence is forged for every owner
 /// including departed ones, and claims are suppressed network-wide for a full presence window per
 /// frame.
 ///
-/// **Sizing.** A legitimate filter at the depth cap sets 30 bits (measured, `MAX_DEPTH` = 8,
-/// `K` = 4 — see the depth/popcount table in the tests). 48 leaves headroom for future class tokens
-/// while bounding a just-under-cap adversary to roughly `(48/94)^4` ≈ 7% per targeted prefix rather
+/// **Sizing.** A legitimate filter at the depth cap sets ~33 bits (measured, `MAX_DEPTH` = 8,
+/// `K` = 4 — see the depth/popcount table in the tests). 64 leaves headroom for future class tokens
+/// while bounding a just-under-cap adversary to roughly `(64/126)^4` ≈ 6.7% per targeted prefix rather
 /// than 100%.
 ///
 /// **Scope, honestly.** This removes the *amplified* attack — one frame forging presence for every
 /// group at once. It does not stop an adversary forging presence for a single group it knows the
 /// name of; that is inherent to unauthenticated MAC-level evidence and is not a property any
-/// arrangement of these 94 bits can provide.
+/// arrangement of these 126 bits can provide.
 ///
 /// Coupled to `MAX_DEPTH`, `K` and any future class tokens, so it is a **shared wire parameter**:
 /// every implementation must use the same value or they disagree about which frames are admissible.
@@ -107,7 +115,7 @@ pub const FILL_CAP: u32 = 64;
 /// The two bits of octet 0 that must not be used by the filter (I/G and U/L).
 const RESERVED_MASK0: u8 = 0b0000_0011;
 
-/// A 96-bit in-frame filter: 94 usable bits plus the two reserved address bits.
+/// A 128-bit in-frame filter: 126 usable bits plus the two reserved address bits.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct PrefixFilter(pub [u8; 16]);
 
@@ -338,7 +346,7 @@ impl PrefixFilter {
         n
     }
 
-    /// The 12 wire bytes, with the reserved bits forced to locally-administered group.
+    /// The 16 wire bytes (addr1 ‖ addr2 ‖ addr3[0..4]), reserved bits forced to locally-administered group.
     ///
     /// Applied at the boundary rather than trusted from the caller: a filter whose bit pattern
     /// happens to clear these would put a globally-unique unicast address on the air.

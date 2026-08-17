@@ -22,9 +22,9 @@ use lr2021_nrf54l15_rs::tier0::{self, PrefixFilter};
 
 /// Runtime-k variants of the filter, so K can be *measured* rather than assumed.
 ///
-/// The textbook optimum `(M/n)·ln2` says ~7 for our sizes, but that formula assumes the k positions
-/// of a query are independent — and with only 94 bits they are not: k=6 positions collide with each
-/// other ~15% of the time, and a query whose 6 positions collapse to 3 distinct bits has the false
+/// The textbook optimum `(M/n)·ln2` says ~11 for our sizes, but that formula assumes the k positions
+/// of a query are independent — and with only 126 bits they are not: k positions collide with each
+/// other, and a query whose positions collapse to fewer distinct bits has the false
 /// positive rate of k=3, not k=6. That effect is invisible to the formula and grows with k, so the
 /// optimum has to be found by counting.
 mod vk {
@@ -249,7 +249,7 @@ async fn main(_spawner: Spawner) {
         }
         let ppm = ((fp_tot as u64) * 1_000_000) / trials_tot as u64;
         defmt::info!(
-            "  k={=u32}: bits_set(avg) {=u32}/94 | FP {=u32}/{=u32} = {=u64} ppm | false negatives {=u32}",
+            "  k={=u32}: bits_set(avg) {=u32}/126 | FP {=u32}/{=u32} = {=u64} ppm | false negatives {=u32}",
             k,
             bits_tot / R,
             fp_tot,

@@ -12,6 +12,7 @@
 
 pub mod board;
 pub mod flrc_link;
+pub mod gcs;
 pub mod hw;
 pub mod serial;
 pub mod tier0;

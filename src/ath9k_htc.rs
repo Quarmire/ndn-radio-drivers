@@ -204,6 +204,10 @@ pub enum WmiCmd {
     /// Create a target virtual interface (payload = `struct ath9k_htc_target_vif`, 12 B).
     /// `ath_vap_create_tgt`. The host picks `index`; TX references it via `tx_frame_hdr.vif_idx`.
     VapCreate = 0x0013,
+    /// Set a node's rate-control state (payload = `struct ath9k_htc_target_rate`). `ath_rc_state_change`.
+    /// Gives the created node a rate table — without it the target has no rate to TX at and drops
+    /// the frame even with a valid node.
+    RcStateChange = 0x0016,
     RegRead = 0x0014,
     RegWrite = 0x0015,
     /// Push the `ieee80211com_target` capability block. `ath_ic_update_tgt`. Not required to
@@ -595,22 +599,27 @@ impl Ath9kHtcBackend {
     /// Send one HTC frame on the register-out (interrupt) pipe.
     fn htc_send(&mut self, endpoint: u8, payload: &[u8]) -> Result<(), FaceError> {
         let total = HTC_HDR_LEN + payload.len();
-        if total > REG_PIPE_MAX {
+        // The reg pipe's `wMaxPacketSize` is 64, but a USB interrupt transfer packetizes — a WMI
+        // command larger than 64 B (e.g. WMI_RC_STATE_CHANGE's 70 B rate struct) is sent as 64+rest,
+        // exactly as the kernel driver does. 64 is the single-packet REPLY budget (see the
+        // ACCESS_MEMORY tuple math), not a cap on the outgoing command. Bound generously.
+        const HTC_MSG_MAX: usize = 512;
+        if total > HTC_MSG_MAX {
             return Err(err(format!(
-                "ath9k_htc: HTC message {total} B exceeds the {REG_PIPE_MAX} B register pipe"
+                "ath9k_htc: HTC message {total} B exceeds {HTC_MSG_MAX} B"
             )));
         }
 
-        let mut buf = [0u8; REG_PIPE_MAX];
+        let mut buf = vec![0u8; total];
         buf[0] = endpoint;
         buf[1] = 0; // flags
         buf[2..4].copy_from_slice(&(payload.len() as u16).to_be_bytes());
-        // buf[4..8] = control bytes, zero
+        // buf[4..8] = control bytes, zero (already)
         buf[HTC_HDR_LEN..total].copy_from_slice(payload);
 
-        dbg_dump("tx", &buf[..total]);
+        dbg_dump("tx", &buf);
         self.handle
-            .write_interrupt(EP_REG_OUT, &buf[..total], USB_TIMEOUT)
+            .write_interrupt(EP_REG_OUT, &buf, USB_TIMEOUT)
             .map_err(|e| usb_err("htc send", e))?;
         Ok(())
     }
@@ -1918,6 +1927,25 @@ impl Ath9kHtcBackend {
         tsta[19..21].copy_from_slice(&0xffffu16.to_be_bytes()); // maxampdu
         // pad (21) = 0
         self.wmi_cmd(WmiCmd::NodeCreate, &tsta)?;
+        Ok(())
+    }
+
+    /// **UNFINISHED — the node's rate table (`WMI_RC_STATE_CHANGE`).** A created node still needs a
+    /// rate table or the target has no rate to TX at and drops the frame. The payload is
+    /// `struct ath9k_htc_target_rate` (70 B: `sta_index`, `isnew`, 2 pad, `capflags` be32, then two
+    /// `rateset`s). ★ BLOCKED: at 70 B the message exceeds the 64-B register pipe, and sending it as
+    /// a multi-packet interrupt transfer TIMED OUT (target didn't process/reply) — so large WMI must
+    /// reach the target another way (a bulk pipe? a fragmentation the target reassembles?). Resolve
+    /// via a golden trace of the kernel's own `WMI_RC_STATE_CHANGE` before wiring this in. Kept as
+    /// documentation of the exact remaining gap; NOT called (it would break `wmi_start`).
+    #[allow(dead_code)]
+    pub fn set_node_rate_table(&mut self) -> Result<(), FaceError> {
+        let mut trate = [0u8; 70];
+        trate[1] = 1; // isnew (sta_index/vif 0, capflags 0 = legacy)
+        let legacy: [u8; 12] = [2, 4, 11, 22, 12, 18, 24, 36, 48, 72, 96, 108]; // 500 kbps units
+        trate[8] = legacy.len() as u8;
+        trate[9..9 + legacy.len()].copy_from_slice(&legacy);
+        self.wmi_cmd(WmiCmd::RcStateChange, &trate)?;
         Ok(())
     }
 

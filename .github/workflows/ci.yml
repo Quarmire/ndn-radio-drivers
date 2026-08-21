@@ -1,0 +1,101 @@
+name: CI — ndn-radio-drivers
+
+# First CI for this repo (P1): clippy + host unit tests.
+#
+# ndn-radio-drivers depends on ndn-rs (radio-hal / frame-io / time / transport)
+# and, in dev-dependencies, ndn-ext (time driver, radio cognition) through `../`
+# path deps, so every job checks those repos out as siblings (ndn-rs/ + ndn-ext/
+# next to ndn-radio-drivers/), mirroring ndn-ext's own CI layout. Unlike the
+# sibling workflows, the sibling checkouts here are pinned to known-good SHAs so
+# a sibling push cannot redden this repo's gate. When the repos are released,
+# switch the path deps to { git, tag } and drop the checkouts.
+#
+# Deliberately NOT built here:
+#   - examples/ — 70+ hardware probe binaries that need a radio on the USB bus
+#     to be useful; building them would dominate CI time for zero signal.
+#   - firmware/* — independent embedded sub-workspaces (thumbv8m / Xtensa /
+#     nRF54) that need their own cross toolchains.
+#
+# Toolchain: no rust-toolchain.toml here — jobs use the runner's stable, which
+# satisfies edition 2024 / rust-version 1.90.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+defaults:
+  run:
+    working-directory: ndn-radio-drivers
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    name: clippy (lib + bins)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { path: ndn-radio-drivers }
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/ndn-rs
+          ref: 445736a2dd8597be0e09b36a31abd15b21e673e3 # pinned sibling; bump deliberately
+          path: ndn-rs
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/ndn-ext
+          ref: f979cb8d638fb79af6019f3583e42b12d087e3e8 # pinned sibling; bump deliberately
+          path: ndn-ext
+      - name: Install system dependencies (libusb)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libusb-1.0-0-dev pkg-config
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ndn-radio-drivers
+          shared-key: lint
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # Plain clippy, not `-D warnings`: the lib carries 18 pre-existing lints
+      # (needless_range_loop and friends in the Realtek backends). Escalate to
+      # `-- -D warnings` once those are burned down.
+      - name: clippy (lib + bins)
+        run: cargo clippy -p ndn-radio-drivers --lib --bins
+
+  test:
+    name: host tests (lib)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { path: ndn-radio-drivers }
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/ndn-rs
+          ref: 445736a2dd8597be0e09b36a31abd15b21e673e3 # pinned sibling; bump deliberately
+          path: ndn-rs
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/ndn-ext
+          ref: f979cb8d638fb79af6019f3583e42b12d087e3e8 # pinned sibling; bump deliberately
+          path: ndn-ext
+      - name: Install system dependencies (libusb)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libusb-1.0-0-dev pkg-config
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ndn-radio-drivers
+          shared-key: test
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # `--lib` on purpose, for two reasons:
+      #   - plain `cargo test` also compiles every example (the 70+ probe
+      #     binaries excluded above by design);
+      #   - tests/tier0_golden.rs does not compile at present: it include!s the
+      #     LR2021 firmware tier0.rs, which b2a5e27 widened to the 126-bit
+      #     PrefixFilter ([u8; 16]) while the test still asserts the v1 12-byte
+      #     wire. De-drift the test, then widen this gate to `--lib --tests`.
+      - name: unit tests
+        run: cargo test -p ndn-radio-drivers --lib

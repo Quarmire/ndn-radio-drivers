@@ -32,13 +32,32 @@
 //! the target-side implementation does not. It has to be added to our firmware before
 //! [`Ath9kHtcBackend::read_target_memory`] can work.
 
+use std::sync::Arc;
 use std::time::Duration;
 
+use async_trait::async_trait;
 use rusb::{Context, DeviceHandle, UsbContext};
 
-use ndn_frame_io::ClockDomainId;
-use ndn_radio_hal::{RadioTime, RadioTimeSource};
+use ndn_frame_io::{ClockDomainId, LatchPoint, LinkStamp};
+use ndn_radio_hal::{RadioCapability, RadioProfile, RadioTime, RadioTimeSource};
 use ndn_transport::FaceError;
+
+use crate::ath9k_htc_structs::{
+    ATH9K_HTC_NORMAL, ATH9K_KEY_TYPE_CLEAR, TX_FRAME_HDR_SIZE, TxFrameHdr,
+};
+use crate::{CapturedFrame, FrameFormat, FrameIo, InjectFrame, McsDescriptor};
+
+/// Bytes before the `ath_htc_rx_status` on the WLAN-RX bulk pipe: the 8-byte HTC frame header
+/// PLUS a 4-byte data-endpoint prefix (observed `04 00 00 00`) — MEASURED, see [`Ath9kHtcBackend::parse_rx`].
+const RX_PREFIX_LEN: usize = HTC_HDR_LEN + 4; // 12
+
+/// Nominal 2.4 GHz noise floor (dBm) used to convert the AR9271's NF-relative `rs_rssi` (dB above
+/// noise) to an approximate dBm: `dBm ≈ rs_rssi - AR9271_NF_DBM_2GHZ`.
+///
+/// ⚠ **BENCH:** −95 dBm is a NOMINAL 2.4 GHz noise floor, not a per-device measurement. The
+/// on-chip NF cal (`set_channel_and_cal` reports `noise_floor_dbm`) gives the real figure; if the
+/// reported RSSI looks off against a known-power source, substitute the calibrated NF here.
+const AR9271_NF_DBM_2GHZ: i16 = 95;
 
 /// Qualcomm Atheros USB vendor ID.
 pub const ATHEROS_VID: u16 = 0x0cf3;
@@ -332,7 +351,10 @@ pub const MAX_ECHO_LEN: usize = REG_PIPE_MAX - HTC_HDR_LEN - WMI_HDR_LEN - 1;
 
 /// A userspace AR9271 over libusb.
 pub struct Ath9kHtcBackend {
-    handle: DeviceHandle<Context>,
+    /// `Arc` so the blocking USB bulk transfers `FrameIo`/the RX pump issue can be moved onto
+    /// `spawn_blocking` / reader threads (mirrors the Realtek backend). Every rusb op is `&self`,
+    /// so the `&mut self` bring-up methods keep working through the `Arc` deref.
+    handle: Arc<DeviceHandle<Context>>,
     /// WMI sequence number; the target echoes it so replies can be matched to commands.
     seq: u16,
     /// Endpoint the target assigned to `WMI_CONTROL_SVC` during the handshake.
@@ -354,6 +376,20 @@ pub struct Ath9kHtcBackend {
     /// `rs_tstamp` is a µs hardware RX timestamp on this domain — a common-view `FreeRunRxStamp`
     /// (M2 / design §15). Mirrors the Realtek `tsf_domain`.
     tsf_domain: ClockDomainId,
+    /// On-air (de)framing — the canonical `RawNdn { ethertype: 0x8624 }`. Set at open; shared with
+    /// every other backend so a frame injected here de-frames identically on any radio.
+    format: FrameFormat,
+    /// Current transmit rate as bearer state ([`FrameIo::set_rate`]). Mirrors the Realtek `cur_mcs`.
+    ///
+    /// ⚠ **DECIDED-BUT-UNACTUATED on this part.** Unlike the Realtek TX descriptor (which carries a
+    /// per-frame `DESC_RATE` code), the ath9k HTC `tx_frame_hdr` has **no rate field** — a data
+    /// frame's rate is chosen by the *target firmware's* rate control for its `node_idx`. So this is
+    /// stored (so the seam is uniform and a future WMI rate-table/node path can consume it) but does
+    /// **not** currently steer the on-air rate. Flagged so nobody reads a stored MCS as an actuated one.
+    cur_mcs: std::sync::Mutex<Option<McsDescriptor>>,
+    /// Shared bulk-IN RX pipeline the pump fills and `recv_frame` drains (mirrors the Realtek). See
+    /// [`crate::rx_pump`].
+    rx_pump: crate::rx_pump::RxPumpState,
 }
 
 fn usb_err<E: std::fmt::Display>(what: &str, e: E) -> FaceError {
@@ -427,7 +463,7 @@ impl Ath9kHtcBackend {
             .map_err(|e| usb_err("claim interface 0", e))?;
 
         Ok(Self {
-            handle,
+            handle: Arc::new(handle),
             seq: 0,
             wmi_endpoint: 0,
             credits: 0,
@@ -437,6 +473,11 @@ impl Ath9kHtcBackend {
             beacon_ep: 0,
             clockrate: crate::ath9k_reg::ATH9K_CLOCK_RATE_2GHZ_OFDM,
             tsf_domain,
+            format: FrameFormat::RawNdn {
+                ethertype: crate::NDN_ETHERTYPE,
+            },
+            cur_mcs: std::sync::Mutex::new(None),
+            rx_pump: crate::rx_pump::RxPumpState::new(),
         })
     }
 
@@ -2093,6 +2134,269 @@ impl RadioTime for Ath9kHtcBackend {
     }
 }
 
+// ── M3 — FrameIo (stamped RX up + TX inject) ─────────────────────────────────────────────────────
+//
+// The AR9271 already RECEIVES and parses frames on silicon (M1-done) and carries a per-frame µs RX
+// stamp (M2), so this makes it a first-class `FrameIo` radio. RX is the low-risk half; TX framing is
+// the uncertain half and is bench-validated (see `build_tx_frame_bytes`).
+
+/// Serialise a [`TxFrameHdr`] to its 12 on-wire bytes (the C struct is all `u8`/`[u8;4]` in
+/// declaration order under `#[repr(C)] __packed`, so this is a faithful field-by-field image).
+fn tx_frame_hdr_bytes(h: &TxFrameHdr) -> [u8; TX_FRAME_HDR_SIZE] {
+    [
+        h.data_type,
+        h.node_idx,
+        h.vif_idx,
+        h.tidno,
+        h.flags[0],
+        h.flags[1],
+        h.flags[2],
+        h.flags[3],
+        h.key_type,
+        h.keyix,
+        h.cookie,
+        h.pad,
+    ]
+}
+
+/// Build one HTC data-endpoint TX buffer for `frame` — pure (no `self`, no I/O) so the byte layout
+/// is unit-testable without a device.
+///
+/// Wire layout, transcribed from mainline ath9k `htc_drv_txrx.c::ath9k_htc_tx_data` +
+/// `htc_hst.c::htc_issue_send` and the firmware TX handler (`~/ath9k-fw/.../wlan/if_ath.c`):
+///
+/// ```text
+///   [ HTC_FRAME_HDR  8B ] endpoint=DataBE, flags=0, be16 payload_len(=tx_frame_hdr+dot11), ctrl[4]=0
+///   [ tx_frame_hdr  12B ] data_type=NORMAL, node_idx, vif_idx, tidno, be32 flags, key_type, keyix, cookie, pad
+///   [ 802.11 MPDU      ] FC|Dur|A1=dst|A2=src|A3|Seq  ++  LLC/SNAP(0x8624)  ++  payload   (from `frame::build_dot11`)
+/// ```
+///
+/// ★★ **BENCH — this is the uncertain part; watch these on silicon (RX-stamp is low-risk, TX is not):**
+///  1. **`data_type`** — mainline `ATH9K_HTC_NORMAL = 2`. If frames are accepted over USB but never
+///     key onto air (TX-PHY-OK stays 0), a wrong `data_type` steering the target handler is suspect #1.
+///  2. **`node_idx` / `vif_idx` = 0.** ath9k data-frame TX resolves the *rate* and TX-queue from a
+///     target **node** (`WMI_NODE_CREATE`) + **vif** the host normally creates via mac80211. We create
+///     neither, so node 0 may be invalid → the target may drop the frame or use a default rate. If TX
+///     is silent, the next thing to add is the node/vif setup (WMI verbs), not more descriptor bytes.
+///  3. **No rate field.** The on-air rate is the target's rate control for `node_idx` — `set_rate`
+///     does not steer it here (see `cur_mcs`). The example's "1 Mbps" is whatever the target picks.
+///  4. **The 4-byte endpoint prefix.** RX carries an extra `04 00 00 00` between the HTC header and the
+///     status block (`RX_PREFIX_LEN`). TX here does *not* prepend one (mainline TX doesn't); if the
+///     target rejects the frame, try mirroring that prefix.
+fn build_tx_frame_bytes(
+    data_be_ep: u8,
+    format: FrameFormat,
+    frame: &InjectFrame,
+) -> Result<Vec<u8>, FaceError> {
+    // The 802.11 data frame + LLC/SNAP(0x8624) + payload — the shared helper, so a frame injected
+    // here de-frames identically on any other backend.
+    let dot11 = crate::frame::build_dot11(format, frame)?;
+    let payload_len = TX_FRAME_HDR_SIZE + dot11.len();
+    if payload_len > u16::MAX as usize {
+        return Err(err(format!(
+            "ath9k_htc: TX frame {payload_len} B exceeds the 16-bit HTC payload length"
+        )));
+    }
+
+    let mut buf = Vec::with_capacity(HTC_HDR_LEN + payload_len);
+    // ── HTC_FRAME_HDR (8 B) ──
+    buf.push(data_be_ep); // endpoint id (DataBE, assigned in connect_data_services)
+    buf.push(0); // flags
+    buf.extend_from_slice(&(payload_len as u16).to_be_bytes()); // be16 payload length
+    buf.extend_from_slice(&[0u8; 4]); // control bytes
+
+    // ── tx_frame_hdr (12 B) ──
+    let hdr = TxFrameHdr {
+        data_type: ATH9K_HTC_NORMAL,
+        node_idx: 0,
+        vif_idx: 0,
+        tidno: 0,
+        flags: [0; 4], // ATH9K_HTC_TX_* — none (no RTS/CTS-only)
+        key_type: ATH9K_KEY_TYPE_CLEAR,
+        keyix: 0,
+        cookie: 0,
+        pad: 0,
+    };
+    buf.extend_from_slice(&tx_frame_hdr_bytes(&hdr));
+
+    // ── 802.11 MPDU ──
+    buf.extend_from_slice(&dot11);
+    Ok(buf)
+}
+
+/// Parse one RX unit at byte offset `at` in a bulk-IN transfer into an optional [`CapturedFrame`]
+/// plus the byte length to advance to the next unit. Pure (format + domain passed in) so it is
+/// unit-testable. A transfer may batch several HTC frames back-to-back; the pump walks them.
+///
+/// Unit layout mirrors [`Ath9kHtcBackend::parse_rx`]: `[HTC 8][ep-prefix 4][ath_htc_rx_status 40]
+/// [802.11 MPDU (`rs_datalen` B)]`. The advance is taken from the HTC header's own `payload_len`
+/// (authoritative), 4-byte aligned; it falls back to the status-derived length if that looks wrong.
+fn parse_rx_unit(
+    format: FrameFormat,
+    domain: ClockDomainId,
+    raw: &[u8],
+    at: usize,
+) -> Option<(Option<CapturedFrame>, usize)> {
+    if at + RX_PREFIX_LEN + HTC_RX_STATUS_LEN > raw.len() {
+        return None;
+    }
+    // HTC payload length = bytes after the 8-byte HTC header (the 4-byte ep prefix + 40-byte status
+    // + MPDU). Authoritative for de-aggregation.
+    let htc_payload_len = u16::from_be_bytes([raw[at + 2], raw[at + 3]]) as usize;
+
+    let s = &raw[at + RX_PREFIX_LEN..at + RX_PREFIX_LEN + HTC_RX_STATUS_LEN];
+    let rs_tstamp = u64::from_be_bytes(s[0..8].try_into().unwrap());
+    let rs_datalen = u16::from_be_bytes([s[8], s[9]]) as usize;
+    let rs_status = s[10];
+    let rs_rssi = s[12] as i8;
+    let rs_rate = s[20];
+
+    // Advance: prefer HTC payload_len (8 + it), else the status-derived length. Always makes at
+    // least one unit of progress so the walk can't loop.
+    let unit = if htc_payload_len >= 4 + HTC_RX_STATUS_LEN {
+        HTC_HDR_LEN + htc_payload_len
+    } else {
+        RX_PREFIX_LEN + HTC_RX_STATUS_LEN + rs_datalen
+    };
+    let advance = ((unit + 3) & !3).max(RX_PREFIX_LEN + HTC_RX_STATUS_LEN);
+
+    let mpdu_start = at + RX_PREFIX_LEN + HTC_RX_STATUS_LEN;
+    let mpdu_end = (mpdu_start + rs_datalen).min(raw.len());
+
+    let captured = (|| {
+        if mpdu_end <= mpdu_start {
+            return None;
+        }
+        // Drop hardware-flagged errors: ATH9K_RXERR_{CRC 0x01, PHY 0x02, FIFO 0x04, DECRYPT 0x08}
+        // occupy the low nibble of rs_status (mainline `ah.h`). A good frame reads 0.
+        // ⚠ BENCH: if RX yields nothing, confirm this offset/gate — relax to `rs_status & 0x01`
+        // (CRC only) or 0 to isolate a mislabelled bit before blaming the air.
+        if rs_status & 0x0f != 0 {
+            return None;
+        }
+        // rs_rssi is dB above the noise floor; convert to approximate dBm (see AR9271_NF_DBM_2GHZ).
+        let rssi_dbm = Some((rs_rssi as i16 - AR9271_NF_DBM_2GHZ).clamp(-128, 127) as i8);
+        // ath9k HT hardware rate codes set bit 7 (`0x80 | mcs`); legacy CCK/OFDM codes are < 0x80.
+        // ⚠ BENCH: this is a best-effort decode; a 1x1 AR9271 only reaches HT MCS0-7.
+        let mcs_index = (rs_rate & 0x80 != 0).then_some(rs_rate & 0x7f);
+        let stamp = Some(LinkStamp::new(
+            rs_tstamp,
+            domain,
+            1_000,
+            LatchPoint::MacDone,
+        ));
+        crate::frame::parse_dot11(format, &raw[mpdu_start..mpdu_end], rssi_dbm, mcs_index, stamp)
+    })();
+
+    Some((captured, advance))
+}
+
+impl Ath9kHtcBackend {
+    /// Build the HTC data-endpoint TX buffer for `frame` (the [`build_tx_frame_bytes`] wire layout,
+    /// bound to this device's DataBE endpoint + format).
+    fn build_tx_frame(&self, frame: &InjectFrame) -> Result<Vec<u8>, FaceError> {
+        build_tx_frame_bytes(self.data_be_ep, self.format, frame)
+    }
+}
+
+#[async_trait]
+impl FrameIo for Ath9kHtcBackend {
+    async fn inject(&self, frame: InjectFrame) -> Result<(), FaceError> {
+        let buf = self.build_tx_frame(&frame)?;
+        let handle = self.handle.clone();
+        tokio::task::spawn_blocking(move || {
+            handle
+                .write_bulk(EP_WLAN_TX, &buf, USB_TIMEOUT)
+                .map_err(|e| usb_err("wlan tx", e))
+                .and_then(|n| {
+                    (n == buf.len()).then_some(()).ok_or_else(|| {
+                        err(format!("ath9k_htc: short TX write {n}/{}", buf.len()))
+                    })
+                })
+        })
+        .await
+        .map_err(|e| err(format!("ath9k_htc tx: join {e}")))?
+    }
+
+    /// Rate as bearer state. ⚠ Stored but not actuated on this HTC part — see [`Ath9kHtcBackend::cur_mcs`].
+    fn set_rate(&self, mcs: McsDescriptor) -> Result<(), FaceError> {
+        *self.cur_mcs.lock().unwrap() = Some(mcs);
+        Ok(())
+    }
+
+    async fn recv_frame(&self) -> Result<CapturedFrame, FaceError> {
+        // Pumped mode: background reader threads keep bulk-IN transfers in flight and fill the shared
+        // queue; just drain it.
+        if self.rx_pump.is_pumped() {
+            return Ok(self.rx_pump.recv().await);
+        }
+        // One-shot fallback (no pump): a blocking bulk-IN read, parsed into the queue, then drained.
+        loop {
+            if let Some(f) = self.rx_pump.try_pop() {
+                return Ok(f);
+            }
+            let handle = self.handle.clone();
+            let buf = tokio::task::spawn_blocking(move || {
+                let mut buf = vec![0u8; 4096];
+                match handle.read_bulk(EP_WLAN_RX, &mut buf, Duration::from_millis(200)) {
+                    Ok(n) => {
+                        buf.truncate(n);
+                        Ok(Some(buf))
+                    }
+                    Err(rusb::Error::Timeout) => Ok(None),
+                    Err(e) => Err(usb_err("wlan rx", e)),
+                }
+            })
+            .await
+            .map_err(|e| err(format!("ath9k_htc recv: join {e}")))??;
+
+            if let Some(buf) = buf {
+                self.rx_pump
+                    .push(crate::rx_pump::Pumpable::parse_transfer(self, &buf));
+            }
+        }
+    }
+}
+
+/// The RX pump's per-transfer parse: de-aggregate every HTC frame the target batched into one
+/// bulk-IN transfer into decodable [`CapturedFrame`]s, each carrying its per-frame `rs_tstamp`.
+impl crate::rx_pump::Pumpable for Ath9kHtcBackend {
+    fn pump_handle(&self) -> Arc<DeviceHandle<Context>> {
+        self.handle.clone()
+    }
+    fn pump_bulk_in(&self) -> u8 {
+        EP_WLAN_RX
+    }
+    fn pump_state(&self) -> &crate::rx_pump::RxPumpState {
+        &self.rx_pump
+    }
+    fn parse_transfer(&self, buf: &[u8]) -> Vec<CapturedFrame> {
+        let mut out = Vec::new();
+        let mut off = 0usize;
+        while let Some((decoded, advance)) = parse_rx_unit(self.format, self.tsf_domain, buf, off) {
+            if let Some(f) = decoded {
+                out.push(f);
+            }
+            if advance == 0 {
+                break;
+            }
+            off += advance;
+            if off + RX_PREFIX_LEN + HTC_RX_STATUS_LEN > buf.len() {
+                break;
+            }
+        }
+        out
+    }
+}
+
+impl RadioProfile for Ath9kHtcBackend {
+    fn capability(&self) -> RadioCapability {
+        // AR9271: single-chain (1x1) 2.4 GHz 802.11n — MCS0-7, 20 MHz. Channels 1..13.
+        // (`_1ss` is the honest constructor: this part has one RX/TX chain, so max_nss = 1.)
+        RadioCapability::wifi_monitor_2ghz_1ss((1..=13).collect())
+    }
+}
+
 /// The AR9271 IQ-mismatch fixed-point correction (`ar9002_hw_iqcalibrate`,
 /// ar9002_calib.c:192-267), for one chain. Inputs are the accumulated
 /// `AR_PHY_CAL_MEAS_0/1/2` reads (`powerMeasI`, `powerMeasQ`, `iqCorrMeas`). Returns the
@@ -2377,5 +2681,128 @@ mod tests {
         let synth =
             AR_PHY_SYNTH_CONTROL_2G_BMODE | AR_PHY_SYNTH_CONTROL_2G_FRACMODE | channel_sel;
         assert_eq!(synth, 0x30a0_cccc);
+    }
+
+    // ── M3 FrameIo: TX frame construction + RX CapturedFrame mapping ──────────────────────────────
+
+    use crate::TxIntent;
+    use bytes::Bytes;
+
+    const TEST_ETHERTYPE: u16 = 0x8624;
+    const DST: [u8; 6] = [0xff, 0xff, 0xff, 0xff, 0xff, 0xff];
+    const SRC: [u8; 6] = [0x02, 0x4e, 0x44, 0x4e, 0x00, 0x01];
+
+    fn ndn_fmt() -> FrameFormat {
+        FrameFormat::RawNdn { ethertype: TEST_ETHERTYPE }
+    }
+
+    /// The injected TX buffer must be `[HTC 8B][tx_frame_hdr 12B][802.11 data + LLC/SNAP + payload]`,
+    /// byte-for-byte. Pins the layout the target parses (the uncertain part) so an edit can't drift it.
+    #[test]
+    fn build_tx_frame_layout() {
+        let payload = b"\x05\x04ping";
+        let frame = InjectFrame {
+            payload: Bytes::copy_from_slice(payload),
+            tx: TxIntent::CONSERVATIVE,
+            dst: DST,
+            src: SRC,
+            addr3: None,
+        };
+        let data_be_ep = 0x07;
+        let buf = build_tx_frame_bytes(data_be_ep, ndn_fmt(), &frame).unwrap();
+        let dot11 = crate::frame::build_dot11(ndn_fmt(), &frame).unwrap();
+
+        // HTC_FRAME_HDR (8 B): endpoint, flags, be16 payload length, control[4].
+        assert_eq!(buf[0], data_be_ep, "HTC endpoint = DataBE");
+        assert_eq!(buf[1], 0, "HTC flags = 0");
+        let payload_len = u16::from_be_bytes([buf[2], buf[3]]) as usize;
+        assert_eq!(payload_len, TX_FRAME_HDR_SIZE + dot11.len(), "HTC payload len = tx_hdr + MPDU");
+        assert_eq!(&buf[4..8], &[0, 0, 0, 0], "HTC control bytes zero");
+
+        // tx_frame_hdr (12 B): data_type=NORMAL, everything else 0 / key CLEAR.
+        let h = &buf[HTC_HDR_LEN..HTC_HDR_LEN + TX_FRAME_HDR_SIZE];
+        assert_eq!(h[0], ATH9K_HTC_NORMAL, "data_type = NORMAL");
+        assert_eq!(&h[1..8], &[0, 0, 0, 0, 0, 0, 0], "node/vif/tid/flags zero");
+        assert_eq!(h[8], ATH9K_KEY_TYPE_CLEAR, "key_type = CLEAR (unencrypted)");
+        assert_eq!(&h[9..12], &[0, 0, 0], "keyix/cookie/pad zero");
+
+        // The 802.11 MPDU that follows is exactly `build_dot11` (same on-air layout as every backend):
+        // FC=Data, addr1=dst, addr2=src, LLC/SNAP(0x8624), payload.
+        let mpdu = &buf[HTC_HDR_LEN + TX_FRAME_HDR_SIZE..];
+        assert_eq!(mpdu, &dot11[..], "MPDU == shared build_dot11");
+        assert_eq!(&mpdu[0..2], &[0x08, 0x00], "FC: type=Data subtype=0");
+        assert_eq!(&mpdu[4..10], &DST, "addr1 = dst");
+        assert_eq!(&mpdu[10..16], &SRC, "addr2 = src");
+        assert_eq!(mpdu.ends_with(payload), true, "payload rides last");
+    }
+
+    /// A synthetic RX transfer must map to a `CapturedFrame` with the payload recovered after
+    /// LLC/SNAP, addr2→addr / addr1→group, the RSSI converted to dBm, the HT rate decoded, and the
+    /// per-frame `rs_tstamp` carried as a hardware `LinkStamp`. Also checks the de-aggregation advance.
+    #[test]
+    fn parse_rx_unit_maps_captured_frame() {
+        let payload = b"\x06\x03abc";
+        let frame = InjectFrame {
+            payload: Bytes::copy_from_slice(payload),
+            tx: TxIntent::CONSERVATIVE,
+            dst: DST,
+            src: SRC,
+            addr3: None,
+        };
+        let mpdu = crate::frame::build_dot11(ndn_fmt(), &frame).unwrap();
+
+        // Build one RX unit: [HTC 8][ep-prefix 4][status 40][MPDU].
+        let htc_payload_len = 4 + HTC_RX_STATUS_LEN + mpdu.len();
+        let mut raw = Vec::new();
+        raw.push(0x02); // HTC endpoint (data)
+        raw.push(0x00); // flags
+        raw.extend_from_slice(&(htc_payload_len as u16).to_be_bytes());
+        raw.extend_from_slice(&[0, 0, 0, 0]); // HTC control
+        raw.extend_from_slice(&[0x04, 0x00, 0x00, 0x00]); // 4-byte data-endpoint prefix
+        // ath_htc_rx_status (40 B), big-endian fields at their offsets.
+        let mut status = [0u8; HTC_RX_STATUS_LEN];
+        status[0..8].copy_from_slice(&0x0011_2233_4455_6677u64.to_be_bytes()); // rs_tstamp
+        status[8..10].copy_from_slice(&(mpdu.len() as u16).to_be_bytes()); // rs_datalen
+        status[10] = 0; // rs_status = no error
+        status[12] = 40; // rs_rssi = 40 dB above NF -> 40-95 = -55 dBm
+        status[20] = 0x80 | 3; // rs_rate = HT MCS3
+        raw.extend_from_slice(&status);
+        raw.extend_from_slice(&mpdu);
+
+        let domain = ClockDomainId(0x1234);
+        let (decoded, advance) = parse_rx_unit(ndn_fmt(), domain, &raw, 0).expect("parses a unit");
+        let cf = decoded.expect("a good RawNdn frame decodes");
+        assert_eq!(cf.payload.as_ref(), payload, "payload recovered after LLC/SNAP");
+        assert_eq!(cf.addr, Some(SRC), "addr2 -> addr");
+        assert_eq!(cf.group, Some(DST), "addr1 -> group");
+        assert_eq!(cf.rssi_dbm, Some(-55), "NF-relative rs_rssi -> dBm");
+        assert_eq!(cf.mcs_index, Some(3), "HT rate code decoded to MCS index");
+        let stamp = cf.stamp.expect("per-frame rs_tstamp -> hardware LinkStamp");
+        assert_eq!(stamp.raw, 0x0011_2233_4455_6677);
+        assert_eq!(stamp.domain, domain);
+        assert_eq!(stamp.latch, LatchPoint::MacDone);
+        // Advance = 8 (HTC hdr) + htc_payload_len, 4-byte aligned.
+        assert_eq!(advance, (HTC_HDR_LEN + htc_payload_len + 3) & !3);
+    }
+
+    /// A CRC-errored unit (rs_status low nibble set) yields no CapturedFrame but still advances so the
+    /// de-aggregation walk continues past it.
+    #[test]
+    fn parse_rx_unit_drops_errored_frame() {
+        let mpdu = vec![0xAAu8; 40];
+        let htc_payload_len = 4 + HTC_RX_STATUS_LEN + mpdu.len();
+        let mut raw = vec![0x02, 0x00];
+        raw.extend_from_slice(&(htc_payload_len as u16).to_be_bytes());
+        raw.extend_from_slice(&[0, 0, 0, 0]);
+        raw.extend_from_slice(&[0x04, 0x00, 0x00, 0x00]);
+        let mut status = [0u8; HTC_RX_STATUS_LEN];
+        status[8..10].copy_from_slice(&(mpdu.len() as u16).to_be_bytes());
+        status[10] = 0x01; // ATH9K_RXERR_CRC
+        raw.extend_from_slice(&status);
+        raw.extend_from_slice(&mpdu);
+
+        let (decoded, advance) = parse_rx_unit(ndn_fmt(), ClockDomainId(0), &raw, 0).unwrap();
+        assert!(decoded.is_none(), "CRC error -> dropped");
+        assert!(advance >= RX_PREFIX_LEN + HTC_RX_STATUS_LEN, "still advances past the unit");
     }
 }

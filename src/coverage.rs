@@ -133,25 +133,15 @@ pub const COVERAGE: &[Row] = &[
         backend: "Ath9kHtcBackend (AR9271)",
         pids: &[0x9271], // AR9271_IDS is (vid,pid) pairs; 0x9271 under Atheros VID
         campaign: false,
-        frame_io: Excluded(
-            "L1 transport only (USB + firmware download + HTC/WMI handshake) — the open-firmware \
-             Tier-0 path (#100/ath9k-htc-ndr) runs the filter ON the dongle; this host backend \
-             does not yet replace ath9k_htc as a FrameIo radio. Lifted by: the ndr firmware's TX \
-             path landing.",
-        ),
+        frame_io: Provided, // M3: stamped RX up + TX inject (build_tx_frame_bytes); RX proven on
+        // silicon, TX framing bench-uncertain (node/rate handling) — flagged at the impl.
         knobs: Excluded(
-            "Follows frame_io: control knobs presuppose a data plane to control; the AR9271's \
-             knob path will be WMI commands once the ndr firmware's TX path lands.",
+            "No `&self` RadioKnobs yet: a channel retune is `hw_reset(&mut self)` on this part, so \
+             channel is fixed at open (`open_ath9k`) — re-open to change it. Lifted by: a WMI-driven \
+             `&self` set_channel (the target owns the PHY over the same register-write commands).",
         ),
-        time: Excluded(
-            "Follows frame_io — though the AR9271 is the measured 1.05 µs TimeToken part, so this \
-             is the FIRST seam to lift once the backend carries frames: the firmware TX counter \
-             path is already validated on air.",
-        ),
-        profile: Excluded(
-            "Follows frame_io: a capability declaration for a backend that cannot carry a frame \
-             would be the decided-but-unactuated defect in its purest form.",
-        ),
+        time: Provided, // M2: per-frame rs_tstamp is a FreeRunRxStamp common-view clock.
+        profile: Provided, // wifi_monitor_2ghz_1ss (1x1 2.4 GHz 11n, ch 1..13).
     },
 ];
 
@@ -231,6 +221,11 @@ mod tests {
         claim!(is_profile::<crate::Mt7612uBackend>);
         claim!(is_frame_io::<crate::Rtl8821cuBackend>);
         claim!(is_profile::<crate::Rtl8821cuBackend>);
+        // AR9271 (ath9k_htc) — M3 FrameIo + M2 RX-stamp clock + capability profile. Knobs stays
+        // excluded (channel retune is &mut self); see the table row.
+        claim!(is_frame_io::<crate::Ath9kHtcBackend>);
+        claim!(is_time::<crate::Ath9kHtcBackend>);
+        claim!(is_profile::<crate::Ath9kHtcBackend>);
         #[cfg(feature = "bw16")]
         {
             claim!(is_frame_io::<crate::Bw16SerialBackend>);

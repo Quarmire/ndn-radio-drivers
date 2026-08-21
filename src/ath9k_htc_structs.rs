@@ -43,6 +43,25 @@ pub struct TxFrameHdr {
 }
 const _: () = assert!(core::mem::size_of::<TxFrameHdr>() == 12);
 
+/// On-wire size of [`TxFrameHdr`] (== `size_of`), prepended before the 802.11 MPDU on the HTC
+/// DATA endpoint.
+pub const TX_FRAME_HDR_SIZE: usize = 12;
+
+/// `tx_frame_hdr.data_type` values, from mainline ath9k `htc.h`:
+///   `#define ATH9K_HTC_AMPDU  1`
+///   `#define ATH9K_HTC_NORMAL 2`
+/// An injected single (non-aggregated) data frame is [`ATH9K_HTC_NORMAL`].
+///
+/// ⚠ **BENCH:** verify this constant against the exact firmware the node runs (`~/ath9k-fw/...`).
+/// A wrong `data_type` steers the frame into the wrong target-side TX handler and it never keys
+/// onto air — the single most likely reason a byte-correct TX descriptor still radiates nothing.
+pub const ATH9K_HTC_AMPDU: u8 = 1;
+pub const ATH9K_HTC_NORMAL: u8 = 2;
+
+/// `tx_frame_hdr.key_type` for an unencrypted frame — `enum ath9k_key_type` starts at
+/// `ATH9K_KEY_TYPE_CLEAR = 0` (ath9k `hw.h`).
+pub const ATH9K_KEY_TYPE_CLEAR: u8 = 0;
+
 /// `struct ath_htc_rx_status` — RX status header prepended to inbound frames.
 ///
 /// SOURCE NOTE: the fetched `htc.h` only *references* this struct (htc.h:277);

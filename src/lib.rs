@@ -108,6 +108,12 @@ pub fn open_named_radio(pid: u16, channel: u8) -> Result<OpenRadio, FaceError> {
     // Which dongle to claim when several identical ones share the host — `NDN_USB_ADDR="<bus>-<port>"`
     // (stable) or `NDN_USB_INDEX=<n>` (enumeration order). Both branches honour it, so a node with two
     // `0bda:a81a` can pin the spare and leave the kernel mesh on the other (see the multi-radio note).
+    // AR9271 (ath9k_htc) — the one Wi-Fi part whose firmware is ours (M3 FrameIo). Its firmware is
+    // NOT embedded (it lives at `~/ath9k-fw/...` on the node), so `open_ath9k` is gated behind the
+    // `NDN_ATH9K_FW` env var pointing at `htc_9271-1.4.0.fw`. Keyed on the AR9271 PID set.
+    if AR9271_IDS.iter().any(|&(_, p)| p == pid) {
+        return open_ath9k(channel);
+    }
     let sel = crate::DeviceSelect::from_env();
     let radio: Arc<dyn FrameIo> = if matches!(pid, 0xa81a | 0xa811 | 0x8814) {
         // RTL8822E: `open_monitor_pid_select` claims the selected device + BB/RF-inits + monitors +
@@ -176,6 +182,62 @@ pub fn open_named_radio(pid: u16, channel: u8) -> Result<OpenRadio, FaceError> {
             profile: Some(d),
         });
     };
+}
+
+/// 2.4 GHz Wi-Fi channel number → centre frequency (MHz). Ch14 is the 2484 special case; the rest
+/// are `2407 + 5·ch` (ch1 = 2412, ch6 = 2437, ch11 = 2462).
+fn ath9k_channel_to_mhz(ch: u8) -> u16 {
+    if ch == 14 {
+        2484
+    } else {
+        2407 + 5 * (ch as u16)
+    }
+}
+
+/// Open the AR9271 as a full [`OpenRadio`] (M3): download firmware, HTC/WMI handshake, the faithful
+/// `ath9k_hw_reset` PHY/MAC bring-up on `channel`, connect the data services, start receive, and
+/// start the RX pump. Returns the backend cloned into `io` / `time` / `profile`.
+///
+/// **Firmware is not embedded.** The AR9271 image lives on the node at `~/ath9k-fw/...`, so this is
+/// gated behind `NDN_ATH9K_FW=<path to htc_9271-1.4.0.fw>`. Without it, this errors with that
+/// instruction rather than half-wiring the dispatch.
+///
+/// `knobs = None`: a channel retune is `hw_reset(&mut self)` on this part (no `&self` `RadioKnobs`
+/// path yet), so channel is fixed at open — re-open to change it. TX framing is bench-uncertain
+/// (see `ath9k_htc::build_tx_frame_bytes`); RX + the RX-stamp clock are the low-risk, proven halves.
+pub fn open_ath9k(channel: u8) -> Result<OpenRadio, FaceError> {
+    use std::sync::Arc;
+    let fw_path = std::env::var("NDN_ATH9K_FW").map_err(|_| {
+        FaceError::Io(std::io::Error::other(
+            "open_ath9k: set NDN_ATH9K_FW=<path to htc_9271-1.4.0.fw> — the AR9271 firmware is not \
+             embedded (it lives at ~/ath9k-fw/target_firmware/build/k2/htc_9271.fw on the node)",
+        ))
+    })?;
+    let fw = std::fs::read(&fw_path).map_err(|e| {
+        FaceError::Io(std::io::Error::other(format!(
+            "open_ath9k: cannot read firmware {fw_path}: {e}"
+        )))
+    })?;
+    let chan_mhz = ath9k_channel_to_mhz(channel);
+
+    let mut dev = Ath9kHtcBackend::open()?;
+    dev.download_firmware(&fw)?;
+    dev.htc_init()?;
+    // Faithful ath9k_hw_reset (reset + initvals + cal) on the requested channel, then the post-reset
+    // RX-start steps, matching `ath9k_htc_start`'s order.
+    dev.hw_reset(chan_mhz)?;
+    dev.connect_data_services()?;
+    dev.start_receive()?;
+    dev.wmi_start()?;
+
+    let dev = Arc::new(dev);
+    start_pump(&dev); // async (NDN_ASYNC_PUMP) or sync pump, lives for the process
+    Ok(OpenRadio {
+        io: dev.clone(),
+        knobs: None,
+        time: Some(dev.clone()),
+        profile: Some(dev),
+    })
 }
 
 /// RX-pump reader-thread / transfer-pool count. Default 8; `NDN_RX_PUMP_DEPTH` overrides.

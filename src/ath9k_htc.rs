@@ -103,6 +103,11 @@ pub const PIPE_REG_OUT: u8 = 4;
 pub const PIPE_WLAN_TX: u8 = 1;
 pub const PIPE_WLAN_RX: u8 = 2;
 
+/// The monitor vif / self-station MAC created on the target for TX (locally-administered, "NDN").
+/// The injected `addr2` need not match this — injection sets addr2 per frame; the target node is
+/// only the rate-control lookup at `tx_frame_hdr.node_idx`.
+const SELF_MAC: [u8; 6] = [0x02, 0x4e, 0x44, 0x4e, 0x00, 0x01];
+
 /// Hard ceiling on a register-pipe message (`wMaxPacketSize` on EP3/EP4).
 pub const REG_PIPE_MAX: usize = 64;
 
@@ -192,6 +197,13 @@ pub enum WmiCmd {
     /// `IEEE80211_MODE_11NG` = 1 for 2.4GHz — its rate table is populated at attach, so this is
     /// safe). `ath_setcurmode_tgt`; a mode with no rate table would `adf_os_assert` on the target.
     SetMode = 0x000f,
+    /// Create a target station/node (payload = `struct ath9k_htc_target_sta`, 22 B). `ath_node_create_tgt`.
+    /// The host picks `sta_index`; TX data frames reference it via `tx_frame_hdr.node_idx` for rate
+    /// control — WITHOUT a created node the target drops the frame (measured: 0 on air with node 0).
+    NodeCreate = 0x0010,
+    /// Create a target virtual interface (payload = `struct ath9k_htc_target_vif`, 12 B).
+    /// `ath_vap_create_tgt`. The host picks `index`; TX references it via `tx_frame_hdr.vif_idx`.
+    VapCreate = 0x0013,
     RegRead = 0x0014,
     RegWrite = 0x0015,
     /// Push the `ieee80211com_target` capability block. `ath_ic_update_tgt`. Not required to
@@ -1874,6 +1886,41 @@ impl Ath9kHtcBackend {
         Ok(())
     }
 
+    /// Create a monitor vif + its self-station on the target so injected data frames have a valid
+    /// `node_idx`/`vif_idx` (0/0) for the target's rate control. Mirrors mainline
+    /// `ath9k_htc_add_monitor_interface` (`WMI_VAP_CREATE`) + `ath9k_htc_add_station`
+    /// (`WMI_NODE_CREATE`). ★ Without a created node the target DROPS injected frames — MEASURED
+    /// 0 on air with `node_idx = 0` referencing a non-existent node. The host picks both indices
+    /// (0/0). `mac` is the vif/node address (locally-administered); the injected `addr2` need not
+    /// match it — injection sets addr2 per frame; the node is only the rate-control lookup at
+    /// `node_idx`.
+    pub fn create_monitor_vif_node(&mut self, mac: [u8; 6]) -> Result<(), FaceError> {
+        const HTC_M_MONITOR: u8 = 8; // htc.h enum htc_opmode
+
+        // struct ath9k_htc_target_vif (htc.h, __packed, 12 B):
+        //   index(1) opmode(1) myaddr[6] ath_cap(1) rtsthreshold(be16) pad(1)
+        let mut hvif = [0u8; 12];
+        hvif[0] = 0; // index = first free vif slot
+        hvif[1] = HTC_M_MONITOR;
+        hvif[2..8].copy_from_slice(&mac);
+        self.wmi_cmd(WmiCmd::VapCreate, &hvif)?;
+
+        // struct ath9k_htc_target_sta (htc.h, __packed, 22 B):
+        //   macaddr[6] bssid[6] sta_index(1) vif_index(1) is_vif_sta(1)
+        //   flags(be16) htcap(be16) maxampdu(be16) pad(1)
+        let mut tsta = [0u8; 22];
+        tsta[0..6].copy_from_slice(&mac); // macaddr
+        // bssid (6..12) = 0
+        tsta[12] = 0; // sta_index = first free
+        tsta[13] = 0; // vif_index = the vif created above
+        tsta[14] = 1; // is_vif_sta (the vif's own station)
+        // flags (15..17) = 0, htcap (17..19) = 0
+        tsta[19..21].copy_from_slice(&0xffffu16.to_be_bytes()); // maxampdu
+        // pad (21) = 0
+        self.wmi_cmd(WmiCmd::NodeCreate, &tsta)?;
+        Ok(())
+    }
+
     /// **WMI RX-start verbs** — the HTC target-side trigger, called after
     /// [`hw_reset`](Self::hw_reset) + [`start_receive`](Self::start_receive), matching
     /// `ath9k_htc_start`'s order: `WMI_ATH_INIT` → `WMI_SET_MODE(11NG)` →
@@ -1887,6 +1934,9 @@ impl Ath9kHtcBackend {
         use crate::ath9k_reg::*;
         self.wmi_cmd(WmiCmd::AthInit, &[])?;
         self.wmi_cmd(WmiCmd::SetMode, &IEEE80211_MODE_11NG.to_be_bytes())?;
+        // Create the monitor vif + self-station so injected data frames (tx_frame_hdr.node_idx=0,
+        // vif_idx=0) have a valid target node for rate control — without it the target drops TX.
+        self.create_monitor_vif_node(SELF_MAC)?;
         self.wmi_cmd(WmiCmd::StartRecv, &[])?;
         self.wmi_cmd(WmiCmd::EnableIntr, &[])?;
         // ath9k_hw_set_interrupts — host-side final AR_IMR arming (golden trace).

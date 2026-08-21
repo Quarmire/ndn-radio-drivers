@@ -504,17 +504,40 @@ impl Mt7612uBackend {
             // NAKs/times out. macOS's slower control path hid this. Wait for the
             // FCE to go busy first (best-effort), then drain.
             std::thread::sleep(Duration::from_millis(1));
+            // DIAGNOSTIC (NDN_RADIO_EP_DEBUG): the handshake read of 0x09a8 is suspected to time
+            // out on a SuperSpeed host (ODROID-C4), which the old `unwrap_or(false)` masked as
+            // "not ready" → the FCE was advanced blind and the next chunk's bulk NAKed. Log the
+            // read outcomes so the real behavior is measured, not guessed.
+            let (mut busy_seen, mut busy_iters, mut busy_errs) = (false, 0u32, 0u32);
             for _ in 0..50 {
-                if self.rr(MT_FCE_PSE_CTRL_GO).map(|v| v & 1 != 0).unwrap_or(false) {
-                    break; // FCE picked up the chunk
+                match self.rr(MT_FCE_PSE_CTRL_GO) {
+                    Ok(v) if v & 1 != 0 => {
+                        busy_seen = true;
+                        break;
+                    }
+                    Ok(_) => {}
+                    Err(_) => busy_errs += 1,
                 }
+                busy_iters += 1;
                 std::thread::sleep(Duration::from_millis(1));
             }
+            let (mut drained, mut drain_iters, mut drain_errs) = (false, 0u32, 0u32);
             for _ in 0..200 {
-                if self.rr(MT_FCE_PSE_CTRL_GO).map(|v| v & 1 == 0).unwrap_or(false) {
-                    break; // drained
+                match self.rr(MT_FCE_PSE_CTRL_GO) {
+                    Ok(v) if v & 1 == 0 => {
+                        drained = true;
+                        break;
+                    }
+                    Ok(_) => {}
+                    Err(_) => drain_errs += 1,
                 }
+                drain_iters += 1;
                 std::thread::sleep(Duration::from_millis(1));
+            }
+            if dbg && (idx <= 2 || !drained) {
+                eprintln!(
+                    "    chunk {idx} handshake: busy_seen={busy_seen} busy_iters={busy_iters} busy_errs={busy_errs} | drained={drained} drain_iters={drain_iters} drain_errs={drain_errs}"
+                );
             }
             self.wr(MT_FCE_PSE_CTRL_GO, 1)?; // advance FCE to next chunk
             pos += cur;

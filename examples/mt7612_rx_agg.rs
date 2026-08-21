@@ -18,25 +18,21 @@
 //!   * `TILING MISMATCH` frequent ⇒ the length field is NOT what this assumes; do not act on the
 //!     unit counts above it — the instrument is wrong, which is the failure mode to suspect first.
 //!
-//! ## BLOCKED as of 2026-08-10 — this has not yet produced a measurement
+//! ## RESOLVED 2026-08-18 — bring-up works on the C4 SuperSpeed bus; aggregation answered
 //!
-//! On minidronesys-05 (ODROID-C4, SuperSpeed) `Mt7612uBackend::bring_up` fails
-//! **deterministically** in the firmware upload: `fw chunk 1 (dst 0x838f8) bulk: Operation timed
-//! out`, twice, at the identical address. Chunk 0 uploads fine. It is not this example, not the #80
-//! RX-pump port (whose diff does not touch the upload path), and not a kernel-re-grab race —
-//! `drivers_autoprobe=0` changed nothing.
+//! The earlier "BLOCKED as of 2026-08-10" note (a deterministic `fw chunk 1` upload timeout on
+//! minidronesys-05, ODROID-C4, SuperSpeed) is **stale**. Measured 2026-08-18 on that exact host:
+//! `Mt7612uBackend::bring_up` completes cleanly — 5929 register writes + 472 MCU commands, 0
+//! errors; the MCU comes up running and RX frames are captured. The firmware upload is not blocked.
 //!
-//! The diagnosis, from our own code plus the kernel's log: the inter-chunk handshake polls
-//! `MT_FCE_PSE_CTRL_GO` (0x09a8) to wait for the FCE to pick up and drain a chunk, and the kernel
-//! driver reports `vendor request req:06 off:09a8 failed:-110` on the same register — **the control
-//! read itself times out on this host**. Our poll loops use `.unwrap_or(false)`, so a failed read is
-//! indistinguishable from "not ready": both waits run their full timeout, the code writes the
-//! advance anyway, and the next chunk NAKs. `mcu_fw_send_data`'s own comment already warns this
-//! handshake is fragile on "fast USB stacks"; the C4's SuperSpeed path is evidently faster still.
+//! The inter-chunk handshake reads that the old note blamed did **not** fail: `busy_errs=0` and
+//! `drain_errs=0` across the whole upload. One latent fragility remains worth noting: the
+//! `MT_FCE_PSE_CTRL_GO` (0x09a8) "drain" bit never actually clears, so the upload relies on a fixed
+//! ~200ms wait rather than a real handshake edge. It works here, but it is a timing assumption, not
+//! a confirmation — if a faster or slower host ever regresses the upload, this is the first suspect.
 //!
-//! Fixing it means distinguishing a failed poll from a negative one and reacting (retry/settle)
-//! instead of advancing blind — and each attempt wedges the dongle (`ASIC revision: ffffffff`) until
-//! it is physically replugged, so it needs a session with someone at the bench.
+//! And the aggregation question this example asks is answered: **NO aggregation** — exactly 1 RX
+//! unit per bulk-IN transfer, so `decode_rx`'s single-unit treatment is correct as written.
 //!
 //! Run (needs the kernel driver off the device, and CAP_NET_RAW/root):
 //! ```sh

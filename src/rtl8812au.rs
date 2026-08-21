@@ -338,6 +338,46 @@ const RXDESC_SIZE: usize = 24;
 /// Hardware rate code (`DESC_RATE6M`) for the `TX_RATE` field — legacy 6 Mbps
 /// OFDM, the rate real NAN devices emit beacons/SDFs at.
 const DESC_RATE_6M: u32 = 0x04;
+/// `DESC_RATEMCS0` — the TX rate code for 802.11n HT MCS0. The MCS index adds on
+/// (0–7 = 1 stream, 8–15 = 2 streams).
+const DESC_RATE_MCS0: u32 = 0x0c;
+/// `DESC_RATEVHTSS1MCS0` — the TX rate code for 802.11ac VHT 1-stream MCS0.
+const DESC_RATE_VHT1SS_MCS0: u32 = 0x2c;
+/// `DESC_RATEVHTSS2MCS0` — the TX rate code for 802.11ac VHT 2-stream MCS0.
+const DESC_RATE_VHT2SS_MCS0: u32 = 0x36;
+
+/// Resolve a control-plane [`McsDescriptor`](crate::McsDescriptor) + the frame's
+/// [`TxIntent`](ndn_radio_hal::TxIntent) into the 8812A `TX_RATE` DESC code —
+/// the pure decision the [`inject`](Rtl8812auBackend::inject) rate path turns on,
+/// factored out so it is unit-testable without a live USB device.
+///
+/// Mirrors the sibling 88xx backend's rate-code selection (the raw Realtek
+/// `DESC_RATE*` table): 802.11n HT is `DESC_RATEMCS0` (`0x0c`) + index (0–7 =
+/// 1 stream, 8–15 = 2 streams); 802.11ac VHT is `DESC_RATEVHTSS1MCS0` (`0x2c`) +
+/// index for 1 stream or `DESC_RATEVHTSS2MCS0` (`0x36`) + index for `nss >= 2`.
+/// Unlike the 8822E path this does **not** remap HT→VHT — that is an 8822E-only
+/// silicon workaround (its HT TX is dead on air); the 8812A emits the requested
+/// PHY verbatim.
+///
+/// A `MostRobust` frame (cooperative reports, discovery, control — anything the
+/// worst receiver in range must decode) is forced to legacy 6 Mbps OFDM
+/// (`DESC_RATE6M`, `0x04`) regardless of the stored rate, exactly as 802.11 sends
+/// beacons/probes at a basic rate for universal reach.
+fn desc_rate_for(mcs: &crate::McsDescriptor, intent: &ndn_radio_hal::TxIntent) -> u32 {
+    if intent.reliability == ndn_radio_hal::Reliability::MostRobust {
+        return DESC_RATE_6M;
+    }
+    let index = mcs.index as u32;
+    if mcs.vht {
+        if mcs.nss >= 2 {
+            DESC_RATE_VHT2SS_MCS0 + index
+        } else {
+            DESC_RATE_VHT1SS_MCS0 + index
+        }
+    } else {
+        DESC_RATE_MCS0 + index
+    }
+}
 
 /// A captured register program: `(addr, width-in-bytes, value)` writes applied in order.
 type RegProgram = &'static [(u16, u8, u32)];
@@ -4254,6 +4294,12 @@ pub struct Rtl8812auBackend {
     /// Saved `REG_EDCA_BE_PARAM` (0x0508) before [`set_cca_ignore`](Self::set_cca_ignore) zeroed the
     /// contention window (aggressive-EDCA blast). `0xffff_ffff` = nothing saved yet.
     edca_saved: std::sync::atomic::AtomicU32,
+    /// Current transmit rate as **state** — the exact MCS every `inject` uses once the
+    /// control plane has decided one via [`FrameIo::set_rate`]; `None` ⇒ fall back to the
+    /// legacy 6 Mbps default (or the `NDN_RADIO_TX_RATE` override). Mirrors the 88xx
+    /// backend's "rate as bearer state" seam so the cognition plane's per-frame MCS
+    /// decision is no longer silently discarded on this chip.
+    cur_mcs: std::sync::Mutex<Option<crate::McsDescriptor>>,
 }
 
 impl Drop for Rtl8812auBackend {
@@ -4351,6 +4397,7 @@ impl Rtl8812auBackend {
             tx_power_info: std::sync::Mutex::new(None),
             cca_saved: std::sync::atomic::AtomicU16::new(0xffff),
             edca_saved: std::sync::atomic::AtomicU32::new(0xffff_ffff),
+            cur_mcs: std::sync::Mutex::new(None),
         })
     }
 
@@ -6388,20 +6435,34 @@ impl FrameIo for Rtl8812auBackend {
         self.mesh_cv.lock().ok().and_then(|g| *g)
     }
 
+    /// Rate as bearer state: store the exact MCS every subsequent `inject` uses (until
+    /// changed or a `MostRobust` frame overrides it to legacy). Before this the 8812au
+    /// discarded the control plane's decision and every frame went out at legacy 6 Mbps.
+    fn set_rate(&self, mcs: crate::McsDescriptor) -> Result<(), FaceError> {
+        *self.cur_mcs.lock().unwrap() = Some(mcs);
+        Ok(())
+    }
+
     async fn inject(&self, frame: InjectFrame) -> Result<(), FaceError> {
         // Build the on-air 802.11 frame under the configured format (Raw80211 = the payload IS the
-        // frame, verbatim, the NAN path; RawNdn = wrap the NDN payload in an 802.11 data frame),
-        // then inject at legacy 6 Mbps OFDM — universally decodable (real NAN + a legacy-only 8733b
-        // RX alike). The HT/VHT `mcs` does not apply to a legacy frame, so it is ignored here.
+        // frame, verbatim, the NAN path; RawNdn = wrap the NDN payload in an 802.11 data frame).
         let handle = self.handle.clone();
         let ep = self.bulk_out;
         let dot11 = frame::build_dot11(self.format, &frame)?;
-        // Default legacy 6 Mbps; NDN_RADIO_TX_RATE=<dec> forces a DESC_RATE code for diagnostics
-        // (e.g. 12 = HT-MCS0, 44 = VHT-1SS-MCS0 — to test a peer's 1SS/20 MHz HT/VHT RX).
+        // Rate is bearer state: once the cognition control plane has decided an MCS via
+        // [`FrameIo::set_rate`], transmit at that DESC code ([`desc_rate_for`]); a `MostRobust`
+        // frame still drops to legacy 6 Mbps inside the resolver so control/report frames stay
+        // universally decodable. With no stored rate we keep the legacy 6 Mbps default (real NAN +
+        // a legacy-only 8733b RX alike). `NDN_RADIO_TX_RATE=<dec>` is the manual override / ultimate
+        // fallback (e.g. 12 = HT-MCS0, 44 = VHT-1SS-MCS0 — to test a peer's HT/VHT RX).
+        let base = match *self.cur_mcs.lock().unwrap() {
+            Some(mcs) => desc_rate_for(&mcs, &frame.tx),
+            None => DESC_RATE_6M,
+        };
         let rate = std::env::var("NDN_RADIO_TX_RATE")
             .ok()
             .and_then(|s| s.parse::<u32>().ok())
-            .unwrap_or(DESC_RATE_6M);
+            .unwrap_or(base);
         let buf = Self::tx_buffer(&dot11, rate);
         tokio::task::spawn_blocking(move || {
             handle
@@ -6441,9 +6502,10 @@ impl FrameIo for Rtl8812auBackend {
     }
 }
 
-// Marker only: this backend injects whole-frame legacy 6 Mbps (NAN management
-// frames), so the exact HT/VHT rate does not apply — `set_rate` (the FrameIo default
-// no-op) and the derived `inject_at` both just inject.
+// `inject_at` is the derived HAL default (`set_rate` + `inject`), so the driver
+// holds the transmit rate as state (`cur_mcs` + [`desc_rate_for`]) and no longer
+// implements a per-frame exact-rate path. With no rate decided the injection
+// default stays legacy 6 Mbps (universally decodable — real NAN + legacy-only RX).
 
 /// Exposes the always-on free-run per-frame RX-stamp clock (RXTSFL) now latched onto every
 /// received management frame. No read-now port TSF here, so `read_clock` stays the default `None`.
@@ -6461,5 +6523,61 @@ impl RadioProfile for Rtl8812auBackend {
             bands: vec![Band::Band2_4GHz, Band::Band5GHz],
             ..RadioCapability::wifi_monitor_5ghz(vec![6, 44, 149])
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::McsDescriptor;
+    use ndn_radio_hal::TxIntent;
+
+    /// Read back the 7-bit `TX_RATE` field (DWORD4, bits\[6:0\]) of a built TX descriptor.
+    fn desc_tx_rate(d: &[u8; TXDESC_SIZE]) -> u32 {
+        u32::from_le_bytes(d[16..20].try_into().unwrap()) & 0x7f
+    }
+
+    /// The regression guard for the fixed bug: a control-plane-decided MCS must actually
+    /// reach the descriptor's on-air rate field. Two distinct rates resolve to two distinct
+    /// DESC codes, and the build path carries each one through — so `set_rate` is no longer a
+    /// no-op that leaves every frame at legacy 6 Mbps.
+    #[test]
+    fn set_rate_changes_on_air_desc_rate() {
+        let ht5 = desc_rate_for(&McsDescriptor::ht(5), &TxIntent::CONSERVATIVE);
+        let vht7 = desc_rate_for(&McsDescriptor::vht(7), &TxIntent::CONSERVATIVE);
+        assert_eq!(ht5, DESC_RATE_MCS0 + 5, "HT MCS5 -> DESC_RATEMCS0 + 5");
+        assert_eq!(
+            vht7,
+            DESC_RATE_VHT1SS_MCS0 + 7,
+            "VHT-1SS MCS7 -> DESC_RATEVHTSS1MCS0 + 7"
+        );
+        assert_ne!(ht5, vht7);
+
+        // The same rate value flowing through the build path lands in TX_RATE, and the two
+        // built descriptors differ in exactly that field.
+        let d_ht = Rtl8812auBackend::build_txdesc(64, ht5, QSLT_MGNT);
+        let d_vht = Rtl8812auBackend::build_txdesc(64, vht7, QSLT_MGNT);
+        assert_eq!(desc_tx_rate(&d_ht), ht5);
+        assert_eq!(desc_tx_rate(&d_vht), vht7);
+        assert_ne!(
+            desc_tx_rate(&d_ht),
+            desc_tx_rate(&d_vht),
+            "the decided rate must change the on-air DESC rate code"
+        );
+    }
+
+    /// VHT `nss >= 2` selects the 2-stream base code, not the 1-stream one.
+    #[test]
+    fn vht_2ss_uses_the_two_stream_base() {
+        let r = desc_rate_for(&McsDescriptor::vht_2ss(3), &TxIntent::CONSERVATIVE);
+        assert_eq!(r, DESC_RATE_VHT2SS_MCS0 + 3);
+    }
+
+    /// A `MostRobust` frame drops to legacy 6 Mbps OFDM regardless of the stored rate, so
+    /// control/report frames stay decodable by the worst receiver in range.
+    #[test]
+    fn most_robust_forces_legacy_regardless_of_stored_mcs() {
+        let r = desc_rate_for(&McsDescriptor::vht_2ss(8), &TxIntent::ROBUST);
+        assert_eq!(r, DESC_RATE_6M);
     }
 }

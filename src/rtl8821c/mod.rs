@@ -1187,7 +1187,11 @@ impl Rtl8821cuBackend {
         // RX TSF-low latched at MAC-done (RXTSFL, µs). Same 88xx layout as the 8733b/8812au backends.
         let rxtsfl = u32::from_le_bytes([d[20], d[21], d[22], d[23]]);
         let stamp = Some(realtek_rx::rx_stamp(rxtsfl, self.tsf_domain));
-        let decoded = frame::parse_dot11(self.format, body, rssi, Some(rate), stamp)
+        // DESC_RATE code -> MCS index (HT/VHT) or None for legacy; the shared Realtek
+        // decode the sibling 88xx/8812au backends use. Passing the raw rate here would
+        // hand every mcs_index consumer the Realtek rate enum, not an MCS index.
+        let mcs_index = realtek_rx::mcs_from_desc_rate(rate);
+        let decoded = frame::parse_dot11(self.format, body, rssi, mcs_index, stamp)
             .into_iter()
             .collect();
         Some((decoded, stride.max(8)))

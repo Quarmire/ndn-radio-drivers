@@ -95,10 +95,11 @@ pub const COVERAGE: &[Row] = &[
         frame_io: Provided,
         knobs: Provided,
         time: Excluded(
-            "#79 ruling (P3.11 confirms): no hardware-validated timestamp path on mt76 — the \
-             RXTSFL-equivalent has never been read on this part, and a fabricated clock is worse \
-             than none (it would be believed). Lifted by: a bench session reading the mt76 TSF \
-             registers and validating one stamp against a known interval.",
+            "MEASURED 2026-08-18: mt76x2 has no usable per-frame RX timestamp. The TSF timer \
+             registers (0x1104/0x1108/0x110c) are static even after enabling MT_BEACON_TIME_CFG \
+             (0x1100) bit4 TIMER_EN; no receive-latched timestamp field exists in the 36-byte RXD \
+             prefix; and a per-frame register read costs ~141us (≈ the 200us common-view guard). So \
+             it cannot be a common-view participant — this is architectural, not a missing bench.",
         ),
         profile: Provided,
     },

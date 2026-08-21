@@ -152,6 +152,8 @@ enum HtcMsg {
     ConnectService = 2,
     ConnectServiceResponse = 3,
     SetupComplete = 4,
+    ConfigPipe = 5,
+    ConfigPipeResponse = 6,
 }
 
 /// HTC service IDs (`htc_services.h`): `(group << 8) | index`.
@@ -751,7 +753,33 @@ impl Ath9kHtcBackend {
         self.mgmt_ep = self.connect_service(HtcService::Mgmt, PIPE_WLAN_RX, PIPE_WLAN_TX)?;
         self.data_be_ep = self.connect_service(HtcService::DataBe, PIPE_WLAN_RX, PIPE_WLAN_TX)?;
         self.beacon_ep = self.connect_service(HtcService::Beacon, PIPE_WLAN_RX, PIPE_WLAN_TX)?;
+        // Allocate the target's flow-control credits to the WLAN-TX pipe so it has TX buffers to
+        // accept injected frames (best-effort — RX doesn't need it).
+        let _ = self.config_wlan_tx_credits();
         Ok(())
+    }
+
+    /// `HTC_MSG_CONFIG_PIPE` (`htc_hst.c::htc_config_pipe_credits`): tell the target how many of its
+    /// flow-control credits back the WLAN-TX pipe. Without it the target has no TX buffers and the
+    /// bulk-OUT pipe blocks after the first injected frame (MEASURED: 2nd `write_bulk` times out).
+    /// `struct htc_config_pipe_msg` = `message_id(be16=5) pipe_id(u8=USB_WLAN_TX_PIPE) credits(u8)`,
+    /// on ENDPOINT0.
+    fn config_wlan_tx_credits(&mut self) -> Result<(), FaceError> {
+        let msg = [0x00u8, 0x05, PIPE_WLAN_TX, self.credits as u8];
+        self.htc_send(HTC_ENDPOINT_CTRL, &msg)?;
+        match self.htc_recv(Duration::from_millis(1000)) {
+            Ok((_ep, resp))
+                if resp.len() >= 2
+                    && u16::from_be_bytes([resp[0], resp[1]])
+                        == HtcMsg::ConfigPipeResponse as u16 =>
+            {
+                Ok(())
+            }
+            Ok((_ep, resp)) => Err(err(format!(
+                "ath9k_htc: expected CONFIG_PIPE_RESPONSE, got {resp:02x?}"
+            ))),
+            Err(e) => Err(e),
+        }
     }
 
     /// The data-service endpoint ids from [`connect_data_services`](Self::connect_data_services),
@@ -2276,7 +2304,17 @@ fn build_tx_frame_bytes(
         )));
     }
 
-    let mut buf = Vec::with_capacity(HTC_HDR_LEN + payload_len);
+    // ── hif_usb TX stream header (4 B): le16 HTC-frame length + le16 stream tag ──
+    // ★ MEASURED (golden trace of the kernel's inject): EVERY TX frame on the bulk WLAN pipe is
+    // prefixed with this 4-byte header (`hif_usb.c` `hif_usb_send_mgmt`/`_send_tx`:
+    // `*hdr = le16(skb->len - 4); *hdr = le16(ATH_USB_TX_STREAM_MODE_TAG)`). Without it the target's
+    // hif_usb layer never frames the transfer as TX, and nothing goes on air (was our 0/40 bug).
+    const ATH_USB_TX_STREAM_MODE_TAG: u16 = 0x697e; // hif_usb.h
+    let htc_frame_len = HTC_HDR_LEN + payload_len;
+    let mut buf = Vec::with_capacity(4 + htc_frame_len);
+    buf.extend_from_slice(&(htc_frame_len as u16).to_le_bytes());
+    buf.extend_from_slice(&ATH_USB_TX_STREAM_MODE_TAG.to_le_bytes());
+
     // ── HTC_FRAME_HDR (8 B) ──
     buf.push(data_be_ep); // endpoint id (DataBE, assigned in connect_data_services)
     buf.push(0); // flags
@@ -2291,7 +2329,7 @@ fn build_tx_frame_bytes(
         tidno: 0,
         flags: [0; 4], // ATH9K_HTC_TX_* — none (no RTS/CTS-only)
         key_type: ATH9K_KEY_TYPE_CLEAR,
-        keyix: 0,
+        keyix: 0xff, // no key (matches the kernel's TX header on air)
         cookie: 0,
         pad: 0,
     };
@@ -2790,23 +2828,30 @@ mod tests {
         let buf = build_tx_frame_bytes(data_be_ep, ndn_fmt(), &frame).unwrap();
         let dot11 = crate::frame::build_dot11(ndn_fmt(), &frame).unwrap();
 
-        // HTC_FRAME_HDR (8 B): endpoint, flags, be16 payload length, control[4].
-        assert_eq!(buf[0], data_be_ep, "HTC endpoint = DataBE");
-        assert_eq!(buf[1], 0, "HTC flags = 0");
-        let payload_len = u16::from_be_bytes([buf[2], buf[3]]) as usize;
-        assert_eq!(payload_len, TX_FRAME_HDR_SIZE + dot11.len(), "HTC payload len = tx_hdr + MPDU");
-        assert_eq!(&buf[4..8], &[0, 0, 0, 0], "HTC control bytes zero");
+        // hif_usb TX stream header (4 B): le16 HTC-frame length + le16 tag 0x697e.
+        const HIF: usize = 4;
+        let htc_frame_len = HTC_HDR_LEN + TX_FRAME_HDR_SIZE + dot11.len();
+        assert_eq!(u16::from_le_bytes([buf[0], buf[1]]) as usize, htc_frame_len, "hif len = HTC frame");
+        assert_eq!(u16::from_le_bytes([buf[2], buf[3]]), 0x697e, "hif stream tag");
 
-        // tx_frame_hdr (12 B): data_type=NORMAL, everything else 0 / key CLEAR.
-        let h = &buf[HTC_HDR_LEN..HTC_HDR_LEN + TX_FRAME_HDR_SIZE];
+        // HTC_FRAME_HDR (8 B): endpoint, flags, be16 payload length, control[4].
+        assert_eq!(buf[HIF], data_be_ep, "HTC endpoint = DataBE");
+        assert_eq!(buf[HIF + 1], 0, "HTC flags = 0");
+        let payload_len = u16::from_be_bytes([buf[HIF + 2], buf[HIF + 3]]) as usize;
+        assert_eq!(payload_len, TX_FRAME_HDR_SIZE + dot11.len(), "HTC payload len = tx_hdr + MPDU");
+        assert_eq!(&buf[HIF + 4..HIF + 8], &[0, 0, 0, 0], "HTC control bytes zero");
+
+        // tx_frame_hdr (12 B): data_type=NORMAL, node/vif/tid/flags 0, key CLEAR, keyix=0xff.
+        let h = &buf[HIF + HTC_HDR_LEN..HIF + HTC_HDR_LEN + TX_FRAME_HDR_SIZE];
         assert_eq!(h[0], ATH9K_HTC_NORMAL, "data_type = NORMAL");
         assert_eq!(&h[1..8], &[0, 0, 0, 0, 0, 0, 0], "node/vif/tid/flags zero");
         assert_eq!(h[8], ATH9K_KEY_TYPE_CLEAR, "key_type = CLEAR (unencrypted)");
-        assert_eq!(&h[9..12], &[0, 0, 0], "keyix/cookie/pad zero");
+        assert_eq!(h[9], 0xff, "keyix = 0xff (no key)");
+        assert_eq!(&h[10..12], &[0, 0], "cookie/pad zero");
 
         // The 802.11 MPDU that follows is exactly `build_dot11` (same on-air layout as every backend):
         // FC=Data, addr1=dst, addr2=src, LLC/SNAP(0x8624), payload.
-        let mpdu = &buf[HTC_HDR_LEN + TX_FRAME_HDR_SIZE..];
+        let mpdu = &buf[HIF + HTC_HDR_LEN + TX_FRAME_HDR_SIZE..];
         assert_eq!(mpdu, &dot11[..], "MPDU == shared build_dot11");
         assert_eq!(&mpdu[0..2], &[0x08, 0x00], "FC: type=Data subtype=0");
         assert_eq!(&mpdu[4..10], &DST, "addr1 = dst");

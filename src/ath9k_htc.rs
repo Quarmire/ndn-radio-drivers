@@ -2290,14 +2290,19 @@ fn tx_frame_hdr_bytes(h: &TxFrameHdr) -> [u8; TX_FRAME_HDR_SIZE] {
 ///     status block (`RX_PREFIX_LEN`). TX here does *not* prepend one (mainline TX doesn't); if the
 ///     target rejects the frame, try mirroring that prefix.
 fn build_tx_frame_bytes(
-    data_be_ep: u8,
+    tx_ep: u8,
     format: FrameFormat,
     frame: &InjectFrame,
 ) -> Result<Vec<u8>, FaceError> {
     // The 802.11 data frame + LLC/SNAP(0x8624) + payload — the shared helper, so a frame injected
     // here de-frames identically on any other backend.
     let dot11 = crate::frame::build_dot11(format, frame)?;
-    let payload_len = TX_FRAME_HDR_SIZE + dot11.len();
+    // ★ MGMT-endpoint framing, matching the kernel's WORKING TX (golden trace): the 8-byte
+    // `tx_mgmt_hdr`, NOT the 12-byte `tx_frame_hdr`. A monitor-vif DATA frame has no associated node
+    // for rate control, so the target buffers but never transmits it; the mgmt path transmits the
+    // raw 802.11 frame as-is. `tx_ep` is the Mgmt endpoint.
+    const TX_MGMT_HDR_SIZE: usize = 8;
+    let payload_len = TX_MGMT_HDR_SIZE + dot11.len();
     if payload_len > u16::MAX as usize {
         return Err(err(format!(
             "ath9k_htc: TX frame {payload_len} B exceeds the 16-bit HTC payload length"
@@ -2316,24 +2321,15 @@ fn build_tx_frame_bytes(
     buf.extend_from_slice(&ATH_USB_TX_STREAM_MODE_TAG.to_le_bytes());
 
     // ── HTC_FRAME_HDR (8 B) ──
-    buf.push(data_be_ep); // endpoint id (DataBE, assigned in connect_data_services)
+    buf.push(tx_ep); // endpoint id (Mgmt, assigned in connect_data_services)
     buf.push(0); // flags
     buf.extend_from_slice(&(payload_len as u16).to_be_bytes()); // be16 payload length
     buf.extend_from_slice(&[0u8; 4]); // control bytes
 
-    // ── tx_frame_hdr (12 B) ──
-    let hdr = TxFrameHdr {
-        data_type: ATH9K_HTC_NORMAL,
-        node_idx: 0,
-        vif_idx: 0,
-        tidno: 0,
-        flags: [0; 4], // ATH9K_HTC_TX_* — none (no RTS/CTS-only)
-        key_type: ATH9K_KEY_TYPE_CLEAR,
-        keyix: 0xff, // no key (matches the kernel's TX header on air)
-        cookie: 0,
-        pad: 0,
-    };
-    buf.extend_from_slice(&tx_frame_hdr_bytes(&hdr));
+    // ── tx_mgmt_hdr (8 B): node_idx, vif_idx, tidno, flags, key_type, keyix, cookie, pad ──
+    // node/vif = 0 (the created monitor vif+node), keyix = 0xff (no key) — matches the kernel's
+    // on-air mgmt TX header from the golden trace.
+    buf.extend_from_slice(&[0, 0, 0, 0, 0, 0xff, 0, 0]);
 
     // ── 802.11 MPDU ──
     buf.extend_from_slice(&dot11);
@@ -2411,7 +2407,7 @@ impl Ath9kHtcBackend {
     /// Build the HTC data-endpoint TX buffer for `frame` (the [`build_tx_frame_bytes`] wire layout,
     /// bound to this device's DataBE endpoint + format).
     fn build_tx_frame(&self, frame: &InjectFrame) -> Result<Vec<u8>, FaceError> {
-        build_tx_frame_bytes(self.data_be_ep, self.format, frame)
+        build_tx_frame_bytes(self.mgmt_ep, self.format, frame)
     }
 }
 
@@ -2812,10 +2808,12 @@ mod tests {
         FrameFormat::RawNdn { ethertype: TEST_ETHERTYPE }
     }
 
-    /// The injected TX buffer must be `[HTC 8B][tx_frame_hdr 12B][802.11 data + LLC/SNAP + payload]`,
-    /// byte-for-byte. Pins the layout the target parses (the uncertain part) so an edit can't drift it.
+    /// The injected TX buffer must be `[hif_usb 4B][HTC 8B][tx_mgmt_hdr 8B][802.11 + LLC/SNAP +
+    /// payload]`, byte-for-byte — the mgmt-endpoint framing the kernel's on-air TX uses. Pins the
+    /// layout the target parses so an edit can't drift it.
     #[test]
     fn build_tx_frame_layout() {
+        const TX_MGMT_HDR_SIZE: usize = 8;
         let payload = b"\x05\x04ping";
         let frame = InjectFrame {
             payload: Bytes::copy_from_slice(payload),
@@ -2824,34 +2822,32 @@ mod tests {
             src: SRC,
             addr3: None,
         };
-        let data_be_ep = 0x07;
-        let buf = build_tx_frame_bytes(data_be_ep, ndn_fmt(), &frame).unwrap();
+        let mgmt_ep = 0x07;
+        let buf = build_tx_frame_bytes(mgmt_ep, ndn_fmt(), &frame).unwrap();
         let dot11 = crate::frame::build_dot11(ndn_fmt(), &frame).unwrap();
 
         // hif_usb TX stream header (4 B): le16 HTC-frame length + le16 tag 0x697e.
         const HIF: usize = 4;
-        let htc_frame_len = HTC_HDR_LEN + TX_FRAME_HDR_SIZE + dot11.len();
+        let htc_frame_len = HTC_HDR_LEN + TX_MGMT_HDR_SIZE + dot11.len();
         assert_eq!(u16::from_le_bytes([buf[0], buf[1]]) as usize, htc_frame_len, "hif len = HTC frame");
         assert_eq!(u16::from_le_bytes([buf[2], buf[3]]), 0x697e, "hif stream tag");
 
         // HTC_FRAME_HDR (8 B): endpoint, flags, be16 payload length, control[4].
-        assert_eq!(buf[HIF], data_be_ep, "HTC endpoint = DataBE");
+        assert_eq!(buf[HIF], mgmt_ep, "HTC endpoint = Mgmt");
         assert_eq!(buf[HIF + 1], 0, "HTC flags = 0");
         let payload_len = u16::from_be_bytes([buf[HIF + 2], buf[HIF + 3]]) as usize;
-        assert_eq!(payload_len, TX_FRAME_HDR_SIZE + dot11.len(), "HTC payload len = tx_hdr + MPDU");
+        assert_eq!(payload_len, TX_MGMT_HDR_SIZE + dot11.len(), "HTC payload len = tx_mgmt_hdr + MPDU");
         assert_eq!(&buf[HIF + 4..HIF + 8], &[0, 0, 0, 0], "HTC control bytes zero");
 
-        // tx_frame_hdr (12 B): data_type=NORMAL, node/vif/tid/flags 0, key CLEAR, keyix=0xff.
-        let h = &buf[HIF + HTC_HDR_LEN..HIF + HTC_HDR_LEN + TX_FRAME_HDR_SIZE];
-        assert_eq!(h[0], ATH9K_HTC_NORMAL, "data_type = NORMAL");
-        assert_eq!(&h[1..8], &[0, 0, 0, 0, 0, 0, 0], "node/vif/tid/flags zero");
-        assert_eq!(h[8], ATH9K_KEY_TYPE_CLEAR, "key_type = CLEAR (unencrypted)");
-        assert_eq!(h[9], 0xff, "keyix = 0xff (no key)");
-        assert_eq!(&h[10..12], &[0, 0], "cookie/pad zero");
+        // tx_mgmt_hdr (8 B): node_idx, vif_idx, tidno, flags, key_type, keyix=0xff, cookie, pad.
+        let h = &buf[HIF + HTC_HDR_LEN..HIF + HTC_HDR_LEN + TX_MGMT_HDR_SIZE];
+        assert_eq!(&h[0..5], &[0, 0, 0, 0, 0], "node/vif/tid/flags/key_type zero");
+        assert_eq!(h[5], 0xff, "keyix = 0xff (no key)");
+        assert_eq!(&h[6..8], &[0, 0], "cookie/pad zero");
 
         // The 802.11 MPDU that follows is exactly `build_dot11` (same on-air layout as every backend):
         // FC=Data, addr1=dst, addr2=src, LLC/SNAP(0x8624), payload.
-        let mpdu = &buf[HIF + HTC_HDR_LEN + TX_FRAME_HDR_SIZE..];
+        let mpdu = &buf[HIF + HTC_HDR_LEN + TX_MGMT_HDR_SIZE..];
         assert_eq!(mpdu, &dot11[..], "MPDU == shared build_dot11");
         assert_eq!(&mpdu[0..2], &[0x08, 0x00], "FC: type=Data subtype=0");
         assert_eq!(&mpdu[4..10], &DST, "addr1 = dst");

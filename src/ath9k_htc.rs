@@ -75,6 +75,13 @@ pub const EP_REG_OUT: u8 = 0x04;
 pub const PIPE_REG_IN: u8 = 3;
 pub const PIPE_REG_OUT: u8 = 4;
 
+/// Bulk WLAN pipe ids (`USB_WLAN_TX_PIPE` / `USB_WLAN_RX_PIPE` in mainline `hif_usb.h`): pipe 1 =
+/// EP1 OUT (TX), pipe 2 = EP2 IN (RX). Every HTC **data** service connects on these (dl=2, ul=1) —
+/// `service_to_dlpipe`/`service_to_ulpipe` in `htc_hst.c` — as opposed to WMI control, which uses
+/// the interrupt register pipes (dl=3, ul=4).
+pub const PIPE_WLAN_TX: u8 = 1;
+pub const PIPE_WLAN_RX: u8 = 2;
+
 /// Hard ceiling on a register-pipe message (`wMaxPacketSize` on EP3/EP4).
 pub const REG_PIPE_MAX: usize = 64;
 
@@ -151,12 +158,32 @@ pub enum WmiCmd {
     /// see the module docs. Our firmware must implement it before this is usable.
     AccessMemory = 0x0002,
     GetFwVersion = 0x0003,
+    /// Toggle the SWBA/BMISS interrupt bits (payload = BE u32 mask). `ath_enable_intr_tgt`.
+    EnableIntr = 0x0005,
+    /// Bring up the target WLAN app: set the interrupt mask (RX/TX/FATAL/…), install the ISR,
+    /// arm the lease tick. **No payload.** `ath_init_tgt`. Prerequisite for RX interrupts firing.
+    AthInit = 0x0006,
+    /// Start the target's RX descriptor ring + program `AR_RXDP`. **No payload.**
+    /// `ath_startrecv_tgt` → `ath_startrecv`. The host still owns the RX filter / opmode /
+    /// `AR_CR_RXE` on its side.
+    StartRecv = 0x000c,
+    /// Select the target PHY-mode rate table (payload = BE u16 `ieee80211_phymode`;
+    /// `IEEE80211_MODE_11NG` = 1 for 2.4GHz — its rate table is populated at attach, so this is
+    /// safe). `ath_setcurmode_tgt`; a mode with no rate table would `adf_os_assert` on the target.
+    SetMode = 0x000f,
     RegRead = 0x0014,
     RegWrite = 0x0015,
+    /// Push the `ieee80211com_target` capability block. `ath_ic_update_tgt`. Not required to
+    /// receive frames (the RX tasklet forwards regardless), so M1.4 skips it.
+    TargetIcUpdate = 0x0018,
     /// Tear the WLAN application down cleanly. Must be the last command — the target's handler
     /// frees its softc.
     TgtDetach = 0x001a,
 }
+
+/// 2.4GHz `ieee80211_phymode` (firmware `_ieee80211.h`): `IEEE80211_MODE_11NG` = 1. Its rate table
+/// is populated by `ath_rate_setup(IEEE80211_MODE_11NG)` at attach, so `WMI_SET_MODE` is safe.
+pub const IEEE80211_MODE_11NG: u16 = 1;
 
 /// `WMI_CMD_HDR`: command id + sequence number, both big-endian.
 const WMI_HDR_LEN: usize = 4;
@@ -205,6 +232,94 @@ pub struct NdrStats {
     pub dropped_popcount: u32,
 }
 
+/// Max `{addr,val}` pairs in one batched `WMI_REG_WRITE`. Bounded by the 64-byte
+/// register pipe: `HTC(8) + WMI(4) + n*8 ≤ 64` ⇒ `n ≤ 6`. The reply is empty
+/// (the firmware's `ath_hal_reg_write_tgt` answers `wmi_cmd_rsp(..., NULL, 0)`),
+/// so no receive-trailer budget is needed on the request side.
+pub const REG_WRITE_MAX_PAIRS: usize = 6;
+
+/// Result of [`Ath9kHtcBackend::phy_reset`] — the read-back evidence that the
+/// M1.1 chip reset landed, straight off the hardware.
+#[derive(Debug, Clone, Copy)]
+pub struct ResetStatus {
+    /// Raw `AR_SREV` (0x4020) after reset — the authoritative value. On the AR9271 this reads
+    /// `0x00_14_11_ff`: the low byte is `0xFF`, so ath9k sources macVersion (0x140) from the HTC
+    /// device path rather than decoding this register (see `ath9k_reg.rs`); the silicon signature
+    /// is still present as bits[23:16] == 0x14 == (0x140 >> 4).
+    pub srev_raw: u32,
+    /// `AR_SREV & 0xFF` — the ID byte. `0xFF` on the AR9271 (routes ath9k to the type2/HTC path).
+    pub srev_id: u32,
+    /// bits[23:16] of `AR_SREV` — the AR9271 signature nibble-pair, `0x14` == `AR_SREV_VERSION_9271
+    /// (0x140) >> 4`. (NB: this is *not* the naive AR9002 `MS(val, AR_SREV_VERSION)` decode, which is
+    /// invalid here because the ID byte is 0xFF.)
+    pub srev_version_field: u32,
+    /// `(AR_SREV & 0xF00) >> 8` — `MS(val, AR_SREV_REVISION2)`, the type2 macRev field (reads 1).
+    pub srev_rev: u32,
+    /// Raw `AR_RTC_STATUS` (0x7044) after reset — `& 0x0f` should read `AR_RTC_STATUS_ON` (0x02).
+    pub rtc_status: u32,
+    /// Raw `AR_RTC_RC` (0x7000) after reset — should read 0 (MAC out of reset).
+    pub rtc_rc: u32,
+    /// `AR_INTR_SYNC_CAUSE & 0x3000` observed mid-reset (PCIe-artefact bits; 0 on this USB part).
+    pub intr_sync_masked: u32,
+}
+
+/// Result of [`Ath9kHtcBackend::apply_initvals`] — sentinel read-back tally for M1.2.
+#[derive(Debug, Clone)]
+pub struct IniVerify {
+    pub total_written: usize,
+    pub matched: usize,
+    pub checked: usize,
+    /// `(addr, expected, got)` for every sentinel that did not read back its written value.
+    pub mismatches: Vec<(u32, u32, u32)>,
+}
+
+/// Result of [`Ath9kHtcBackend::set_channel_and_cal`] — M1.3 evidence.
+#[derive(Debug, Clone, Copy)]
+pub struct CalStatus {
+    /// Channel centre in MHz that was programmed.
+    pub chan_mhz: u16,
+    /// `AR_PHY_SYNTH_CONTROL` (0x9874) read back after programming the synth.
+    pub synth_control: u32,
+    /// `AR_PHY_MODE` (0xA200) read back — should be `AR_PHY_MODE_DYNAMIC` (0x04) for 2.4GHz.
+    pub phy_mode: u32,
+    /// `AR_PHY_ACTIVE` (0x981C) read back — should read `AR_PHY_ACTIVE_EN` (0x01).
+    pub phy_active: u32,
+    /// Did the AGC/offset cal (`AR_PHY_AGC_CONTROL_CAL`) clear within timeout? `false` = cal hung.
+    pub agc_cal_converged: bool,
+    /// `AR_PHY_AGC_CONTROL` (0x9860) read back after the cal (for diagnosis if it hung).
+    pub agc_control: u32,
+    /// `AR_PHY_CCA` (0x9864) after NF cal was started.
+    pub phy_cca: u32,
+    /// Noise floor decoded from `AR_PHY_CCA` `MINCCA_PWR` (bits[28:20], 9-bit signed), in dBm.
+    pub noise_floor_dbm: i32,
+}
+
+/// One received frame off EP 0x82: the parsed `ath_htc_rx_status` plus the 802.11 bytes.
+///
+/// Wire layout (big-endian multi-byte), 40 bytes, matching the host's `struct ath_htc_rx_status`
+/// (our firmware is the matching target-firmware fork): `rs_tstamp` be64, `rs_datalen` be16,
+/// `rs_status`, `rs_phyerr`, `rs_rssi`(combined), `rs_rssi_ctl[3]`, `rs_rssi_ext[3]`, `rs_keyix`,
+/// `rs_rate`, `rs_antenna`, `rs_more`, `rs_isaggr`, `rs_moreaggr`, `rs_num_delims`, `rs_flags`,
+/// `rs_dummy`, `rs_evm0/1/2` be32.
+#[derive(Debug, Clone)]
+pub struct RxFrame {
+    pub rs_tstamp: u64,
+    pub rs_datalen: u16,
+    pub rs_status: u8,
+    pub rs_phyerr: u8,
+    pub rs_rssi: i8,
+    pub rs_keyix: u8,
+    pub rs_rate: u8,
+    pub rs_antenna: u8,
+    pub rs_more: u8,
+    pub rs_flags: u8,
+    /// The 802.11 frame that followed the status block (`rs_datalen` bytes when consistent).
+    pub frame: Vec<u8>,
+}
+
+/// Bytes of the on-wire `ath_htc_rx_status` block that precede the 802.11 frame.
+pub const HTC_RX_STATUS_LEN: usize = 40;
+
 /// Largest echo payload whose *reply* fits one register-pipe packet:
 /// `64 - HTC(8) - WMI(4) - msgSize(1) = 51`.
 ///
@@ -223,6 +338,16 @@ pub struct Ath9kHtcBackend {
     /// Credits the target offered in its READY message — the HTC flow-control budget.
     credits: u16,
     credit_size: u16,
+    /// Endpoint ids the target assigns to the data services in [`connect_data_services`]
+    /// (`Ath9kHtcBackend::connect_data_services`); 0 = not yet connected. The RX path (M1) rides
+    /// these; the WMI-control endpoint stays [`wmi_endpoint`](Self::wmi_endpoint).
+    mgmt_ep: u8,
+    data_be_ep: u8,
+    beacon_ep: u8,
+    /// MAC clock rate in MHz used by `ath9k_hw_mac_to_clks` (timing math in
+    /// `init_global_settings`). Computed by [`Ath9kHtcBackend::set_clockrate`];
+    /// 44 for 2.4 GHz OFDM (the value the golden trace's SIFS/SLOT writes imply).
+    clockrate: u32,
 }
 
 fn usb_err<E: std::fmt::Display>(what: &str, e: E) -> FaceError {
@@ -296,6 +421,10 @@ impl Ath9kHtcBackend {
             wmi_endpoint: 0,
             credits: 0,
             credit_size: 0,
+            mgmt_ep: 0,
+            data_be_ep: 0,
+            beacon_ep: 0,
+            clockrate: crate::ath9k_reg::ATH9K_CLOCK_RATE_2GHZ_OFDM,
         })
     }
 
@@ -473,44 +602,9 @@ impl Ath9kHtcBackend {
         self.credits = u16::from_be_bytes([msg[2], msg[3]]);
         self.credit_size = u16::from_be_bytes([msg[4], msg[5]]);
 
-        // 2. CONNECT_SERVICE for WMI control.
-        //
-        //    HTC_CONNECT_SERVICE_MSG is **10** bytes, not 8:
-        //    MessageID(2) ServiceID(2) ConnectionFlags(2) DownLinkPipeID(1) UpLinkPipeID(1)
-        //    ServiceMetaLength(1) _Pad1(1)
-        //    A short message leaves the target reading ServiceMetaLength off the end of the buffer.
-        //
-        //    ★ The pipe IDs are load-bearing and must not be left zero. The target replies on
-        //    `Endpoints[ep].DownLinkPipeID` (`htc.c:402`) — whatever the host puts here. Send 0 and
-        //    every WMI response is dispatched to pipe 0 and never arrives, which presents as a
-        //    read timeout on a handshake that otherwise looks completely successful.
-        let mut req = [0u8; 10];
-        req[0..2].copy_from_slice(&(HtcMsg::ConnectService as u16).to_be_bytes());
-        req[2..4].copy_from_slice(&(HtcService::WmiControl as u16).to_be_bytes());
-        req[6] = PIPE_REG_IN; // DownLinkPipeID: target -> host
-        req[7] = PIPE_REG_OUT; // UpLinkPipeID:   host -> target
-        self.htc_send(HTC_ENDPOINT_CTRL, &req)?;
-
-        let (_ep, resp) = self.htc_recv(Duration::from_millis(1000))?;
-        if resp.len() < 5
-            || u16::from_be_bytes([resp[0], resp[1]]) != HtcMsg::ConnectServiceResponse as u16
-        {
-            return Err(err(format!(
-                "ath9k_htc: expected CONNECT_SERVICE_RESPONSE, got {resp:02x?}"
-            )));
-        }
-        // MessageID(2) ServiceID(2) Status(1) EndpointID(1) ...
-        let status = resp[4];
-        if status != 0 {
-            return Err(err(format!(
-                "ath9k_htc: WMI service connect refused, status {status}"
-            )));
-        }
-        self.wmi_endpoint = *resp.get(5).ok_or_else(|| {
-            err("ath9k_htc: CONNECT_SERVICE_RESPONSE has no endpoint id".to_string())
-        })?;
-
-        dbg_dump("connect-resp", &resp);
+        // 2. CONNECT_SERVICE for WMI control (interrupt reg pipes, dl=3/ul=4).
+        self.wmi_endpoint =
+            self.connect_service(HtcService::WmiControl, PIPE_REG_IN, PIPE_REG_OUT)?;
         if std::env::var_os("NDR_ATH9K_DEBUG").is_some() {
             eprintln!("[ath9k] WMI endpoint assigned: {}", self.wmi_endpoint);
         }
@@ -520,6 +614,86 @@ impl Ath9kHtcBackend {
         self.htc_send(HTC_ENDPOINT_CTRL, &done)?;
 
         Ok(())
+    }
+
+    /// Send an HTC `CONNECT_SERVICE` for `service` with the given pipe ids and return the endpoint
+    /// id the target assigns.
+    ///
+    /// `HTC_CONNECT_SERVICE_MSG` is **10** bytes, not 8:
+    /// `MessageID(2) ServiceID(2) ConnectionFlags(2) DownLinkPipeID(1) UpLinkPipeID(1)
+    /// ServiceMetaLength(1) _Pad1(1)`. A short message leaves the target reading `ServiceMetaLength`
+    /// off the end of the buffer.
+    ///
+    /// ★ The pipe ids are load-bearing and must not be left zero. The target replies on
+    /// `Endpoints[ep].DownLinkPipeID` (`htc.c:402`) — whatever the host puts here. Send 0 and every
+    /// response is dispatched to pipe 0 and never arrives, presenting as a read timeout on a
+    /// handshake that otherwise looks completely successful. WMI control uses the interrupt reg
+    /// pipes (dl=3, ul=4); every data service uses the bulk WLAN pipes (dl=2, ul=1) — the exact
+    /// split `service_to_dlpipe`/`service_to_ulpipe` encode in mainline `htc_hst.c`.
+    fn connect_service(
+        &mut self,
+        service: HtcService,
+        dl_pipe: u8,
+        ul_pipe: u8,
+    ) -> Result<u8, FaceError> {
+        let mut req = [0u8; 10];
+        req[0..2].copy_from_slice(&(HtcMsg::ConnectService as u16).to_be_bytes());
+        req[2..4].copy_from_slice(&(service as u16).to_be_bytes());
+        req[6] = dl_pipe; // DownLinkPipeID: target -> host
+        req[7] = ul_pipe; // UpLinkPipeID:   host -> target
+        self.htc_send(HTC_ENDPOINT_CTRL, &req)?;
+
+        let (_ep, resp) = self.htc_recv(Duration::from_millis(1000))?;
+        // MessageID(2) ServiceID(2) Status(1) EndpointID(1) ...
+        if resp.len() < 6
+            || u16::from_be_bytes([resp[0], resp[1]]) != HtcMsg::ConnectServiceResponse as u16
+        {
+            return Err(err(format!(
+                "ath9k_htc: expected CONNECT_SERVICE_RESPONSE for {service:?}, got {resp:02x?}"
+            )));
+        }
+        let status = resp[4];
+        if status != 0 {
+            return Err(err(format!(
+                "ath9k_htc: service {service:?} connect refused, status {status}"
+            )));
+        }
+        Ok(resp[5])
+    }
+
+    /// **M1.0** — connect the HTC data services the RX/TX frame path rides on, capturing the
+    /// endpoint ids the target assigns. All three ride the bulk WLAN pipes (dl=2 RX, ul=1 TX).
+    ///
+    /// This is prerequisite plumbing for FrameIo. No PHY is up yet, so nothing arrives on the RX
+    /// pipe until the M1 bring-up (reset → initvals → cal → RX enable) completes — the point of
+    /// doing it first is to prove the data-service handshake and pipe claim in isolation.
+    pub fn connect_data_services(&mut self) -> Result<(), FaceError> {
+        self.mgmt_ep = self.connect_service(HtcService::Mgmt, PIPE_WLAN_RX, PIPE_WLAN_TX)?;
+        self.data_be_ep = self.connect_service(HtcService::DataBe, PIPE_WLAN_RX, PIPE_WLAN_TX)?;
+        self.beacon_ep = self.connect_service(HtcService::Beacon, PIPE_WLAN_RX, PIPE_WLAN_TX)?;
+        Ok(())
+    }
+
+    /// The data-service endpoint ids from [`connect_data_services`](Self::connect_data_services),
+    /// as `(mgmt, data_be, beacon)`. Zero until connected.
+    pub fn data_endpoints(&self) -> (u8, u8, u8) {
+        (self.mgmt_ep, self.data_be_ep, self.beacon_ep)
+    }
+
+    /// Read one raw transfer from the bulk WLAN-RX pipe ([`EP_WLAN_RX`]).
+    ///
+    /// The target frames each received packet as `[HTC_FRAME_HDR 8B][ath_htc_rx_status 40B]
+    /// [802.11…]`; stripping and parsing that is the caller's job (M1-done / M2). Returns the bytes
+    /// actually transferred. Until the PHY is up this only ever times out — a clean timeout here is
+    /// the M1.0 success signal (the pipe is claimable), not a failure.
+    pub fn recv_raw_frame(&mut self, timeout: Duration) -> Result<Vec<u8>, FaceError> {
+        let mut buf = vec![0u8; 2048];
+        let n = self
+            .handle
+            .read_bulk(EP_WLAN_RX, &mut buf, timeout)
+            .map_err(|e| usb_err("wlan rx", e))?;
+        buf.truncate(n);
+        Ok(buf)
     }
 
     // ── WMI ──────────────────────────────────────────────────────────────────
@@ -745,6 +919,1222 @@ impl Ath9kHtcBackend {
             dropped_popcount: w[5],
         })
     }
+
+    // ── Register access (WMI_REG_READ / WMI_REG_WRITE) ────────────────────────
+    //
+    // Wire format resolved from BOTH ends (they must agree):
+    //   host  — ath9k `htc_drv_init.c` `ath9k_regread` / `ath9k_regwrite_single` /
+    //           `ath9k_regwrite_multi`.
+    //   target — our firmware `wlan/if_ath.c` `ath_hal_reg_read_tgt` /
+    //           `ath_hal_reg_write_tgt` (the authoritative parser — we run this fork).
+    //
+    // WMI_REG_READ_CMDID (0x14):  payload = addr as one big-endian u32.
+    //                             reply   = value as one big-endian u32.
+    //   (The firmware loops the payload in 4-byte strides, so N addresses ⇒ N values;
+    //    we only ever send one here.)
+    // WMI_REG_WRITE_CMDID (0x15): payload = N × { u32 reg, u32 val }, each big-endian,
+    //                             reg first then val (host `buf[2] = {reg, val}`).
+    //                             reply   = EMPTY (`wmi_cmd_rsp(..., NULL, 0)`).
+    // Every WMI multi-byte field is big-endian, and the target is big-endian, so
+    // `to_be_bytes` / `from_be_bytes` round-trips values exactly on both paths.
+
+    /// Read one 32-bit hardware register through `WMI_REG_READ`.
+    ///
+    /// ★ Oracle: `reg_read(0x4020)` (`AR_SREV`) returns the AR9271's silicon-revision
+    /// register — a stable, non-degenerate value (not 0, not `0xffff_ffff`, not the
+    /// address echoed back). That is the unambiguous proof this primitive works before
+    /// anything is written.
+    pub fn reg_read(&mut self, addr: u32) -> Result<u32, FaceError> {
+        let resp = self.wmi_cmd(WmiCmd::RegRead, &addr.to_be_bytes())?;
+        if resp.len() < 4 {
+            return Err(err(format!(
+                "ath9k_htc: REG_READ({addr:#010x}) reply is {} B, expected 4",
+                resp.len()
+            )));
+        }
+        Ok(u32::from_be_bytes([resp[0], resp[1], resp[2], resp[3]]))
+    }
+
+    /// Write one 32-bit hardware register through `WMI_REG_WRITE` (single pair).
+    ///
+    /// The firmware replies with a zero-length payload, so nothing is returned; the
+    /// proof a write landed is a subsequent [`reg_read`](Self::reg_read).
+    pub fn reg_write(&mut self, addr: u32, val: u32) -> Result<(), FaceError> {
+        let mut payload = [0u8; 8];
+        payload[0..4].copy_from_slice(&addr.to_be_bytes());
+        payload[4..8].copy_from_slice(&val.to_be_bytes());
+        self.wmi_cmd(WmiCmd::RegWrite, &payload)?;
+        Ok(())
+    }
+
+    /// Write many registers, batching up to [`REG_WRITE_MAX_PAIRS`] `{addr,val}` pairs
+    /// per `WMI_REG_WRITE` to respect the 64-byte register pipe — the volume path M1.2
+    /// needs (≈670 rows would otherwise be ≈670 USB round-trips).
+    pub fn reg_write_batch(&mut self, pairs: &[(u32, u32)]) -> Result<(), FaceError> {
+        for chunk in pairs.chunks(REG_WRITE_MAX_PAIRS) {
+            let mut payload = Vec::with_capacity(chunk.len() * 8);
+            for (addr, val) in chunk {
+                payload.extend_from_slice(&addr.to_be_bytes());
+                payload.extend_from_slice(&val.to_be_bytes());
+            }
+            self.wmi_cmd(WmiCmd::RegWrite, &payload)?;
+        }
+        Ok(())
+    }
+
+    /// A generous settle gap. The µs-scale `udelay`s in the reference reset/PLL paths
+    /// are dwarfed by a single WMI USB round-trip (~1 ms), but a few explicit
+    /// milliseconds at the RTC state transitions costs nothing and removes all doubt.
+    fn settle(ms: u64) {
+        std::thread::sleep(Duration::from_millis(ms));
+    }
+
+    /// Poll `reg` until `(value & mask) == want`, returning the final read. Errors on
+    /// timeout — mirrors `ath9k_hw_wait`, but each iteration is a WMI round-trip so a
+    /// modest iteration count already spans hundreds of ms of wall time.
+    fn wait_reg(&mut self, reg: u32, mask: u32, want: u32) -> Result<u32, FaceError> {
+        for _ in 0..64 {
+            let v = self.reg_read(reg)?;
+            if v & mask == want {
+                return Ok(v);
+            }
+            Self::settle(2);
+        }
+        Err(err(format!(
+            "ath9k_htc: reg {reg:#010x} never reached (&{mask:#x})=={want:#x}"
+        )))
+    }
+
+    // ── M1.1 — chip reset / wake ──────────────────────────────────────────────
+
+    /// **M1.1 / hw_reset step 3** — reset and wake the AR9271 MAC/baseband, following
+    /// `ath9k_hw_set_reset_reg(POWER_ON)` → `ath9k_hw_set_reset_power_on` →
+    /// `ath9k_hw_set_reset(WARM)` (hw.c) for the not-9100/not-9300 path, plus the
+    /// AR9271-only `htc_reset_init` RF-gate writes that bracket the chip reset.
+    ///
+    /// Now also folds in the tail of `ath9k_hw_chip_reset` — `ath9k_hw_init_pll`
+    /// (the 0x7014/0x50040/0x7048 PLL / 117 MHz core-clock / derived-sleep-clock
+    /// writes) — and the AR9271 `GATE_MAC_CTL` write, so this method reproduces the
+    /// golden trace's reset region 1:1 (RF_RST → reset → PLL → GATE) IN ORDER, before
+    /// any initval replay. (Previously the PLL/GATE lived in `apply_initvals`, which
+    /// put GATE before PLL — the ordering this rewrite corrects.)
+    ///
+    /// The firmware CPU and USB/HIF block are untouched by an RTC MAC reset, so WMI
+    /// keeps servicing register I/O throughout — which is exactly why `ath9k_htc`
+    /// drives the whole PHY from the host over these same commands.
+    pub fn phy_reset(&mut self) -> Result<ResetStatus, FaceError> {
+        use crate::ath9k_reg::*;
+
+        // AR9271 first-reset only: assert the radio RF reset just before the chip
+        // reset (hw.c: AR_SREV_9271 && htc_reset_init).
+        self.reg_write(AR9271_RESET_POWER_DOWN_CONTROL, AR9271_RADIO_RF_RST)?;
+        Self::settle(2);
+
+        // ── ath9k_hw_set_reset_reg(POWER_ON) ──
+        self.reg_write(
+            AR_RTC_FORCE_WAKE,
+            AR_RTC_FORCE_WAKE_EN | AR_RTC_FORCE_WAKE_ON_INT,
+        )?;
+
+        // ── ath9k_hw_set_reset_power_on() ──
+        self.reg_write(
+            AR_RTC_FORCE_WAKE,
+            AR_RTC_FORCE_WAKE_EN | AR_RTC_FORCE_WAKE_ON_INT,
+        )?;
+        self.reg_write(AR_RC, AR_RC_AHB)?;
+        self.reg_write(AR_RTC_RESET, 0)?;
+        Self::settle(2); // udelay(2)
+        self.reg_write(AR_RC, 0)?;
+        self.reg_write(AR_RTC_RESET, AR_RTC_RESET_EN)?; // = 1
+        // Poll RTC power-on: (STATUS & 0x0f) == ON(0x02).
+        self.wait_reg(AR_RTC_STATUS, AR_RTC_STATUS_M, AR_RTC_STATUS_ON)?;
+
+        // ── ath9k_hw_set_reset(WARM) ──
+        self.reg_write(
+            AR_RTC_FORCE_WAKE,
+            AR_RTC_FORCE_WAKE_EN | AR_RTC_FORCE_WAKE_ON_INT,
+        )?;
+        let intr_sync = self.reg_read(AR_INTR_SYNC_CAUSE)?
+            & (AR_INTR_SYNC_LOCAL_TIMEOUT | AR_INTR_SYNC_RADM_CPL_TIMEOUT);
+        if intr_sync != 0 {
+            self.reg_write(AR_INTR_SYNC_ENABLE, 0)?;
+            self.reg_write(AR_RC, AR_RC_HOSTIF | AR_RC_AHB)?;
+        } else {
+            self.reg_write(AR_RC, AR_RC_AHB)?;
+        }
+        // WARM (not COLD) ⇒ rst_flags = MAC_WARM only.
+        self.reg_write(AR_RTC_RC, AR_RTC_RC_MAC_WARM)?;
+        Self::settle(2); // udelay(100)
+        self.reg_write(AR_RTC_RC, 0)?;
+        // Poll the MAC out of reset: (RC & 0x3) == 0.
+        self.wait_reg(AR_RTC_RC, AR_RTC_RC_M, 0)?;
+        self.reg_write(AR_RC, 0)?;
+
+        // Re-assert force-wake so the part stays awake for initvals.
+        self.reg_write(
+            AR_RTC_FORCE_WAKE,
+            AR_RTC_FORCE_WAKE_EN | AR_RTC_FORCE_WAKE_ON_INT,
+        )?;
+
+        // ── ath9k_hw_init_pll (called from the tail of ath9k_hw_chip_reset, BEFORE
+        // the AR9271 GATE_MAC_CTL write and BEFORE process_ini) ──
+        // For AR9271 none of the DPLL SREV branches apply: it is a plain PLL write,
+        // the AR9271 core-clock switch to 117 MHz, then the derived sleep clock.
+        // Golden trace lines 8-10: 0x7014=0x142c, 0x50040=0x304, 0x7048=0x02. ✓
+        self.reg_write(AR_RTC_PLL_CONTROL, AR9271_PLL_CONTROL_2GHZ)?; // 0x7014 = 0x142c
+        Self::settle(1); // udelay(500) — AR9271 core-clock switch guard
+        self.reg_write(AR9271_CORE_CLOCK_REG, AR9271_CORE_CLOCK_117MHZ)?; // 0x50040 = 0x304
+        Self::settle(1); // RTC_PLL_SETTLE_DELAY
+        self.reg_write(AR_RTC_SLEEP_CLK, AR_RTC_FORCE_DERIVED_CLK)?; // 0x7048 = 0x02
+
+        // ── AR9271 htc_reset_init: gate MAC control just AFTER the chip reset /
+        // init_pll, and BEFORE process_ini (hw.c:1945-1951). Trace line 11. ──
+        self.reg_write(AR9271_RESET_POWER_DOWN_CONTROL, AR9271_GATE_MAC_CTL)?; // 0x50044 = 0x4000
+        Self::settle(1); // udelay(50)
+
+        // Read-back evidence.
+        let srev_raw = self.reg_read(AR_SREV)?;
+        let rtc_status = self.reg_read(AR_RTC_STATUS)?;
+        let rtc_rc = self.reg_read(AR_RTC_RC)?;
+        Ok(ResetStatus {
+            srev_raw,
+            srev_id: srev_raw & AR_SREV_ID,
+            srev_version_field: (srev_raw >> 16) & 0xff,
+            srev_rev: (srev_raw & 0x0000_0f00) >> 8,
+            rtc_status,
+            rtc_rc,
+            intr_sync_masked: intr_sync,
+        })
+    }
+
+    // ── M1.2 — PLL + apply initvals (2.4 GHz HT20) ────────────────────────────
+
+    /// Stream one MODES-shaped table (`{addr, 5G_HT20, 5G_HT40, 2G_HT40, 2G_HT20}`)
+    /// at the given column, recording each `{addr,val}` written.
+    fn stream_modes(
+        &mut self,
+        table: &[[u32; 5]],
+        col: usize,
+        written: &mut Vec<(u32, u32)>,
+    ) -> Result<(), FaceError> {
+        let pairs: Vec<(u32, u32)> = table.iter().map(|r| (r[0], r[col])).collect();
+        self.reg_write_batch(&pairs)?;
+        written.extend_from_slice(&pairs);
+        Ok(())
+    }
+
+    /// Stream a COMMON-shaped table (`{addr, val}`), recording each write.
+    fn stream_common(
+        &mut self,
+        table: &[[u32; 2]],
+        written: &mut Vec<(u32, u32)>,
+    ) -> Result<(), FaceError> {
+        let pairs: Vec<(u32, u32)> = table.iter().map(|r| (r[0], r[1])).collect();
+        self.reg_write_batch(&pairs)?;
+        written.extend_from_slice(&pairs);
+        Ok(())
+    }
+
+    /// **M1.2** — program the 2.4 GHz PLL, then replay the AR9271 init-value tables
+    /// for the 2.4 GHz-HT20 mode and verify a spread of sentinel registers read back
+    /// what was written.
+    ///
+    /// Order follows the reference bring-up: `ath9k_hw_init_pll` (AR9271 path) →
+    /// `AR9271_GATE_MAC_CTL` (post-reset gate) → the "baseband to analog shift" write
+    /// (`ar9002_hw_rf_claim`, so the 0x78xx COMMON rows latch) → MODES(col 4) →
+    /// COMMON(col 1) → ANI(col 4) → normal-power TX-gain(col 4), streamed with
+    /// `ath9k_hw_write_array`'s plain `REG_WRITE` semantics, then `AR_PHY_TURBO` forced
+    /// to HT20 (DYN2040 cleared).
+    ///
+    /// Full channel-synth programming and calibration are M1.3 and are deliberately
+    /// **not** done here.
+    pub fn apply_initvals(&mut self) -> Result<IniVerify, FaceError> {
+        use crate::ath9k_initvals::*;
+        use crate::ath9k_reg::*;
+        const COL_2G_HT20: usize = 4;
+
+        // NOTE: PLL / core-clock / sleep-clock and the AR9271 GATE_MAC_CTL write
+        // now live in `phy_reset()` (they belong inside ath9k_hw_chip_reset /
+        // htc_reset_init, which run BEFORE process_ini). This method is the faithful
+        // `ath9k_hw_process_ini` body: analog-shift route → the mode/common/ANI/
+        // TX-gain tables → `ath9k_hw_override_ini` → the HT20 AR_PHY_TURBO clear.
+
+        // Route the baseband to analog-shift so the 0x78xx COMMON rows take.
+        self.reg_write(AR_PHY_BASE, AR_PHY_ANALOG_SHIFT_ENABLE)?; // 0x9800 = 0x07
+        Self::settle(1);
+
+        // Stream the tables in reference order; record every write for verification.
+        let mut written: Vec<(u32, u32)> = Vec::new();
+        self.stream_modes(AR9271MODES_9271, COL_2G_HT20, &mut written)?;
+        self.stream_common(AR9271COMMON_9271, &mut written)?;
+        self.stream_modes(AR9271MODES_9271_ANI_REG, COL_2G_HT20, &mut written)?;
+        self.stream_modes(
+            AR9271MODES_NORMAL_POWER_TX_GAIN_9271,
+            COL_2G_HT20,
+            &mut written,
+        )?;
+
+        // ── ath9k_hw_override_ini tail of process_ini ──
+        // ⚠ ath9k_hw_override_ini is NOT among the fetched sources. Its one
+        // AR9271-relevant, trace-observable effect is on AR_PCU_MISC_MODE2 (0x8344):
+        // the working kernel driver ends up with 0x00581083 there (golden trace
+        // lines 41/166). We write that observed absolute value so the reset tail
+        // matches the working driver; the exact RMW derivation is unverified.
+        self.reg_write(AR_PCU_MISC_MODE2, AR_PCU_MISC_MODE2_TRACE_VAL)?;
+        written.push((AR_PCU_MISC_MODE2, AR_PCU_MISC_MODE2_TRACE_VAL));
+
+        // HT20: clear the dynamic-20/40 enable in AR_PHY_TURBO (already clear in the
+        // MODES col-4 value 0x300; make it explicit as ath9k_hw_set_channel would).
+        let turbo = self.reg_read(AR_PHY_TURBO)? & !AR_PHY_FC_DYN2040_EN;
+        self.reg_write(AR_PHY_TURBO, turbo)?;
+        written.push((AR_PHY_TURBO, turbo));
+
+        // Verify sentinels spread across MODES / COMMON(digital+analog) / ANI /
+        // TX-gain. Expected = last value written to each addr (overlaps resolve to the
+        // last writer automatically).
+        let sentinels: [u32; 8] = [
+            0x9840,  // MODES digital PHY
+            0x9848,  // MODES digital PHY (2G-HT20 col: 0x1053)
+            0x9910,  // MODES digital PHY
+            0x99c0,  // MODES ∩ ANI (same col-4 value)
+            0x7804,  // COMMON analog (0x78xx)
+            0x7808,  // COMMON analog (0x78xx)
+            0xa208,  // COMMON ∩ ANI
+            0xa30c,  // TX-gain (normal power)
+        ];
+        let mut mismatches = Vec::new();
+        let mut matched = 0usize;
+        let mut checked = 0usize;
+        for addr in sentinels {
+            let Some(expected) = written.iter().rev().find(|(a, _)| *a == addr).map(|(_, v)| *v)
+            else {
+                continue; // addr not in any streamed table — skip
+            };
+            checked += 1;
+            let got = self.reg_read(addr)?;
+            if got == expected {
+                matched += 1;
+            } else {
+                mismatches.push((addr, expected, got));
+            }
+        }
+
+        Ok(IniVerify {
+            total_written: written.len(),
+            matched,
+            checked,
+            mismatches,
+        })
+    }
+
+    // ── register read-modify-write helpers (REG_SET_BIT / REG_CLR_BIT) ────────
+
+    /// `REG_SET_BIT` — read, OR in `bits`, write back.
+    fn reg_set_bit(&mut self, addr: u32, bits: u32) -> Result<(), FaceError> {
+        let v = self.reg_read(addr)?;
+        self.reg_write(addr, v | bits)
+    }
+
+    /// `REG_CLR_BIT` — read, mask out `bits`, write back.
+    fn reg_clr_bit(&mut self, addr: u32, bits: u32) -> Result<(), FaceError> {
+        let v = self.reg_read(addr)?;
+        self.reg_write(addr, v & !bits)
+    }
+
+    /// `REG_RMW` — read, replace the `mask` field with `set` (masked), write back.
+    fn reg_rmw(&mut self, addr: u32, set: u32, mask: u32) -> Result<(), FaceError> {
+        let v = self.reg_read(addr)?;
+        self.reg_write(addr, (v & !mask) | (set & mask))
+    }
+
+    /// `ath9k_hw_loadnf` (chain-0, HT20 subset): force the software-filtered nominal noise floor
+    /// into the baseband's `minCCApwr` so the receiver's CCA/detection threshold is sane.
+    ///
+    /// ★ Without this the receiver is deaf: the hardware NF cal alone left `minCCApwr` at ~-15 dBm
+    /// on the first RX attempt (measured), which sits *above* every real beacon (-30..-90 dBm), so
+    /// nothing was ever detected. `nf_regs[0]` for the AR9002 family is `AR_PHY_CCA` (0x9864); the
+    /// write field is bits[8:0] in 0.5-dB units (`nfval << 1`), distinct from the bits[28:20]
+    /// measurement field that `getnf` reads.
+    fn load_nf_nominal(&mut self) -> Result<(), FaceError> {
+        use crate::ath9k_reg::*;
+        let field = |nf: i32| ((nf << 1) as u32) & 0x1ff;
+
+        // Load the nominal 2.4 GHz NF (-118 dBm) into minCCApwr, then pulse the NF-load.
+        self.reg_rmw(AR_PHY_CCA, field(AR_PHY_CCA_NOM_VAL_2GHZ), 0x1ff)?;
+        self.reg_clr_bit(AR_PHY_AGC_CONTROL, AR_PHY_AGC_CONTROL_ENABLE_NF)?;
+        self.reg_clr_bit(AR_PHY_AGC_CONTROL, AR_PHY_AGC_CONTROL_NO_UPDATE_NF)?;
+        self.reg_set_bit(AR_PHY_AGC_CONTROL, AR_PHY_AGC_CONTROL_NF)?;
+        // Wait for the load to complete (NF bit self-clears). Best-effort — a timeout just means an
+        // in-progress rx; the cap still applies.
+        let _ = self.wait_reg(AR_PHY_AGC_CONTROL, AR_PHY_AGC_CONTROL_NF, 0);
+
+        // Restore maxCCApwr (-50) so the next hardware NF cal is not capped by the median we loaded.
+        self.reg_rmw(AR_PHY_CCA, field(-50), 0x1ff)?;
+        Ok(())
+    }
+
+    // ── M1.3 — channel synth + AGC/offset cal + noise floor ───────────────────
+
+    /// **M1.3** — program the RF synthesiser for a 2.4 GHz HT20 channel, enable the
+    /// baseband, run the AR9271 AGC/offset calibration, and start the noise-floor cal.
+    ///
+    /// Only the RX-relevant pieces of the reference reset tail are done here:
+    /// `ath9k_hw_set_rfmode` (AR_PHY_MODE), `ar9002_hw_set_channel` (AR_PHY_SYNTH_CONTROL, the
+    /// 2.4 GHz fractional-mode plain write — the analog-shift path is 5 GHz only),
+    /// `ath9k_hw_init_bb` (AR_PHY_ACTIVE), then `ath9k_hw_init_cal`'s AR9271 branch
+    /// (`ar9285_hw_cl_cal`, which runs the offset/AGC cal) and `ath9k_hw_start_nfcal`.
+    ///
+    /// Deliberately **skipped** (not needed to receive): `ar9271_hw_pa_cal` and the carrier-leak
+    /// redo (both TX-only), IQ/ADC periodic cals, per-channel EEPROM board values, delta-slope /
+    /// spur (2.4 GHz beacons ride 1 Mbps CCK, which needs neither), and the software `loadnf`
+    /// minCCApwr write (the hardware NF cal seeds itself). `chan_mhz` is the centre, e.g. 2412
+    /// (ch1) or 2437 (ch6).
+    pub fn set_channel_and_cal(&mut self, chan_mhz: u16) -> Result<CalStatus, FaceError> {
+        use crate::ath9k_reg::*;
+
+        // The legacy M1.3 flow, now delegating to the same granular helpers that
+        // `hw_reset` interleaves in the faithful ath9k_hw_reset() order. Here they
+        // run back-to-back (rfmode → synth → bb → cal), which is fine for the
+        // M1.3-only example path.
+        self.set_rfmode()?;
+        self.rf_set_freq(chan_mhz)?;
+        self.init_bb()?;
+        let agc_cal_converged = self.init_cal(chan_mhz)?;
+
+        let synth_control = self.reg_read(AR_PHY_SYNTH_CONTROL)?;
+        let phy_mode = self.reg_read(AR_PHY_MODE)?;
+        let phy_active = self.reg_read(AR_PHY_ACTIVE)?;
+        let agc_control = self.reg_read(AR_PHY_AGC_CONTROL)?;
+        let phy_cca = self.reg_read(AR_PHY_CCA)?;
+        // MINCCA_PWR is a 9-bit signed field at bits[28:20].
+        let raw_nf = (phy_cca & AR9280_PHY_MINCCA_PWR) >> AR9280_PHY_MINCCA_PWR_S;
+        let noise_floor_dbm = sign_extend(raw_nf, 9);
+
+        Ok(CalStatus {
+            chan_mhz,
+            synth_control,
+            phy_mode,
+            phy_active,
+            agc_cal_converged,
+            agc_control,
+            phy_cca,
+            noise_floor_dbm,
+        })
+    }
+
+    // ── granular reset-tail helpers (shared by set_channel_and_cal + hw_reset) ──
+
+    /// `ath9k_hw_set_rfmode` (hw.c:1967 → ar5008_hw_set_rfmode). For a 2.4 GHz
+    /// single-chip post-9280 part the RF mode is `AR_PHY_MODE_DYNAMIC` (CCK+OFDM).
+    /// Golden trace line 50: 0xa200 = 0x04. ✓
+    pub fn set_rfmode(&mut self) -> Result<(), FaceError> {
+        use crate::ath9k_reg::*;
+        self.reg_write(AR_PHY_MODE, AR_PHY_MODE_DYNAMIC)?;
+        Ok(())
+    }
+
+    /// `ath9k_hw_rf_set_freq` → `ar9002_hw_set_channel` (ar9002_phy.c:66), the 2.4 GHz
+    /// fractional-mode synth program. `reg32 = (prev & 0xc0000000) | bMode<<29 |
+    /// fracMode<<28 | aModeRefSel<<26 | CHANSEL_2G(freq)` with bMode=fracMode=1,
+    /// aModeRefSel=0. Channel-14 spreading (CCK_TX_CTRL_JAPAN) on only for 2484.
+    /// Golden trace line 57: 0x9874 = 0x30a0cccc for freq 2412 (BMODE|FRACMODE|
+    /// CHANSEL_2G(2412)=0xa0cccc). ✓
+    pub fn rf_set_freq(&mut self, chan_mhz: u16) -> Result<(), FaceError> {
+        use crate::ath9k_reg::*;
+        if chan_mhz != 2484 {
+            self.reg_clr_bit(AR_PHY_CCK_TX_CTRL, AR_PHY_CCK_TX_CTRL_JAPAN)?;
+        } else {
+            self.reg_set_bit(AR_PHY_CCK_TX_CTRL, AR_PHY_CCK_TX_CTRL_JAPAN)?;
+        }
+        let channel_sel = ((chan_mhz as u64 * 0x1_0000) / CHANSEL_2G_DIV) as u32;
+        let prev = self.reg_read(AR_PHY_SYNTH_CONTROL)? & 0xc000_0000;
+        let synth = prev
+            | AR_PHY_SYNTH_CONTROL_2G_BMODE
+            | AR_PHY_SYNTH_CONTROL_2G_FRACMODE
+            | channel_sel; // aModeRefSel = 0
+        self.reg_write(AR_PHY_SYNTH_CONTROL, synth)?;
+        Self::settle(2);
+        Ok(())
+    }
+
+    /// `ath9k_hw_init_bb` — enable the baseband (`AR_PHY_ACTIVE = EN`), then wait the
+    /// synth-settle delay. Golden trace line 94: 0x981c = 0x01. ✓
+    pub fn init_bb(&mut self) -> Result<(), FaceError> {
+        use crate::ath9k_reg::*;
+        // The reference reads AR_PHY_RX_DELAY to compute an exact synth-settle udelay;
+        // a fixed few-ms settle dwarfs it on the WMI path, so read is informational.
+        let _ = self.reg_read(AR_PHY_RX_DELAY)?;
+        self.reg_write(AR_PHY_ACTIVE, AR_PHY_ACTIVE_EN)?;
+        Self::settle(3); // synthDelay + BASE_ACTIVATE_DELAY
+        Ok(())
+    }
+
+    /// `ath9k_hw_init_cal` → `ar9002_hw_init_cal` (ar9002_calib.c) AR9271 branch, in
+    /// the EXACT source order: `ar9285_hw_cl_cal` (offset/AGC cal) → (PA cal, TX-only,
+    /// skipped) → `ath9k_hw_loadnf` → `ath9k_hw_start_nfcal(true)` → arm+run the IQ
+    /// cal on the HT20 cal list (IQ-mismatch only). Returns whether the AGC cal
+    /// converged. ★ This is the whole point of the rewrite: it runs LAST, after the
+    /// full PHY/MAC setup, not before.
+    pub fn init_cal(&mut self, chan_mhz: u16) -> Result<bool, FaceError> {
+        use crate::ath9k_reg::*;
+        // 1. ar9285_hw_cl_cal (AR9271 offset + AGC cal).
+        let agc_cal_converged = self.ar9271_cl_cal_ht20()?;
+        // 2. ath9k_hw_loadnf — seed the nominal NF so the receiver isn't deaf.
+        self.load_nf_nominal()?;
+        // 3. ath9k_hw_start_nfcal(update = true) — kick the hardware noise-floor cal.
+        self.reg_set_bit(AR_PHY_AGC_CONTROL, AR_PHY_AGC_CONTROL_ENABLE_NF)?;
+        self.reg_clr_bit(AR_PHY_AGC_CONTROL, AR_PHY_AGC_CONTROL_NO_UPDATE_NF)?;
+        self.reg_set_bit(AR_PHY_AGC_CONTROL, AR_PHY_AGC_CONTROL_NF)?;
+        Self::settle(5);
+        // 4. ar9002_hw_init_cal tail: arm+run the IQ-mismatch RX cal (HT20 list = IQ only).
+        self.run_rx_calibration(chan_mhz)?;
+        Ok(agc_cal_converged)
+    }
+
+    // ── ath9k_hw_reset() sub-functions, transcribed faithfully (2.4 GHz HT20) ─────
+
+    /// `ath9k_hw_setpower(ATH9K_PM_AWAKE)` → `ath9k_hw_set_power_awake` — the force-wake
+    /// that opens `ath9k_hw_reset` (step 1). On this USB part it is just the
+    /// FORCE_WAKE_EN write; the WA-register poking is 9300-only.
+    pub fn setpower_awake(&mut self) -> Result<(), FaceError> {
+        use crate::ath9k_reg::*;
+        self.reg_write(
+            AR_RTC_FORCE_WAKE,
+            AR_RTC_FORCE_WAKE_EN | AR_RTC_FORCE_WAKE_ON_INT,
+        )?;
+        Ok(())
+    }
+
+    /// `ath9k_hw_mark_phy_inactive` — write `AR_PHY_ACTIVE = AR_PHY_ACTIVE_DIS` (0).
+    /// Golden trace line 1: 0x981c = 0. ✓
+    pub fn mark_phy_inactive(&mut self) -> Result<(), FaceError> {
+        use crate::ath9k_reg::*;
+        self.reg_write(AR_PHY_ACTIVE, AR_PHY_ACTIVE_DIS)?;
+        Ok(())
+    }
+
+    /// `ar9002_hw_enable_async_fifo` (ar9002_hw.c:371). **No-op on AR9271** — the body
+    /// is gated behind `AR_SREV_9287_13_OR_LATER`, which the AR9271 is not. Kept as a
+    /// faithful placeholder so the call sits in its ath9k_hw_reset() slot.
+    pub fn enable_async_fifo(&mut self) -> Result<(), FaceError> {
+        // AR9271 is not 9287 → nothing to do.
+        Ok(())
+    }
+
+    /// `ath9k_hw_init_mfp` (hw.c:1680), AR9280_20_OR_LATER branch: RMW the FC_MGMT
+    /// field of `AR_AES_MUTE_MASK1` to 0xc7ff (mask Retry/PwrMgt/MoreData in CCMP AAD).
+    pub fn init_mfp(&mut self) -> Result<(), FaceError> {
+        use crate::ath9k_reg::*;
+        self.reg_rmw(
+            AR_AES_MUTE_MASK1,
+            (AR_MFP_MGMT_MASK_VAL << AR_AES_MUTE_MASK1_FC_MGMT_S) & AR_AES_MUTE_MASK1_FC_MGMT,
+            AR_AES_MUTE_MASK1_FC_MGMT,
+        )?;
+        Ok(())
+    }
+
+    /// `ath9k_hw_set_delta_slope` (ar5008_hw_set_delta_slope, in ar5008_phy.c — NOT
+    /// fetched; transcribed from the canonical mainline body). Programs the OFDM
+    /// timing delta-slope mantissa/exponent for full-GI (`AR_PHY_TIMING3`) and
+    /// half-GI (`AR_PHY_HALFGI`, 0.9× coefficient). `coef = (100 MHz << 24) /
+    /// synth_center`. Uses [`delta_slope_vals`] (ath9k_hw_get_delta_slope_vals,
+    /// hw.c:1297, transcribed exactly).
+    pub fn set_delta_slope(&mut self, chan_mhz: u16) -> Result<(), FaceError> {
+        use crate::ath9k_reg::*;
+        let coef_scaled = DELTA_SLOPE_CLOCK_MHZ_SCALED / chan_mhz as u32;
+        let (man, exp) = delta_slope_vals(coef_scaled);
+        self.reg_rmw(
+            AR_PHY_TIMING3,
+            (man << AR_PHY_TIMING3_DSC_MAN_S) & AR_PHY_TIMING3_DSC_MAN,
+            AR_PHY_TIMING3_DSC_MAN,
+        )?;
+        self.reg_rmw(
+            AR_PHY_TIMING3,
+            (exp << AR_PHY_TIMING3_DSC_EXP_S) & AR_PHY_TIMING3_DSC_EXP,
+            AR_PHY_TIMING3_DSC_EXP,
+        )?;
+        // Half-GI uses 0.9× the coefficient.
+        let coef_scaled_hg = (9 * coef_scaled) / 10;
+        let (man_hg, exp_hg) = delta_slope_vals(coef_scaled_hg);
+        self.reg_rmw(
+            AR_PHY_HALFGI,
+            (man_hg << AR_PHY_HALFGI_DSC_MAN_S) & AR_PHY_HALFGI_DSC_MAN,
+            AR_PHY_HALFGI_DSC_MAN,
+        )?;
+        self.reg_rmw(
+            AR_PHY_HALFGI,
+            (exp_hg << AR_PHY_HALFGI_DSC_EXP_S) & AR_PHY_HALFGI_DSC_EXP,
+            AR_PHY_HALFGI_DSC_EXP,
+        )?;
+        Ok(())
+    }
+
+    /// `ath9k_hw_spur_mitigate_freq` → `ar9002_hw_spur_mitigate` (ar9002_phy.c:168).
+    /// The AR9271 EEPROM carries no spur channels for ordinary operation, so this is
+    /// the `AR_NO_SPUR` path (ar9002_phy.c:214-221): clear `AR_PHY_FORCE_CLKEN_CCK`'s
+    /// MRC_MUX bit and return. (The full spur-mask programming needs an EEPROM spur
+    /// frequency, which we do not have; documented so the bench knows why the spur
+    /// registers stay untouched.)
+    pub fn spur_mitigate_freq(&mut self, _chan_mhz: u16) -> Result<(), FaceError> {
+        use crate::ath9k_reg::*;
+        self.reg_clr_bit(AR_PHY_FORCE_CLKEN_CCK, AR_PHY_FORCE_CLKEN_CCK_MRC_MUX)?;
+        Ok(())
+    }
+
+    /// `ath9k_hw_reset_opmode` (hw.c:1707) + `ath9k_hw_set_operating_mode` (hw.c:1266).
+    /// Writes the STA_ID1 opmode/defaults, default antenna, a zeroed BSSID/AID, clears
+    /// the ISR, seeds the RSSI threshold, then applies the operating mode (monitor ⇒
+    /// KSRCH_MODE only, both AP/ADHOC opmode bits cleared). `mac_sta_id1` is the
+    /// `AR_STA_ID1 & BASE_RATE_11B` saved before the chip reset.
+    pub fn reset_opmode(&mut self, mac_sta_id1: u32, save_def_antenna: u32) -> Result<(), FaceError> {
+        use crate::ath9k_reg::*;
+        // REG_RMW(AR_STA_ID1, macStaId1 | RTS_USE_DEF | sta_id1_defaults, ~SADH_MASK).
+        // sta_id1_defaults is 0 for our config.
+        self.reg_rmw(
+            AR_STA_ID1,
+            mac_sta_id1 | AR_STA_ID1_RTS_USE_DEF,
+            !AR_STA_ID1_SADH_MASK,
+        )?;
+        // ath_hw_setbssidmask (AR_BSSMSK_L/U) is omitted: monitor accepts all, and the
+        // post-reset default mask is already all-ones. Documented, not a silent skip.
+        self.reg_write(AR_DEF_ANTENNA, save_def_antenna)?;
+        // ath9k_hw_write_associd — no association ⇒ BSSID/AID zero.
+        self.reg_write(AR_BSS_ID0, 0)?;
+        self.reg_write(AR_BSS_ID1, 0)?;
+        self.reg_write(AR_ISR, 0xffff_ffff)?; // REG_WRITE(AR_ISR, ~0)
+        self.reg_write(AR_RSSI_THR, INIT_RSSI_THR)?;
+        // ath9k_hw_set_operating_mode(ah->opmode = monitor): KSRCH_MODE, clear AP/ADHOC.
+        self.reg_rmw(
+            AR_STA_ID1,
+            AR_STA_ID1_KSRCH_MODE,
+            AR_STA_ID1_STA_AP | AR_STA_ID1_ADHOC,
+        )?;
+        Ok(())
+    }
+
+    /// `ath9k_hw_set_clockrate` (hw.c:39) — computes `common->clockrate` and writes
+    /// **no register**. For a 2.4 GHz OFDM channel the rate is 44 MHz (confirmed by
+    /// the golden trace: SIFS write 0x1030=0x160=8×44). Stored for `init_global_settings`.
+    pub fn set_clockrate(&mut self) {
+        use crate::ath9k_reg::*;
+        self.clockrate = ATH9K_CLOCK_RATE_2GHZ_OFDM;
+    }
+
+    /// `ath9k_hw_init_queues` (hw.c:1729): write the DCU→QCU mask for all 10 DCUs,
+    /// then reset every active TX queue. The DQCUMASK loop is deterministic; the
+    /// per-queue reset uses the standard data-AC defaults (which reproduce the golden
+    /// trace's `AR_DLCL_IFS=0x002ffc0f` / `AR_DRETRY_LIMIT=0x0008200a` exactly).
+    ///
+    /// ⚠ SCOPE: the beacon/CAB queues (8/9) and any mac80211-pushed EDCA parameters
+    /// are driver-runtime state the HTC host normally supplies; here we reset the four
+    /// data ACs (QCU 0-3) with USEDEFAULT parameters. This is the TX-queue plumbing —
+    /// not RX-gating — and the golden trace of these registers is itself partial
+    /// (buffered REGWRITE flushes). Data queues 0-3 are transcribed in full.
+    pub fn init_queues(&mut self) -> Result<(), FaceError> {
+        use crate::ath9k_reg::*;
+        // for i in 0..AR_NUM_DCU: REG_WRITE(AR_DQCUMASK(i), 1<<i)
+        let masks: Vec<(u32, u32)> = (0..AR_NUM_DCU)
+            .map(|i| (AR_D0_QCUMASK + (i << 2), 1u32 << i))
+            .collect();
+        self.reg_write_batch(&masks)?;
+        // Reset the four data ACs with the standard USEDEFAULT queue parameters.
+        for q in 0..4u32 {
+            self.reset_tx_queue(q)?;
+        }
+        Ok(())
+    }
+
+    /// `ath9k_hw_resettxqueue` (mac.c:367) for a standard data-AC queue using the
+    /// USEDEFAULT parameters (cwmin auto=15, cwmax=1023, aifs=2, shretry=10). Writes
+    /// `AR_DLCL_IFS`, `AR_DRETRY_LIMIT`, `AR_QMISC`, `AR_DMISC`, `AR_DCHNTIME` for the
+    /// queue. Verified: LCL_IFS=0x002ffc0f, RETRY=0x0008200a match the golden trace.
+    fn reset_tx_queue(&mut self, q: u32) -> Result<(), FaceError> {
+        use crate::ath9k_reg::*;
+        // cwMin: USEDEFAULT ⇒ round INIT_CWMIN up to 2^n-1 (15 → stays 15).
+        let mut cw_min = 1u32;
+        while cw_min < INIT_CWMIN {
+            cw_min = (cw_min << 1) | 1;
+        }
+        let lcl_ifs = ((cw_min << AR_D_LCL_IFS_CWMIN_S) & AR_D_LCL_IFS_CWMIN)
+            | ((INIT_CWMAX << AR_D_LCL_IFS_CWMAX_S) & AR_D_LCL_IFS_CWMAX)
+            | ((INIT_AIFS << AR_D_LCL_IFS_AIFS_S) & AR_D_LCL_IFS_AIFS);
+        self.reg_write(AR_D0_LCL_IFS + (q << 2), lcl_ifs)?;
+
+        let retry = ((INIT_SSH_RETRY << AR_D_RETRY_LIMIT_STA_SH_S) & AR_D_RETRY_LIMIT_STA_SH)
+            | ((INIT_SLG_RETRY << AR_D_RETRY_LIMIT_STA_LG_S) & AR_D_RETRY_LIMIT_STA_LG)
+            | ((INIT_SH_RETRY << AR_D_RETRY_LIMIT_FR_SH_S) & AR_D_RETRY_LIMIT_FR_SH);
+        self.reg_write(AR_D0_RETRY_LIMIT + (q << 2), retry)?;
+
+        self.reg_write(AR_Q0_MISC + (q << 2), AR_Q_MISC_DCU_EARLY_TERM_REQ)?;
+        // Non-9340 path: BKOFF_EN | FRAG_WAIT_EN | 0x2.
+        self.reg_write(
+            AR_D0_MISC + (q << 2),
+            AR_D_MISC_CW_BKOFF_EN | AR_D_MISC_FRAG_WAIT_EN | 0x2,
+        )?;
+        // tqi_burstTime = 0 ⇒ AR_DCHNTIME = 0 (no burst).
+        self.reg_write(AR_D0_CHNTIME + (q << 2), 0)?;
+        Ok(())
+    }
+
+    /// `ath9k_hw_init_interrupt_masks` (hw.c:931), non-9300 no-mitigation path.
+    /// Computes the base IMR (`TXERR|TXURN|RXERR|RXORN|BCNMISC|RXOK|TXOK`), ORs GTT
+    /// into IMR_S2, and programs the INTR_SYNC cause/enable/mask. The **final** host
+    /// IMR arming (the 0x81800964 value) is `ath9k_hw_set_interrupts`, done later in
+    /// [`wmi_start`](Self::wmi_start) — this is only the reset-time base.
+    pub fn init_interrupt_masks(&mut self) -> Result<(), FaceError> {
+        use crate::ath9k_reg::*;
+        let imr_reg = AR_IMR_TXERR
+            | AR_IMR_TXURN
+            | AR_IMR_RXERR
+            | AR_IMR_RXORN
+            | AR_IMR_BCNMISC
+            | AR_IMR_RXOK
+            | AR_IMR_TXOK;
+        self.reg_write(AR_IMR, imr_reg)?;
+        // ah->imrs2_reg |= AR_IMR_S2_GTT (imrs2 base is 0 here).
+        self.reg_write(AR_IMR_S2, AR_IMR_S2_GTT)?;
+        // Non-9100: program the sync-interrupt registers (PCIe artefacts on USB).
+        self.reg_write(AR_INTR_SYNC_CAUSE, 0xffff_ffff)?;
+        self.reg_write(AR_INTR_SYNC_ENABLE, AR_INTR_SYNC_DEFAULT)?;
+        self.reg_write(AR_INTR_SYNC_MASK, 0)?;
+        Ok(())
+    }
+
+    /// `ath9k_hw_ani_cache_ini_regs` — caches a set of ANI/PHY registers into the
+    /// driver's `ah->ani` state by **reading** them. It writes nothing, and we do not
+    /// use the cache, so this is a faithful no-op for bring-up.
+    pub fn ani_cache_ini_regs(&mut self) -> Result<(), FaceError> {
+        Ok(())
+    }
+
+    /// `ath9k_hw_init_qos` (hw.c:714). Golden trace: 0x8118=0x100aa, 0x811c=0x3210. ✓
+    pub fn init_qos(&mut self) -> Result<(), FaceError> {
+        use crate::ath9k_reg::*;
+        self.reg_write(AR_MIC_QOS_CONTROL, 0x100aa)?;
+        self.reg_write(AR_MIC_QOS_SELECT, 0x3210)?;
+        let no_ack = ((2 << AR_QOS_NO_ACK_TWO_BIT_S) & AR_QOS_NO_ACK_TWO_BIT)
+            | ((5 << AR_QOS_NO_ACK_BIT_OFF_S) & AR_QOS_NO_ACK_BIT_OFF)
+            | ((0 << AR_QOS_NO_ACK_BYTE_OFF_S) & AR_QOS_NO_ACK_BYTE_OFF);
+        self.reg_write(AR_QOS_NO_ACK, no_ack)?;
+        self.reg_write(AR_TXOP_X, AR_TXOP_X_VAL)?;
+        self.reg_write(AR_TXOP_0_3, 0xffff_ffff)?;
+        self.reg_write(AR_TXOP_4_7, 0xffff_ffff)?;
+        self.reg_write(AR_TXOP_8_11, 0xffff_ffff)?;
+        self.reg_write(AR_TXOP_12_15, 0xffff_ffff)?;
+        Ok(())
+    }
+
+    /// `ath9k_hw_init_global_settings` (hw.c:1047) — the MAC timing block for a
+    /// 2.4 GHz HT20 channel: SIFS/slot/ACK/CTS timeouts, EIFS and USEC. Uses the
+    /// stored `clockrate` (44) via `mac_to_clks`. Golden trace: SIFS 0x1030=0x160,
+    /// SLOT 0x1070=0x18c, EIFS 0x10b0=0x3e38. ✓
+    pub fn init_global_settings(&mut self, _chan_mhz: u16) -> Result<(), FaceError> {
+        use crate::ath9k_reg::*;
+        let clk = self.clockrate;
+        let mac_to_clks = |usecs: u32| usecs * clk;
+
+        let sifstime = 10u32; // 2.4 GHz
+        let slottime = ATH9K_INIT_SLOTTIME_2GHZ; // 9
+        // acktimeout/ctstimeout: 2.4 GHz non-half/quarter closes to 64/48 µs
+        // (the slottime terms cancel, see hw.c:1116-1130).
+        let acktimeout = 64u32;
+        let ctstimeout = 48u32;
+
+        // EIFS: read current, divide by clockrate (idempotent re-scale on write-back).
+        let eifs_reg = self.reg_read(AR_D_GBL_IFS_EIFS)?;
+        let eifs = if clk != 0 { eifs_reg / clk } else { 0 };
+        // rx/tx latency come from the current AR_USEC field values.
+        let usec = self.reg_read(AR_USEC)?;
+        let rx_lat = (usec & AR_USEC_RX_LAT) >> AR_USEC_RX_LAT_S;
+        let tx_lat = (usec & AR_USEC_TX_LAT) >> AR_USEC_TX_LAT_S;
+
+        // set_sifs_time(sifs): AR_D_GBL_IFS_SIFS = mac_to_clks(sifs - 2), capped 0xffff.
+        self.reg_write(AR_D_GBL_IFS_SIFS, mac_to_clks(sifstime - 2).min(0xffff))?;
+        // setslottime(slot): AR_D_GBL_IFS_SLOT = mac_to_clks(slot), capped 0xffff.
+        self.reg_write(AR_D_GBL_IFS_SLOT, mac_to_clks(slottime).min(0xffff))?;
+        // set_ack_timeout: RMW_FIELD(AR_TIME_OUT, ACK, mac_to_clks(ack)).
+        let ack_clks = mac_to_clks(acktimeout).min(AR_TIME_OUT_ACK >> AR_TIME_OUT_ACK_S);
+        self.reg_rmw(
+            AR_TIME_OUT,
+            (ack_clks << AR_TIME_OUT_ACK_S) & AR_TIME_OUT_ACK,
+            AR_TIME_OUT_ACK,
+        )?;
+        // set_cts_timeout: RMW_FIELD(AR_TIME_OUT, CTS, mac_to_clks(cts)).
+        let cts_clks = mac_to_clks(ctstimeout).min(AR_TIME_OUT_CTS >> AR_TIME_OUT_CTS_S);
+        self.reg_rmw(
+            AR_TIME_OUT,
+            (cts_clks << AR_TIME_OUT_CTS_S) & AR_TIME_OUT_CTS,
+            AR_TIME_OUT_CTS,
+        )?;
+        // globaltxtimeout defaults to (u32)-1 ⇒ not written.
+        // REG_WRITE(AR_D_GBL_IFS_EIFS, mac_to_clks(eifs)).
+        self.reg_write(AR_D_GBL_IFS_EIFS, mac_to_clks(eifs))?;
+        // REG_RMW(AR_USEC, (clk-1) | SM(rx_lat) | SM(tx_lat), TX_LAT|RX_LAT|USEC).
+        self.reg_rmw(
+            AR_USEC,
+            (clk - 1)
+                | ((rx_lat << AR_USEC_RX_LAT_S) & AR_USEC_RX_LAT)
+                | ((tx_lat << AR_USEC_TX_LAT_S) & AR_USEC_TX_LAT),
+            AR_USEC_TX_LAT | AR_USEC_RX_LAT | AR_USEC_USEC,
+        )?;
+        Ok(())
+    }
+
+    /// `ath9k_hw_set_dma` (hw.c:1192), non-9300 path: AHB prefetch, 128-byte MAC DMA
+    /// read/write bursts, and the RX FIFO threshold. (AR9271 skips the PCU_TXBUF_CTRL
+    /// write.) This is the RX-DMA config the old `rx_enable` carried inline; here it
+    /// sits in its faithful reset slot.
+    pub fn set_dma(&mut self) -> Result<(), FaceError> {
+        use crate::ath9k_reg::*;
+        self.reg_set_bit(AR_AHB_MODE, AR_AHB_PREFETCH_RD_EN)?;
+        self.reg_rmw(AR_TXCFG, AR_TXCFG_DMASZ_128B, AR_TXCFG_DMASZ_MASK)?;
+        self.reg_rmw(AR_RXCFG, AR_RXCFG_DMASZ_128B, AR_RXCFG_DMASZ_MASK)?;
+        self.reg_write(AR_RXFIFO_CFG, 0x200)?;
+        Ok(())
+    }
+
+    /// `ath9k_hw_restore_chainmask` (hw.c:2048). **No-op for the 1-chain AR9271**: the
+    /// reference only writes `AR_PHY_RX_CHAINMASK`/`AR_PHY_CAL_CHAINMASK` when the RX
+    /// chainmask is 0x3 or 0x5. Faithful placeholder kept in its reset slot.
+    pub fn restore_chainmask(&mut self) -> Result<(), FaceError> {
+        // rxchainmask == 1 ⇒ neither 0x3 nor 0x5 ⇒ nothing written.
+        Ok(())
+    }
+
+    /// `ath9k_hw_init_desc` (hw.c:1748), AR9271 USB branch: descriptor byte-swap
+    /// `AR_CFG = AR_CFG_SWRB | AR_CFG_SWTB` (= 0x0a). Golden trace line 112: 0x0014=0x0a. ✓
+    pub fn init_desc(&mut self) -> Result<(), FaceError> {
+        use crate::ath9k_reg::*;
+        self.reg_write(AR_CFG, AR_CFG_SWRB | AR_CFG_SWTB)?;
+        Ok(())
+    }
+
+    // ── the faithful ath9k_hw_reset(), in EXACT source order ──────────────────
+
+    /// **Faithful `ath9k_hw_reset()`** for the AR9271 (non-9100 / non-9300,
+    /// 2.4 GHz HT20). Replaces the piecemeal `phy_reset` → `apply_initvals` →
+    /// `set_channel_and_cal` approximation with the reference's exact ordered spine.
+    /// The one thing the previous approach got wrong — running the calibration before
+    /// the PHY/MAC was set up — is fixed here: `init_cal` (step 21) runs LAST, after
+    /// everything else, exactly as `ath9k_hw_reset()` does.
+    ///
+    /// This performs the reset + PHY/MAC bring-up only. `connect_data_services()`,
+    /// [`start_receive`](Self::start_receive) and [`wmi_start`](Self::wmi_start) are
+    /// the separate post-reset RX-start steps (as `ath9k_htc_start` does).
+    pub fn hw_reset(&mut self, chan_mhz: u16) -> Result<(), FaceError> {
+        use crate::ath9k_reg::*;
+
+        // Save state a cold reset would clear (macStaId1 = AR_STA_ID1 & BASE_RATE_11B;
+        // saveDefAntenna, min 1; saveLedState). Read before the reset.
+        let mac_sta_id1 = self.reg_read(AR_STA_ID1)? & AR_STA_ID1_BASE_RATE_11B;
+        let mut save_def_antenna = self.reg_read(AR_DEF_ANTENNA)?;
+        if save_def_antenna == 0 {
+            save_def_antenna = 1;
+        }
+        let save_led_state = self.reg_read(AR_CFG_LED)?
+            & (AR_CFG_LED_ASSOC_CTL
+                | AR_CFG_LED_MODE_SEL
+                | AR_CFG_LED_BLINK_THRESH_SEL
+                | AR_CFG_LED_BLINK_SLOW);
+
+        // 1. setpower AWAKE (force-wake).
+        self.setpower_awake()?;
+        // 2. mark_phy_inactive.
+        self.mark_phy_inactive()?;
+        // 3. AR9271 RADIO_RF_RST + ath9k_hw_chip_reset (reset regs + init_pll) +
+        //    GATE_MAC_CTL — all inside phy_reset().
+        self.phy_reset()?;
+        // AR9280_20_OR_LATER: disable JTAG on the shared GPIO (hw.c:1958).
+        self.reg_set_bit(AR_GPIO_INPUT_EN_VAL, AR_GPIO_JTAG_DISABLE)?;
+        // 4. ar9002_hw_enable_async_fifo (no-op on AR9271).
+        self.enable_async_fifo()?;
+        // 5. process_ini (analog-shift + MODES/COMMON/ANI/TX-gain + override_ini + TURBO).
+        self.apply_initvals()?;
+        // 6. set_rfmode (AR_PHY_MODE).
+        self.set_rfmode()?;
+        // 7. init_mfp.
+        self.init_mfp()?;
+        // 8. set_delta_slope.
+        self.set_delta_slope(chan_mhz)?;
+        // 9. spur_mitigate_freq (no-spur path).
+        self.spur_mitigate_freq(chan_mhz)?;
+        // (eep_ops->set_board_values — SKIPPED: EEPROM TX-power/gain, not RX-gating.)
+        // 10. reset_opmode (STA_ID/BSSID/opmode).
+        self.reset_opmode(mac_sta_id1, save_def_antenna)?;
+        // 11. rf_set_freq (the synth).
+        self.rf_set_freq(chan_mhz)?;
+        // 12. set_clockrate (computes the MAC clock; writes nothing).
+        self.set_clockrate();
+        // 13. init_queues.
+        self.init_queues()?;
+        // 14. init_interrupt_masks.
+        self.init_interrupt_masks()?;
+        // 15. ani_cache_ini_regs (read-only no-op).
+        self.ani_cache_ini_regs()?;
+        // 16. init_qos.
+        self.init_qos()?;
+        // 17. init_global_settings.
+        self.init_global_settings(chan_mhz)?;
+        // REG_SET_BIT(AR_STA_ID1, PRESERVE_SEQNUM) (hw.c:2015).
+        self.reg_set_bit(AR_STA_ID1, AR_STA_ID1_PRESERVE_SEQNUM)?;
+        // 18. set_dma.
+        self.set_dma()?;
+        // 19. REG_WRITE(AR_OBS, 8).
+        self.reg_write(AR_OBS, 8)?;
+        // 20. init_bb (AR_PHY_ACTIVE).
+        self.init_bb()?;
+        // 21. init_cal — ★ runs LAST, after the full PHY/MAC setup.
+        self.init_cal(chan_mhz)?;
+        // 22. restore_chainmask (no-op for 1-chain).
+        self.restore_chainmask()?;
+        // 23. REG_WRITE(AR_CFG_LED, saveLedState | AR_CFG_SCLK_32KHZ).
+        self.reg_write(AR_CFG_LED, save_led_state | AR_CFG_SCLK_32KHZ)?;
+        // 24. init_desc (AR_CFG descriptor byte-swap).
+        self.init_desc()?;
+        Ok(())
+    }
+
+    /// **Start receive** — the host register side of `ath9k_hw_startpcureceive` +
+    /// `ath9k_hw_setrxfilter` + `ath9k_hw_rxena`, done AFTER [`hw_reset`](Self::hw_reset)
+    /// (as `ath9k_htc_start` does). Sets the monitor RX filter (0xc03f), opens the
+    /// multicast hash, clears the RX-disable/abort diag bits, and enables RX DMA
+    /// (`AR_CR_RXE`). Opmode/STA and the RX-DMA burst config were already applied by
+    /// `hw_reset` (reset_opmode / set_dma).
+    pub fn start_receive(&mut self) -> Result<(), FaceError> {
+        use crate::ath9k_reg::*;
+        // ath9k_hw_setrxfilter: RX_FILTER then AR_PHY_ERR (0 = no PHY-err filtering).
+        self.reg_write(AR_RX_FILTER, 0x0000_c03f)?;
+        self.reg_write(AR_PHY_ERR, 0)?;
+        // Accept all multicast/broadcast (64-bit hash defaults to 0 after reset).
+        self.reg_write(AR_MCAST_FIL0, 0xffff_ffff)?;
+        self.reg_write(AR_MCAST_FIL1, 0xffff_ffff)?;
+        // ath9k_hw_startpcureceive: clear the RX-disable/abort diag bits.
+        self.reg_clr_bit(AR_DIAG_SW, AR_DIAG_RX_DIS | AR_DIAG_RX_ABORT)?;
+        // ath9k_hw_rxena: start RX DMA on the MAC.
+        self.reg_write(AR_CR, AR_CR_RXE)?;
+        Ok(())
+    }
+
+    /// **WMI RX-start verbs** — the HTC target-side trigger, called after
+    /// [`hw_reset`](Self::hw_reset) + [`start_receive`](Self::start_receive), matching
+    /// `ath9k_htc_start`'s order: `WMI_ATH_INIT` → `WMI_SET_MODE(11NG)` →
+    /// `WMI_START_RECV` → `WMI_ENABLE_INTR`. Then the host arms `AR_IMR/S0/S1/S2`
+    /// (`ath9k_hw_set_interrupts`) with the golden-trace values, written AFTER
+    /// ENABLE_INTR so they stick — without this the target's RX ISR stays dormant.
+    ///
+    /// `connect_data_services()` must have run first (the RX endpoints must exist
+    /// before `START_RECV`).
+    pub fn wmi_start(&mut self) -> Result<(), FaceError> {
+        use crate::ath9k_reg::*;
+        self.wmi_cmd(WmiCmd::AthInit, &[])?;
+        self.wmi_cmd(WmiCmd::SetMode, &IEEE80211_MODE_11NG.to_be_bytes())?;
+        self.wmi_cmd(WmiCmd::StartRecv, &[])?;
+        self.wmi_cmd(WmiCmd::EnableIntr, &[])?;
+        // ath9k_hw_set_interrupts — host-side final AR_IMR arming (golden trace).
+        self.reg_write(AR_IMR, 0x8180_0964)?;
+        self.reg_write(AR_IMR_S0, 0x0001_0000)?;
+        self.reg_write(AR_IMR_S1, 0x0001_0000)?;
+        self.reg_write(AR_IMR_S2, 0x0080_0000)?;
+        Ok(())
+    }
+
+    /// `ar9285_hw_cl_cal` for an HT20 channel (the AR9271 offset + AGC calibration path). Returns
+    /// whether the AGC cal (`AR_PHY_AGC_CONTROL_CAL`) cleared — a stuck bit means the cal hung
+    /// (noisy environment / bad initvals), which the caller reports rather than hiding.
+    fn ar9271_cl_cal_ht20(&mut self) -> Result<bool, FaceError> {
+        use crate::ath9k_reg::*;
+
+        self.reg_set_bit(AR_PHY_CL_CAL_CTL, AR_PHY_CL_CAL_ENABLE)?;
+
+        // HT20 branch: parallel offset cal with DYN2040 temporarily set.
+        self.reg_set_bit(AR_PHY_CL_CAL_CTL, AR_PHY_PARALLEL_CAL_ENABLE)?;
+        self.reg_set_bit(AR_PHY_TURBO, AR_PHY_FC_DYN2040_EN)?;
+        self.reg_clr_bit(AR_PHY_AGC_CONTROL, AR_PHY_AGC_CONTROL_FLTR_CAL)?;
+        self.reg_clr_bit(AR_PHY_TPCRG1, AR_PHY_TPCRG1_PD_CAL_ENABLE)?;
+        self.reg_set_bit(AR_PHY_AGC_CONTROL, AR_PHY_AGC_CONTROL_CAL)?;
+        if self
+            .wait_reg(AR_PHY_AGC_CONTROL, AR_PHY_AGC_CONTROL_CAL, 0)
+            .is_err()
+        {
+            return Ok(false);
+        }
+        self.reg_clr_bit(AR_PHY_TURBO, AR_PHY_FC_DYN2040_EN)?;
+        self.reg_clr_bit(AR_PHY_CL_CAL_CTL, AR_PHY_PARALLEL_CAL_ENABLE)?;
+        self.reg_clr_bit(AR_PHY_CL_CAL_CTL, AR_PHY_CL_CAL_ENABLE)?;
+
+        // Main AGC/filter cal.
+        self.reg_clr_bit(AR_PHY_ADC_CTL, AR_PHY_ADC_CTL_OFF_PWDADC)?;
+        self.reg_set_bit(AR_PHY_AGC_CONTROL, AR_PHY_AGC_CONTROL_FLTR_CAL)?;
+        self.reg_set_bit(AR_PHY_TPCRG1, AR_PHY_TPCRG1_PD_CAL_ENABLE)?;
+        self.reg_set_bit(AR_PHY_AGC_CONTROL, AR_PHY_AGC_CONTROL_CAL)?;
+        let converged = self
+            .wait_reg(AR_PHY_AGC_CONTROL, AR_PHY_AGC_CONTROL_CAL, 0)
+            .is_ok();
+
+        self.reg_set_bit(AR_PHY_ADC_CTL, AR_PHY_ADC_CTL_OFF_PWDADC)?;
+        self.reg_clr_bit(AR_PHY_CL_CAL_CTL, AR_PHY_CL_CAL_ENABLE)?;
+        self.reg_clr_bit(AR_PHY_AGC_CONTROL, AR_PHY_AGC_CONTROL_FLTR_CAL)?;
+
+        Ok(converged)
+    }
+
+    /// **M1.3 (cal tail)** — the AR9271 reset-time RX RF calibration. This is the piece
+    /// that makes the receiver actually decode: without it the demod never converges.
+    ///
+    /// Transcribed from mainline ath9k `ar9002_calib.c`: `ar9002_hw_init_cal` (the cal
+    /// list) + `ath9k_hw_per_calibration` / `ath9k_hw_reset_calibration` (the arm ->
+    /// poll-DO_CAL -> collect -> apply loop) + `ar9002_hw_iqcal_collect` (:125) +
+    /// `ar9002_hw_iqcalibrate` (:192).
+    ///
+    /// * The IQ-mismatch cal latches RX-path correction coefficients into
+    /// hardware-owned registers (the `AR_PHY_TIMING_CTRL4` IQCORR fields and the deeper
+    /// RX-correction registers the cal engine writes as a side effect) that cannot be
+    /// programmed directly — proven on silicon.
+    ///
+    /// **Scope: AR9271, single 2.4 GHz HT20 chain (numChains = 1).** On an HT20 channel
+    /// the AR9271 cal list contains **only** the IQ-mismatch cal.
+    /// `ar9002_hw_is_cal_supported` (ar9002_calib.c:40-45) gates ADC-gain and ADC-DC
+    /// behind `IS_CHAN_HT40`, and `ar9002_hw_init_cal` (ar9002_calib.c:919-923) inserts
+    /// IQ unconditionally but the two ADC cals only for HT40. So HT20 reset = IQ only.
+    /// (A future HT40 mode would add the two ADC cals here — read `AR_PHY_CAL_MEAS_0..3`,
+    /// write `AR_PHY_NEW_ADC_DC_GAIN_CORR`; deliberately omitted, HT20 never runs them.)
+    ///
+    /// AR9271 uses the **single-sample** percal profile (`ar9002_hw_init_cal_settings`:
+    /// `AR_SREV_9280_20_OR_LATER` is true for macVersion 0x140), i.e.
+    /// `iq_cal_single_sample` (ar9002_calib.c:944-950): `calNumSamples = MIN_CAL_SAMPLES
+    /// = 1`, `calCountMax = PER_MAX_LOG_COUNT = 10`. One collect, one apply — the minimum
+    /// WMI round-trips.
+    ///
+    /// Call this from [`set_channel_and_cal`](Self::set_channel_and_cal) after
+    /// `ar9271_cl_cal_ht20` and after `start_nfcal`, matching `ar9002_hw_init_cal`'s
+    /// order (AGC/CL cal -> loadnf -> start_nfcal -> arm+run the periodic cal list).
+    pub fn run_rx_calibration(&mut self, chan_mhz: u16) -> Result<(), FaceError> {
+        use crate::ath9k_reg::*;
+
+        if std::env::var_os("NDR_ATH9K_DEBUG").is_some() {
+            eprintln!("[ath9k] IQ-mismatch RX cal on {chan_mhz} MHz (HT20, chain 0)");
+        }
+
+        // AR9271 single-sample IQ profile (ar9002_calib.c:944-950, iq_cal_single_sample).
+        const CAL_COUNT_MAX: u32 = 10; // PER_MAX_LOG_COUNT -> IQCAL_LOG_COUNT_MAX field
+        const CAL_NUM_SAMPLES: u32 = 1; // MIN_CAL_SAMPLES
+
+        // -- ar9002_hw_setup_calibration: program IQCAL_LOG_COUNT_MAX + CALMODE, arm DO_CAL.
+        let arm = |me: &mut Self| -> Result<(), FaceError> {
+            // REG_RMW_FIELD(TIMING_CTRL4(0), IQCAL_LOG_COUNT_MAX, calCountMax)
+            me.reg_rmw(
+                AR_PHY_TIMING_CTRL4,
+                (CAL_COUNT_MAX << AR_PHY_TIMING_CTRL4_IQCAL_LOG_COUNT_MAX_S)
+                    & AR_PHY_TIMING_CTRL4_IQCAL_LOG_COUNT_MAX,
+                AR_PHY_TIMING_CTRL4_IQCAL_LOG_COUNT_MAX,
+            )?;
+            me.reg_write(AR_PHY_CALMODE, AR_PHY_CALMODE_IQ)?; // = 0
+            me.reg_set_bit(AR_PHY_TIMING_CTRL4, AR_PHY_TIMING_CTRL4_DO_CAL)?;
+            Ok(())
+        };
+
+        let _ = CAL_NUM_SAMPLES;
+
+        // ★ ath9k_hw_reset_calibration (calib.c): at RESET the driver only ARMS the IQ cal —
+        // `setup_calibration` sets DO_CAL, `calState = CAL_RUNNING` — and RETURNS. It does NOT block
+        // on DO_CAL. The measurement collect + correction apply (`ar9002_hw_per_calibration`) run
+        // LATER over the driver's periodic cal timer, which a bring-up-only driver doesn't have.
+        // The IQ correction is a refinement, NOT a prerequisite for RX, so kicking is both faithful
+        // and sufficient. (The previous blocking `wait_reg(DO_CAL == 0)` hung forever because the
+        // cal never completes in one shot at reset — the collect/apply math lives in
+        // `iq_cal_correction`, still unit-tested, for a future periodic-cal implementation.)
+        arm(self)?;
+        Ok(())
+    }
+
+    // ── M1.4 — RX enable (host register side + target verbs) ───────────────────
+
+    /// **M1.4** — open the receiver. Host register side: monitor opmode, the 0xBF RX filter,
+    /// clear the RX-disable/abort diag bits, enable RX DMA (`AR_CR_RXE`). Then the WMI verbs that
+    /// start the target's RX tasklet: `WMI_ATH_INIT` → `WMI_SET_MODE(11NG)` → `WMI_START_RECV`.
+    ///
+    /// [`connect_data_services`](Self::connect_data_services) must already have run so the
+    /// Mgmt/DataBE/Beacon endpoints exist before `START_RECV`.
+    pub fn rx_enable(&mut self) -> Result<(), FaceError> {
+        use crate::ath9k_reg::*;
+
+        // ── ath9k_hw_set_dma (reset tail we had skipped) ──
+        // ★ THE MISSING RX STEP. The MAC receives frames but never DMAs them into the descriptor
+        // ring unless AR_RXCFG's burst size is set — leaving the target RX tasklet with nothing
+        // (measured ndr_stats.seen=0, while the kernel driver receives fine on the same dongle).
+        // 128-byte DMA bursts + the RX FIFO threshold, non-9300 path (AR9271).
+        self.reg_set_bit(AR_AHB_MODE, AR_AHB_PREFETCH_RD_EN)?;
+        self.reg_rmw(AR_TXCFG, AR_TXCFG_DMASZ_128B, AR_TXCFG_DMASZ_MASK)?;
+        self.reg_rmw(AR_RXCFG, AR_RXCFG_DMASZ_128B, AR_RXCFG_DMASZ_MASK)?;
+        self.reg_write(AR_RXFIFO_CFG, 0x200)?;
+
+        // Monitor opmode: set KSRCH_MODE, clear the AP/ADHOC opmode bits (ath9k_hw_set_operating_mode
+        // default/monitor case). A benign station address keeps STA_ID sane; monitor RX doesn't gate
+        // on it.
+        self.reg_write(AR_STA_ID0, 0x1a2b_3c4d)?;
+        let id1 = self.reg_read(AR_STA_ID1)?;
+        let id1 = (id1 & !(AR_STA_ID1_STA_AP | AR_STA_ID1_ADHOC)) | AR_STA_ID1_KSRCH_MODE;
+        self.reg_write(AR_STA_ID1, id1)?;
+
+        // Open the receiver to everything on-channel. Use the kernel driver's exact monitor value
+        // (golden trace) 0xc03f, not our 0xBF — it adds MCAST_BCAST_ALL (0x8000) + 0x4000, without
+        // which broadcast beacons are dropped at the hardware RX filter (before DMA → seen=0).
+        self.reg_write(AR_RX_FILTER, 0x0000_c03f)?;
+
+        // ★ Accept ALL multicast. AR_MCAST_FIL0/1 is a 64-bit hash that defaults to 0 after reset,
+        // which drops every multicast/broadcast frame — i.e. every beacon — before RX DMA. This was
+        // the seen=0 deaf-receiver root cause: the golden trace of the working kernel driver writes
+        // both to 0xffffffff, and the RX_FILTER MCAST bit alone is not enough.
+        self.reg_write(AR_MCAST_FIL0, 0xffff_ffff)?;
+        self.reg_write(AR_MCAST_FIL1, 0xffff_ffff)?;
+        // MAC config / descriptor byte-swap — the kernel writes 0x0a on this host (golden trace).
+        self.reg_write(AR_CFG, 0x0000_000a)?;
+
+        // ath9k_hw_startpcureceive: clear the RX-disable/abort diag bits.
+        self.reg_clr_bit(AR_DIAG_SW, AR_DIAG_RX_DIS | AR_DIAG_RX_ABORT)?;
+
+        // Bring up the target WLAN app (interrupts + ISR), select the 2.4 GHz rate table, then
+        // start the target RX ring (programs AR_RXDP on the target side).
+        self.wmi_cmd(WmiCmd::AthInit, &[])?;
+        self.wmi_cmd(WmiCmd::SetMode, &IEEE80211_MODE_11NG.to_be_bytes())?;
+        self.wmi_cmd(WmiCmd::StartRecv, &[])?;
+        // Enable the target's interrupts so its RX ISR fires and `ath_tgt_rx_tasklet` actually
+        // delivers received frames up HTC. Without this the MAC receives fine (filter/DIAG/RXE all
+        // set) but nothing ever crosses USB — the RX tasklet is interrupt-driven and stays dormant.
+        // Mirrors the kernel `ath9k_htc_start` order (ATH_INIT → START_RECV → ENABLE_INTR); the
+        // firmware handler `ath_enable_intr_tgt` takes no payload (kernel uses `WMI_CMD`, not `_BUF`).
+        self.wmi_cmd(WmiCmd::EnableIntr, &[])?;
+
+        // ★ Arm the hardware interrupt mask from the host. AR_IMR gates which MAC events raise the
+        // target CPU's interrupt; the target's ENABLE_INTR only edits its software SWBA/BMISS mask
+        // and never sets AR_IMR to enable RX, so its RX ISR/tasklet stays dormant (seen=0). Values
+        // from the working kernel driver's golden trace; written AFTER ENABLE_INTR so they stick.
+        self.reg_write(AR_IMR, 0x8180_0964)?;
+        self.reg_write(AR_IMR_S0, 0x0001_0000)?;
+        self.reg_write(AR_IMR_S1, 0x0001_0000)?;
+        self.reg_write(AR_IMR_S2, 0x0080_0000)?;
+
+        // Start RX DMA on the MAC now that the target's descriptor ring + RXDP are set.
+        self.reg_write(AR_CR, AR_CR_RXE)?;
+
+        Ok(())
+    }
+
+    /// Receive one frame off the bulk WLAN-RX pipe and parse the `ath_htc_rx_status` prefix.
+    ///
+    /// Transfer layout: `[HTC_FRAME_HDR 8B][ath_htc_rx_status 40B][802.11 …]`. Returns `Ok(None)`
+    /// on a short/empty transfer (e.g. a keepalive) so the caller can keep polling; the 802.11
+    /// bytes and every decoded status field come back in [`RxFrame`].
+    pub fn recv_frame(&mut self, timeout: Duration) -> Result<Option<RxFrame>, FaceError> {
+        let raw = self.recv_raw_frame(timeout)?;
+        Ok(Self::parse_rx(&raw))
+    }
+
+    /// Parse a raw bulk-RX transfer into an [`RxFrame`]. Split out for unit-testing the field
+    /// offsets against a captured buffer without hardware.
+    pub fn parse_rx(raw: &[u8]) -> Option<RxFrame> {
+        // ★ MEASURED wire layout on the WLAN-RX bulk pipe (raw dump): the `ath_rx_status` (40 B,
+        // `rx_frame_header` = u32[10], ah_desc.h) sits at offset 12, and the 802.11 MPDU at 52 —
+        // i.e. the prefix is the 8-byte HTC frame header PLUS a 4-byte data-endpoint prefix
+        // (observed `04 00 00 00`), NOT the bare 8-byte HTC header. All status fields are
+        // big-endian (the target is big-endian; the memcpy'd status rides the wire as-is).
+        const RX_HDR_LEN: usize = HTC_HDR_LEN + 4; // = 12
+        if raw.len() < RX_HDR_LEN + HTC_RX_STATUS_LEN {
+            return None;
+        }
+        let s = &raw[RX_HDR_LEN..RX_HDR_LEN + HTC_RX_STATUS_LEN];
+        let rs_tstamp = u64::from_be_bytes(s[0..8].try_into().unwrap());
+        let rs_datalen = u16::from_be_bytes([s[8], s[9]]);
+        let frame = raw[RX_HDR_LEN + HTC_RX_STATUS_LEN..].to_vec();
+        Some(RxFrame {
+            rs_tstamp,
+            rs_datalen,
+            rs_status: s[10],
+            rs_phyerr: s[11],
+            rs_rssi: s[12] as i8,
+            rs_keyix: s[19],
+            rs_rate: s[20],
+            rs_antenna: s[21],
+            rs_more: s[22],
+            rs_flags: s[26],
+            frame,
+        })
+    }
+}
+
+/// The AR9271 IQ-mismatch fixed-point correction (`ar9002_hw_iqcalibrate`,
+/// ar9002_calib.c:192-267), for one chain. Inputs are the accumulated
+/// `AR_PHY_CAL_MEAS_0/1/2` reads (`powerMeasI`, `powerMeasQ`, `iqCorrMeas`). Returns the
+/// `(iCoff, qCoff)` field values to program, or `None` when the measurement is degenerate
+/// (the C `powerMeasQ && iCoffDenom && qCoffDenom` guard) — the caller still sets
+/// IQCORR_ENABLE in that case, exactly as the reference does.
+///
+/// Kept bit-identical to the C integer semantics: every division is truncating u32, and
+/// `qCoff = powerMeasI / qCoffDenom - 64` is computed in u32 then reinterpreted as i32
+/// (the C assigns the unsigned result into an `int32_t`), so a quotient below 64 yields a
+/// negative `qCoff` — that is the path that produces the RX-correction the demod needs.
+fn iq_cal_correction(power_meas_i: u32, power_meas_q: u32, iq_corr_meas: u32) -> Option<(i32, i32)> {
+    let mut iq_corr_meas = iq_corr_meas;
+    // C: `if (iqCorrMeas > 0x80000000)` — strictly greater; 0x80000000 stays positive.
+    let iq_corr_neg = if iq_corr_meas > 0x8000_0000 {
+        iq_corr_meas = (0xffff_ffffu32 - iq_corr_meas).wrapping_add(1);
+        true
+    } else {
+        false
+    };
+
+    let i_coff_denom = (power_meas_i / 2 + power_meas_q / 2) / 128;
+    let q_coff_denom = power_meas_q / 64;
+
+    if power_meas_q == 0 || i_coff_denom == 0 || q_coff_denom == 0 {
+        return None;
+    }
+
+    let mut i_coff = (iq_corr_meas / i_coff_denom) as i32;
+    // u32 arithmetic stored into int32_t; wrapping_sub then `as i32` reproduces the wrap.
+    let mut q_coff = (power_meas_i / q_coff_denom).wrapping_sub(64) as i32;
+
+    i_coff &= 0x3f;
+    if !iq_corr_neg {
+        i_coff = 0x40 - i_coff;
+    }
+
+    if q_coff > 15 {
+        q_coff = 15;
+    } else if q_coff <= -16 {
+        q_coff = -16;
+    }
+
+    Some((i_coff, q_coff))
+}
+
+/// Sign-extend the low `bits` of `v` to a full `i32`.
+fn sign_extend(v: u32, bits: u32) -> i32 {
+    let shift = 32 - bits;
+    ((v << shift) as i32) >> shift
+}
+
+/// `ath9k_hw_get_delta_slope_vals` (hw.c:1297) — the OFDM timing delta-slope
+/// fixed-point split into `(mantissa, exponent)`. Transcribed bit-for-bit,
+/// including the C's `u32` wrap in `14 - (coef_exp - COEF_SCALE_S)` (which nets to
+/// `38 - coef_exp` for the exponents this radio produces). Used by
+/// [`Ath9kHtcBackend::set_delta_slope`].
+fn delta_slope_vals(coef_scaled: u32) -> (u32, u32) {
+    use crate::ath9k_reg::COEF_SCALE_S;
+    // Find the highest set bit (mirrors the C for-loop from 31 down to 0).
+    let mut coef_exp = 31u32;
+    while coef_exp > 0 {
+        if (coef_scaled >> coef_exp) & 0x1 == 1 {
+            break;
+        }
+        coef_exp -= 1;
+    }
+    // C: coef_exp = 14 - (coef_exp - COEF_SCALE_S), computed in u32 (wraps).
+    coef_exp = 14u32.wrapping_sub(coef_exp.wrapping_sub(COEF_SCALE_S));
+    let coef_man = coef_scaled.wrapping_add(1u32 << (COEF_SCALE_S - coef_exp - 1));
+    let coef_mantissa = coef_man >> (COEF_SCALE_S - coef_exp);
+    let coef_exponent = coef_exp.wrapping_sub(16);
+    (coef_mantissa, coef_exponent)
 }
 
 #[cfg(test)]
@@ -777,8 +2167,38 @@ mod tests {
         assert_eq!(WmiCmd::Echo as u16, 0x0001);
         assert_eq!(WmiCmd::AccessMemory as u16, 0x0002);
         assert_eq!(WmiCmd::GetFwVersion as u16, 0x0003);
+        assert_eq!(WmiCmd::EnableIntr as u16, 0x0005);
+        assert_eq!(WmiCmd::AthInit as u16, 0x0006);
+        assert_eq!(WmiCmd::StartRecv as u16, 0x000c);
+        assert_eq!(WmiCmd::SetMode as u16, 0x000f);
         assert_eq!(WmiCmd::RegRead as u16, 0x0014);
         assert_eq!(WmiCmd::RegWrite as u16, 0x0015);
+        assert_eq!(WmiCmd::TargetIcUpdate as u16, 0x0018);
+        assert_eq!(WmiCmd::TgtDetach as u16, 0x001a);
+    }
+
+    /// The 802.11 frame starts after the 12-byte RX prefix (HTC 8 + 4-byte data-endpoint prefix)
+    /// + rx_status(40) = offset 52 (MEASURED on the wire); status fields are big-endian at fixed
+    /// offsets. Pin the parse against a synthetic buffer so an offset can't silently drift.
+    #[test]
+    fn parse_rx_decodes_status_offsets() {
+        const RX_HDR_LEN: usize = HTC_HDR_LEN + 4; // = 12
+        let mut raw = vec![0u8; RX_HDR_LEN + HTC_RX_STATUS_LEN + 4];
+        // rx_status starts at offset 12.
+        let s = RX_HDR_LEN;
+        raw[s..s + 8].copy_from_slice(&0x0011_2233_4455_6677u64.to_be_bytes()); // rs_tstamp
+        raw[s + 8..s + 10].copy_from_slice(&0x0004u16.to_be_bytes()); // rs_datalen = 4
+        raw[s + 12] = 0xd0; // rs_rssi = -48 (i8)
+        raw[s + 20] = 0x0b; // rs_rate (1 Mbps CCK code)
+        raw[RX_HDR_LEN + HTC_RX_STATUS_LEN..].copy_from_slice(&[0xaa, 0xbb, 0xcc, 0xdd]);
+        let f = Ath9kHtcBackend::parse_rx(&raw).expect("parses");
+        assert_eq!(f.rs_tstamp, 0x0011_2233_4455_6677);
+        assert_eq!(f.rs_datalen, 4);
+        assert_eq!(f.rs_rssi, -48);
+        assert_eq!(f.rs_rate, 0x0b);
+        assert_eq!(f.frame, vec![0xaa, 0xbb, 0xcc, 0xdd]);
+        // A runt transfer yields None rather than panicking.
+        assert!(Ath9kHtcBackend::parse_rx(&[0u8; 10]).is_none());
     }
 
     /// The vendor's `WMI_ACCESS_MEMORY_MAX_TUPLES` is 8 and does not fit the 64-byte register
@@ -792,6 +2212,16 @@ mod tests {
         assert!(hdr + 8 * 8 > REG_PIPE_MAX, "the vendor's 8 tuples overflow the pipe");
     }
 
+    /// A batched `WMI_REG_WRITE` must fit the 64-byte register pipe: `HTC(8) + WMI(4) + n*8`.
+    /// The write reply is empty, so (unlike ACCESS_MEMORY) no trailer budget is needed. Pin the
+    /// derived bound so it cannot drift into pipe overflow.
+    #[test]
+    fn reg_write_batch_fits_the_register_pipe() {
+        let hdr = HTC_HDR_LEN + WMI_HDR_LEN; // 12
+        assert!(hdr + REG_WRITE_MAX_PAIRS * 8 <= REG_PIPE_MAX);
+        assert!(hdr + (REG_WRITE_MAX_PAIRS + 1) * 8 > REG_PIPE_MAX, "one more pair overflows");
+    }
+
     /// A maximal echo must fit one register-pipe packet — and the firmware's own
     /// `WMI_ECHOCMD_MSG_MAX_LEN` (53) does **not**: 8 + 4 + 1 + 53 = 66 > 64. This pins the derived
     /// limit so nobody "corrects" it back to the header's value.
@@ -800,5 +2230,121 @@ mod tests {
         assert_eq!(MAX_ECHO_LEN, 51);
         assert!(HTC_HDR_LEN + WMI_HDR_LEN + 1 + MAX_ECHO_LEN <= REG_PIPE_MAX);
         assert!(HTC_HDR_LEN + WMI_HDR_LEN + 1 + 53 > REG_PIPE_MAX, "the firmware constant overflows");
+    }
+
+    /// IQ-mismatch fixed-point correction (`ar9002_hw_iqcalibrate`). Hand-computed against
+    /// the C so a stray shift or sign can't slip in. All values are the accumulated
+    /// AR_PHY_CAL_MEAS words for chain 0.
+    #[test]
+    fn iq_cal_correction_positive_and_negative() {
+        // Balanced I/Q, small positive iqCorrMeas.
+        //   iCoffDenom = (0x40000/2 + 0x40000/2)/128 = 2048; qCoffDenom = 0x40000/64 = 4096
+        //   iCoff = 4096/2048 = 2; &0x3f = 2; not-neg => 0x40-2 = 62
+        //   qCoff = 0x40000/4096 - 64 = 64-64 = 0
+        assert_eq!(iq_cal_correction(0x0004_0000, 0x0004_0000, 0x0000_1000), Some((62, 0)));
+
+        // Same magnitude, but iqCorrMeas > 0x80000000 => the negative branch.
+        //   iqCorrMeas -> (0xffffffff - 0xfffff000)+1 = 0x1000 = 4096, neg=true
+        //   iCoff = 2; &0x3f = 2; neg => NOT flipped => 2 ; qCoff = 0
+        assert_eq!(iq_cal_correction(0x0004_0000, 0x0004_0000, 0xffff_f000), Some((2, 0)));
+    }
+
+    /// A quotient below 64 must make qCoff negative (the u32->int32_t wrap) and then clamp
+    /// to -16 — this is the branch that carries the RX correction, so pin it.
+    #[test]
+    fn iq_cal_correction_negative_qcoff_clamps() {
+        // powerMeasI=0x20000, powerMeasQ=0x40000, iqCorrMeas=0x800
+        //   iCoffDenom = (0x20000/2 + 0x40000/2)/128 = (65536+131072)/128 = 1536
+        //   qCoffDenom = 0x40000/64 = 4096
+        //   iCoff = 0x800/1536 = 1; &0x3f=1; not-neg => 0x40-1 = 63
+        //   qCoff = 0x20000/4096 - 64 = 32-64 = -32 (wrap) => clamp to -16
+        assert_eq!(iq_cal_correction(0x0002_0000, 0x0004_0000, 0x0000_0800), Some((63, -16)));
+    }
+
+    /// Degenerate measurements match the C guard (`powerMeasQ && iCoffDenom && qCoffDenom`)
+    /// and yield no coefficients.
+    #[test]
+    fn iq_cal_correction_degenerate_is_none() {
+        assert_eq!(iq_cal_correction(0, 0, 0), None);
+        assert_eq!(iq_cal_correction(0x0004_0000, 0, 0x1000), None); // powerMeasQ == 0
+    }
+
+    /// `ath9k_hw_get_delta_slope_vals` fixed-point split, hand-computed against the C
+    /// so the u32-wrap in `14 - (coef_exp - COEF_SCALE_S)` can't silently drift.
+    #[test]
+    fn delta_slope_vals_matches_c() {
+        // coef_scaled = (100 MHz << 24) / 2412 = 0x64000000 / 2412 = 695572 (floor).
+        // Highest set bit: 19. coef_exp = 14 - (19 - 24) = 19.
+        //   man = 695572 + (1 << (24-19-1=4)) = 695572 + 16 = 695588
+        //   mantissa = 695588 >> (24-19=5) = 21737 ; exponent = 19 - 16 = 3
+        let coef = 0x6400_0000u32 / 2412;
+        assert_eq!(coef, 695572);
+        assert_eq!(delta_slope_vals(coef), (21737, 3));
+
+        // Half-GI coefficient (0.9×): (9*695572)/10 = 626014, top bit 19.
+        //   coef_exp=19; man=626014+16=626030; mantissa=626030>>5=19563; exp=3
+        let coef_hg = (9 * coef) / 10;
+        assert_eq!(delta_slope_vals(coef_hg), (19563, 3));
+    }
+
+    /// The 2.4 GHz MAC timing math `init_global_settings` emits, pinned against the
+    /// golden-trace register values (clockrate = 44). SIFS = mac_to_clks(10-2) = 8*44,
+    /// SLOT = 9*44, ACK = 64*44, CTS = 48*44.
+    #[test]
+    fn global_settings_timing_matches_trace() {
+        let clk = crate::ath9k_reg::ATH9K_CLOCK_RATE_2GHZ_OFDM;
+        assert_eq!(clk, 44);
+        assert_eq!((10u32 - 2) * clk, 0x160); // AR_D_GBL_IFS_SIFS (trace 0x1030)
+        assert_eq!(9u32 * clk, 0x18c); // AR_D_GBL_IFS_SLOT (trace 0x1070)
+        assert_eq!(64u32 * clk, 0xb00); // AR_TIME_OUT ACK field
+        assert_eq!(48u32 * clk, 0x840); // AR_TIME_OUT CTS field
+    }
+
+    /// The data-AC queue reset values, pinned against the golden trace
+    /// (AR_DLCL_IFS = 0x002ffc0f, AR_DRETRY_LIMIT = 0x0008200a).
+    #[test]
+    fn reset_tx_queue_values_match_trace() {
+        use crate::ath9k_reg::*;
+        let mut cw_min = 1u32;
+        while cw_min < INIT_CWMIN {
+            cw_min = (cw_min << 1) | 1;
+        }
+        assert_eq!(cw_min, 15);
+        let lcl_ifs = ((cw_min << AR_D_LCL_IFS_CWMIN_S) & AR_D_LCL_IFS_CWMIN)
+            | ((INIT_CWMAX << AR_D_LCL_IFS_CWMAX_S) & AR_D_LCL_IFS_CWMAX)
+            | ((INIT_AIFS << AR_D_LCL_IFS_AIFS_S) & AR_D_LCL_IFS_AIFS);
+        assert_eq!(lcl_ifs, 0x002f_fc0f);
+        let retry = ((INIT_SSH_RETRY << AR_D_RETRY_LIMIT_STA_SH_S) & AR_D_RETRY_LIMIT_STA_SH)
+            | ((INIT_SLG_RETRY << AR_D_RETRY_LIMIT_STA_LG_S) & AR_D_RETRY_LIMIT_STA_LG)
+            | ((INIT_SH_RETRY << AR_D_RETRY_LIMIT_FR_SH_S) & AR_D_RETRY_LIMIT_FR_SH);
+        assert_eq!(retry, 0x0008_200a);
+    }
+
+    /// The base interrupt mask `init_interrupt_masks` computes for the AR9271
+    /// (non-9300, no mitigation): TXERR|TXURN|RXERR|RXORN|BCNMISC|RXOK|TXOK.
+    #[test]
+    fn init_interrupt_masks_base_imr() {
+        use crate::ath9k_reg::*;
+        let imr = AR_IMR_TXERR
+            | AR_IMR_TXURN
+            | AR_IMR_RXERR
+            | AR_IMR_RXORN
+            | AR_IMR_BCNMISC
+            | AR_IMR_RXOK
+            | AR_IMR_TXOK;
+        assert_eq!(imr, 0x0080_0965);
+        // AR_INTR_SYNC_DEFAULT resolved from the reg.h enum.
+        assert_eq!(AR_INTR_SYNC_DEFAULT, 0x0002_3f60);
+    }
+
+    /// `ar9002_hw_set_channel`'s 2.4 GHz synth value for ch1 (2412), pinned against the
+    /// golden trace: 0x9874 = 0x30a0cccc = BMODE|FRACMODE|CHANSEL_2G(2412).
+    #[test]
+    fn rf_set_freq_synth_matches_trace() {
+        use crate::ath9k_reg::*;
+        let channel_sel = ((2412u64 * 0x1_0000) / CHANSEL_2G_DIV) as u32;
+        let synth =
+            AR_PHY_SYNTH_CONTROL_2G_BMODE | AR_PHY_SYNTH_CONTROL_2G_FRACMODE | channel_sel;
+        assert_eq!(synth, 0x30a0_cccc);
     }
 }

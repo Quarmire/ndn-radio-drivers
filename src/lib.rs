@@ -37,9 +37,16 @@ pub use libusb_rtl88xx::{
 // L1: USB transport + firmware download + HTC handshake + WMI. Does not yet replace ath9k_htc.
 pub mod coverage;
 mod ath9k_htc;
+// PHY-init data for the M1 bring-up port, transcribed verbatim from mainline ath9k v6.12.33:
+// AR9271 initval tables (ar9002_initvals.h), the register offsets/bits the reset+cal path writes
+// (reg.h / ar9002_phy.h / mac.h), and the HTC wire structs (htc.h). Consumed by ath9k_htc.rs.
+mod ath9k_htc_structs;
+mod ath9k_initvals;
+mod ath9k_reg;
 pub use ath9k_htc::{
-    AR9271_FIRMWARE, AR9271_FIRMWARE_TEXT, AR9271_IDS, ATHEROS_VID, Ath9kHtcBackend, FW_NAME,
-    HtcService, NDR_MEM_MAX_TUPLES, NdrStats, WmiCmd,
+    AR9271_FIRMWARE, AR9271_FIRMWARE_TEXT, AR9271_IDS, ATHEROS_VID, Ath9kHtcBackend, CalStatus,
+    FW_NAME, HTC_RX_STATUS_LEN, HtcService, IEEE80211_MODE_11NG, IniVerify, NDR_MEM_MAX_TUPLES,
+    NdrStats, REG_WRITE_MAX_PAIRS, ResetStatus, RxFrame, WmiCmd,
 };
 mod rtl8821c;
 pub use rtl8821c::{RTL8821CU_PIDS, Rtl8821cuBackend};
@@ -119,6 +126,16 @@ pub fn open_named_radio(pid: u16, channel: u8) -> Result<OpenRadio, FaceError> {
             profile: Some(d),
         });
     } else {
+        // Dispatch by PID, don't silently fall through: an unknown/unsupported pid (e.g. an
+        // MT7612U's 0x7612) must NOT open the first 8812au on the bus. Only pids in the 8812au set
+        // reach this branch; anything else is a caller error, named as such. (mt7612 has no arm here
+        // on purpose — it's ch6-only and needs separate design; #110.)
+        if !RTL8812AU_PIDS.contains(&pid) {
+            return Err(FaceError::Io(std::io::Error::other(format!(
+                "open_named_radio: pid 0x{pid:04x} is not a dispatchable radio \
+                 (supported: 8822E 0xa81a/0xa811/0x8814, 8812AU {RTL8812AU_PIDS:#06x?})"
+            ))));
+        }
         // RTL8812AU: force the canonical format (its own default is Raw80211 for the NAN path), then
         // bring up monitor (MAC/BB/RF + IQK/LCK) on the channel. `sel` (NDN_USB_ADDR / NDN_USB_INDEX)
         // selects which adapter when several identical 8812au dongles share the host.

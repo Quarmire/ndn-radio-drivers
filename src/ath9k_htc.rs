@@ -36,6 +36,8 @@ use std::time::Duration;
 
 use rusb::{Context, DeviceHandle, UsbContext};
 
+use ndn_frame_io::ClockDomainId;
+use ndn_radio_hal::{RadioTime, RadioTimeSource};
 use ndn_transport::FaceError;
 
 /// Qualcomm Atheros USB vendor ID.
@@ -348,6 +350,10 @@ pub struct Ath9kHtcBackend {
     /// `init_global_settings`). Computed by [`Ath9kHtcBackend::set_clockrate`];
     /// 44 for 2.4 GHz OFDM (the value the golden trace's SIFS/SLOT writes imply).
     clockrate: u32,
+    /// Per-device RX-stamp clock domain (`bus << 8 | address`). The AR9271's per-frame
+    /// `rs_tstamp` is a µs hardware RX timestamp on this domain — a common-view `FreeRunRxStamp`
+    /// (M2 / design §15). Mirrors the Realtek `tsf_domain`.
+    tsf_domain: ClockDomainId,
 }
 
 fn usb_err<E: std::fmt::Display>(what: &str, e: E) -> FaceError {
@@ -378,6 +384,11 @@ impl Ath9kHtcBackend {
         let ctx = Context::new().map_err(|e| usb_err("libusb init", e))?;
 
         let mut handle = Self::find_and_open(&ctx)?;
+
+        // Per-device RX-stamp clock domain (bus<<8 | address), for the FreeRunRxStamp M2 clock.
+        let d = handle.device();
+        let tsf_domain =
+            ClockDomainId((u32::from(d.bus_number()) << 8) | u32::from(d.address()));
 
         // ⛔ DO NOT port-reset this device. It was tried and it is destructive: `handle.reset()`
         // on an AR9271 that is already running firmware makes it re-enumerate, and on the o5p-1
@@ -425,7 +436,14 @@ impl Ath9kHtcBackend {
             data_be_ep: 0,
             beacon_ep: 0,
             clockrate: crate::ath9k_reg::ATH9K_CLOCK_RATE_2GHZ_OFDM,
+            tsf_domain,
         })
+    }
+
+    /// The clock domain the AR9271's per-frame `rs_tstamp` lives on — build a `LinkStamp` from an
+    /// [`RxFrame::rs_tstamp`] against this to feed the common-view timekeeper.
+    pub fn tsf_domain(&self) -> ClockDomainId {
+        self.tsf_domain
     }
 
     /// Find the first AR9271 and open it, retrying while a reset-induced re-enumeration settles.
@@ -2059,6 +2077,19 @@ impl Ath9kHtcBackend {
             rs_flags: s[26],
             frame,
         })
+    }
+}
+
+/// **M2 — the AR9271 as a common-view clock source.** Every received frame carries a per-frame
+/// hardware RX timestamp (`rs_tstamp`, µs) on a stable free-running counter — a `FreeRunRxStamp`,
+/// the strongest link clock in the taxonomy (design §15). MEASURED advancing frame-to-frame on
+/// silicon. That makes `FaceTimeProfile::derive` report `can_common_view = true`: two receivers'
+/// stamps of one on-air frame difference into a µs cross-node offset. `read_clock` stays the
+/// default `None` — the AR_TSF register is readable but read-now would need `&mut self` (a WMI
+/// round-trip); the per-frame latch is what common-view uses, and it is the honest best clock.
+impl RadioTime for Ath9kHtcBackend {
+    fn time_sources(&self) -> Vec<RadioTimeSource> {
+        vec![RadioTimeSource::free_run_rx_stamp(self.tsf_domain, 1_000)]
     }
 }
 

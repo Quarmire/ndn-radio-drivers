@@ -7,8 +7,10 @@ license = "MPL-2.0"
 description = "Userspace USB Wi-Fi monitor-mode driver backends (RTL8812EU/8822E, RTL8821CU, MT7612U, RTL8812AU, RTL8731BU/8733BU) over the ndn-radio-hal contract."
 
 [dependencies]
-ndn-radio-hal = { path = "../ndn-rs/crates/core/ndn-radio-hal" }
-ndn-frame-io  = { path = "../ndn-rs/crates/core/ndn-frame-io" }
+# In-repo since P2/D5: the radio campaign's foundation crates live here now,
+# not in ndn-rs crates/core (history there up to df454d63).
+ndn-radio-hal = { path = "crates/ndn-radio-hal" }
+ndn-frame-io  = { path = "crates/ndn-frame-io" }
 # RefBelief (#75) parsed from mesh timing beacons.
 ndn-time      = { path = "../ndn-rs/crates/core/ndn-time", default-features = false }
 ndn-transport = { path = "../ndn-rs/crates/core/ndn-transport" }
@@ -59,10 +61,6 @@ name = "lora_contention"
 required-features = ["lora"]
 
 [[example]]
-name = "lora_cognition"
-required-features = ["lora"]
-
-[[example]]
 name = "ndn_dataplane_test"
 required-features = ["lora"]
 
@@ -70,12 +68,43 @@ required-features = ["lora"]
 name = "lora_dfu"
 required-features = ["lora"]
 
-[dev-dependencies]
-# Cross-repo: the live named-time driver (wifi transport) for the on-air node example.
-ndn-time-driver = { path = "../ndn-ext/crates/time/ndn-time-driver", features = ["wifi"] }
-ndn-time-sources = { path = "../ndn-ext/crates/time/ndn-time-sources" }
-ndn-time = { path = "../ndn-rs/crates/core/ndn-time", default-features = false }
-# The cognitive control plane — drives the live LoRa radio from real RSSI in lora_cognition.
-ndn-radio-cognition = { path = "../ndn-ext/crates/faces/ndn-radio-cognition" }
+# The two examples that consumed ndn-ext crates (lora_cognition,
+# named_time_node) moved to ndn-ext in P2 — that dev-dep back-edge was the
+# repo cycle ext <-> radio-drivers; the graph is a DAG again:
+# ndn-rs <- ndn-radio-drivers <- ndn-ext.
 
 [workspace]
+members = [
+    "crates/ndn-radio-hal",
+    "crates/ndn-frame-io",
+    "crates/ndn-env",
+]
+
+# The moved crates keep their original licensing (they came from ndn-rs, which
+# is MIT OR Apache-2.0); the root driver package stays MPL-2.0 explicitly.
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+license = "MIT OR Apache-2.0"
+
+[workspace.lints.rust]
+# Same policy as ndn-rs: unsafe-free by default; the OS-I/O boundary
+# (ndn-frame-io's AF_PACKET backend, the USB backends) opts back in with
+# scoped allows at the module that owns the raw-socket/FFI boundary.
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+dbg_macro = "warn"
+todo = "warn"
+unimplemented = "warn"
+
+[workspace.dependencies]
+ndn-radio-hal = { path = "crates/ndn-radio-hal" }
+ndn-transport = { path = "../ndn-rs/crates/core/ndn-transport" }
+ndn-time      = { path = "../ndn-rs/crates/core/ndn-time", default-features = false }
+bytes       = { version = "1", default-features = false }
+async-trait = "0.1"
+tokio       = { version = "1", default-features = false }
+libc        = "0.2"
+proptest    = "1"

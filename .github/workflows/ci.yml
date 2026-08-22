@@ -47,12 +47,12 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: ${{ github.repository_owner }}/ndn-rs
-          ref: 445736a2dd8597be0e09b36a31abd15b21e673e3 # pinned sibling; bump deliberately
+          ref: 2f0d8cf5733fbcd5fcbecc66a38c4cbe9887e385 # pinned sibling; bump deliberately
           path: ndn-rs
       - uses: actions/checkout@v4
         with:
           repository: ${{ github.repository_owner }}/ndn-ext
-          ref: f979cb8d638fb79af6019f3583e42b12d087e3e8 # pinned sibling; bump deliberately
+          ref: c3a26aa755a5fce10bad3c391b22cc59f1326ad1 # pinned sibling; bump deliberately
           path: ndn-ext
       - name: Install system dependencies (libusb)
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libusb-1.0-0-dev pkg-config
@@ -76,12 +76,12 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: ${{ github.repository_owner }}/ndn-rs
-          ref: 445736a2dd8597be0e09b36a31abd15b21e673e3 # pinned sibling; bump deliberately
+          ref: 2f0d8cf5733fbcd5fcbecc66a38c4cbe9887e385 # pinned sibling; bump deliberately
           path: ndn-rs
       - uses: actions/checkout@v4
         with:
           repository: ${{ github.repository_owner }}/ndn-ext
-          ref: f979cb8d638fb79af6019f3583e42b12d087e3e8 # pinned sibling; bump deliberately
+          ref: c3a26aa755a5fce10bad3c391b22cc59f1326ad1 # pinned sibling; bump deliberately
           path: ndn-ext
       - name: Install system dependencies (libusb)
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libusb-1.0-0-dev pkg-config

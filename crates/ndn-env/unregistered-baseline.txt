@@ -1,0 +1,52 @@
+# NDN_* names read somewhere in the workspace (env::var / env::var_os in .rs files)
+# but NOT registered in the ndn-env classification table (crates/ndn-env/src/lib.rs).
+#
+# This is FROZEN DEBT, enforced by tools/env_census.py in CI: a new NDN_* read must
+# either be registered in ndn-env (preferred — it becomes visible to snapshot()/
+# describe() run headers) or added here in the same commit, deliberately. Shrink this
+# file by registering names and regenerating it (tools/env_census.py --write-baseline);
+# never grow it silently.
+NDN_2T
+NDN_AGG_K
+NDN_ATH9K_FW
+NDN_BCN_SPACE
+NDN_BENCH
+NDN_BLAST
+NDN_CH
+NDN_CONTTX
+NDN_CXX_LIB
+NDN_DUR
+NDN_DUR_SECS
+NDN_DWELL_MS
+NDN_EMIT_MS
+NDN_GUARD_LIVE_LINK
+NDN_HALOW_BATCH
+NDN_HALOW_COUNT
+NDN_HALOW_DELAY_MS
+NDN_HALOW_SIZE
+NDN_LBT
+NDN_LORA_FEC
+NDN_MODE
+NDN_NO_CARRIER
+NDN_NO_TONE
+NDN_PIB
+NDN_PID
+NDN_POKE
+NDN_RADIO_CHANNEL
+NDN_RADIO_DEV
+NDN_RADIO_REVERSE
+NDN_RADIO_SECS
+NDN_RATE_HZ
+NDN_RELAY_PREFIXES
+NDN_ROLE
+NDN_SCHED_D1
+NDN_SCHED_NO_BACKOFF
+NDN_SKIP_CAL
+NDN_SMOKE_SOCKET
+NDN_SWEEP_SCALE
+NDN_TIER0_REGEN
+NDN_TXPWR
+NDN_TX_BAND
+NDN_TX_DEPTH
+NDN_TX_EDCA
+NDN_USB_ADDR

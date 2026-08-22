@@ -24,7 +24,7 @@ The repo expects the `ndn-rs` checkout as a sibling (`../ndn-rs`) for its
 | `golden/` | Captured golden state from the kernel drivers: rtw88 usbmon register traces per channel (the 8812au bring-up oracle) and `tier0/vectors.txt` (the shared Tier-0 filter vectors). |
 | `tests/` | `tier0_golden.rs` — the three-way Tier-0 wire gate: the LR2021 firmware copy (mounted via `#[path]`, so the bytes that ship are the bytes tested) checked against the golden vectors ndn-ext's `tier0.rs` generates; the ath9k C copy is checked by `firmware/ath9k-htc-ndr/tools`. |
 | `scripts/` | `supervise_tx.sh` — process-level TX supervisor for the RTL8731BU (its per-boot analog TX state is locked at process start, so reliable TX = relaunch until delivery is confirmed). |
-| `tools/` | Gone — the one-shot RTL8733B RE tools (hwprobe, usbmon parser) were absorbed into `src/libusb_rtl8733b.rs` and archived; see [`ARCHIVE.md`](ARCHIVE.md). |
+| `tools/` | `env_census.py` — the CI gate over the `NDN_*` environment surface: every `env::var("NDN_…")` read across the sibling repos must be registered in ndn-env or frozen in `crates/ndn-env/unregistered-baseline.txt`. (The one-shot RTL8733B RE tools that used to live here were absorbed into `src/libusb_rtl8733b.rs` and archived; see [`ARCHIVE.md`](ARCHIVE.md).) |
 | `ARCHIVE.md` | Tombstones for everything removed from the working tree (one-shot RE probes, superseded firmware); git history is the archive. |
 
 ## Backends by chip (`src/`)

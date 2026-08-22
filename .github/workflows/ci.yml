@@ -83,6 +83,13 @@ jobs:
           repository: ${{ github.repository_owner }}/ndn-ext
           ref: c3a26aa755a5fce10bad3c391b22cc59f1326ad1 # pinned sibling; bump deliberately
           path: ndn-ext
+      # The NDN_* surface gate (#81): every env::var("NDN_…") read in the
+      # checked-out repos must be either registered in crates/ndn-env/src/lib.rs
+      # or frozen in crates/ndn-env/unregistered-baseline.txt. The scan is scoped
+      # to the siblings this job already checks out (repos not checked out here
+      # are skipped), so the runner's workspace root is passed explicitly.
+      - name: env census (NDN_* surface gate)
+        run: python3 tools/env_census.py "${{ github.workspace }}"
       - name: Install system dependencies (libusb)
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libusb-1.0-0-dev pkg-config
       - uses: Swatinem/rust-cache@v2

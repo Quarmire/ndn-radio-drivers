@@ -50,8 +50,10 @@ const fn dbg_(name: &'static str, what: &'static str) -> Var {
     Var { name, class: Class::DebugBisect, what }
 }
 
-/// **The classification table.** Every `NDN_*` read from library source across ndn-rs, ndn-ext and
-/// ndn-radio-drivers, swept 2026-08-11.
+/// **The classification table.** Every `NDN_*` read from library source across ndn-rs, ndn-ext,
+/// ndn-fwd and ndn-radio-drivers, swept 2026-08-11 — and held complete since by the census gate
+/// `tools/env_census.py` (repo root): CI fails when a new `NDN_*` read is neither registered here
+/// nor deliberately baselined in `unregistered-baseline.txt` beside this crate.
 ///
 /// The `NDN_RADIO_*` block is large because the Realtek bring-up was bisected register block by
 /// register block — that is the documented driver-porting method, and each switch is one step of it.
@@ -106,6 +108,13 @@ pub const KNOWN: &[Var] = &[
     cfg("NDN_HALOW_POWER", "HaLow TX power"),
     cfg("NDN_CAD_ON", "LoRa carrier-activity-detect LBT (measured: hurts at N=2)"),
     cfg("NDN_NODE_ID", "node identity for reports"),
+    // ---- ndn-fwd radio daemon (cooperative sensing + TX opt-ins; read in radio_face.rs) ----
+    cfg("NDN_RADIO_TX_2T", "opt in to driving both antenna paths on TX, beyond the regulatory-calibrated default (#38)"),
+    cfg("NDN_RADIO_TX_RAW", "raw TXAGC index 0..63 written as-is — CAN EXCEED LICENSED EIRP; explicit operator opt-in only"),
+    cfg("NDN_RADIO_NODE_ID", "stable per-node id for cooperative sensing (the neighbour key others record); default FNV-1a of /etc/hostname"),
+    cfg("NDN_RADIO_REPORT_MS", "reception-report interval, ms (default 1000; 0 = reports off)"),
+    cfg("NDN_RADIO_FEC_MIN", "parity floor for known-lossy links: pins FEC redundancy R >= this (default 0 = fully loss-driven)"),
+    dbg_("NDN_RADIO_REPORT_DATA", "send reception reports via the data path instead of the basic legacy rate — exercises the HT->VHT rate mapping, but legacy-only-RX neighbours stop hearing reports"),
     // ---- debug-bisect: driver bring-up ----
     dbg_("NDN_NO_PUMP", "disable the shared RX pump — starves RX to free USB bandwidth for TX"),
     dbg_("NDN_ASYNC_PUMP", "switch the RX pump to async transfers"),

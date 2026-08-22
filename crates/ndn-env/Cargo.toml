@@ -2,5 +2,9 @@
 name = "ndn-env"
 version = "0.1.0"
 edition = "2024"
+# Moved from ndn-rs in P2/D5; keeps its original ndn-rs licensing like the
+# other foundation crates here (the MPL-2.0 root package does not apply).
+license.workspace = true
+description = "The classified NDN_* environment surface (#81): every registered variable, config vs debug-bisect, with a run-header snapshot."
 
 [dependencies]

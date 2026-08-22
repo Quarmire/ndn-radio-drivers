@@ -47,12 +47,12 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: ${{ github.repository_owner }}/ndn-rs
-          ref: 2f0d8cf5733fbcd5fcbecc66a38c4cbe9887e385 # pinned sibling; bump deliberately
+          ref: 36f4394884bdf7729909edc842649aca8c212db2 # pinned sibling; bump deliberately
           path: ndn-rs
       - uses: actions/checkout@v4
         with:
           repository: ${{ github.repository_owner }}/ndn-ext
-          ref: c3a26aa755a5fce10bad3c391b22cc59f1326ad1 # pinned sibling; bump deliberately
+          ref: 76e913dcef511a3c1d76186289a53376a83a2efa # pinned sibling; bump deliberately
           path: ndn-ext
       - name: Install system dependencies (libusb)
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libusb-1.0-0-dev pkg-config
@@ -76,12 +76,12 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: ${{ github.repository_owner }}/ndn-rs
-          ref: 2f0d8cf5733fbcd5fcbecc66a38c4cbe9887e385 # pinned sibling; bump deliberately
+          ref: 36f4394884bdf7729909edc842649aca8c212db2 # pinned sibling; bump deliberately
           path: ndn-rs
       - uses: actions/checkout@v4
         with:
           repository: ${{ github.repository_owner }}/ndn-ext
-          ref: c3a26aa755a5fce10bad3c391b22cc59f1326ad1 # pinned sibling; bump deliberately
+          ref: 76e913dcef511a3c1d76186289a53376a83a2efa # pinned sibling; bump deliberately
           path: ndn-ext
       # The NDN_* surface gate (#81): every env::var("NDN_…") read in the
       # checked-out repos must be either registered in crates/ndn-env/src/lib.rs

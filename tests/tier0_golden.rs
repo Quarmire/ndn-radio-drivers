@@ -26,7 +26,7 @@ struct Row {
     label: String,
     key: [u8; 16],
     name: String,
-    wire: [u8; 12],
+    wire: [u8; 16],
     popcount: u32,
 }
 
@@ -55,7 +55,7 @@ fn vectors() -> (Vec<Row>, (u32, u32, usize, u32)) {
         assert_eq!(f.len(), 5, "row shape: label key name wire popcount");
         let mut key = [0u8; 16];
         key.copy_from_slice(f[1].as_bytes());
-        let mut wire = [0u8; 12];
+        let mut wire = [0u8; 16];
         for (i, b) in wire.iter_mut().enumerate() {
             *b = u8::from_str_radix(&f[3][2 * i..2 * i + 2], 16).expect("hex");
         }
@@ -129,7 +129,7 @@ fn firmware_honours_keying_and_the_fill_cap() {
 
     // F1: an over-full filter is inert here too. A copy that skips the cap is a hole even if every
     // other byte agrees, which is why the cap is a vector parameter and not an implementation choice.
-    let all_ones = PrefixFilter([0xff; 12]);
+    let all_ones = PrefixFilter([0xff; 16]);
     assert!(all_ones.popcount() > FILL_CAP);
     assert!(!all_ones.may_match(&mask), "the amplified universal wake is dead in the firmware copy");
 }

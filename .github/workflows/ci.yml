@@ -68,7 +68,7 @@ jobs:
         run: cargo clippy -p ndn-radio-drivers --lib --bins
 
   test:
-    name: host tests (lib)
+    name: host tests (lib + tier0 golden)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -90,12 +90,10 @@ jobs:
           workspaces: ndn-radio-drivers
           shared-key: test
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      # `--lib` on purpose, for two reasons:
-      #   - plain `cargo test` also compiles every example (the 70+ probe
-      #     binaries excluded above by design);
-      #   - tests/tier0_golden.rs does not compile at present: it include!s the
-      #     LR2021 firmware tier0.rs, which b2a5e27 widened to the 126-bit
-      #     PrefixFilter ([u8; 16]) while the test still asserts the v1 12-byte
-      #     wire. De-drift the test, then widen this gate to `--lib --tests`.
-      - name: unit tests
-        run: cargo test -p ndn-radio-drivers --lib
+      # `--lib --test tier0_golden` rather than plain `cargo test`: the latter
+      # also compiles every example (the hardware probe binaries excluded above
+      # by design). tier0_golden is the three-way Tier-0 wire gate (LR2021
+      # firmware include! + ath9k C copy via `cc` + the shared golden vectors
+      # ndn-ext generates) — it runs on the host and must stay in CI.
+      - name: unit tests + tier0 golden vectors
+        run: cargo test -p ndn-radio-drivers --lib --test tier0_golden

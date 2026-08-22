@@ -47,9 +47,9 @@ static int hex_to_filter(const char *hex, ndr_filter_t *out)
 {
 	int i;
 
-	if (strlen(hex) != 24)
+	if (strlen(hex) != 32)
 		return 0;
-	for (i = 0; i < 12; i++) {
+	for (i = 0; i < 16; i++) {
 		unsigned byte;
 
 		if (sscanf(hex + 2 * i, "%2x", &byte) != 1)
@@ -142,7 +142,7 @@ int main(int argc, char **argv)
 		ndr_filter_t all_ones, mask;
 		int i;
 
-		for (i = 0; i < 12; i++)
+		for (i = 0; i < 16; i++)
 			all_ones.b[i] = 0xff;
 		ndr_mask_for(&mask, (const a_uint8_t *)"ndr/tier0-vec-01",
 			     (const a_uint8_t *)"/ndn", 4);

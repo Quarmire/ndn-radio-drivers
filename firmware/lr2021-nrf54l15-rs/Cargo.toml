@@ -36,7 +36,7 @@ embedded-hal-bus = { version = "0.3", features = ["async"] }
 lr2021 = { path = "vendor/lr2021", features = ["defmt"] }
 # The SAME no_std NDN data plane the Waveshare/Heltec nodes run — shared by path, not copied, so
 # name-hash/filter/dedup semantics cannot drift between the nodes that must interoperate.
-ndn-embedded = { path = "../../../ndn-embedded/crates/ndn-embedded", default-features = false, features = ["cs"] }
+ndn-embedded = { git = "https://github.com/Quarmire/ndn-embedded", tag = "v0.1.0-alpha.3", default-features = false, features = ["cs"] }
 defmt = "1"
 defmt-rtt = "1"
 panic-probe = { version = "1", features = ["print-defmt"] }

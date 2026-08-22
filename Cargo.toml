@@ -12,8 +12,8 @@ description = "Userspace USB Wi-Fi monitor-mode driver backends (RTL8812EU/8822E
 ndn-radio-hal = { path = "crates/ndn-radio-hal" }
 ndn-frame-io  = { path = "crates/ndn-frame-io" }
 # RefBelief (#75) parsed from mesh timing beacons.
-ndn-time      = { path = "../ndn-rs/crates/core/ndn-time", default-features = false }
-ndn-transport = { path = "../ndn-rs/crates/core/ndn-transport" }
+ndn-time      = { workspace = true }
+ndn-transport = { workspace = true }
 async-trait = "0.1"
 tracing = "0.1"
 bytes = { version = "1", features = ["std"] }
@@ -101,8 +101,8 @@ unimplemented = "warn"
 
 [workspace.dependencies]
 ndn-radio-hal = { path = "crates/ndn-radio-hal" }
-ndn-transport = { path = "../ndn-rs/crates/core/ndn-transport" }
-ndn-time      = { path = "../ndn-rs/crates/core/ndn-time", default-features = false }
+ndn-transport = { git = "https://github.com/Quarmire/ndn-rs", tag = "v0.1.0-alpha.3" }
+ndn-time      = { git = "https://github.com/Quarmire/ndn-rs", tag = "v0.1.0-alpha.3", default-features = false }
 bytes       = { version = "1", default-features = false }
 async-trait = "0.1"
 tokio       = { version = "1", default-features = false }

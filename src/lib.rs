@@ -45,8 +45,8 @@ mod ath9k_initvals;
 mod ath9k_reg;
 pub use ath9k_htc::{
     AR9271_FIRMWARE, AR9271_FIRMWARE_TEXT, AR9271_IDS, ATHEROS_VID, Ath9kHtcBackend, CalStatus,
-    FW_NAME, HTC_RX_STATUS_LEN, HtcService, IEEE80211_MODE_11NG, IniVerify, NDR_MEM_MAX_TUPLES,
-    NdrStats, REG_WRITE_MAX_PAIRS, ResetStatus, RxFrame, WmiCmd,
+    FW_NAME, HTC_RX_STATUS_LEN, HtcService, IEEE80211_MODE_11NG, IniVerify, LegacyRate,
+    NDR_MEM_MAX_TUPLES, NdrStats, REG_WRITE_MAX_PAIRS, ResetStatus, RxFrame, WmiCmd,
 };
 mod rtl8821c;
 pub use rtl8821c::{RTL8821CU_PIDS, Rtl8821cuBackend};
@@ -156,6 +156,7 @@ pub fn open_named_radio(pid: u16, channel: u8) -> Result<OpenRadio, FaceError> {
         if let Some(p) = std::env::var("NDN_TX_PWR").ok().and_then(|s| s.parse::<u32>().ok()) {
             let _ = d.set_tx_power(p);
         }
+        apply_bw_override(d.as_ref(), channel);
         start_pump(&d);
         return Ok(OpenRadio {
             io: d.clone(),
@@ -174,6 +175,7 @@ pub fn open_named_radio(pid: u16, channel: u8) -> Result<OpenRadio, FaceError> {
         if let Some(p) = std::env::var("NDN_TX_PWR").ok().and_then(|s| s.parse::<u32>().ok()) {
             let _ = d.set_tx_power(p);
         }
+        apply_bw_override(d.as_ref(), channel);
         start_pump(&d); // async (NDN_ASYNC_PUMP) or sync pump, lives for the process
         return Ok(OpenRadio {
             io: d.clone(),
@@ -320,6 +322,40 @@ pub fn open_ath9k(channel: u8) -> Result<OpenRadio, FaceError> {
         time: Some(dev.clone()),
         profile: Some(dev),
     })
+}
+
+/// `NDN_RADIO_BW` — bring a radio up at a non-default channel width: `5` / `10` (narrowband),
+/// `20` (default), `40`. Applied through `RadioKnobs::set_channel` after the chip's own bring-up,
+/// which is the ordering the narrowband path requires: on the 8733b the 5/10 MHz BB registers must
+/// be written AFTER the RF registers or, in the vendor's words, the MAC rate is right but nothing
+/// comes out of the RF.
+///
+/// Narrowband trades rate for link budget — a quarter-clocked 5 MHz channel puts the same energy in
+/// a quarter of the bandwidth, so the noise floor drops ~6 dB. Both the RTL8733BU and the
+/// RTL8812EU/8822E implement it; the 8812au path does not, and an unsupported width surfaces as the
+/// backend's own error rather than being silently ignored.
+fn apply_bw_override(knobs: &dyn RadioKnobs, channel: u8) {
+    use ndn_radio_hal::Bandwidth;
+    let Some(v) = std::env::var("NDN_RADIO_BW").ok() else { return };
+    let bw = match v.trim() {
+        "5" => Bandwidth::Nb5,
+        "10" => Bandwidth::Nb10,
+        "20" => Bandwidth::Bw20,
+        "40" => Bandwidth::Bw40,
+        other => {
+            tracing::warn!("NDN_RADIO_BW={other}: expected 5|10|20|40, ignoring");
+            return;
+        }
+    };
+    // `eprintln!`, NOT `tracing`: an operator running a bring-up binary that never installs a
+    // subscriber would see NOTHING — and this message exists precisely to stop a narrowband run
+    // from silently measuring 20 MHz twice. (Learned the hard way on 2026-08-24: the first attempt
+    // at this experiment ran both arms at 20 MHz because the override was not deployed, and the
+    // tracing-based confirmation could not have reported that either way.)
+    match knobs.set_channel(channel, bw) {
+        Ok(()) => eprintln!("NDN_RADIO_BW: channel {channel} set to {bw:?}"),
+        Err(e) => eprintln!("NDN_RADIO_BW={v} NOT APPLIED: {e}"),
+    }
 }
 
 /// RX-pump reader-thread / transfer-pool count. Default 8; `NDN_RX_PUMP_DEPTH` overrides.

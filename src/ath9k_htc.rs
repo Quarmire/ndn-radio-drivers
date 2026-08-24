@@ -420,6 +420,13 @@ pub struct Ath9kHtcBackend {
     /// stored (so the seam is uniform and a future WMI rate-table/node path can consume it) but does
     /// **not** currently steer the on-air rate. Flagged so nobody reads a stored MCS as an actuated one.
     cur_mcs: std::sync::Mutex<Option<McsDescriptor>>,
+    /// Selected legacy (non-HT) transmit rate as the raw AR5416 hardware rate code (#6). `Some(code)`
+    /// overrides `cur_mcs` and injects at a CCK/OFDM legacy PHY rate (rate_flags cleared — no HT/SGI/
+    /// HT40); `None` defers to `cur_mcs` (HT) or, if that too is None, the target min rate. Set by
+    /// [`set_legacy_rate`](Self::set_legacy_rate); cleared when an HT MCS is chosen via `set_rate`.
+    /// This is the honest legacy lever the worst-receiver adaptation needs when a legacy-only neighbour
+    /// is advertised — the AR9271 can now name a *specific* legacy rate, not just "target min".
+    cur_legacy: std::sync::atomic::AtomicU8, // 0 = none; else the hw rate code (always < 0x80)
     /// Shared bulk-IN RX pipeline the pump fills and `recv_frame` drains (mirrors the Realtek). See
     /// [`crate::rx_pump`].
     rx_pump: crate::rx_pump::RxPumpState,
@@ -523,6 +530,7 @@ impl Ath9kHtcBackend {
                 ethertype: crate::NDN_ETHERTYPE,
             },
             cur_mcs: std::sync::Mutex::new(None),
+            cur_legacy: std::sync::atomic::AtomicU8::new(0),
             rx_pump: crate::rx_pump::RxPumpState::new(),
             channel: std::sync::atomic::AtomicU8::new(0),
             cur_power: std::sync::atomic::AtomicU8::new(0),
@@ -1326,7 +1334,7 @@ impl Ath9kHtcBackend {
     /// Stream one MODES-shaped table (`{addr, 5G_HT20, 5G_HT40, 2G_HT40, 2G_HT20}`)
     /// at the given column, recording each `{addr,val}` written.
     fn stream_modes(
-        &mut self,
+        &self,
         table: &[[u32; 5]],
         col: usize,
         written: &mut Vec<(u32, u32)>,
@@ -1339,7 +1347,7 @@ impl Ath9kHtcBackend {
 
     /// Stream a COMMON-shaped table (`{addr, val}`), recording each write.
     fn stream_common(
-        &mut self,
+        &self,
         table: &[[u32; 2]],
         written: &mut Vec<(u32, u32)>,
     ) -> Result<(), FaceError> {
@@ -1362,7 +1370,7 @@ impl Ath9kHtcBackend {
     ///
     /// Full channel-synth programming and calibration are M1.3 and are deliberately
     /// **not** done here.
-    pub fn apply_initvals(&mut self) -> Result<IniVerify, FaceError> {
+    pub fn apply_initvals(&self) -> Result<IniVerify, FaceError> {
         use crate::ath9k_initvals::*;
         use crate::ath9k_reg::*;
         // MODES table columns are {addr, 5G_HT20, 5G_HT40, 2G_HT40, 2G_HT20}: pick the 2.4 GHz
@@ -1539,6 +1547,35 @@ impl Ath9kHtcBackend {
             phy_cca,
             noise_floor_dbm,
         })
+    }
+
+    /// ★ **Live HT20↔HT40 bandwidth switch (#7)** — reprogram the PHY to the new width without a
+    /// re-open, on the `&self` path (HTC/RX ring stay up). This is the piece `set_channel`'s width flag
+    /// alone could not do: the 40 MHz PHY needs the *2G_HT40 initval column* streamed and the synth
+    /// re-centred (+10 MHz), not just the per-frame `HAL_RATESERIES_2040` bit. Runs the same three
+    /// moves `hw_reset` does for width — re-stream initvals (picks the column from `self.ht40`, sets/
+    /// clears DYN2040), re-synth+cal (`rf_set_freq` reads `self.ht40` for the HT40+ centre), then
+    /// re-assert DYN2040 (the HT20 CL-cal inside `init_cal` clears it — the documented gotcha).
+    ///
+    /// ⚠ This is a live PHY re-init (streams the full mode/common/ANI/TX-gain tables + re-cal), the
+    /// same disruption ath9k takes on any bandwidth change. Verify on air (the witness must match the
+    /// AR9271's HT40+ centre to demod 40 MHz). Returns the post-switch [`CalStatus`] (AGC converged +
+    /// synth/TURBO readback) so a caller can confirm the width took.
+    pub fn set_bandwidth(&self, ht40: bool) -> Result<CalStatus, FaceError> {
+        use crate::ath9k_reg::*;
+        use std::sync::atomic::Ordering::Relaxed;
+        self.ht40.store(ht40, Relaxed);
+        // Re-stream the PHY mode tables for the new width (2G_HT40 vs HT20 column + DYN2040).
+        self.apply_initvals()?;
+        // Re-synth + re-cal at the current channel; rf_set_freq applies the +10 MHz HT40 centre.
+        let ch = self.channel.load(Relaxed);
+        let chan_mhz = if ch == 14 { 2484 } else { 2407 + 5 * ch as u16 };
+        let status = self.set_channel_and_cal(chan_mhz)?;
+        // init_cal's HT20 CL-cal clears DYN2040 — re-assert for HT40 (same as the hw_reset tail).
+        if ht40 {
+            self.reg_set_bit(AR_PHY_TURBO, AR_PHY_FC_DYN2040_EN)?;
+        }
+        Ok(status)
     }
 
     // ── granular reset-tail helpers (shared by set_channel_and_cal + hw_reset) ──
@@ -2593,7 +2630,44 @@ fn parse_rx_unit(
     Some((captured, advance))
 }
 
+/// A legacy (non-HT) 802.11 transmit rate — the AR5416 hardware rate codes (#6). CCK is 802.11b
+/// (2.4 GHz only), OFDM is 802.11a/g. These go verbatim into the mgmt-header `pad` byte, which our
+/// firmware writes into `series[i].Rate` with no HT rate flags. All codes are `< 0x80`, which is how
+/// `send_mgt` distinguishes a legacy code from an HT MCS (`0x80|mcs`). Long-preamble CCK codes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum LegacyRate {
+    Cck1 = 0x1b,
+    Cck2 = 0x1a,
+    Cck5_5 = 0x19,
+    Cck11 = 0x18,
+    Ofdm6 = 0x0b,
+    Ofdm9 = 0x0f,
+    Ofdm12 = 0x0a,
+    Ofdm18 = 0x0e,
+    Ofdm24 = 0x09,
+    Ofdm36 = 0x0d,
+    Ofdm48 = 0x08,
+    Ofdm54 = 0x0c,
+}
+
 impl Ath9kHtcBackend {
+    /// ★ **Select a specific legacy (non-HT) transmit rate (#6).** The chosen CCK/OFDM rate is encoded
+    /// into every injected frame's mgmt-header `pad` byte and the firmware transmits at that legacy PHY
+    /// rate (no HT/SGI/HT40). Clears any HT `cur_mcs`, so exactly one rate mode is active. This is the
+    /// worst-receiver lever for a legacy-only neighbour: the AR9271 can name 6 Mbps OFDM (the widely
+    /// decodable robust default) or 1 Mbps CCK explicitly, rather than relying on the target min rate.
+    pub fn set_legacy_rate(&self, rate: LegacyRate) {
+        *self.cur_mcs.lock().unwrap() = None;
+        self.cur_legacy
+            .store(rate as u8, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Clear the legacy-rate override — subsequent frames use `cur_mcs` (HT) or the target min rate.
+    pub fn clear_legacy_rate(&self) {
+        self.cur_legacy.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// Build the HTC data-endpoint TX buffer for `frame` (the [`build_tx_frame_bytes`] wire layout,
     /// bound to this device's DataBE endpoint + format).
     fn build_tx_frame(&self, frame: &InjectFrame) -> Result<Vec<u8>, FaceError> {
@@ -2601,11 +2675,19 @@ impl Ath9kHtcBackend {
         // `cur_mcs` → HT MCS rate code (`0x80|index`, MCS0-7 on this 1×1 part); None → 0 = the
         // target's min rate. `cur_power` → `AR_XmitPower` (0 = firmware default 30 dBm).
         use std::sync::atomic::Ordering::Relaxed;
-        let (rate_code, mut rate_flags) = match *self.cur_mcs.lock().unwrap() {
-            Some(mcs) => (0x80 | mcs.index.min(7), if mcs.short_gi { 0x01 } else { 0x00 }),
-            None => (0, 0),
+        // A selected legacy rate (#6) wins: inject at a specific CCK/OFDM PHY rate with NO HT flags
+        // (rate_flags = 0 ⇒ the firmware's `series[i].RateFlags` is legacy, `series[i].Rate` = the code).
+        let legacy = self.cur_legacy.load(Relaxed);
+        let (rate_code, mut rate_flags) = if legacy != 0 {
+            (legacy, 0)
+        } else {
+            match *self.cur_mcs.lock().unwrap() {
+                Some(mcs) => (0x80 | mcs.index.min(7), if mcs.short_gi { 0x01 } else { 0x00 }),
+                None => (0, 0),
+            }
         };
-        if self.ht40.load(Relaxed) {
+        // HT40 only applies to an HT MCS, never to a legacy rate (20 MHz-only PHY modes).
+        if legacy == 0 && self.ht40.load(Relaxed) {
             rate_flags |= 0x02; // HAL_RATESERIES_2040 — transmit the MCS at 40 MHz
         }
         let tx_power = self.cur_power.load(Relaxed);
@@ -2649,6 +2731,8 @@ impl FrameIo for Ath9kHtcBackend {
     /// On stock ath9k firmware the byte is ignored and the target picks the rate (hence the old
     /// "inert" note); on ours it steers the on-air rate. See [`build_tx_frame`](Self::build_tx_frame).
     fn set_rate(&self, mcs: McsDescriptor) -> Result<(), FaceError> {
+        // Choosing an HT MCS supersedes any legacy override (#6) — exactly one rate mode is active.
+        self.cur_legacy.store(0, std::sync::atomic::Ordering::Relaxed);
         *self.cur_mcs.lock().unwrap() = Some(mcs);
         Ok(())
     }
@@ -2822,19 +2906,27 @@ impl Ath9kHtcBackend {
 }
 
 impl RadioKnobs for Ath9kHtcBackend {
-    /// ★ **Live channel retune.** Re-programs the RF synth + re-cals on the new channel via the now
-    /// `&self` [`set_channel_and_cal`](Self::set_channel_and_cal) — no re-open, HTC/RX ring stay up.
-    /// A same-channel apply is a fast no-op. `bw` selects HT20/HT40: HT40 sets the `ht40` flag so
-    /// injected MCS frames carry `HAL_RATESERIES_2040` (the 40 MHz PHY itself is programmed at open).
+    /// ★ **Live channel + bandwidth retune.** Re-programs the RF synth + re-cals on the `&self` path —
+    /// no re-open, HTC/RX ring stay up. A same-channel same-width apply is a fast no-op. A **width
+    /// change** (HT20↔HT40) triggers a full live PHY reprogram via [`set_bandwidth`](Self::set_bandwidth)
+    /// (the 2G_HT40 initval column + HT40+ synth centre — not just the per-frame `HAL_RATESERIES_2040`
+    /// bit); a channel-only change re-runs synth+cal at the new centre.
     fn set_channel(&self, channel: u8, bw: Bandwidth) -> Result<(), FaceError> {
         use std::sync::atomic::Ordering::Relaxed;
-        self.ht40.store(matches!(bw, Bandwidth::Bw40), Relaxed);
-        if channel == self.channel.load(Relaxed) {
+        let want_ht40 = matches!(bw, Bandwidth::Bw40);
+        let width_changed = want_ht40 != self.ht40.load(Relaxed);
+        let channel_changed = channel != self.channel.load(Relaxed);
+        if !width_changed && !channel_changed {
             return Ok(());
         }
-        let chan_mhz = if channel == 14 { 2484 } else { 2407 + 5 * channel as u16 };
-        self.set_channel_and_cal(chan_mhz)?;
+        // Record the target channel first so set_bandwidth re-synths at the right centre.
         self.channel.store(channel, Relaxed);
+        if width_changed {
+            self.set_bandwidth(want_ht40)?; // reprograms the PHY for the new width at self.channel
+        } else {
+            let chan_mhz = if channel == 14 { 2484 } else { 2407 + 5 * channel as u16 };
+            self.set_channel_and_cal(chan_mhz)?;
+        }
         Ok(())
     }
 

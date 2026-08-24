@@ -104,6 +104,51 @@ pub fn build_tx_legacy(rate_500kbps: u8) -> [u8; TX_LEGACY_HEADER_LEN] {
     h
 }
 
+/// Total length of the VHT TX header produced by [`build_tx_vht`].
+pub const TX_VHT_HEADER_LEN: usize = 22;
+
+/// Build a radiotap **TX** header selecting an 802.11**ac** (VHT) rate.
+///
+/// The sibling of [`build_tx_header`] for VHT: `mcs` is the VHT modulation-and-coding index
+/// (0–8 at 20 MHz, 0–9 for wider), `nss` the number of spatial streams, `short_gi` the 400 ns
+/// guard interval. Bandwidth is fixed at 20 MHz, which is what a 1×1 20 MHz part can receive.
+///
+/// Exists because the HT builder cannot express VHT at all — `McsDescriptor::vht` was carried
+/// through the API but silently dropped at the radiotap boundary, so every "VHT" injection went
+/// out as HT. That made VHT RX untestable rather than failing (2026-08-24).
+///
+/// Field layout (VHT is 2-byte aligned; it starts at offset 10, which is already even):
+/// ```text
+/// off 0  : version = 0, pad = 0
+/// off 2  : le16 len = 22
+/// off 4  : le32 present = (1<<TX_FLAGS) | (1<<VHT)
+/// off 8  : le16 TX_FLAGS = NOACK
+/// off 10 : le16 VHT.known = BANDWIDTH | GI
+/// off 12 : u8  VHT.flags = SGI?
+/// off 13 : u8  VHT.bandwidth = 0 (20 MHz)
+/// off 14 : u8[4] VHT.mcs_nss — user 0 = (mcs << 4) | nss
+/// off 18 : u8  VHT.coding = 0 (BCC)
+/// off 19 : u8  VHT.group_id = 0
+/// off 20 : le16 VHT.partial_aid = 0
+/// ```
+pub fn build_tx_vht(mcs: u8, nss: u8, short_gi: bool) -> [u8; TX_VHT_HEADER_LEN] {
+    const BIT_VHT: u32 = 21;
+    const VHT_KNOWN_GI: u16 = 0x0004;
+    const VHT_KNOWN_BANDWIDTH: u16 = 0x0040;
+    const VHT_FLAG_SGI: u8 = 0x04;
+
+    let present: u32 = (1 << BIT_TX_FLAGS) | (1 << BIT_VHT);
+    let mut h = [0u8; TX_VHT_HEADER_LEN];
+    h[2..4].copy_from_slice(&(TX_VHT_HEADER_LEN as u16).to_le_bytes());
+    h[4..8].copy_from_slice(&present.to_le_bytes());
+    h[8..10].copy_from_slice(&TX_FLAG_NOACK.to_le_bytes());
+    h[10..12].copy_from_slice(&(VHT_KNOWN_BANDWIDTH | VHT_KNOWN_GI).to_le_bytes());
+    h[12] = if short_gi { VHT_FLAG_SGI } else { 0 };
+    h[13] = 0; // 20 MHz
+    h[14] = (mcs << 4) | (nss & 0x0f); // user 0
+    h
+}
+
 /// Total length of the S1G TX header produced by [`build_tx_s1g`].
 pub const TX_S1G_HEADER_LEN: usize = 10;
 

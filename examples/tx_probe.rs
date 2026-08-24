@@ -76,11 +76,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 tokio::task::yield_now().await;
             }
             if last.elapsed() >= Duration::from_secs(1) {
-                println!("  TX sent={sent} mode={}", if slotted { "slotted" } else { "contention" });
+                println!("  TX sent={sent} mode={}", if flood { "flood" } else if slotted { "slotted" } else { "contention" });
                 last = Instant::now();
             }
         }
-        println!("=== TX DONE sent={sent} mode={} ===", if slotted { "slotted" } else { "contention" });
+        println!("=== TX DONE sent={sent} mode={} ===", if flood { "flood" } else if slotted { "slotted" } else { "contention" });
     } else {
         let raw0 = ndn_radio_drivers::rx_raw_frames(); // pump's raw pull count (pre-CRC filter)
         let counts = [Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0))];

@@ -37,7 +37,7 @@ use ndn_frame_io::{
 use crate::realtek_rx;
 use ndn_radio_hal::{
     Band, Bandwidth, McsDescriptor, RadioCapability, RadioKnobs, RadioProfile, RadioTime,
-    RadioTimeSource, TxDiscipline, };
+    RadioTimeSource, RateCapability, TxDiscipline, };
 use ndn_transport::FaceError;
 use rusb::{Context, Device, DeviceHandle, Direction, TransferType, UsbContext};
 
@@ -1276,13 +1276,14 @@ impl Rtl8733buBackend {
     /// tune `channel` → promiscuous RX. After this the backend **captures** frames and
     /// **injects to the MAC** (the [`FrameIo`] path) — both verified on the OPi.
     ///
-    /// TX status: injected frames reach and are accepted by the MAC, but the RF does not
-    /// yet radiate on air. This was exhaustively reverse-engineered against the vendor
-    /// driver — firmware (bit-identical), all register writes (full ordered replay), the
-    /// TX descriptor, H2C box commands, and the reserved-page download all match the
-    /// radiating vendor, yet no RF output. The residual gate is firmware-internal /
-    /// analog and needs firmware-level tooling (see the port notes). On-air TX is the one
-    /// open item; everything else (RX/monitor, inject-to-MAC, knobs) works.
+    /// TX status: this call alone gets RX + inject-to-MAC. It does **not** complete the
+    /// on-air TX path — that additionally needs [`enable_tx`](Self::enable_tx)'s full
+    /// calibration and datapath TXAGC block, after which injected frames do radiate
+    /// (verified against a witness radio). Use [`bring_up_tx`](Self::bring_up_tx) or
+    /// [`bring_up_tx_tracked`](Self::bring_up_tx_tracked) for a transmitting radio; the
+    /// residual open item there is the ~62%/boot analog cold-start variance, not the
+    /// register path. (An earlier revision of this comment claimed the RF never radiates
+    /// — that was true before `enable_tx` landed and is no longer.)
     ///
     /// Note the chip wedges after repeated re-inits in a process — open once per
     /// power-cycle.
@@ -3003,6 +3004,15 @@ impl Rtl8733buBackend {
             let rx_rate = (dw3 & 0x7f) as u8; // RX HwRate (DESC_RATE code)
             let is_c2h = dw2 & (1 << 28) != 0;
             let fstart = off + 24 + drvinfo + shift;
+            // Raw pump throughput: every RX unit pulled off USB, counted BEFORE the C2H/CRC/name
+            // filters below, so it matches the 8812au's count and a kernel monitor's `rx_packets`.
+            // ⚠ This backend was absent from the counter entirely, so `rx_raw_frames()` reported
+            // 0/s for a *working* 8733b pump — an instrument fault that reads exactly like a dead
+            // radio, and did (2026-08-24). Only the PUMP path counts here; `capture()` (the direct
+            // read used by the probes) deliberately does not, so the two never double-count.
+            if fstart + pkt_len <= data.len() {
+                crate::RX_RAW_FRAMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             if !is_c2h && fstart + pkt_len <= data.len() {
                 // Field interpretation is shared across the Realtek USB backends (realtek_rx):
                 // MCS from the RX HwRate; RSSI from the jaguar3 type1 phystatus path-A power
@@ -3192,10 +3202,26 @@ impl RadioTime for Rtl8733buBackend {
 
 impl RadioProfile for Rtl8733buBackend {
     fn capability(&self) -> RadioCapability {
-        // RTL8731BU: single-chain (1x1) 11ac, dual-band (2.4 + 5 GHz — tune_channel handles both).
+        // RTL8731BU/8733BU: single-chain (1×1) **802.11n**, dual-band (2.4 + 5 GHz — `tune_channel`
+        // handles both), 20/40 MHz.
+        //
+        // ★ NOT 11ac, despite what this port's notes long claimed. The vendor driver's own
+        // `rtl8733b_init_hal_spec` declares `proto_cap = 11B|11G|11N` with `bw_cap = 20M|40M` and
+        // **no** `PROTO_CAP_11AC`, and the part enumerates as "802.11n WLAN Adapter".
+        // MEASURED 2026-08-24 against a mac80211 transmitter with an independent kernel witness:
+        // the BB decodes 1SS/HT20 MCS0 cleanly (~1250/s, BB HT error counter 0x2c10 stays at ZERO),
+        // but never classifies VHT at all — injected 1SS/VHT20 PPDUs land on the legacy-OFDM ERROR
+        // counter (0x2c14 high half, ~1280/s) and deliver nothing. There is no VHT receiver to turn on.
+        //
+        // This previously used `wifi_monitor_5ghz_1ss`, which advertises `max_mcs: 8` — a VHT index,
+        // since 1SS HT stops at MCS7 — and `max_bw: 2` (80 MHz). Both are rates this radio can
+        // neither transmit nor receive, and cognition's rate selection and the worst-receiver cap
+        // ([[worst-receiver-rate-adaptation]]) would have taken the advertisement at face value and
+        // aimed undecodable traffic at it.
         RadioCapability {
             bands: vec![Band::Band2_4GHz, Band::Band5GHz],
-            ..RadioCapability::wifi_monitor_5ghz_1ss(vec![
+            rate: RateCapability::Wifi { max_mcs: 7, max_nss: 1, max_bw: 1 },
+            ..RadioCapability::wifi_monitor_5ghz(vec![
                 1, 6, 11, 36, 40, 44, 48, 149, 153, 157, 161,
             ])
         }

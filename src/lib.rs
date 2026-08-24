@@ -54,8 +54,12 @@ mod mt7612;
 pub use mt7612::{MT7612U_PIDS, Mt7612uBackend};
 mod rtl8812au;
 pub use rtl8812au::{ChipInfo, IqkResult, PhySense, RTL8812AU_PIDS, Rtl8812auBackend};
-// RTL8731BU / RTL8733BU (halmac_87xx, 1x1 11ac) — ground-up port, M1 (open +
-// reg-I/O + chip-version). REALTEK_VID is already re-exported above.
+// RTL8731BU / RTL8733BU (halmac_87xx, 1x1 802.11n, dual-band, 20/40) — ground-up port, complete
+// against the HAL: power-on,
+// firmware download, MAC/BB/RF init, 1x1 calibration (IQK/TXGAPK/DPK), channel/power, RX capture and
+// on-air TX, impl'ing FrameIo + RadioKnobs + RadioTime + RadioProfile. It is the *reference* RadioTime
+// implementation (both link clocks: free-run RX stamp + port TSF). Open it through `open_named_radio`.
+// REALTEK_VID is already re-exported above.
 mod libusb_rtl8733b;
 pub use libusb_rtl8733b::{
     ChipVersion, FW_NIC_8733B, FwHeader, PowerTracker, RTL8733B_PIDS, Rtl8733buBackend,
@@ -85,6 +89,13 @@ pub const NDN_ETHERTYPE: u16 = 0x8624;
 /// `parse_transfer`, BEFORE the CRC/name filter) — the pump's raw throughput, directly comparable to a
 /// kernel monitor iface's `rx_packets`. Read via [`rx_raw_frames`] to isolate pump speed from parse
 /// acceptance (the kernel counts bad-FCS frames; our parse drops them).
+///
+/// ⚠ **NOT every backend increments this**, despite the name. Implemented by **RTL8812AU** and
+/// **RTL8733BU** only. `LibUsbRtl88xxBackend` (the a81a) and `Ath9kHtcBackend` are pumped but never
+/// touch it, so `rx_raw_frames()` is structurally **0** for them — which reads exactly like a dead
+/// receiver and cost a full debugging detour on 2026-08-24 before the 8733b was wired in. On those
+/// two backends, judge RX by decoded-frame counts, never by this. A backend added to the pump must
+/// increment this in its `parse_transfer` or inherit the same trap.
 pub static RX_RAW_FRAMES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Snapshot of [`RX_RAW_FRAMES`].
 pub fn rx_raw_frames() -> u64 {
@@ -99,9 +110,11 @@ pub fn rx_raw_frames() -> u64 {
 /// (the leak that made "both implement FrameIo" not mean "they interoperate"). Broadcast rate is legacy
 /// 6 Mbps by default (universally decodable); override per-driver with `NDN_RADIO_TX_RATE`.
 ///
-/// Chip family from the PID: `0xa81a`/`0xa811`/`0x8814` = **RTL8822E** (chip 0x17, the 88xx backend);
-/// everything else in the 8812au PID set (`0x8812`/`0x881a`/…, chip 0x04) = **RTL8812AU**. (The 8812au
-/// backend opens the first matching device; for multiple 8812au on one host it takes the first.)
+/// Chip family from the PID: the AR9271 set = **ath9k_htc** (via [`open_ath9k`]); `0xf72b`/`0xb733` =
+/// **RTL8731BU/8733BU** (halmac_87xx, 1×1); `0xa81a`/`0xa811`/`0x8814` = **RTL8822E** (chip 0x17, the
+/// 88xx backend); everything else in the 8812au PID set (`0x8812`/`0x881a`/…, chip 0x04) = **RTL8812AU**.
+/// (The 8812au and 8733bu backends open the first matching device; for several identical ones on a host
+/// the 8812au/88xx arms honour `NDN_USB_ADDR`/`NDN_USB_INDEX`, the 8733bu arm does not yet.)
 pub fn open_named_radio(pid: u16, channel: u8) -> Result<OpenRadio, FaceError> {
     use std::sync::Arc;
     let fmt = FrameFormat::RawNdn { ethertype: NDN_ETHERTYPE };
@@ -113,6 +126,43 @@ pub fn open_named_radio(pid: u16, channel: u8) -> Result<OpenRadio, FaceError> {
     // `NDN_ATH9K_FW` env var pointing at `htc_9271-1.4.0.fw`. Keyed on the AR9271 PID set.
     if AR9271_IDS.iter().any(|&(_, p)| p == pid) {
         return open_ath9k(channel);
+    }
+    // RTL8731BU/8733BU (halmac_87xx, 1×1 802.11n) — the ground-up port. Its bring-up is the one that does
+    // NOT collapse into "monitor mode and you're done": `bring_up_monitor` gets RX + inject-to-MAC, but
+    // *radiating* additionally needs `enable_tx`'s full cal (IQK → TXGAPK → DPK, then the datapath TXAGC
+    // block the cal zeroes) plus a background power-tracking loop that trims the OFDM swing off the die
+    // thermal so output doesn't fade as the PA heats. `bring_up_tx_tracked` is that whole path, and its
+    // `PowerTracker` guard is leaked deliberately so tracking outlives this function — the same lifetime
+    // discipline `start_pump` uses for the RX pump.
+    //
+    // ⚠ Per-boot analog variance: only ~62% of cold bring-ups radiate at all, and no on-chip signal
+    // distinguishes a radiating boot from a dead one (RX, cal results and registers read identically).
+    // A caller that must transmit therefore needs **external** feedback — verify delivery and relaunch,
+    // via `Rtl8733buBackend::bring_up_tx_until` or `scripts/supervise_tx.sh`. This opener cannot do that
+    // for you (it has no peer to hear it), so it brings the TX path up and reports success on the
+    // register path only. RX/monitor carries no such variance.
+    if RTL8733B_PIDS.contains(&pid) {
+        // No `DeviceSelect` arm: `Rtl8733buBackend::open` claims the first match and has no
+        // `open_select` sibling. Fine while a host carries one f72b; a second would need it added.
+        let d = Arc::new(Rtl8733buBackend::open()?.with_format(fmt));
+        // `NDN_8733B_RX_ONLY=1` stops at monitor RX and skips the cal — a witness/receiver node
+        // doesn't need the TX path, and the cal is both the slow part and the variable part.
+        if std::env::var_os("NDN_8733B_RX_ONLY").is_some() {
+            d.bring_up_monitor(channel)?;
+        } else {
+            std::mem::forget(d.bring_up_tx_tracked(channel)?);
+        }
+        // Same `NDN_TX_PWR` contract as the other Realtek arms — here it is the per-rate TXAGC index.
+        if let Some(p) = std::env::var("NDN_TX_PWR").ok().and_then(|s| s.parse::<u32>().ok()) {
+            let _ = d.set_tx_power(p);
+        }
+        start_pump(&d);
+        return Ok(OpenRadio {
+            io: d.clone(),
+            knobs: Some(d.clone()),
+            time: Some(d.clone()),
+            profile: Some(d),
+        });
     }
     let sel = crate::DeviceSelect::from_env();
     let radio: Arc<dyn FrameIo> = if matches!(pid, 0xa81a | 0xa811 | 0x8814) {

@@ -39,7 +39,9 @@ use async_trait::async_trait;
 use rusb::{Context, DeviceHandle, UsbContext};
 
 use ndn_frame_io::{ClockDomainId, LatchPoint, LinkStamp};
-use ndn_radio_hal::{RadioCapability, RadioProfile, RadioTime, RadioTimeSource};
+use ndn_radio_hal::{
+    Bandwidth, RadioCapability, RadioKnobs, RadioProfile, RadioTime, RadioTimeSource,
+};
 use ndn_transport::FaceError;
 
 use crate::ath9k_htc_structs::{
@@ -413,6 +415,11 @@ pub struct Ath9kHtcBackend {
     /// Shared bulk-IN RX pipeline the pump fills and `recv_frame` drains (mirrors the Realtek). See
     /// [`crate::rx_pump`].
     rx_pump: crate::rx_pump::RxPumpState,
+    /// The 2.4 GHz channel number the PHY was brought up on (0 until [`note_channel`] records it).
+    /// `RadioKnobs::set_channel` reads it via `&self` to answer a same-channel apply with `Ok` and a
+    /// different-channel request with an honest `Unsupported` (a live retune is `hw_reset(&mut self)`,
+    /// not yet exposed over the `&self` knob path). Atomic so it stays interior-mutable for that future.
+    channel: std::sync::atomic::AtomicU8,
 }
 
 fn usb_err<E: std::fmt::Display>(what: &str, e: E) -> FaceError {
@@ -501,7 +508,14 @@ impl Ath9kHtcBackend {
             },
             cur_mcs: std::sync::Mutex::new(None),
             rx_pump: crate::rx_pump::RxPumpState::new(),
+            channel: std::sync::atomic::AtomicU8::new(0),
         })
+    }
+
+    /// Record the channel number the PHY was brought up on (see [`Ath9kHtcBackend::channel`]).
+    /// Called by `open_ath9k` after `hw_reset`, so `RadioKnobs::set_channel` can validate applies.
+    pub fn note_channel(&self, channel: u8) {
+        self.channel.store(channel, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// The clock domain the AR9271's per-frame `rs_tstamp` lives on — build a `LinkStamp` from an
@@ -2554,6 +2568,34 @@ impl RadioProfile for Ath9kHtcBackend {
         // AR9271: single-chain (1x1) 2.4 GHz 802.11n — MCS0-7, 20 MHz. Channels 1..13.
         // (`_1ss` is the honest constructor: this part has one RX/TX chain, so max_nss = 1.)
         RadioCapability::wifi_monitor_2ghz_1ss((1..=13).collect())
+    }
+}
+
+/// The AR9271's cognition control surface. ★ **Minimal-but-honest first cut.** Only `set_channel` is
+/// wired (validating a fixed-channel apply); the power / EDCCA / occupancy knobs keep the trait's
+/// defaults because actuating them needs `&self` access to the WMI register path, which is `&mut self`
+/// today (the WMI seq counter) — a bounded follow-on, not a fabricated no-op. What this DOES buy: with
+/// a `RadioKnobs` impl present, `open_ath9k` can populate `OpenRadio.knobs`, so the AR9271 plugs into
+/// `RadioControl::libusb_actuator` / `RadioBearer::from_open` and cognition drives it as a first-class
+/// radio (register capability, apply allocations on its channel) exactly like the 8812au/8822E.
+impl RadioKnobs for Ath9kHtcBackend {
+    /// The AR9271 is tuned at open by `hw_reset(chan)`. A live retune is `hw_reset(&mut self)`, which
+    /// the `&self` knob path cannot reach yet — so this answers a same-channel apply with `Ok` (the
+    /// steady-state cognition case on a fixed channel) and a different channel with an honest
+    /// `Unsupported`, rather than silently pretending to hop. Bandwidth is ignored: this part is HT20.
+    fn set_channel(&self, channel: u8, _bw: Bandwidth) -> Result<(), FaceError> {
+        let cur = self.channel.load(std::sync::atomic::Ordering::Relaxed);
+        if channel == cur {
+            Ok(())
+        } else {
+            Err(FaceError::Io(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                format!(
+                    "ath9k_htc: live retune not wired — opened on ch{cur}, asked ch{channel}. \
+                     A channel change is hw_reset(&mut self); re-open the radio to change channel."
+                ),
+            )))
+        }
     }
 }
 

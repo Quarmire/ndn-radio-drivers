@@ -202,9 +202,11 @@ fn ath9k_channel_to_mhz(ch: u8) -> u16 {
 /// gated behind `NDN_ATH9K_FW=<path to htc_9271-1.4.0.fw>`. Without it, this errors with that
 /// instruction rather than half-wiring the dispatch.
 ///
-/// `knobs = None`: a channel retune is `hw_reset(&mut self)` on this part (no `&self` `RadioKnobs`
-/// path yet), so channel is fixed at open — re-open to change it. TX framing is bench-uncertain
-/// (see `ath9k_htc::build_tx_frame_bytes`); RX + the RX-stamp clock are the low-risk, proven halves.
+/// `knobs = Some` (M3): the AR9271 impls `RadioKnobs`, so cognition binds it as an actuator. Only
+/// `set_channel` is wired (validates a same-channel apply; a live retune is still `hw_reset(&mut self)`
+/// — re-open to change channel); power/EDCCA/occupancy keep the trait defaults pending the `&self` WMI
+/// path. TX (`FrameIo::inject`) is on-air proven (needs `WMI_TARGET_IC_UPDATE` + queue-1 TXOK, both in
+/// `wmi_start`); RX + the RX-stamp common-view clock are the proven halves.
 pub fn open_ath9k(channel: u8) -> Result<OpenRadio, FaceError> {
     use std::sync::Arc;
     let fw_path = std::env::var("NDN_ATH9K_FW").map_err(|_| {
@@ -227,14 +229,39 @@ pub fn open_ath9k(channel: u8) -> Result<OpenRadio, FaceError> {
     // RX-start steps, matching `ath9k_htc_start`'s order.
     dev.hw_reset(chan_mhz)?;
     dev.connect_data_services()?;
-    dev.start_receive()?;
+    // Disable the NDR Tier-0 name filter so broadcast/ambient frames aren't dropped in firmware
+    // before the USB handoff (the proven RX path in `examples/ath9k_hw_reset.rs` does this). Best
+    // effort: on a build where the symbol has moved the write is harmless (the filter defaults off).
+    let _ = dev.write_target_u32s(0x0050_cf44, &[0]);
+    // Order is load-bearing (proven in `examples/ath9k_hw_reset.rs`): the target's `WMI_START_RECV`
+    // (inside `wmi_start`) programs `AR_RXDP` — the RX descriptor ring — so the host RX-DMA enable
+    // (`AR_CR_RXE` in `start_receive`) must come AFTER it, or it latches a stale/zero pointer and the
+    // ring never advances (seen=0). `wmi_start` also sends `WMI_TARGET_IC_UPDATE` + arms queue-1 TXOK,
+    // both required for the injected-TX path to actually radiate and sustain.
     dev.wmi_start()?;
+    dev.start_receive()?;
+    // Record the channel the PHY came up on so `RadioKnobs::set_channel` can validate cognition's
+    // fixed-channel applies (a live retune is `hw_reset(&mut self)`, not yet on the `&self` path).
+    dev.note_channel(channel);
 
     let dev = Arc::new(dev);
-    start_pump(&dev); // async (NDN_ASYNC_PUMP) or sync pump, lives for the process
+    // RX delivery: default to the on-demand path (`FrameIo::recv_frame` does a single blocking
+    // bulk-IN read when no pump is marked) — proven to read 802.11 on this HTC pipe (the M2 oracle:
+    // `ndr_stats.seen` climbing, dozens of frames/s). `NDN_ATH9K_PUMP=1` opts into the concurrent
+    // submit-ahead pump for higher throughput; it uses the same `parse_transfer` and is the standard
+    // Realtek path, but the 8-reader HTC bulk-IN pattern isn't yet load-tested here, so it stays
+    // opt-in. Either path surfaces only NDN frames (`parse_dot11` filters to ethertype 0x8624), so a
+    // channel with only ambient Wi-Fi yields no `recv_frame` output by design — that is correct, not
+    // a fault; RX-of-NDN needs an on-channel NDN sender to observe.
+    if std::env::var_os("NDN_ATH9K_PUMP").is_some() {
+        start_pump(&dev); // async (NDN_ASYNC_PUMP) or sync pump, lives for the process
+    }
     Ok(OpenRadio {
         io: dev.clone(),
-        knobs: None,
+        // `knobs` is now populated (M3): the AR9271 impls `RadioKnobs` (`set_channel` wired; power /
+        // EDCCA / occupancy keep the trait defaults pending the `&self` WMI-register path). This is
+        // what lets `RadioControl::libusb_actuator` bind it and cognition drive it like the 8812au.
+        knobs: Some(dev.clone()),
         time: Some(dev.clone()),
         profile: Some(dev),
     })

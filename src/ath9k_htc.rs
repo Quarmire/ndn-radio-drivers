@@ -2352,6 +2352,24 @@ impl RadioTime for Ath9kHtcBackend {
     fn time_sources(&self) -> Vec<RadioTimeSource> {
         vec![RadioTimeSource::free_run_rx_stamp(self.tsf_domain, 1_000)]
     }
+
+    /// Read the hardware TSF (µs) — `AR_TSF_U32`/`AR_TSF_L32` (0x8050/0x804c), the same free-running
+    /// clock the per-frame `rs_tstamp` samples. Wrap-safe (re-read the high word). Only answers this
+    /// radio's own `tsf_domain`; any other domain is unknown here. This makes the AR9271's clock
+    /// *readable now*, not just per-frame — the read side of the TimeToken / common-view (#3).
+    fn read_clock(&self, domain: ClockDomainId) -> Result<Option<u64>, FaceError> {
+        if domain != self.tsf_domain {
+            return Ok(None);
+        }
+        const AR_TSF_L32: u32 = 0x804c;
+        const AR_TSF_U32: u32 = 0x8050;
+        let hi1 = self.reg_read(AR_TSF_U32)?;
+        let lo = self.reg_read(AR_TSF_L32)?;
+        let hi2 = self.reg_read(AR_TSF_U32)?;
+        // If the low word wrapped between the two high reads, take the second high with lo=0-ish edge.
+        let (hi, lo) = if hi1 == hi2 { (hi1, lo) } else { (hi2, self.reg_read(AR_TSF_L32)?) };
+        Ok(Some(((hi as u64) << 32) | lo as u64))
+    }
 }
 
 // ── M3 — FrameIo (stamped RX up + TX inject) ─────────────────────────────────────────────────────
@@ -2739,6 +2757,18 @@ impl RadioKnobs for Ath9kHtcBackend {
         let level = d as usize * (TX_GAIN_LADDER.len() - 1) / 30;
         self.set_tx_gain_level(level)?;
         Ok(d)
+    }
+
+    /// Frame-free channel occupancy (#4/#30): `AR_RCCNT` (0x80f0) is the MAC's free-running "rx-clear"
+    /// / medium-busy cycle counter — it climbs while the channel is busy, WITHOUT the host decoding
+    /// frames. The occupancy sampler differences two reads into a busy-rate the cognition plane maps
+    /// to channel-busy%. Scaled `>> 8` so a differenced sample fits u16 over a sampler window without
+    /// wrapping on a mostly-idle channel. Cycle-based (not a frame count like the 8812au's
+    /// `REG_RXERR_RPT`), so the mapping is approximate but tracks activity monotonically.
+    fn read_channel_activity(&self) -> Result<Option<u16>, FaceError> {
+        const AR_RCCNT: u32 = 0x80f0;
+        let busy = self.reg_read(AR_RCCNT)?;
+        Ok(Some((busy >> 8) as u16))
     }
 }
 

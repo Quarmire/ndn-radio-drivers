@@ -1958,6 +1958,27 @@ impl Ath9kHtcBackend {
         Ok(())
     }
 
+    /// Push the `ieee80211com_target` capability block (`WMI_TARGET_IC_UPDATE`). ★ **Load-bearing for
+    /// TX:** the target's `ath_tgt_send_mgt` sets every rate series' `ChSel = sc_ic.ic_tx_chainmask`,
+    /// and `sc_ic` is populated ONLY here. Without this the chain-select field of the TX descriptor
+    /// (`AR_ChainSel0`, ds_ctl7) is 0 → **no antenna chain drives the frame**: the MAC keys the
+    /// transmitter (TFCNT advances, TXOK completes) but nothing coherent radiates — MEASURED, a
+    /// witness at inches decoded 0 of our frames until this was sent. RX is unaffected (its chainmask
+    /// comes from the initvals registers), which is why M1 RX worked without it.
+    ///
+    /// `struct ieee80211com_target` (wlan_hdr.h, 8 B): `ic_ampdu_limit(be32) ic_ampdu_subframes(1)
+    /// ic_enable_coex(1) ic_tx_chainmask(1) pad(1)`. The AR9271 is 1×1 → tx chainmask = 1 (chain 0).
+    pub fn send_ic_update(&mut self) -> Result<(), FaceError> {
+        const AR9271_TX_CHAINMASK: u8 = 1; // 1×1 part → chain 0 only
+        let mut ic = [0u8; 8];
+        // ic_ampdu_limit (0..4) = 0 — we send single (non-aggregated) frames, so the AMPDU limit is
+        // irrelevant; the target `ntohl`s it. ic_ampdu_subframes (4) / ic_enable_coex (5) = 0.
+        ic[6] = AR9271_TX_CHAINMASK; // ic_tx_chainmask ← the actual fix
+        // pad (7) = 0
+        self.wmi_cmd(WmiCmd::TargetIcUpdate, &ic)?;
+        Ok(())
+    }
+
     /// **UNFINISHED — the node's rate table (`WMI_RC_STATE_CHANGE`).** A created node still needs a
     /// rate table or the target has no rate to TX at and drops the frame. The payload is
     /// `struct ath9k_htc_target_rate` (70 B: `sta_index`, `isnew`, 2 pad, `capflags` be32, then two
@@ -1990,6 +2011,10 @@ impl Ath9kHtcBackend {
         use crate::ath9k_reg::*;
         self.wmi_cmd(WmiCmd::AthInit, &[])?;
         self.wmi_cmd(WmiCmd::SetMode, &IEEE80211_MODE_11NG.to_be_bytes())?;
+        // Push the IC capability block so `sc_ic.ic_tx_chainmask` is set BEFORE any TX — the target
+        // copies it into every frame's rate-series ChSel. Without it ChSel=0 → no TX chain radiates
+        // (MEASURED: TXOK completes but 0 frames on air). Must precede the first injected frame.
+        self.send_ic_update()?;
         // Create the monitor vif + self-station so injected data frames (tx_frame_hdr.node_idx=0,
         // vif_idx=0) have a valid target node for rate control — without it the target drops TX.
         self.create_monitor_vif_node(SELF_MAC)?;

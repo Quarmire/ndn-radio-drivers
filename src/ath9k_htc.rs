@@ -2663,6 +2663,34 @@ impl RadioProfile for Ath9kHtcBackend {
 /// a `RadioKnobs` impl present, `open_ath9k` can populate `OpenRadio.knobs`, so the AR9271 plugs into
 /// `RadioControl::libusb_actuator` / `RadioBearer::from_open` and cognition drives it as a first-class
 /// radio (register capability, apply allocations on its channel) exactly like the 8812au/8822E.
+/// TX-gain LUT entries in increasing-power order (from `AR9271MODES_NORMAL_POWER_TX_GAIN`). ★ This is
+/// the AR9271's REAL TX-power lever: the EEPROM open-loop-power calibration (`set_board_values`) is
+/// skipped in `hw_reset`, so the descriptor `AR_XmitPower` and the `AR_PHY_POWER_TX_RATE` registers are
+/// **inert** (MEASURED: 0 dB change) — the PA drive is fixed by the gain LUT, whose top entries the
+/// OLPC latches. Overwriting them with a lower-index gain config lowers the output. MEASURED graduated
+/// on air at the bench: 0x19608≈−74, 0x2d6d0≈−71, 0x3e9df≈−69 dBm (~5 dB usable range); 0x9200 crashes
+/// below the noise floor. Not dBm-calibrated (that needs the OLPC/PDADC port), so it's a relative knob.
+const TX_GAIN_LADDER: [u32; 11] = [
+    0x0000_9200, 0x0001_0208, 0x0001_9608, 0x0001_e610, 0x0002_4650, 0x0002_d6d0, 0x0003_16d2,
+    0x0003_9758, 0x0003_b759, 0x0003_d75a, 0x0003_e9df,
+];
+/// The high-index gain LUT registers the OLPC latches (`AR9271MODES_NORMAL_POWER_TX_GAIN` tail).
+const TX_GAIN_LUT_TOP: [u32; 9] = [
+    0xa334, 0xa338, 0xa33c, 0xa340, 0xa344, 0xa348, 0xa34c, 0xa350, 0xa354,
+];
+
+impl Ath9kHtcBackend {
+    /// Write the top TX-gain LUT registers to ladder `level` (0 = min power, `LADDER.len()-1` = max /
+    /// the reset default) — the AR9271's actual TX-power actuator. See [`TX_GAIN_LADDER`].
+    fn set_tx_gain_level(&self, level: usize) -> Result<(), FaceError> {
+        let v = TX_GAIN_LADDER[level.min(TX_GAIN_LADDER.len() - 1)];
+        for &a in &TX_GAIN_LUT_TOP {
+            self.reg_write(a, v)?;
+        }
+        Ok(())
+    }
+}
+
 impl RadioKnobs for Ath9kHtcBackend {
     /// ★ **Live channel retune.** Re-programs the RF synth + re-cals on the new channel via the now
     /// `&self` [`set_channel_and_cal`](Self::set_channel_and_cal) — no re-open, HTC/RX ring stay up.
@@ -2692,24 +2720,25 @@ impl RadioKnobs for Ath9kHtcBackend {
         }
     }
 
-    /// TX power as an opaque index = `AR_XmitPower` in 0.5-dB units (0-63 ⇒ 0-31.5 dBm), carried
-    /// per-frame in our mgmt header and applied by our firmware's `ath_tgt_send_mgt`. ★ Actuated.
-    /// `idx = 0` restores the firmware default (30 dBm); prefer [`set_tx_power_dbm`] for a portable
-    /// scale. (On stock ath9k firmware this byte is ignored — the knob is live only on ours.)
+    /// TX power as an opaque 0-63 index, actuated via the **gain LUT** ([`set_tx_gain_level`]) — the
+    /// real PA lever. (The per-frame `AR_XmitPower` header byte and `AR_PHY_POWER_TX_RATE` are inert on
+    /// this part — the EEPROM OLPC cal is skipped — MEASURED 0 dB; do NOT read a set XmitPower as an
+    /// actuated one.) `idx = 63` = the reset-default max; lower = lower. Coarse (~11 levels / ~5 dB).
     fn set_tx_power(&self, idx: u32) -> Result<(), FaceError> {
-        self.cur_power
-            .store(idx.min(63) as u8, std::sync::atomic::Ordering::Relaxed);
-        Ok(())
+        let level = (idx.min(63) as usize * (TX_GAIN_LADDER.len() - 1)) / 63;
+        self.cur_power.store(idx.min(63) as u8, std::sync::atomic::Ordering::Relaxed);
+        self.set_tx_gain_level(level)
     }
 
-    /// TX power on the absolute dBm scale (the portable knob cognition reasons in). Clamped to the
-    /// AR9271's 0-31.5 dBm `AR_XmitPower` range; returns the dBm actually applied. Actuated per-frame
-    /// via our firmware (see [`set_tx_power`](Self::set_tx_power)).
+    /// TX power on the dBm scale. ⚠ **APPROXIMATE**: the AR9271's OLPC/PDADC calibration is not ported,
+    /// so there is no true dBm↔gain map — this spreads a nominal 0-30 dBm request across the gain LUT's
+    /// ~5 dB usable range ([`set_tx_gain_level`]) and echoes back the nominal value. It is a *relative*
+    /// knob (higher dBm ⇒ higher gain), not an absolute-power guarantee. Precise dBm needs the OLPC port.
     fn set_tx_power_dbm(&self, dbm: i8) -> Result<i8, FaceError> {
-        let units = ((dbm.max(0) as u32) * 2).clamp(1, 63) as u8; // 0.5-dB units, never 0 (=default)
-        self.cur_power
-            .store(units, std::sync::atomic::Ordering::Relaxed);
-        Ok((units / 2) as i8)
+        let d = dbm.clamp(0, 30);
+        let level = d as usize * (TX_GAIN_LADDER.len() - 1) / 30;
+        self.set_tx_gain_level(level)?;
+        Ok(d)
     }
 }
 

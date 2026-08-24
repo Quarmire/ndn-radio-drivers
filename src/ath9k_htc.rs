@@ -384,8 +384,12 @@ pub struct Ath9kHtcBackend {
     /// `spawn_blocking` / reader threads (mirrors the Realtek backend). Every rusb op is `&self`,
     /// so the `&mut self` bring-up methods keep working through the `Arc` deref.
     handle: Arc<DeviceHandle<Context>>,
-    /// WMI sequence number; the target echoes it so replies can be matched to commands.
-    seq: u16,
+    /// WMI sequence number; the target echoes it so replies can be matched to commands. A `Mutex`
+    /// (not a bare `u16`) so the whole reg/WMI path is `&self`: [`wmi_cmd`](Self::wmi_cmd) holds the
+    /// lock across send+recv, which both bumps the seq and serializes concurrent commands (the reg
+    /// pipe is one-in-flight). This is what lets the `&self` `RadioKnobs` — live channel retune,
+    /// EDCCA, occupancy — drive the register path.
+    seq: std::sync::Mutex<u16>,
     /// Endpoint the target assigned to `WMI_CONTROL_SVC` during the handshake.
     wmi_endpoint: u8,
     /// Credits the target offered in its READY message — the HTC flow-control budget.
@@ -428,6 +432,10 @@ pub struct Ath9kHtcBackend {
     /// carried in the repurposed `tidno` byte of our mgmt header and honoured by our firmware's
     /// `ath_tgt_send_mgt`. Set via [`RadioKnobs::set_tx_power`]/`set_tx_power_dbm`. Atomic for `&self`.
     cur_power: std::sync::atomic::AtomicU8,
+    /// Whether the PHY was brought up in HT40 (40 MHz) mode — set by [`hw_reset`](Self::hw_reset) from
+    /// its bandwidth argument. Injected frames then carry the `HAL_RATESERIES_2040` flag (keytype
+    /// bit1) so the MCS rate is transmitted at 40 MHz. `false` = HT20 (the default).
+    ht40: std::sync::atomic::AtomicBool,
 }
 
 fn usb_err<E: std::fmt::Display>(what: &str, e: E) -> FaceError {
@@ -502,7 +510,7 @@ impl Ath9kHtcBackend {
 
         Ok(Self {
             handle: Arc::new(handle),
-            seq: 0,
+            seq: std::sync::Mutex::new(0),
             wmi_endpoint: 0,
             credits: 0,
             credit_size: 0,
@@ -518,6 +526,7 @@ impl Ath9kHtcBackend {
             rx_pump: crate::rx_pump::RxPumpState::new(),
             channel: std::sync::atomic::AtomicU8::new(0),
             cur_power: std::sync::atomic::AtomicU8::new(0),
+            ht40: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -627,7 +636,7 @@ impl Ath9kHtcBackend {
     // ── HTC ──────────────────────────────────────────────────────────────────
 
     /// Send one HTC frame on the register-out (interrupt) pipe.
-    fn htc_send(&mut self, endpoint: u8, payload: &[u8]) -> Result<(), FaceError> {
+    fn htc_send(&self, endpoint: u8, payload: &[u8]) -> Result<(), FaceError> {
         let total = HTC_HDR_LEN + payload.len();
         // The reg pipe's `wMaxPacketSize` is 64, but a USB interrupt transfer packetizes — a WMI
         // command larger than 64 B (e.g. WMI_RC_STATE_CHANGE's 70 B rate struct) is sent as 64+rest,
@@ -655,7 +664,7 @@ impl Ath9kHtcBackend {
     }
 
     /// Receive one HTC frame from the register-in (interrupt) pipe, returning `(endpoint, payload)`.
-    fn htc_recv(&mut self, timeout: Duration) -> Result<(u8, Vec<u8>), FaceError> {
+    fn htc_recv(&self, timeout: Duration) -> Result<(u8, Vec<u8>), FaceError> {
         let mut buf = [0u8; REG_PIPE_MAX];
         let n = self
             .handle
@@ -859,9 +868,12 @@ impl Ath9kHtcBackend {
     /// months because nothing ever checked for a reply.
     ///
     /// Unsolicited events (id ≥ `0x1001`) share this pipe and are skipped while waiting.
-    pub fn wmi_cmd(&mut self, cmd: WmiCmd, payload: &[u8]) -> Result<Vec<u8>, FaceError> {
-        self.seq = self.seq.wrapping_add(1);
-        let seq = self.seq;
+    pub fn wmi_cmd(&self, cmd: WmiCmd, payload: &[u8]) -> Result<Vec<u8>, FaceError> {
+        // Hold the seq lock across the whole send+recv: it bumps the sequence AND serializes
+        // concurrent WMI (the reg pipe is strictly one-command-in-flight).
+        let mut seq_guard = self.seq.lock().unwrap();
+        *seq_guard = seq_guard.wrapping_add(1);
+        let seq = *seq_guard;
 
         let mut buf = Vec::with_capacity(WMI_HDR_LEN + payload.len());
         buf.extend_from_slice(&(cmd as u16).to_be_bytes());
@@ -1094,7 +1106,7 @@ impl Ath9kHtcBackend {
     /// register — a stable, non-degenerate value (not 0, not `0xffff_ffff`, not the
     /// address echoed back). That is the unambiguous proof this primitive works before
     /// anything is written.
-    pub fn reg_read(&mut self, addr: u32) -> Result<u32, FaceError> {
+    pub fn reg_read(&self, addr: u32) -> Result<u32, FaceError> {
         let resp = self.wmi_cmd(WmiCmd::RegRead, &addr.to_be_bytes())?;
         if resp.len() < 4 {
             return Err(err(format!(
@@ -1109,7 +1121,7 @@ impl Ath9kHtcBackend {
     ///
     /// The firmware replies with a zero-length payload, so nothing is returned; the
     /// proof a write landed is a subsequent [`reg_read`](Self::reg_read).
-    pub fn reg_write(&mut self, addr: u32, val: u32) -> Result<(), FaceError> {
+    pub fn reg_write(&self, addr: u32, val: u32) -> Result<(), FaceError> {
         let mut payload = [0u8; 8];
         payload[0..4].copy_from_slice(&addr.to_be_bytes());
         payload[4..8].copy_from_slice(&val.to_be_bytes());
@@ -1120,7 +1132,7 @@ impl Ath9kHtcBackend {
     /// Write many registers, batching up to [`REG_WRITE_MAX_PAIRS`] `{addr,val}` pairs
     /// per `WMI_REG_WRITE` to respect the 64-byte register pipe — the volume path M1.2
     /// needs (≈670 rows would otherwise be ≈670 USB round-trips).
-    pub fn reg_write_batch(&mut self, pairs: &[(u32, u32)]) -> Result<(), FaceError> {
+    pub fn reg_write_batch(&self, pairs: &[(u32, u32)]) -> Result<(), FaceError> {
         for chunk in pairs.chunks(REG_WRITE_MAX_PAIRS) {
             let mut payload = Vec::with_capacity(chunk.len() * 8);
             for (addr, val) in chunk {
@@ -1142,7 +1154,7 @@ impl Ath9kHtcBackend {
     /// Poll `reg` until `(value & mask) == want`, returning the final read. Errors on
     /// timeout — mirrors `ath9k_hw_wait`, but each iteration is a WMI round-trip so a
     /// modest iteration count already spans hundreds of ms of wall time.
-    fn wait_reg(&mut self, reg: u32, mask: u32, want: u32) -> Result<u32, FaceError> {
+    fn wait_reg(&self, reg: u32, mask: u32, want: u32) -> Result<u32, FaceError> {
         for _ in 0..64 {
             let v = self.reg_read(reg)?;
             if v & mask == want {
@@ -1380,19 +1392,19 @@ impl Ath9kHtcBackend {
     // ── register read-modify-write helpers (REG_SET_BIT / REG_CLR_BIT) ────────
 
     /// `REG_SET_BIT` — read, OR in `bits`, write back.
-    fn reg_set_bit(&mut self, addr: u32, bits: u32) -> Result<(), FaceError> {
+    fn reg_set_bit(&self, addr: u32, bits: u32) -> Result<(), FaceError> {
         let v = self.reg_read(addr)?;
         self.reg_write(addr, v | bits)
     }
 
     /// `REG_CLR_BIT` — read, mask out `bits`, write back.
-    fn reg_clr_bit(&mut self, addr: u32, bits: u32) -> Result<(), FaceError> {
+    fn reg_clr_bit(&self, addr: u32, bits: u32) -> Result<(), FaceError> {
         let v = self.reg_read(addr)?;
         self.reg_write(addr, v & !bits)
     }
 
     /// `REG_RMW` — read, replace the `mask` field with `set` (masked), write back.
-    fn reg_rmw(&mut self, addr: u32, set: u32, mask: u32) -> Result<(), FaceError> {
+    fn reg_rmw(&self, addr: u32, set: u32, mask: u32) -> Result<(), FaceError> {
         let v = self.reg_read(addr)?;
         self.reg_write(addr, (v & !mask) | (set & mask))
     }
@@ -1405,7 +1417,7 @@ impl Ath9kHtcBackend {
     /// nothing was ever detected. `nf_regs[0]` for the AR9002 family is `AR_PHY_CCA` (0x9864); the
     /// write field is bits[8:0] in 0.5-dB units (`nfval << 1`), distinct from the bits[28:20]
     /// measurement field that `getnf` reads.
-    fn load_nf_nominal(&mut self) -> Result<(), FaceError> {
+    fn load_nf_nominal(&self) -> Result<(), FaceError> {
         use crate::ath9k_reg::*;
         let field = |nf: i32| ((nf << 1) as u32) & 0x1ff;
 
@@ -1439,7 +1451,7 @@ impl Ath9kHtcBackend {
     /// spur (2.4 GHz beacons ride 1 Mbps CCK, which needs neither), and the software `loadnf`
     /// minCCApwr write (the hardware NF cal seeds itself). `chan_mhz` is the centre, e.g. 2412
     /// (ch1) or 2437 (ch6).
-    pub fn set_channel_and_cal(&mut self, chan_mhz: u16) -> Result<CalStatus, FaceError> {
+    pub fn set_channel_and_cal(&self, chan_mhz: u16) -> Result<CalStatus, FaceError> {
         use crate::ath9k_reg::*;
 
         // The legacy M1.3 flow, now delegating to the same granular helpers that
@@ -1477,7 +1489,7 @@ impl Ath9kHtcBackend {
     /// `ath9k_hw_set_rfmode` (hw.c:1967 → ar5008_hw_set_rfmode). For a 2.4 GHz
     /// single-chip post-9280 part the RF mode is `AR_PHY_MODE_DYNAMIC` (CCK+OFDM).
     /// Golden trace line 50: 0xa200 = 0x04. ✓
-    pub fn set_rfmode(&mut self) -> Result<(), FaceError> {
+    pub fn set_rfmode(&self) -> Result<(), FaceError> {
         use crate::ath9k_reg::*;
         self.reg_write(AR_PHY_MODE, AR_PHY_MODE_DYNAMIC)?;
         Ok(())
@@ -1489,7 +1501,7 @@ impl Ath9kHtcBackend {
     /// aModeRefSel=0. Channel-14 spreading (CCK_TX_CTRL_JAPAN) on only for 2484.
     /// Golden trace line 57: 0x9874 = 0x30a0cccc for freq 2412 (BMODE|FRACMODE|
     /// CHANSEL_2G(2412)=0xa0cccc). ✓
-    pub fn rf_set_freq(&mut self, chan_mhz: u16) -> Result<(), FaceError> {
+    pub fn rf_set_freq(&self, chan_mhz: u16) -> Result<(), FaceError> {
         use crate::ath9k_reg::*;
         if chan_mhz != 2484 {
             self.reg_clr_bit(AR_PHY_CCK_TX_CTRL, AR_PHY_CCK_TX_CTRL_JAPAN)?;
@@ -1509,7 +1521,7 @@ impl Ath9kHtcBackend {
 
     /// `ath9k_hw_init_bb` — enable the baseband (`AR_PHY_ACTIVE = EN`), then wait the
     /// synth-settle delay. Golden trace line 94: 0x981c = 0x01. ✓
-    pub fn init_bb(&mut self) -> Result<(), FaceError> {
+    pub fn init_bb(&self) -> Result<(), FaceError> {
         use crate::ath9k_reg::*;
         // The reference reads AR_PHY_RX_DELAY to compute an exact synth-settle udelay;
         // a fixed few-ms settle dwarfs it on the WMI path, so read is informational.
@@ -1525,7 +1537,7 @@ impl Ath9kHtcBackend {
     /// cal on the HT20 cal list (IQ-mismatch only). Returns whether the AGC cal
     /// converged. ★ This is the whole point of the rewrite: it runs LAST, after the
     /// full PHY/MAC setup, not before.
-    pub fn init_cal(&mut self, chan_mhz: u16) -> Result<bool, FaceError> {
+    pub fn init_cal(&self, chan_mhz: u16) -> Result<bool, FaceError> {
         use crate::ath9k_reg::*;
         // 1. ar9285_hw_cl_cal (AR9271 offset + AGC cal).
         let agc_cal_converged = self.ar9271_cl_cal_ht20()?;
@@ -2080,7 +2092,7 @@ impl Ath9kHtcBackend {
     /// `ar9285_hw_cl_cal` for an HT20 channel (the AR9271 offset + AGC calibration path). Returns
     /// whether the AGC cal (`AR_PHY_AGC_CONTROL_CAL`) cleared — a stuck bit means the cal hung
     /// (noisy environment / bad initvals), which the caller reports rather than hiding.
-    fn ar9271_cl_cal_ht20(&mut self) -> Result<bool, FaceError> {
+    fn ar9271_cl_cal_ht20(&self) -> Result<bool, FaceError> {
         use crate::ath9k_reg::*;
 
         self.reg_set_bit(AR_PHY_CL_CAL_CTL, AR_PHY_CL_CAL_ENABLE)?;
@@ -2147,7 +2159,7 @@ impl Ath9kHtcBackend {
     /// Call this from [`set_channel_and_cal`](Self::set_channel_and_cal) after
     /// `ar9271_cl_cal_ht20` and after `start_nfcal`, matching `ar9002_hw_init_cal`'s
     /// order (AGC/CL cal -> loadnf -> start_nfcal -> arm+run the periodic cal list).
-    pub fn run_rx_calibration(&mut self, chan_mhz: u16) -> Result<(), FaceError> {
+    pub fn run_rx_calibration(&self, chan_mhz: u16) -> Result<(), FaceError> {
         use crate::ath9k_reg::*;
 
         if std::env::var_os("NDR_ATH9K_DEBUG").is_some() {
@@ -2159,7 +2171,7 @@ impl Ath9kHtcBackend {
         const CAL_NUM_SAMPLES: u32 = 1; // MIN_CAL_SAMPLES
 
         // -- ar9002_hw_setup_calibration: program IQCAL_LOG_COUNT_MAX + CALMODE, arm DO_CAL.
-        let arm = |me: &mut Self| -> Result<(), FaceError> {
+        let arm = |me: &Self| -> Result<(), FaceError> {
             // REG_RMW_FIELD(TIMING_CTRL4(0), IQCAL_LOG_COUNT_MAX, calCountMax)
             me.reg_rmw(
                 AR_PHY_TIMING_CTRL4,
@@ -2369,6 +2381,7 @@ fn build_tx_frame_bytes(
     frame: &InjectFrame,
     rate_code: u8,
     tx_power: u8,
+    rate_flags: u8,
 ) -> Result<Vec<u8>, FaceError> {
     // The 802.11 data frame + LLC/SNAP(0x8624) + payload — the shared helper, so a frame injected
     // here de-frames identically on any other backend.
@@ -2408,7 +2421,7 @@ fn build_tx_frame_bytes(
     // bytes as per-frame TX knobs (`ath_tgt_send_mgt`): `tidno` = `AR_XmitPower` (0.5-dB units, 0 =
     // firmware default), `pad` = the HW rate code (0 = target min rate; `0x80|mcs` = HT MCS). This is
     // the actuated MCS/rate/power path — inert on stock ath9k firmware, live on ours.
-    buf.extend_from_slice(&[0, 0, tx_power, 0, 0, 0xff, 0, rate_code]);
+    buf.extend_from_slice(&[0, 0, tx_power, 0, rate_flags, 0xff, 0, rate_code]);
 
     // ── 802.11 MPDU ──
     buf.extend_from_slice(&dot11);
@@ -2489,12 +2502,16 @@ impl Ath9kHtcBackend {
         // Per-frame rate + power our firmware's `ath_tgt_send_mgt` reads from the mgmt header.
         // `cur_mcs` → HT MCS rate code (`0x80|index`, MCS0-7 on this 1×1 part); None → 0 = the
         // target's min rate. `cur_power` → `AR_XmitPower` (0 = firmware default 30 dBm).
-        let rate_code = match *self.cur_mcs.lock().unwrap() {
-            Some(mcs) => 0x80 | mcs.index.min(7),
-            None => 0,
+        use std::sync::atomic::Ordering::Relaxed;
+        let (rate_code, mut rate_flags) = match *self.cur_mcs.lock().unwrap() {
+            Some(mcs) => (0x80 | mcs.index.min(7), if mcs.short_gi { 0x01 } else { 0x00 }),
+            None => (0, 0),
         };
-        let tx_power = self.cur_power.load(std::sync::atomic::Ordering::Relaxed);
-        build_tx_frame_bytes(self.mgmt_ep, self.format, frame, rate_code, tx_power)
+        if self.ht40.load(Relaxed) {
+            rate_flags |= 0x02; // HAL_RATESERIES_2040 — transmit the MCS at 40 MHz
+        }
+        let tx_power = self.cur_power.load(Relaxed);
+        build_tx_frame_bytes(self.mgmt_ep, self.format, frame, rate_code, tx_power, rate_flags)
     }
 }
 
@@ -2619,22 +2636,31 @@ impl RadioProfile for Ath9kHtcBackend {
 /// `RadioControl::libusb_actuator` / `RadioBearer::from_open` and cognition drives it as a first-class
 /// radio (register capability, apply allocations on its channel) exactly like the 8812au/8822E.
 impl RadioKnobs for Ath9kHtcBackend {
-    /// The AR9271 is tuned at open by `hw_reset(chan)`. A live retune is `hw_reset(&mut self)`, which
-    /// the `&self` knob path cannot reach yet — so this answers a same-channel apply with `Ok` (the
-    /// steady-state cognition case on a fixed channel) and a different channel with an honest
-    /// `Unsupported`, rather than silently pretending to hop. Bandwidth is ignored: this part is HT20.
-    fn set_channel(&self, channel: u8, _bw: Bandwidth) -> Result<(), FaceError> {
-        let cur = self.channel.load(std::sync::atomic::Ordering::Relaxed);
-        if channel == cur {
-            Ok(())
+    /// ★ **Live channel retune.** Re-programs the RF synth + re-cals on the new channel via the now
+    /// `&self` [`set_channel_and_cal`](Self::set_channel_and_cal) — no re-open, HTC/RX ring stay up.
+    /// A same-channel apply is a fast no-op. `bw` selects HT20/HT40: HT40 sets the `ht40` flag so
+    /// injected MCS frames carry `HAL_RATESERIES_2040` (the 40 MHz PHY itself is programmed at open).
+    fn set_channel(&self, channel: u8, bw: Bandwidth) -> Result<(), FaceError> {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.ht40.store(matches!(bw, Bandwidth::Bw40), Relaxed);
+        if channel == self.channel.load(Relaxed) {
+            return Ok(());
+        }
+        let chan_mhz = if channel == 14 { 2484 } else { 2407 + 5 * channel as u16 };
+        self.set_channel_and_cal(chan_mhz)?;
+        self.channel.store(channel, Relaxed);
+        Ok(())
+    }
+
+    /// ★ **EDCCA / listen-before-talk toggle.** `on` forces `AR_DIAG_FORCE_RX_CLEAR` so the DCU never
+    /// defers TX on a busy medium (blast on owned spectrum — the token/slot is the only collision
+    /// avoidance); `off` restores normal carrier-sense deference. A single `&self` register write.
+    fn set_edcca_ignore(&self, on: bool) -> Result<(), FaceError> {
+        use crate::ath9k_reg::{AR_DIAG_FORCE_RX_CLEAR, AR_DIAG_SW};
+        if on {
+            self.reg_set_bit(AR_DIAG_SW, AR_DIAG_FORCE_RX_CLEAR)
         } else {
-            Err(FaceError::Io(std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                format!(
-                    "ath9k_htc: live retune not wired — opened on ch{cur}, asked ch{channel}. \
-                     A channel change is hw_reset(&mut self); re-open the radio to change channel."
-                ),
-            )))
+            self.reg_clr_bit(AR_DIAG_SW, AR_DIAG_FORCE_RX_CLEAR)
         }
     }
 
@@ -2973,8 +2999,8 @@ mod tests {
             addr3: None,
         };
         let mgmt_ep = 0x07;
-        let (rate_code, tx_power) = (0x85u8, 0x28u8); // HT MCS5, 20 dBm — the per-frame knobs
-        let buf = build_tx_frame_bytes(mgmt_ep, ndn_fmt(), &frame, rate_code, tx_power).unwrap();
+        let (rate_code, tx_power, rate_flags) = (0x85u8, 0x28u8, 0x01u8); // HT MCS5, 20 dBm, short-GI
+        let buf = build_tx_frame_bytes(mgmt_ep, ndn_fmt(), &frame, rate_code, tx_power, rate_flags).unwrap();
         let dot11 = crate::frame::build_dot11(ndn_fmt(), &frame).unwrap();
 
         // hif_usb TX stream header (4 B): le16 HTC-frame length + le16 tag 0x697e.
@@ -2995,7 +3021,8 @@ mod tests {
         let h = &buf[HIF + HTC_HDR_LEN..HIF + HTC_HDR_LEN + TX_MGMT_HDR_SIZE];
         assert_eq!(&h[0..2], &[0, 0], "node/vif zero");
         assert_eq!(h[2], tx_power, "tidno byte carries AR_XmitPower");
-        assert_eq!(&h[3..5], &[0, 0], "flags/key_type zero");
+        assert_eq!(h[3], 0, "flags zero");
+        assert_eq!(h[4], rate_flags, "keytype byte carries HT rate flags (SGI/HT40)");
         assert_eq!(h[5], 0xff, "keyix = 0xff (no key)");
         assert_eq!(h[6], 0, "cookie zero");
         assert_eq!(h[7], rate_code, "pad byte carries the HW rate code");

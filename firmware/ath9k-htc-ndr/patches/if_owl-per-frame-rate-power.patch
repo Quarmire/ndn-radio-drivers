@@ -1,14 +1,17 @@
-# NDR: per-frame TX rate + power on the mgmt-inject path (AR9271 / open-ath9k-htc-firmware)
+# NDR: per-frame TX rate / power / GI / bandwidth on the mgmt-inject path (AR9271)
 #
-# `ath_tgt_send_mgt()` hardcodes the transmit rate to the vap's min rate and the TX power to 60
-# (30 dBm). Our host injects on the Mgmt endpoint, so this made rate/MCS/power dealer's-choice.
-# This patch repurposes two otherwise-unused bytes of the 8-byte mgmt TX header (ath_mgt_hdr_t):
-#   mh->pad   (byte 7) -> the HW rate code: 0 = target min rate; 0x80|mcs = HT MCS; else a legacy code.
-#   mh->tidno (byte 2) -> AR_XmitPower in 0.5-dB units (0 = firmware default 60 = 30 dBm).
-# The host encodes these in Ath9kHtcBackend::build_tx_frame (FrameIo::set_rate / RadioKnobs::set_tx_power).
-# Verified on air: MCS0-4 produce 6.5/13/19.5/26/39 Mb/s on a witness; descriptor reads XmitRate0=0x85
-# (MCS5) and XmitPower=24 (12 dBm) when commanded. Bump ATH_VERSION_MINOR when building so the running
-# image is identifiable via WMI_GET_FW_VERSION. Apply against qca/open-ath9k-htc-firmware target_firmware.
+# `ath_tgt_send_mgt()` hardcodes rate=min, power=60, RateFlags=0, so rate/MCS/GI/BW/power were
+# dealer's-choice for our Mgmt-endpoint injection. This repurposes three otherwise-unused bytes of the
+# 8-byte mgmt TX header (ath_mgt_hdr_t):
+#   mh->pad     (byte 7) -> HW rate code: 0 = target min; 0x80|mcs = HT MCS; else a legacy rateCode.
+#   mh->tidno   (byte 2) -> AR_XmitPower in 0.5-dB units (0 = firmware default 60 = 30 dBm).
+#   mh->keytype (byte 4) -> HT rate flags: bit0 = short-GI (HAL_RATESERIES_HALFGI), bit1 = HT40 (2040).
+# The host encodes these in Ath9kHtcBackend::build_tx_frame (FrameIo::set_rate stores the McsDescriptor;
+# RadioKnobs::set_tx_power/_dbm store the power). Verified: MCS0-4 on air = 6.5/13/19.5/26/39 Mb/s;
+# descriptor XmitRate0=0x85 (MCS5), XmitPower=24 (12 dBm), ds_ctl7 AR_GI0 set for short-GI. Bump
+# ATH_VERSION_MINOR when building. Apply against qca/open-ath9k-htc-firmware target_firmware.
+# (HT40 also needs the PHY brought up at 40 MHz — the 2G_HT40 initval column + DYN2040 + synth offset —
+#  which is a separate host-side change; this patch only wires the per-frame 2040 rate flag.)
 --- a/target_firmware/wlan/if_owl.c
 +++ b/target_firmware/wlan/if_owl.c
 @@ -1175,6 +1175,11 @@
@@ -32,3 +35,15 @@
  			    , txrate, try0
  			    , keyix
  			    , flags
+@@ -1248,7 +1253,10 @@
+ 		series[i].Tries = 2;
+ 		series[i].Rate = txrate;
+ 		series[i].ChSel = sc->sc_ic.ic_tx_chainmask;
+-		series[i].RateFlags = 0;
++		/* NDR: per-frame HT rate flags from the mgmt header keytype byte: bit0=short-GI, bit1=HT40. */
++		series[i].RateFlags =
++			((mh->keytype & 0x1) ? HAL_RATESERIES_HALFGI : 0) |
++			((mh->keytype & 0x2) ? HAL_RATESERIES_2040 : 0);
+ 	}
+ 	ah->ah_set11nRateScenario(ds, 0, ctsrate, series, 4, 0);
+ 	ath_tgt_txqaddbuf(sc, txq, bf, bf->bf_lastds);

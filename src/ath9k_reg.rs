@@ -375,6 +375,10 @@ pub const AR_RX_FILTER_MONITOR: u32 = AR_RX_FILTER_UCAST
 /// AR_DIAG_SW register offset (reg.h:1689).
 pub const AR_DIAG_SW: u32 = 0x8048;
 pub const AR_DIAG_RX_DIS: u32 = 0x00000020; // reg.h:1695 (RX block)
+/// `AR_DIAG_FORCE_RX_CLEAR` (reg.h) — force CCA/carrier-sense to read "clear" so the DCU never defers
+/// TX on a busy medium. The EDCCA-ignore / LBT-off knob: set to blast on owned spectrum (the doctrine's
+/// monitor-mode-without-CSMA sender), clear for normal deference.
+pub const AR_DIAG_FORCE_RX_CLEAR: u32 = 0x00000200;
 pub const AR_DIAG_RX_ABORT: u32 = 0x02000000; // reg.h:1711 (force RX abort)
 
 /// AR_STA_ID0/1. UNVERIFIED (mac.h): NOT defined in the fetched reg.h (only

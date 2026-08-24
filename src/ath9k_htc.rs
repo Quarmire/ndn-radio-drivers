@@ -974,12 +974,12 @@ impl Ath9kHtcBackend {
     ///
     /// Addresses must be 4-byte aligned — Xtensa has no unaligned 32-bit load, so the firmware
     /// rejects unaligned requests rather than faulting.
-    pub fn read_target_u32s(&mut self, addr: u32, n: usize) -> Result<Vec<u32>, FaceError> {
+    pub fn read_target_u32s(&self, addr: u32, n: usize) -> Result<Vec<u32>, FaceError> {
         self.access_memory(addr, &vec![0u32; n], false)
     }
 
     /// Write 32-bit words to target memory. Returns what the target echoed back.
-    pub fn write_target_u32s(&mut self, addr: u32, vals: &[u32]) -> Result<Vec<u32>, FaceError> {
+    pub fn write_target_u32s(&self, addr: u32, vals: &[u32]) -> Result<Vec<u32>, FaceError> {
         self.access_memory(addr, vals, true)
     }
 
@@ -992,7 +992,7 @@ impl Ath9kHtcBackend {
     ///   request:   u16 flags | u16 count | count * { u32 addr, u32 value }
     ///   response:  u16 status | u16 count | count * { u32 addr, u32 value }
     /// ```
-    fn access_memory(&mut self, addr: u32, vals: &[u32], write: bool) -> Result<Vec<u32>, FaceError> {
+    fn access_memory(&self, addr: u32, vals: &[u32], write: bool) -> Result<Vec<u32>, FaceError> {
         if addr % 4 != 0 {
             return Err(err(format!(
                 "ath9k_htc: target address {addr:#010x} is not 4-byte aligned"
@@ -1070,7 +1070,7 @@ impl Ath9kHtcBackend {
     /// ```sh
     /// xtensa-elf-nm build/k2/fw.elf | grep ndr_stats
     /// ```
-    pub fn read_ndr_stats(&mut self, addr: u32) -> Result<NdrStats, FaceError> {
+    pub fn read_ndr_stats(&self, addr: u32) -> Result<NdrStats, FaceError> {
         let w = self.read_target_u32s(addr, 6)?;
         Ok(NdrStats {
             seen: w[0],
@@ -1080,6 +1080,58 @@ impl Ath9kHtcBackend {
             short_frame: w[4],
             dropped_popcount: w[5],
         })
+    }
+
+    // ── Tier-0 name filter control (#2 / §8.2) — the pre-USB drop that no other Wi-Fi part we own can
+    // do, live on the libusb path. `struct ndr_cfg` at NDR_CFG_ADDR (from `xtensa-nm fw.elf`):
+    //   magic(u32) enabled(u32) drop_foreign(u32) n_masks(u32) key[16] masks[8]×16B  = 160 B.
+    // Rewritten in place via WMI_ACCESS_MEMORY — no firmware rebuild. Masks are the 16-byte prefix-set
+    // Bloom filters (`ndr_filter_t`) the cognition layer derives (SipHash-2-4, key = group context).
+    /// Symbol addresses in the current fw build (re-extract via `xtensa-elf-nm build/k2/fw.elf` if the
+    /// firmware is rebuilt — text/data layout can shift).
+    pub const NDR_CFG_ADDR: u32 = 0x0050_cf40;
+    pub const NDR_STATS_ADDR: u32 = 0x0050_dc18;
+    const NDR_CFG_MAGIC: u32 = 0x4E44_5230; // "NDR0"
+
+    /// Enable/disable the Tier-0 filter and the `drop_foreign` (non-group addr1) rule, leaving the
+    /// configured masks/key intact. `enabled=false` = stock (every frame crosses USB).
+    pub fn set_name_filter(&self, enabled: bool, drop_foreign: bool) -> Result<(), FaceError> {
+        // words 0..3 = magic, enabled, drop_foreign  (n_masks left as-is at word 3).
+        self.write_target_u32s(
+            Self::NDR_CFG_ADDR,
+            &[Self::NDR_CFG_MAGIC, enabled as u32, drop_foreign as u32],
+        )?;
+        Ok(())
+    }
+
+    /// Load the full filter config: the 16-byte group `key` and up to 8 `masks` (16-byte prefix-set
+    /// Bloom filters derived by cognition), then enable. This is the §8.2 name-filter proper — a frame
+    /// whose name-hash isn't in the mask set is dropped on the dongle before the USB transfer.
+    pub fn configure_name_filter(
+        &self,
+        drop_foreign: bool,
+        key: &[u8; 16],
+        masks: &[[u8; 16]],
+    ) -> Result<(), FaceError> {
+        let n = masks.len().min(8);
+        // Pack the whole struct as u32 words (LE — the host↔target ACCESS_MEMORY path is byte-exact).
+        let mut words = vec![Self::NDR_CFG_MAGIC, 1, drop_foreign as u32, n as u32];
+        for chunk in key.chunks(4) {
+            words.push(u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+        }
+        for m in &masks[..n] {
+            for chunk in m.chunks(4) {
+                words.push(u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+            }
+        }
+        self.write_target_u32s(Self::NDR_CFG_ADDR, &words)?;
+        Ok(())
+    }
+
+    /// Read the Tier-0 counters (frames seen / passed to host / dropped by filter/foreign/popcount) —
+    /// the §8.2 evidence: `seen - passed` USB transfers and host wakeups that did not happen.
+    pub fn ndr_stats(&self) -> Result<NdrStats, FaceError> {
+        self.read_ndr_stats(Self::NDR_STATS_ADDR)
     }
 
     // ── Register access (WMI_REG_READ / WMI_REG_WRITE) ────────────────────────

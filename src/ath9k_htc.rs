@@ -2900,6 +2900,15 @@ const TX_GAIN_LADDER: [u32; 11] = [
 const TX_GAIN_LUT_TOP: [u32; 9] = [
     0xa334, 0xa338, 0xa33c, 0xa340, 0xa344, 0xa348, 0xa34c, 0xa350, 0xa354,
 ];
+/// **B210-measured absolute output (dBm) for each gain level 0..10**, indexed by `TX_GAIN_LADDER` level.
+/// MEASURED 2026-08-24: AR9271 on mds-05, OFDM 6 Mbps flood, ch14 (clean channel, no ambient), captured
+/// by the B210 at 2484 MHz (lo-offset 7 MHz, 99th-pct power per window). Anchor: level 10 (reset-default
+/// max gain) = 20 dBm (datasheet max at top gain — the one assumption; the *relative* dB steps are the
+/// SDR-measured truth). Levels 0-4 fell below the SDR noise floor at that gain (all ~minimum, ≤~6 dBm),
+/// so they carry the last-measured value; refine with a higher-B210-gain stitch capture if needed.
+/// ⚠ This is ONE chip; true per-chip absolute dBm needs the OLPC/PDADC EEPROM cal. OFDM-only (CCK flat).
+const MEASURED_DBM_BY_LEVEL: [f32; 11] =
+    [5.6, 6.0, 6.0, 6.4, 6.4, 7.5, 8.8, 11.4, 12.2, 12.9, 20.0];
 
 impl Ath9kHtcBackend {
     /// Write the top TX-gain LUT registers to ladder `level` (0 = min power, `LADDER.len()-1` = max /
@@ -2953,22 +2962,40 @@ impl RadioKnobs for Ath9kHtcBackend {
     /// TX power as an opaque 0-63 index, actuated via the **gain LUT** ([`set_tx_gain_level`]) — the
     /// real PA lever. (The per-frame `AR_XmitPower` header byte and `AR_PHY_POWER_TX_RATE` are inert on
     /// this part — the EEPROM OLPC cal is skipped — MEASURED 0 dB; do NOT read a set XmitPower as an
-    /// actuated one.) `idx = 63` = the reset-default max; lower = lower. Coarse (~11 levels / ~5 dB).
+    /// actuated one.) `idx = 63` = the reset-default max; lower = lower.
+    ///
+    /// ⚠ **The gain LUT is the OFDM power table** (`AR9271MODES_NORMAL_POWER_TX_GAIN`) — it moves
+    /// 802.11a/g/n (OFDM) power but NOT 802.11b (CCK 1/2/5.5/11 Mbps), which has a separate power path.
+    /// MEASURED with a B210 on the clean channel (ch14, no ambient): a CCK 1 Mbps flood is FLAT across
+    /// all 11 levels (< 1 dB); an OFDM 6 Mbps flood spans ~12.5 dB (levels 10→5 = 20→7.5 dBm, anchor
+    /// L10 = datasheet max; levels 4-0 fall below the SDR noise floor). So this knob only bites when the
+    /// frame goes out OFDM ([`set_legacy_rate`] ≥ Ofdm6, or an HT MCS) — see [`MEASURED_DBM_BY_LEVEL`].
     fn set_tx_power(&self, idx: u32) -> Result<(), FaceError> {
         let level = (idx.min(63) as usize * (TX_GAIN_LADDER.len() - 1)) / 63;
         self.cur_power.store(idx.min(63) as u8, std::sync::atomic::Ordering::Relaxed);
         self.set_tx_gain_level(level)
     }
 
-    /// TX power on the dBm scale. ⚠ **APPROXIMATE**: the AR9271's OLPC/PDADC calibration is not ported,
-    /// so there is no true dBm↔gain map — this spreads a nominal 0-30 dBm request across the gain LUT's
-    /// ~5 dB usable range ([`set_tx_gain_level`]) and echoes back the nominal value. It is a *relative*
-    /// knob (higher dBm ⇒ higher gain), not an absolute-power guarantee. Precise dBm needs the OLPC port.
+    /// TX power on the dBm scale, from the **B210-measured** OFDM power curve ([`MEASURED_DBM_BY_LEVEL`]):
+    /// pick the gain level whose measured output is closest to the request, and echo back that level's
+    /// measured dBm. This is a real SDR-calibrated map (not the old naive linear spread), but two honest
+    /// caveats remain: (1) it is **OFDM-only** — CCK power does not move with the LUT (see
+    /// [`set_tx_power`]); (2) the absolute anchor is the datasheet max at top gain and the curve was
+    /// measured on ONE chip, so true **per-chip** absolute dBm (accounting for part-to-part + temp + freq
+    /// variation) still needs the OLPC/PDADC EEPROM cal port. The *relative* ladder is SDR-measured truth.
     fn set_tx_power_dbm(&self, dbm: i8) -> Result<i8, FaceError> {
-        let d = dbm.clamp(0, 30);
-        let level = d as usize * (TX_GAIN_LADDER.len() - 1) / 30;
+        let req = dbm as f32;
+        // Closest measured level to the requested dBm.
+        let level = (0..MEASURED_DBM_BY_LEVEL.len())
+            .min_by(|&a, &b| {
+                (MEASURED_DBM_BY_LEVEL[a] - req)
+                    .abs()
+                    .total_cmp(&(MEASURED_DBM_BY_LEVEL[b] - req).abs())
+            })
+            .unwrap_or(TX_GAIN_LADDER.len() - 1);
+        self.cur_power.store(((level * 63) / (TX_GAIN_LADDER.len() - 1)) as u8, std::sync::atomic::Ordering::Relaxed);
         self.set_tx_gain_level(level)?;
-        Ok(d)
+        Ok(MEASURED_DBM_BY_LEVEL[level].round() as i8)
     }
 
     /// Frame-free channel occupancy (#4/#30): `AR_RCCNT` (0x80f0) is the MAC's free-running "rx-clear"

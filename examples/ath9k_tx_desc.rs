@@ -17,6 +17,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use ndn_radio_drivers::{Ath9kHtcBackend, FrameIo, InjectFrame, TxIntent};
+use ndn_radio_hal::{McsDescriptor, RadioKnobs};
 
 const AR_TFCNT: u32 = 0x80ec;
 const AR_QTXDP1: u32 = 0x0800 + (1 << 2);
@@ -37,6 +38,11 @@ fn main() -> ExitCode {
         .and_then(|_| dev.connect_data_services())
         .and_then(|_| dev.wmi_start())
         .expect("bring-up");
+    // Command DISTINCT knob values so the descriptor read proves they reach the hardware:
+    // rate = HT MCS5 ⇒ XmitRate0 should read 0x85; power = idx 24 ⇒ XmitPower should read 24.
+    dev.set_rate(McsDescriptor { index: 5, short_gi: false, vht: false, nss: 1, stbc: false, ldpc: false }).ok();
+    dev.set_tx_power(24).ok();
+    println!("commanded: MCS5 (rate code 0x85), tx_power idx 24 — expect XmitRate0=0x85, XmitPower=24");
 
     let t0 = r(&mut dev, AR_TFCNT);
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();

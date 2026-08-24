@@ -424,6 +424,10 @@ pub struct Ath9kHtcBackend {
     /// different-channel request with an honest `Unsupported` (a live retune is `hw_reset(&mut self)`,
     /// not yet exposed over the `&self` knob path). Atomic so it stays interior-mutable for that future.
     channel: std::sync::atomic::AtomicU8,
+    /// Per-frame TX power (`AR_XmitPower`, 6-bit 0.5-dB units; 0 = the firmware default 60 = 30 dBm),
+    /// carried in the repurposed `tidno` byte of our mgmt header and honoured by our firmware's
+    /// `ath_tgt_send_mgt`. Set via [`RadioKnobs::set_tx_power`]/`set_tx_power_dbm`. Atomic for `&self`.
+    cur_power: std::sync::atomic::AtomicU8,
 }
 
 fn usb_err<E: std::fmt::Display>(what: &str, e: E) -> FaceError {
@@ -513,6 +517,7 @@ impl Ath9kHtcBackend {
             cur_mcs: std::sync::Mutex::new(None),
             rx_pump: crate::rx_pump::RxPumpState::new(),
             channel: std::sync::atomic::AtomicU8::new(0),
+            cur_power: std::sync::atomic::AtomicU8::new(0),
         })
     }
 
@@ -2362,6 +2367,8 @@ fn build_tx_frame_bytes(
     tx_ep: u8,
     format: FrameFormat,
     frame: &InjectFrame,
+    rate_code: u8,
+    tx_power: u8,
 ) -> Result<Vec<u8>, FaceError> {
     // The 802.11 data frame + LLC/SNAP(0x8624) + payload — the shared helper, so a frame injected
     // here de-frames identically on any other backend.
@@ -2397,8 +2404,11 @@ fn build_tx_frame_bytes(
 
     // ── tx_mgmt_hdr (8 B): node_idx, vif_idx, tidno, flags, key_type, keyix, cookie, pad ──
     // node/vif = 0 (the created monitor vif+node), keyix = 0xff (no key) — matches the kernel's
-    // on-air mgmt TX header from the golden trace.
-    buf.extend_from_slice(&[0, 0, 0, 0, 0, 0xff, 0, 0]);
+    // on-air mgmt TX header from the golden trace. ★ Our firmware repurposes two otherwise-unused
+    // bytes as per-frame TX knobs (`ath_tgt_send_mgt`): `tidno` = `AR_XmitPower` (0.5-dB units, 0 =
+    // firmware default), `pad` = the HW rate code (0 = target min rate; `0x80|mcs` = HT MCS). This is
+    // the actuated MCS/rate/power path — inert on stock ath9k firmware, live on ours.
+    buf.extend_from_slice(&[0, 0, tx_power, 0, 0, 0xff, 0, rate_code]);
 
     // ── 802.11 MPDU ──
     buf.extend_from_slice(&dot11);
@@ -2476,7 +2486,15 @@ impl Ath9kHtcBackend {
     /// Build the HTC data-endpoint TX buffer for `frame` (the [`build_tx_frame_bytes`] wire layout,
     /// bound to this device's DataBE endpoint + format).
     fn build_tx_frame(&self, frame: &InjectFrame) -> Result<Vec<u8>, FaceError> {
-        build_tx_frame_bytes(self.mgmt_ep, self.format, frame)
+        // Per-frame rate + power our firmware's `ath_tgt_send_mgt` reads from the mgmt header.
+        // `cur_mcs` → HT MCS rate code (`0x80|index`, MCS0-7 on this 1×1 part); None → 0 = the
+        // target's min rate. `cur_power` → `AR_XmitPower` (0 = firmware default 30 dBm).
+        let rate_code = match *self.cur_mcs.lock().unwrap() {
+            Some(mcs) => 0x80 | mcs.index.min(7),
+            None => 0,
+        };
+        let tx_power = self.cur_power.load(std::sync::atomic::Ordering::Relaxed);
+        build_tx_frame_bytes(self.mgmt_ep, self.format, frame, rate_code, tx_power)
     }
 }
 
@@ -2510,7 +2528,11 @@ impl FrameIo for Ath9kHtcBackend {
         .map_err(|e| err(format!("ath9k_htc tx: join {e}")))?
     }
 
-    /// Rate as bearer state. ⚠ Stored but not actuated on this HTC part — see [`Ath9kHtcBackend::cur_mcs`].
+    /// The transmit MCS/rate. ★ **Actuated** (with our firmware): stored here and encoded into every
+    /// injected frame's mgmt header (`pad` byte = `0x80|index` HT rate code), which our patched
+    /// `ath_tgt_send_mgt` writes into the TX descriptor's rate series. MCS0-7 (this part is 1×1).
+    /// On stock ath9k firmware the byte is ignored and the target picks the rate (hence the old
+    /// "inert" note); on ours it steers the on-air rate. See [`build_tx_frame`](Self::build_tx_frame).
     fn set_rate(&self, mcs: McsDescriptor) -> Result<(), FaceError> {
         *self.cur_mcs.lock().unwrap() = Some(mcs);
         Ok(())
@@ -2614,6 +2636,26 @@ impl RadioKnobs for Ath9kHtcBackend {
                 ),
             )))
         }
+    }
+
+    /// TX power as an opaque index = `AR_XmitPower` in 0.5-dB units (0-63 ⇒ 0-31.5 dBm), carried
+    /// per-frame in our mgmt header and applied by our firmware's `ath_tgt_send_mgt`. ★ Actuated.
+    /// `idx = 0` restores the firmware default (30 dBm); prefer [`set_tx_power_dbm`] for a portable
+    /// scale. (On stock ath9k firmware this byte is ignored — the knob is live only on ours.)
+    fn set_tx_power(&self, idx: u32) -> Result<(), FaceError> {
+        self.cur_power
+            .store(idx.min(63) as u8, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// TX power on the absolute dBm scale (the portable knob cognition reasons in). Clamped to the
+    /// AR9271's 0-31.5 dBm `AR_XmitPower` range; returns the dBm actually applied. Actuated per-frame
+    /// via our firmware (see [`set_tx_power`](Self::set_tx_power)).
+    fn set_tx_power_dbm(&self, dbm: i8) -> Result<i8, FaceError> {
+        let units = ((dbm.max(0) as u32) * 2).clamp(1, 63) as u8; // 0.5-dB units, never 0 (=default)
+        self.cur_power
+            .store(units, std::sync::atomic::Ordering::Relaxed);
+        Ok((units / 2) as i8)
     }
 }
 
@@ -2931,7 +2973,8 @@ mod tests {
             addr3: None,
         };
         let mgmt_ep = 0x07;
-        let buf = build_tx_frame_bytes(mgmt_ep, ndn_fmt(), &frame).unwrap();
+        let (rate_code, tx_power) = (0x85u8, 0x28u8); // HT MCS5, 20 dBm — the per-frame knobs
+        let buf = build_tx_frame_bytes(mgmt_ep, ndn_fmt(), &frame, rate_code, tx_power).unwrap();
         let dot11 = crate::frame::build_dot11(ndn_fmt(), &frame).unwrap();
 
         // hif_usb TX stream header (4 B): le16 HTC-frame length + le16 tag 0x697e.
@@ -2947,11 +2990,15 @@ mod tests {
         assert_eq!(payload_len, TX_MGMT_HDR_SIZE + dot11.len(), "HTC payload len = tx_mgmt_hdr + MPDU");
         assert_eq!(&buf[HIF + 4..HIF + 8], &[0, 0, 0, 0], "HTC control bytes zero");
 
-        // tx_mgmt_hdr (8 B): node_idx, vif_idx, tidno, flags, key_type, keyix=0xff, cookie, pad.
+        // tx_mgmt_hdr (8 B): node_idx, vif_idx, tidno(=tx_power), flags, key_type, keyix=0xff,
+        // cookie, pad(=rate_code) — the last two repurposed as our firmware's per-frame TX knobs.
         let h = &buf[HIF + HTC_HDR_LEN..HIF + HTC_HDR_LEN + TX_MGMT_HDR_SIZE];
-        assert_eq!(&h[0..5], &[0, 0, 0, 0, 0], "node/vif/tid/flags/key_type zero");
+        assert_eq!(&h[0..2], &[0, 0], "node/vif zero");
+        assert_eq!(h[2], tx_power, "tidno byte carries AR_XmitPower");
+        assert_eq!(&h[3..5], &[0, 0], "flags/key_type zero");
         assert_eq!(h[5], 0xff, "keyix = 0xff (no key)");
-        assert_eq!(&h[6..8], &[0, 0], "cookie/pad zero");
+        assert_eq!(h[6], 0, "cookie zero");
+        assert_eq!(h[7], rate_code, "pad byte carries the HW rate code");
 
         // The 802.11 MPDU that follows is exactly `build_dot11` (same on-air layout as every backend):
         // FC=Data, addr1=dst, addr2=src, LLC/SNAP(0x8624), payload.

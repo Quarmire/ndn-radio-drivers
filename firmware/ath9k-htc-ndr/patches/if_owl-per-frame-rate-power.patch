@@ -1,0 +1,34 @@
+# NDR: per-frame TX rate + power on the mgmt-inject path (AR9271 / open-ath9k-htc-firmware)
+#
+# `ath_tgt_send_mgt()` hardcodes the transmit rate to the vap's min rate and the TX power to 60
+# (30 dBm). Our host injects on the Mgmt endpoint, so this made rate/MCS/power dealer's-choice.
+# This patch repurposes two otherwise-unused bytes of the 8-byte mgmt TX header (ath_mgt_hdr_t):
+#   mh->pad   (byte 7) -> the HW rate code: 0 = target min rate; 0x80|mcs = HT MCS; else a legacy code.
+#   mh->tidno (byte 2) -> AR_XmitPower in 0.5-dB units (0 = firmware default 60 = 30 dBm).
+# The host encodes these in Ath9kHtcBackend::build_tx_frame (FrameIo::set_rate / RadioKnobs::set_tx_power).
+# Verified on air: MCS0-4 produce 6.5/13/19.5/26/39 Mb/s on a witness; descriptor reads XmitRate0=0x85
+# (MCS5) and XmitPower=24 (12 dBm) when commanded. Bump ATH_VERSION_MINOR when building so the running
+# image is identifiable via WMI_GET_FW_VERSION. Apply against qca/open-ath9k-htc-firmware target_firmware.
+--- a/target_firmware/wlan/if_owl.c
++++ b/target_firmware/wlan/if_owl.c
+@@ -1175,6 +1175,11 @@
+ 		txrate |= rt->info[rix].shortPreamble;
+ 	}
+
++	/* NDR: per-frame TX rate override from the mgmt header pad byte (0 = target min rate;
++	   0x80|mcs = HT MCS, else a legacy rateCode). */
++	if (mh->pad != 0)
++		txrate = mh->pad;
++
+ 	vap = ni->ni_vap;
+ 	bf->bf_node = ni;
+
+@@ -1225,7 +1230,7 @@
+ 			    , pktlen
+ 			    , hdrlen
+ 			    , atype
+-			    , 60
++			    , (mh->tidno ? mh->tidno : 60)
+ 			    , txrate, try0
+ 			    , keyix
+ 			    , flags

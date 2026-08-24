@@ -276,8 +276,13 @@ pub fn open_ath9k(channel: u8) -> Result<OpenRadio, FaceError> {
     dev.download_firmware(&fw)?;
     dev.htc_init()?;
     // Faithful ath9k_hw_reset (reset + initvals + cal) on the requested channel, then the post-reset
-    // RX-start steps, matching `ath9k_htc_start`'s order.
-    dev.hw_reset(chan_mhz)?;
+    // RX-start steps, matching `ath9k_htc_start`'s order. `NDN_ATH9K_HT40=1` brings the PHY up at
+    // 40 MHz (HT40+) — EXPERIMENTAL, cal convergence unverified on this HT20-class part.
+    if std::env::var_os("NDN_ATH9K_HT40").is_some() {
+        dev.hw_reset_ht40(chan_mhz)?;
+    } else {
+        dev.hw_reset(chan_mhz)?;
+    }
     dev.connect_data_services()?;
     // Disable the NDR Tier-0 name filter so broadcast/ambient frames aren't dropped in firmware
     // before the USB handoff (the proven RX path in `examples/ath9k_hw_reset.rs` does this). Best

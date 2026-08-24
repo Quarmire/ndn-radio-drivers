@@ -1313,7 +1313,12 @@ impl Ath9kHtcBackend {
     pub fn apply_initvals(&mut self) -> Result<IniVerify, FaceError> {
         use crate::ath9k_initvals::*;
         use crate::ath9k_reg::*;
+        // MODES table columns are {addr, 5G_HT20, 5G_HT40, 2G_HT40, 2G_HT20}: pick the 2.4 GHz
+        // column matching the requested bandwidth. HT40 also keeps DYN2040 set (below).
         const COL_2G_HT20: usize = 4;
+        const COL_2G_HT40: usize = 3;
+        let ht40 = self.ht40.load(std::sync::atomic::Ordering::Relaxed);
+        let col = if ht40 { COL_2G_HT40 } else { COL_2G_HT20 };
 
         // NOTE: PLL / core-clock / sleep-clock and the AR9271 GATE_MAC_CTL write
         // now live in `phy_reset()` (they belong inside ath9k_hw_chip_reset /
@@ -1327,14 +1332,10 @@ impl Ath9kHtcBackend {
 
         // Stream the tables in reference order; record every write for verification.
         let mut written: Vec<(u32, u32)> = Vec::new();
-        self.stream_modes(AR9271MODES_9271, COL_2G_HT20, &mut written)?;
+        self.stream_modes(AR9271MODES_9271, col, &mut written)?;
         self.stream_common(AR9271COMMON_9271, &mut written)?;
-        self.stream_modes(AR9271MODES_9271_ANI_REG, COL_2G_HT20, &mut written)?;
-        self.stream_modes(
-            AR9271MODES_NORMAL_POWER_TX_GAIN_9271,
-            COL_2G_HT20,
-            &mut written,
-        )?;
+        self.stream_modes(AR9271MODES_9271_ANI_REG, col, &mut written)?;
+        self.stream_modes(AR9271MODES_NORMAL_POWER_TX_GAIN_9271, col, &mut written)?;
 
         // ── ath9k_hw_override_ini tail of process_ini ──
         // ⚠ ath9k_hw_override_ini is NOT among the fetched sources. Its one
@@ -1345,9 +1346,13 @@ impl Ath9kHtcBackend {
         self.reg_write(AR_PCU_MISC_MODE2, AR_PCU_MISC_MODE2_TRACE_VAL)?;
         written.push((AR_PCU_MISC_MODE2, AR_PCU_MISC_MODE2_TRACE_VAL));
 
-        // HT20: clear the dynamic-20/40 enable in AR_PHY_TURBO (already clear in the
-        // MODES col-4 value 0x300; make it explicit as ath9k_hw_set_channel would).
-        let turbo = self.reg_read(AR_PHY_TURBO)? & !AR_PHY_FC_DYN2040_EN;
+        // AR_PHY_TURBO dynamic-20/40 enable: SET for HT40 (40 MHz operation around the synth center),
+        // CLEAR for HT20 — as ath9k_hw_set_channel does per bandwidth.
+        let turbo = if ht40 {
+            self.reg_read(AR_PHY_TURBO)? | AR_PHY_FC_DYN2040_EN
+        } else {
+            self.reg_read(AR_PHY_TURBO)? & !AR_PHY_FC_DYN2040_EN
+        };
         self.reg_write(AR_PHY_TURBO, turbo)?;
         written.push((AR_PHY_TURBO, turbo));
 
@@ -1508,7 +1513,14 @@ impl Ath9kHtcBackend {
         } else {
             self.reg_set_bit(AR_PHY_CCK_TX_CTRL, AR_PHY_CCK_TX_CTRL_JAPAN)?;
         }
-        let channel_sel = ((chan_mhz as u64 * 0x1_0000) / CHANSEL_2G_DIV) as u32;
+        // HT40+ programs the synth to the 40 MHz band CENTRE = primary + 10 MHz (the extension is the
+        // 20 MHz above). HT20 uses the control-channel centre directly.
+        let synth_mhz = if self.ht40.load(std::sync::atomic::Ordering::Relaxed) {
+            chan_mhz + 10
+        } else {
+            chan_mhz
+        };
+        let channel_sel = ((synth_mhz as u64 * 0x1_0000) / CHANSEL_2G_DIV) as u32;
         let prev = self.reg_read(AR_PHY_SYNTH_CONTROL)? & 0xc000_0000;
         let synth = prev
             | AR_PHY_SYNTH_CONTROL_2G_BMODE
@@ -1883,6 +1895,16 @@ impl Ath9kHtcBackend {
     /// This performs the reset + PHY/MAC bring-up only. `connect_data_services()`,
     /// [`start_receive`](Self::start_receive) and [`wmi_start`](Self::wmi_start) are
     /// the separate post-reset RX-start steps (as `ath9k_htc_start` does).
+    /// Bring the PHY up in **HT40 (40 MHz)** on `chan_mhz` (the control/primary channel; HT40+ uses
+    /// the 20 MHz above). Sets the `ht40` flag so [`apply_initvals`](Self::apply_initvals) streams the
+    /// 2G_HT40 column + keeps DYN2040 and [`rf_set_freq`](Self::rf_set_freq) offsets the synth centre;
+    /// injected MCS frames then carry the `2040` rate flag. Otherwise identical to [`hw_reset`].
+    /// ⚠ EXPERIMENTAL: 40 MHz cal convergence on this HT20-class part is unverified.
+    pub fn hw_reset_ht40(&mut self, chan_mhz: u16) -> Result<(), FaceError> {
+        self.ht40.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.hw_reset(chan_mhz)
+    }
+
     pub fn hw_reset(&mut self, chan_mhz: u16) -> Result<(), FaceError> {
         use crate::ath9k_reg::*;
 
@@ -1947,6 +1969,12 @@ impl Ath9kHtcBackend {
         self.init_bb()?;
         // 21. init_cal — ★ runs LAST, after the full PHY/MAC setup.
         self.init_cal(chan_mhz)?;
+        // 21b. HT40: the HT20 CL-cal (ar9271_cl_cal_ht20, run by init_cal) clears DYN2040 at its end.
+        // Re-assert it so the PHY actually operates 40 MHz — the streamed 2G_HT40 initvals and the
+        // +10 MHz synth centre are already in place; DYN2040 is the enable that ties them together.
+        if self.ht40.load(std::sync::atomic::Ordering::Relaxed) {
+            self.reg_set_bit(AR_PHY_TURBO, AR_PHY_FC_DYN2040_EN)?;
+        }
         // 22. restore_chainmask (no-op for 1-chain).
         self.restore_chainmask()?;
         // 23. REG_WRITE(AR_CFG_LED, saveLedState | AR_CFG_SCLK_32KHZ).

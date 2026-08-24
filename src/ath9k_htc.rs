@@ -2785,8 +2785,10 @@ impl crate::rx_pump::Pumpable for Ath9kHtcBackend {
     }
     fn parse_transfer(&self, buf: &[u8]) -> Vec<CapturedFrame> {
         let mut out = Vec::new();
+        let mut raw = 0u64; // raw units pulled off USB (incl. CRC-failed) — the pump-speed metric
         let mut off = 0usize;
         while let Some((decoded, advance)) = parse_rx_unit(self.format, self.tsf_domain, buf, off) {
+            raw += 1;
             if let Some(f) = decoded {
                 out.push(f);
             }
@@ -2797,6 +2799,12 @@ impl crate::rx_pump::Pumpable for Ath9kHtcBackend {
             if off + RX_PREFIX_LEN + HTC_RX_STATUS_LEN > buf.len() {
                 break;
             }
+        }
+        // Feed the shared RAW-pull counter so `rx_raw_frames()`/RAW_PULL reflects the HTC pipe too
+        // (it was structurally 0 for this backend — reads like a dead pump, isn't). Pre-CRC-filter, so
+        // it isolates pump/USB speed from decode success. Matters for the #9 async-vs-sync RX ceiling.
+        if raw > 0 {
+            crate::RX_RAW_FRAMES.fetch_add(raw, std::sync::atomic::Ordering::Relaxed);
         }
         out
     }

@@ -132,6 +132,11 @@ pub const FW_NAME: &str = "ath9k_htc/htc_9271-1.4.0.fw";
 
 const USB_TIMEOUT: Duration = Duration::from_millis(1000);
 
+/// Per-attempt timeout for a TX bulk-OUT write. Short so WLAN-endpoint backpressure (a NAK when the
+/// target's TX buffer ring is full) is detected quickly and retried in [`FrameIo::inject`], rather
+/// than stalling a full second per frame. A timed-out write transferred 0 bytes (safe to retry).
+const TX_WRITE_TIMEOUT: Duration = Duration::from_millis(20);
+
 // ── HTC ──────────────────────────────────────────────────────────────────────
 // Wire formats from the open firmware's `wlan/include/htc.h`. All multi-byte HTC and WMI fields
 // are **big-endian** on the wire.
@@ -2022,7 +2027,14 @@ impl Ath9kHtcBackend {
         self.wmi_cmd(WmiCmd::EnableIntr, &[])?;
         // ath9k_hw_set_interrupts — host-side final AR_IMR arming (golden trace).
         self.reg_write(AR_IMR, 0x8180_0964)?;
-        self.reg_write(AR_IMR_S0, 0x0001_0000)?;
+        // AR_IMR_S0 gates per-QCU TX completion interrupts: TXOK = bits[9:0], TXDESC = bits[25:16].
+        // ★ The golden-trace value (0x0001_0000 = TXDESC q0 only) was a RX-focused monitor capture and
+        // enables NO TXOK for the data queues — so queue 1 (the one `ath_tgt_send_mgt` uses) never
+        // raises a completion interrupt, the target's TX tasklet never reaps, and its WLAN-endpoint
+        // buffers never recycle → injection blocks at the ring depth (~33 credits). Enable TXOK for
+        // the four data ACs (q0-3) so completions fire and sustained TX works. MEASURED: without this
+        // the 34th injected frame's bulk-OUT NAKs forever.
+        self.reg_write(AR_IMR_S0, 0x0001_000f)?;
         self.reg_write(AR_IMR_S1, 0x0001_0000)?;
         self.reg_write(AR_IMR_S2, 0x0080_0000)?;
         Ok(())
@@ -2442,14 +2454,25 @@ impl FrameIo for Ath9kHtcBackend {
         let buf = self.build_tx_frame(&frame)?;
         let handle = self.handle.clone();
         tokio::task::spawn_blocking(move || {
-            handle
-                .write_bulk(EP_WLAN_TX, &buf, USB_TIMEOUT)
-                .map_err(|e| usb_err("wlan tx", e))
-                .and_then(|n| {
-                    (n == buf.len()).then_some(()).ok_or_else(|| {
-                        err(format!("ath9k_htc: short TX write {n}/{}", buf.len()))
-                    })
-                })
+            // Flow control by retry. The target's WLAN-TX endpoint has a fixed buffer ring (~`credits`
+            // deep); once it fills, the bulk-OUT pipe NAKs and the write times out having transferred
+            // 0 bytes (device NAKed — nothing left the host), so re-sending the same frame is safe.
+            // The target frees a buffer when a TX completes (its interrupt-driven completion tasklet,
+            // fed by both TX-done and ambient RX interrupts), so a short bounded retry rides out the
+            // backpressure instead of erroring at the pool depth (~34 frames) — the difference between
+            // a 34-frame burst and sustained TX. A non-timeout error is a real fault: surface it.
+            const TX_RETRY_MAX: u32 = 250; // × TX_WRITE_TIMEOUT ⇒ up to a few seconds of backpressure
+            for attempt in 0..=TX_RETRY_MAX {
+                match handle.write_bulk(EP_WLAN_TX, &buf, TX_WRITE_TIMEOUT) {
+                    Ok(n) if n == buf.len() => return Ok(()),
+                    Ok(n) => {
+                        return Err(err(format!("ath9k_htc: short TX write {n}/{}", buf.len())))
+                    }
+                    Err(rusb::Error::Timeout) if attempt < TX_RETRY_MAX => continue,
+                    Err(e) => return Err(usb_err("wlan tx", e)),
+                }
+            }
+            Err(err("ath9k_htc: wlan tx backpressure did not clear".to_string()))
         })
         .await
         .map_err(|e| err(format!("ath9k_htc tx: join {e}")))?

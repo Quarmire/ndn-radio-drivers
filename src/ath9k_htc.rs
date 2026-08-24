@@ -222,6 +222,10 @@ pub enum WmiCmd {
     /// Push the `ieee80211com_target` capability block. `ath_ic_update_tgt`. Not required to
     /// receive frames (the RX tasklet forwards regardless), so M1.4 skips it.
     TargetIcUpdate = 0x0018,
+    /// Query the target's RX buffer accounting (`ath_rx_stats_tgt`). Reply = 3 big-endian u32s:
+    /// `ast_rx_nobuf` (RX-buffer alloc failures — the pool-exhaustion / leak witness), `ast_rx_send`
+    /// (frames handed to the host), `ast_rx_done` (HTC send-completions = buffers recycled).
+    RxStats = 0x001e,
     /// Tear the WLAN application down cleanly. Must be the last command — the target's handler
     /// frees its softc.
     TgtDetach = 0x001a,
@@ -926,6 +930,20 @@ impl Ath9kHtcBackend {
     /// [`htc_init`](Self::htc_init); useful mainly as evidence the READY message parsed sanely.
     pub fn credits(&self) -> (u16, u16) {
         (self.credits, self.credit_size)
+    }
+
+    /// Query the target's RX-buffer accounting via `WMI_RX_STATS` → `(nobuf, send, done)`:
+    /// `nobuf` = RX-buffer alloc failures (a nonzero, growing value witnesses the pool draining —
+    /// the sustained-RX ceiling), `send` = frames handed to the host, `done` = HTC send-completions
+    /// that recycled a buffer. A widening `send - done` gap means the host isn't draining bulk-IN
+    /// fast enough to recycle. All three big-endian (the target is big-endian).
+    pub fn rx_stats(&mut self) -> Result<(u32, u32, u32), FaceError> {
+        let r = self.wmi_cmd(WmiCmd::RxStats, &[])?;
+        if r.len() < 12 {
+            return Err(err(format!("ath9k_htc: RX_STATS reply {} B < 12", r.len())));
+        }
+        let g = |o: usize| u32::from_be_bytes([r[o], r[o + 1], r[o + 2], r[o + 3]]);
+        Ok((g(0), g(4), g(8)))
     }
 
     // ── Target memory (WMI_ACCESS_MEMORY) ────────────────────────────────────

@@ -1395,7 +1395,21 @@ impl Ath9kHtcBackend {
         self.stream_modes(AR9271MODES_9271, col, &mut written)?;
         self.stream_common(AR9271COMMON_9271, &mut written)?;
         self.stream_modes(AR9271MODES_9271_ANI_REG, col, &mut written)?;
-        self.stream_modes(AR9271MODES_NORMAL_POWER_TX_GAIN_9271, col, &mut written)?;
+        // TX-gain table: NORMAL vs HIGH power. Because `hw_reset` skips the EEPROM OLPC/`set_board_values`
+        // cal (which normally boosts the base gain to the regulatory target), the AR9271 runs the PA well
+        // below the part's real output — MEASURED: a link a couple feet away lands at ~−76 dBm (≈50 dB
+        // under a normal +15 dBm part). ⚠ **`NDN_ATH9K_HIGHPWR=1` does NOT fix this — it makes it WORSE.**
+        // B210-MEASURED (2026-08-24, mds AR9271, ch1, co-located): NORMAL p99 −16.6 dB vs HIGH −28.2 dB
+        // (12 dB LOWER). The high-power ladder is restructured to be used WITH the module's OLPC/EEPROM
+        // cal; applied standalone it misconfigures the drive. The real fix for the low output is the
+        // OLPC/PDADC `set_board_values` port (per-rate target power) — the flag stays only to document
+        // the dead end. Default (NORMAL) is the better of the two here.
+        let tx_gain = if std::env::var_os("NDN_ATH9K_HIGHPWR").is_some() {
+            AR9271MODES_HIGH_POWER_TX_GAIN_9271
+        } else {
+            AR9271MODES_NORMAL_POWER_TX_GAIN_9271
+        };
+        self.stream_modes(tx_gain, col, &mut written)?;
 
         // ── ath9k_hw_override_ini tail of process_ini ──
         // ⚠ ath9k_hw_override_ini is NOT among the fetched sources. Its one

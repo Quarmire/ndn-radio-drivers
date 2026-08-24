@@ -46,7 +46,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut rng: u64 = (std::process::id() as u64).wrapping_mul(0x9E37_79B9) ^ (tag as u64 + 1);
         let mut coin = || { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; rng % 3 == my_slot };
         let src = [0x02, b'M', b'D', b'R', tag, 0x01];
-        let pad = vec![0u8; 900];
+        // NDN_PAYLOAD_LEN: total payload bytes (default 900). SMALL frames flood far faster (the
+        // inject rate is per-frame, not per-byte) — use ~20 to offer >1000 f/s for an RX-ceiling probe.
+        let plen: usize = env("NDN_PAYLOAD_LEN").and_then(|s| s.parse().ok()).unwrap_or(902);
+        let pad = vec![0u8; plen.saturating_sub(2)];
         let mut sent = 0u64;
         let mut last = Instant::now();
         let (mut cur_epoch, mut tx_this) = (u64::MAX, false);

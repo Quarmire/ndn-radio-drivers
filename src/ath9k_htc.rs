@@ -2718,6 +2718,66 @@ impl crate::rx_pump::Pumpable for Ath9kHtcBackend {
     }
 }
 
+impl Ath9kHtcBackend {
+    // ── Named airtime lease (#1 / §8.5) — hardware-scheduled TX on the libusb path ─────────────────
+    //
+    // The lease is enforced IN OUR FIRMWARE (`wlan/ndr_mac.c`), not by host register pokes. The MAC's
+    // quiet-time block (AR_QUIET1/AR_QUIET2 PCU enable + the AR_TIMER_MODE generic timer that phases
+    // it) gates ALL TX — including our mgmt-endpoint injection — to the node's slot. `ndr_quiet_rearm()`
+    // runs from the firmware's RX/TX path and re-applies the epoch-rotated schedule
+    //   slot = (H(prefix) + epoch(t)) mod N,  period = N · slot_tu,  quiet = the whole period but our slot
+    // in COMMON time (local TSF + merged offset) so every node computes the same boundaries.
+    //
+    // Direct register pokes from the host DO NOTHING: the firmware re-arms over them every ~100/s, and
+    // the generic timer alone (without the AR_QUIET1 PCU enable the firmware sets) fires an interrupt
+    // but does not hold off the transmitter — MEASURED (2026-08-24): 1588 f/s armed == 1588 f/s free.
+    // The actuation is the runtime lease-override the firmware exposes for exactly this — set here by
+    // writing its `.bss`/`.data` symbols via WMI_ACCESS_MEMORY, the same owned-memory path
+    // `set_name_filter` uses. Mirrors the `NDR_OP_LEASE` control frame in `ndr_ctl.c`.
+    //
+    // ⚠ Symbol addresses are from `xtensa-elf-nm build/k2/fw.elf` — re-extract if the firmware is
+    // rebuilt (text/data layout shifts, like NDR_CFG_ADDR).
+    const NDR_LEASE_SLOT_TU_ADDR: u32 = 0x0050_cdc0; // a_uint32_t ndr_ctl_lease_slot_tu
+    const NDR_LEASE_SLOTS_ADDR: u32 = 0x0050_cdc4; //   a_uint32_t ndr_ctl_lease_slots
+    const NDR_QUIET_OFF_ADDR: u32 = 0x0050_d904; //     a_uint32_t ndr_ctl_quiet_off
+    const NDR_LEASE_SLOT_ADDR: u32 = 0x0050_d908; //    a_uint32_t ndr_ctl_lease_slot
+    const NDR_LEASE_OVERRIDE_ADDR: u32 = 0x0050_d90c; // a_uint32_t ndr_ctl_lease_override
+
+    /// ★ **Arm the named airtime lease.** The node owns 1 of `slots` slots, each `slot_tu` TU (1024 µs)
+    /// long, per period of `slots · slot_tu` TU; `slot` is the base slot the name hashes to (the
+    /// firmware adds the epoch rotation on top). The MAC is quiet the rest of every period, so a
+    /// saturating transmitter is gated to ~`1/slots` of the airtime — MAC-enforced, no host in the loop.
+    ///
+    /// ⚠ **Power-of-two geometry is mandatory** (MAGPIE has no DIV32, the firmware links no libgcc): the
+    /// firmware masks instead of divides, so `slots` and `slots · slot_tu · 1024` must both be powers of
+    /// two. Defaults 4 slots × 8 TU = 32768 µs = 2¹⁵. `slots` here is the literal count (the firmware's
+    /// control-frame path takes log2; this owned-memory path writes the count the firmware reads directly).
+    pub fn arm_airtime_lease(&self, slots: u32, slot_tu: u32, slot: u32) -> Result<(), FaceError> {
+        // Shape first, then flip override on — so the next `ndr_quiet_rearm()` (driven by our injects)
+        // reads a consistent lease. Clear the generic-timer enable to force a fresh arm (mirrors the
+        // `ndr_quiet_disarm()` the NDR_OP_LEASE control frame calls; `armed_ok` is 0 on the first arm).
+        self.write_target_u32s(Self::NDR_LEASE_SLOT_TU_ADDR, &[slot_tu])?;
+        self.write_target_u32s(Self::NDR_LEASE_SLOTS_ADDR, &[slots])?;
+        self.write_target_u32s(Self::NDR_LEASE_SLOT_ADDR, &[slot])?;
+        self.write_target_u32s(Self::NDR_QUIET_OFF_ADDR, &[0])?;
+        const AR_TIMER_MODE: u32 = 0x8240;
+        const AR_QUIET_TIMER_EN: u32 = 0x0000_0040;
+        self.reg_clr_bit(AR_TIMER_MODE, AR_QUIET_TIMER_EN)?;
+        self.write_target_u32s(Self::NDR_LEASE_OVERRIDE_ADDR, &[1])?;
+        Ok(())
+    }
+
+    /// Release the airtime lease — `ndr_ctl_quiet_off = 1`, clear the override, and clear the
+    /// generic-timer enable so the MAC transmits freely again (mirrors `NDR_OP_QUIET_OFF`).
+    pub fn disarm_airtime_lease(&self) -> Result<(), FaceError> {
+        self.write_target_u32s(Self::NDR_QUIET_OFF_ADDR, &[1])?;
+        self.write_target_u32s(Self::NDR_LEASE_OVERRIDE_ADDR, &[0])?;
+        const AR_TIMER_MODE: u32 = 0x8240;
+        const AR_QUIET_TIMER_EN: u32 = 0x0000_0040;
+        self.reg_clr_bit(AR_TIMER_MODE, AR_QUIET_TIMER_EN)
+    }
+}
+
 impl RadioProfile for Ath9kHtcBackend {
     fn capability(&self) -> RadioCapability {
         // AR9271: single-chain (1x1) 2.4 GHz 802.11n — MCS0-7, 20 MHz. Channels 1..13.
@@ -2821,6 +2881,14 @@ impl RadioKnobs for Ath9kHtcBackend {
         const AR_RCCNT: u32 = 0x80f0;
         let busy = self.reg_read(AR_RCCNT)?;
         Ok(Some((busy >> 8) as u16))
+    }
+
+    /// ★ The AR9271 can promise **`ScheduledAt`** — hardware-gated TX off the TSF via the generic-timer
+    /// airtime lease ([`arm_airtime_lease`](Self::arm_airtime_lease)), MEASURED sub-µs boundary on air
+    /// (M3b). This is the named-time Cut-2 capability the beacon-slot / URLLC lane / TSCH-by-name read,
+    /// and it is *unique to this part* among the Wi-Fi we own — every other backend is `BestEffort`.
+    fn tx_discipline(&self) -> ndn_radio_hal::TxDiscipline {
+        ndn_radio_hal::TxDiscipline::ScheduledAt { granularity_ns: 1_000 }
     }
 }
 

@@ -323,6 +323,25 @@ pub struct IniVerify {
     pub mismatches: Vec<(u32, u32, u32)>,
 }
 
+/// Cal values read from the 4k EEPROM and applied by [`Ath9kHtcBackend::set_board_values`] (OLPC M2).
+#[derive(Debug, Clone, Copy)]
+pub struct BoardValues {
+    /// XOR checksum over the EEPROM validated (always true if the call returned Ok).
+    pub checksum_ok: bool,
+    /// 0 = normal-power module, 1 = high-power (this AR9271 = 1) — which gain table the part wants.
+    pub tx_gain_type: u8,
+    /// RF switch table config written to `AR_PHY_SWITCH_COM`.
+    pub ant_ctrl_common: u32,
+    /// PA output-bias per modulation (cck, psk, qam) — the big power lever.
+    pub ob: [u8; 3],
+    /// PA driver-bias 1 / 2 (chain 0).
+    pub db1_0: u8,
+    pub db2_0: u8,
+    /// TX/RX attenuation + margin (chain 0), from the modal header.
+    pub tx_rx_atten: u8,
+    pub rx_tx_margin: u8,
+}
+
 /// Result of [`Ath9kHtcBackend::set_channel_and_cal`] — M1.3 evidence.
 #[derive(Debug, Clone, Copy)]
 pub struct CalStatus {
@@ -1590,6 +1609,100 @@ impl Ath9kHtcBackend {
             self.reg_set_bit(AR_PHY_TURBO, AR_PHY_FC_DYN2040_EN)?;
         }
         Ok(status)
+    }
+
+    /// ★ **OLPC `set_board_values` port — M2 (analog config).** The AR9271 runs the PA low because
+    /// `hw_reset` skips this EEPROM-driven cal (per-chip PA bias + antenna/gain config). Ports the
+    /// analog half of `ath9k_hw_4k_set_board_values`: reads the 4k cal (M1), then programs
+    /// `antCtrlCommon → AR_PHY_SWITCH_COM`, the XATTEN gain (`AR_PHY_GAIN_2GHZ` block 0+1), and — the big
+    /// power lever — the **ob/db PA-bias** analog registers (AR9271 path: `AR9285_AN_RF2G3/RF2G4`). Refuses
+    /// if the EEPROM checksum is bad (never program the PA from garbage). Call after `apply_initvals`.
+    /// Returns the applied cal so a caller can verify + measure the TX-power change. M3 (the per-rate
+    /// target-power / OLPC gain table) is still TODO — this is the analog config only.
+    pub fn set_board_values(&self) -> Result<BoardValues, FaceError> {
+        // M1: read + XOR-validate the 4k EEPROM (word w = reg 0x2000 + ((w+64)<<2)). Retry the whole
+        // read — a single glitched reg_read among 376 words fails the strict XOR, and the WMI reg path
+        // can glitch one word under concurrent TX; a clean re-read fixes it.
+        let rd = |w: usize| (self.reg_read(0x2000 + (((w as u32) + 64) << 2)).unwrap_or(0xffff_ffff) & 0xffff) as u16;
+        let mut s: Vec<u16> = Vec::new();
+        let mut checksum_ok = false;
+        for _ in 0..5 {
+            s = (0..400).map(rd).collect();
+            let length = (s[0] as usize).min(400);
+            if length >= 32 && (0..length).fold(0u16, |a, i| a ^ s[i]) == 0xffff {
+                checksum_ok = true;
+                break;
+            }
+        }
+        if !checksum_ok {
+            return Err(err(format!(
+                "set_board_values: EEPROM checksum invalid after 5 reads (word0={:#06x}) — refusing to program the PA",
+                s.first().copied().unwrap_or(0)
+            )));
+        }
+        let byte = |off: usize| -> u8 {
+            let w = s[off / 2];
+            if off & 1 == 0 { (w & 0xff) as u8 } else { (w >> 8) as u8 }
+        };
+
+        // base_eep_header_4k = 32 B (txGainType@31); custData[20]; modalHeader @byte 52.
+        let tx_gain_type = byte(31);
+        let m = 52usize;
+        let ant_ctrl_common = (s[(m + 4) / 2] as u32) | ((s[(m + 6) / 2] as u32) << 16);
+        let tx_rx_atten = byte(m + 10);
+        let rx_tx_margin = byte(m + 11);
+        let bsw_atten = byte(m + 31);
+        let bsw_margin = byte(m + 32);
+        let xatten2_db = byte(m + 34);
+        let xatten2_margin = byte(m + 35);
+        // ob/db (modal version >= 2): ob_0/ob_1 packed @m+25, ob_2 @m+38 low nibble; db1_0 @m+26,
+        // db2_0 @m+36 (all low-nibble 4-bit fields).
+        let ob = [byte(m + 25) & 0xf, byte(m + 25) >> 4, byte(m + 38) & 0xf];
+        let db1_0 = byte(m + 26) & 0xf;
+        let db2_0 = byte(m + 36) & 0xf;
+
+        let skip_gain = std::env::var_os("NDN_SB_SKIP_GAIN").is_some();
+        let skip_obdb = std::env::var_os("NDN_SB_SKIP_OBDB").is_some();
+
+        // 1. antCtrlCommon → AR_PHY_SWITCH_COM (0x9964). ⚠ **DEFAULT-SKIPPED**: writing the EEPROM value
+        // (0x11111441) MEASURED-killed TX by ~40 dB (bisect: skipping it recovers full power) — it
+        // disconnects the RF T/R switch the initvals already configured working. Likely a parse/format
+        // issue (the raw le32 needs the same treatment ath9k's antCtrl handling gives it) — opt in with
+        // NDN_SB_ANT to debug. The initvals' switch config is what works; don't clobber it blind.
+        if std::env::var_os("NDN_SB_ANT").is_some() {
+            self.reg_write(0x9964, ant_ctrl_common)?;
+        }
+
+        // 2. ath9k_hw_4k_set_gain — XATTEN fields in AR_PHY_GAIN_2GHZ (0xA20C), block 0 + block 1 (+0x1000).
+        if !skip_gain {
+            for base in [0xA20Cu32, 0xA20C + 0x1000] {
+                self.reg_rmw(base, (bsw_margin as u32) << 12, 0x0001_F000)?; // XATTEN1_MARGIN
+                self.reg_rmw(base, bsw_atten as u32, 0x0000_003F)?; //          XATTEN1_DB
+                self.reg_rmw(base, (xatten2_margin as u32) << 17, 0x003E_0000)?; // XATTEN2_MARGIN
+                self.reg_rmw(base, (xatten2_db as u32) << 6, 0x0000_0FC0)?; //   XATTEN2_DB
+            }
+        }
+
+        // 3. ob/db PA bias (AR9271 analog path). ath9k's `analog_shift_rmw` is a plain REG_RMW — do NOT
+        // touch AR_PHY_BASE analog-shift routing (that leaves the baseband in shift mode, kills TX ~39 dB).
+        if !skip_obdb {
+            self.reg_rmw(0x7828, (ob[0] as u32) << 18, 0x001C_0000)?; // AR9271_AN_RF2G3_OB_cck
+            self.reg_rmw(0x7828, (ob[1] as u32) << 15, 0x0003_8000)?; // OB_psk
+            self.reg_rmw(0x7828, (ob[2] as u32) << 12, 0x0000_7000)?; // OB_qam
+            self.reg_rmw(0x7828, (db1_0 as u32) << 21, 0x00E0_0000)?; // DB_1
+            self.reg_rmw(0x782C, (db2_0 as u32) << 29, 0xE000_0000)?; // DB_2
+        }
+
+        Ok(BoardValues {
+            checksum_ok,
+            tx_gain_type,
+            ant_ctrl_common,
+            ob,
+            db1_0,
+            db2_0,
+            tx_rx_atten,
+            rx_tx_margin,
+        })
     }
 
     // ── granular reset-tail helpers (shared by set_channel_and_cal + hw_reset) ──

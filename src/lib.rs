@@ -44,7 +44,8 @@ mod ath9k_htc_structs;
 mod ath9k_initvals;
 mod ath9k_reg;
 pub use ath9k_htc::{
-    AR9271_FIRMWARE, AR9271_FIRMWARE_TEXT, AR9271_IDS, ATHEROS_VID, Ath9kHtcBackend, CalStatus,
+    AR9271_FIRMWARE, AR9271_FIRMWARE_TEXT, AR9271_IDS, ATHEROS_VID, Ath9kHtcBackend, BoardValues,
+    CalStatus,
     FW_NAME, HTC_RX_STATUS_LEN, HtcService, IEEE80211_MODE_11NG, IniVerify, LegacyRate,
     NDR_MEM_MAX_TUPLES, NdrStats, REG_WRITE_MAX_PAIRS, ResetStatus, RxFrame, WmiCmd,
 };

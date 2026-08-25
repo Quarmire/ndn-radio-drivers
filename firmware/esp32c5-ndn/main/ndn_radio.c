@@ -126,6 +126,9 @@ void app_main(void) {
     ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_start());
+    // C5 is dual-band: enable 2.4 GHz + 5 GHz so a T_CHANNEL for a 5 GHz channel (36 = 5180 MHz, ..)
+    // switches band automatically via esp_wifi_set_channel. Best-effort — older blobs may lack it.
+    esp_wifi_set_band_mode(WIFI_BAND_MODE_AUTO);
     ESP_ERROR_CHECK(esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE));
     ESP_ERROR_CHECK(esp_wifi_set_promiscuous_rx_cb(rx_cb));
     ESP_ERROR_CHECK(esp_wifi_set_promiscuous(true));

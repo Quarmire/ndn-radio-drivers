@@ -10,15 +10,16 @@
 use std::time::Duration;
 
 use bytes::Bytes;
-use ndn_radio_drivers::Bw16SerialBackend;
-use ndn_radio_hal::{FrameIo, InjectFrame, TxIntent};
+use ndn_radio_drivers::Esp32SerialBackend;
+use ndn_radio_hal::{Bandwidth, FrameIo, InjectFrame, RadioKnobs, RadioProfile, TxIntent};
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let port = std::env::args().nth(1).unwrap_or_else(|| "/dev/cu.usbmodem1101".into());
-    let dev = Bw16SerialBackend::open_no_reset(&port)?; // C5 = native USB-Serial-JTAG: never reset via RTS/DTR
-    dev.set_channel(1)?;
-    println!("C5 bridge open on {port}, ch1");
+    let dev = Esp32SerialBackend::open_c5(&port)?; // dual-band C5 over native USB-Serial-JTAG (no RTS/DTR reset)
+    dev.set_channel(1, Bandwidth::Bw20)?;
+    let cap = dev.capability();
+    println!("C5 bridge open on {port}, ch1 — bands {:?}, channels {:?}", cap.bands, cap.channels);
 
     // TX: inject 20 NDN 0x8624 frames through the C5 (witness with the mt76).
     for i in 0..20u32 {

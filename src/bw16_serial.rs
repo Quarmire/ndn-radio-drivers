@@ -282,6 +282,66 @@ impl RadioProfile for Bw16SerialBackend {
     }
 }
 
+/// **ESP32-C5 serial-bridge backend** — the C5 speaks the *same* BW16 wire protocol over its native
+/// USB-Serial-JTAG, so transport, framing, and knobs are the RTL8720DN [`Bw16SerialBackend`] verbatim.
+/// It differs in exactly one thing that matters to the planner: it is **dual-band** (2.4 + 5 GHz, both
+/// validated on air), whereas the BW16 profile is 2.4-only — so cognition driving a C5 through the BW16
+/// identity would never pick a 5 GHz channel. This newtype supplies the dual-band [`RadioCapability`]
+/// and delegates everything else. A distinct type (not a config flag) so C5-specific behaviour — 5 GHz
+/// knobs, a hardware-TSF clock — has a home as it diverges from the BW16.
+pub struct Esp32SerialBackend {
+    inner: Bw16SerialBackend,
+    capability: RadioCapability,
+}
+
+impl Esp32SerialBackend {
+    /// Open an ESP32-C5 running the `firmware/esp32c5-ndn` (or `-rs`) serial bridge on its native
+    /// USB-Serial-JTAG. Uses [`Bw16SerialBackend::open_no_reset`] — RTS/DTR map to EN/GPIO9 on the C5,
+    /// so they are never toggled (asserting RTS holds the chip in reset). Dual-band capability spans
+    /// 2.4 GHz (1/6/11) and 5 GHz (36/40/44/48).
+    pub fn open_c5(path: &str) -> Result<Self, FaceError> {
+        Ok(Self {
+            inner: Bw16SerialBackend::open_no_reset(path)?,
+            capability: RadioCapability::wifi_monitor_dual_1ss(vec![1, 6, 11, 36, 40, 44, 48]),
+        })
+    }
+}
+
+#[async_trait]
+impl FrameIo for Esp32SerialBackend {
+    async fn inject(&self, frame: InjectFrame) -> Result<(), FaceError> {
+        self.inner.inject(frame).await
+    }
+    async fn recv_frame(&self) -> Result<CapturedFrame, FaceError> {
+        self.inner.recv_frame().await
+    }
+}
+
+impl RadioKnobs for Esp32SerialBackend {
+    fn set_channel(&self, channel: u8, bw: Bandwidth) -> Result<(), FaceError> {
+        // FQ call: Bw16SerialBackend has an inherent 1-arg `set_channel` that would shadow this.
+        RadioKnobs::set_channel(&self.inner, channel, bw)
+    }
+    fn set_tx_power(&self, idx: u32) -> Result<(), FaceError> {
+        RadioKnobs::set_tx_power(&self.inner, idx)
+    }
+}
+
+impl RadioTime for Esp32SerialBackend {
+    fn time_sources(&self) -> Vec<RadioTimeSource> {
+        self.inner.time_sources()
+    }
+    fn read_clock(&self, domain: ClockDomainId) -> Result<Option<u64>, FaceError> {
+        self.inner.read_clock(domain)
+    }
+}
+
+impl RadioProfile for Esp32SerialBackend {
+    fn capability(&self) -> RadioCapability {
+        self.capability.clone()
+    }
+}
+
 fn io_err(msg: String) -> FaceError {
     FaceError::Io(std::io::Error::other(msg))
 }

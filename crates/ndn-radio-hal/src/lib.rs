@@ -1145,6 +1145,23 @@ impl RadioCapability {
         }
     }
 
+    /// A single-chain (1x1) **dual-band** (2.4 + 5 GHz) Wi-Fi monitor radio — e.g. the ESP32-C5 over
+    /// the serial bridge. Unlike the RTL parts above, the capability model's `bands` set carries both,
+    /// so the planner can actually pick a 5 GHz channel. `channels` spans both bands (e.g.
+    /// `[1, 6, 11, 36, 40, 44, 48]`); the backend's `set_channel` switches band by channel number.
+    /// One antenna => 1 spatial stream, 11n MCS0-7, 20 MHz base.
+    pub fn wifi_monitor_dual_1ss(channels: Vec<u8>) -> Self {
+        Self {
+            bands: vec![Band::Band2_4GHz, Band::Band5GHz],
+            rate: RateCapability::Wifi {
+                max_mcs: 7,
+                max_nss: 1,
+                max_bw: 0,
+            },
+            ..Self::wifi_monitor_2ghz(channels)
+        }
+    }
+
     /// A Wi-Fi HaLow (802.11ah / S1G) monitor radio — our Newracom NRC7292 on
     /// the sub-GHz band. Same 802.11-family framing and monitor-injection model
     /// as the 2.4/5 GHz backends (so it pools uniformly), but on the ~900 MHz S1G

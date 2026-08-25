@@ -3270,6 +3270,76 @@ impl Rtl8733buBackend {
         Ok(())
     }
 
+    /// **Set the TSSI target power** — the actual TX-power knob on this part.
+    ///
+    /// The port spent a long search concluding "the whole TXAGC page is inert", which is TRUE and,
+    /// per the vendor source, EXPECTED: this chip's efuse byte `0xc8[7:4]` reads 4, i.e.
+    /// `power_track_type = 4`, and *every* vendor TXAGC writer is gated on
+    /// `if (power_track_type >= 4 && power_track_type <= 7) return false;`
+    /// (`config_phydm_write_txagc_ref_8733b`, `config_phydm_write_txagc_diff_8733b`,
+    /// `config_phydm_set_txagc_to_hw_8733b`). On a TSSI part the TXAGC page is disconnected by
+    /// design; power comes from the TSSI closed loop instead.
+    ///
+    /// The vendor's knob is `halrf_tssi_turn_target_power` → `halrf_tssi_set_powerbyrate_pout_8733b`:
+    ///
+    /// ```c
+    /// rateidx_offset = (s8)(power_offset / 25);                 /* 0.01 dB units -> 0.25 dB steps */
+    /// value0 = (s8)(odm_get_bb_reg(dm, rate_reg, mask) & 0xff) + rateidx_offset;   /* SIGNED RMW */
+    /// odm_set_bb_reg(dm, rate_reg, mask, value);                /* per-RATE byte in 0x3A00..0x3A14 */
+    /// pout = (s32)value0 * 100 / 4 + 1600;                      /* dBm*100 */
+    /// if (odm_get_bb_reg(dm, R_0x4318, BIT30) == 0)
+    ///         halrf_enable_tssi_8733b(dm);                      /* the loop MUST be running */
+    /// ```
+    ///
+    /// So the byte is a **signed target power**, `target_dBm = q * 0.25 + 16.00`, and it is
+    /// actuated only while the TSSI loop runs. Two consequences explain every earlier null result:
+    ///  * the earlier sweeps covered `0x00..=0x3f`, i.e. targets of **+16.0 to +31.75 dBm** — all at
+    ///    or above what a 1x1 USB part can emit, so the loop saturated and output never moved.
+    ///    Going *down* requires **negative** `q`.
+    ///  * bring-up pins the table at `0x2d` = **+27.25 dBm**, i.e. permanently saturated: this part
+    ///    has been transmitting flat-out at maximum the whole time.
+    ///
+    /// Writes every rate slot so the caller need not know which rate the frame goes out at.
+    pub fn set_tssi_target(&self, q: i8) -> Result<(), FaceError> {
+        for reg in [0x3a00u16, 0x3a04, 0x3a08, 0x3a0c, 0x3a10, 0x3a14] {
+            let v = u32::from(q as u8);
+            self.bb_set(reg, 0xFFFF_FFFF, v | (v << 8) | (v << 16) | (v << 24))?;
+        }
+        // `if (odm_get_bb_reg(dm, R_0x4318, BIT30) == 0) halrf_enable_tssi_8733b(dm);`
+        if self.read32(0x4318)? & (1 << 30) == 0 {
+            self.set_tssi_enabled(true)?;
+        }
+        Ok(())
+    }
+
+    /// **Set the TSSI DE** — the offset the closed loop applies, and what the vendor writes in
+    /// NORMAL (non-MP) operation via `halrf_tssi_set_efuse_de_8733b` / `halrf_tssi_set_de_8733b`:
+    ///
+    /// ```c
+    /// i = (u8)odm_get_bb_reg(dm, 0x1884, BIT(20));      /* active path */
+    /// de = (s8)(tssi_de & 0xff) + phydm_get_tssi_trim_de(dm, i);
+    /// odm_set_bb_reg(dm, R_0x4334, 0x0FF00000, de);     /* path A */
+    /// odm_set_bb_reg(dm, R_0x43b0, 0x000000FF, de);     /* ... and all four 0x43b0 bytes */
+    /// odm_set_bb_reg(dm, R_0x433c, 0x0FF00000, de);
+    /// tssi_dbm = (((de + 0x80) & 0xff) * 100 + 5) / 8;  /* => 0.125 dB per step */
+    /// ```
+    ///
+    /// Signed, 0.125 dB/step, so a s8 spans about +-16 dB.
+    pub fn set_tssi_de(&self, de: i8) -> Result<(), FaceError> {
+        let v = u32::from(de as u8);
+        self.bb_set(0x4334, 0x0FF0_0000, v)?;
+        for m in [0x0000_00FFu32, 0xFF00_0000, 0x0000_FF00, 0x00FF_0000] {
+            self.bb_set(0x43b0, m, v)?;
+        }
+        self.bb_set(0x433c, 0x0FF0_0000, v)?;
+        Ok(())
+    }
+
+    /// Target power in dBm that [`set_tssi_target`](Self::set_tssi_target) commands for `q`.
+    pub fn tssi_target_dbm(q: i8) -> f32 {
+        q as f32 * 0.25 + 16.0
+    }
+
     /// Write RF register `0x01[4:0]` on both paths.
     ///
     /// ⚠ **NOT a working TX-power knob — the write does not stick.** MEASURED 2026-08-24 by

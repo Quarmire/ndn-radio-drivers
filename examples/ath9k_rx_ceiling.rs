@@ -35,6 +35,8 @@ fn main() -> ExitCode {
         eprintln!("transport FAILED: {e}");
         return ExitCode::FAILURE;
     }
+    // Confirm WHICH firmware is running (instrument-trap guard): the RX-pool-slack build sets minor=80.
+    println!("running firmware version: {:?}", dev.fw_version());
     // Same bring-up as open_ath9k (order: wmi_start before start_receive; filter off).
     if let Err(e) = dev.hw_reset(chan_mhz).and_then(|_| dev.connect_data_services()) {
         eprintln!("bring-up FAILED: {e}");

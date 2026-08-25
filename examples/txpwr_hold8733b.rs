@@ -25,7 +25,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let knob = std::env::var("NDN_PWR_KNOB").unwrap_or_else(|_| "datapath".into());
     let dwell: u64 = std::env::var("NDN_DWELL").ok().and_then(|s| s.parse().ok()).unwrap_or(3);
     // Interleaved, so a monotone thermal drift over the ~96 s pass cannot fake a monotone curve.
-    // Datapath TXAGC sweep, to be run WITH the full TSSI loop enabled (NDN_8733B_TSSI=1).
+    // Datapath TXAGC sweep, run WITH the full TSSI loop (now the default in bring_up_tx).
     // Every gain control measured inert with TSSI off; if the loop is what consults these tables,
     // the same indices that gave 1.9 dB of unordered scatter should now produce a curve.
     let indices: Vec<u8> = vec![0x3f, 0x00, 0x30, 0x08, 0x20, 0x10, 0x28, 0x18];

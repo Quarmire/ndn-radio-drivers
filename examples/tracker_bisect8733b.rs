@@ -14,7 +14,8 @@
 //! and the fix is exactly the one applied (suppress the software tracker when TSSI owns thermal).
 //! If only `thermal` fails, the RF read path is disturbing the running loop.
 //!
-//!   sudo NDN_8733B_TSSI=1 ./tracker_bisect8733b <channel> <mode 0..3>
+//!   sudo ./tracker_bisect8733b <channel> <mode 0..3>   (TSSI is now on by default;
+//!   use NDN_8733B_NO_TSSI=1 for the loop-off arm)
 //! mode 0 none (control) · 1 thermal-only · 2 swing-only · 3 both (full tracker)
 
 use std::sync::Arc;
@@ -29,7 +30,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mode: u8 = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(0);
 
     let dev = Arc::new(Rtl8733buBackend::open()?);
-    // `bring_up_tx` applies TSSI when NDN_8733B_TSSI is set; it does NOT spawn a tracker, so the
+    // `bring_up_tx` applies TSSI by default now; it does NOT spawn a tracker, so the
     // only tracker running is the one this example starts below.
     dev.bring_up_tx(ch)?;
 

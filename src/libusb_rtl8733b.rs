@@ -1371,7 +1371,7 @@ impl Rtl8733buBackend {
         // observed failure was intermittent and its cause is UNKNOWN.
         // What remains true, and is why this stays: TSSI performs thermal compensation in hardware,
         // so a software tracker writing the same quantity is redundant and semantically wrong.
-        if std::env::var_os("NDN_8733B_TSSI").is_some() {
+        if std::env::var_os("NDN_8733B_NO_TSSI").is_none() {
             eprintln!("8733b: TSSI enabled — skipping the software power tracker (hardware loop owns thermal)");
             return Ok(PowerTracker::inert());
         }
@@ -1394,6 +1394,19 @@ impl Rtl8733buBackend {
         let s = Arc::clone(&stop);
         let handle = std::thread::spawn(move || {
             while !s.load(Ordering::Relaxed) {
+                // ⚠ YIELD TO THE HARDWARE LOOP. When TSSI is running (0x4318 BIT30) it performs the
+                // thermal compensation itself, in closed loop against a real power detector. This
+                // software tracker is an open-loop stand-in for exactly that, so running both puts
+                // two controllers on one quantity and the result is neither.
+                //
+                // Checked per tick rather than latched at spawn because `RadioKnobs::set_tx_power`
+                // enables the loop LAZILY, long after this thread starts — an env-var or spawn-time
+                // check silently misses that path, which is how the first end-to-end HAL sweep came
+                // to drift 7 dB and fail its own return-to-baseline arm.
+                if dev.read32(0x4318).map(|v| v & (1 << 30) != 0).unwrap_or(false) {
+                    std::thread::sleep(Duration::from_millis(400));
+                    continue;
+                }
                 let die = dev.read_thermal().unwrap_or(32);
                 let sw = u32::from(die.saturating_sub(31)).saturating_mul(16).min(0x28);
                 if let Ok(v) = dev.read32(0x18a0) {
@@ -1433,7 +1446,7 @@ impl Rtl8733buBackend {
     /// The ~62% was an external USB fault plus per-boot `usbreset`s, not this chip.)
     pub fn bring_up_tx(&self, ch: u8) -> Result<(), FaceError> {
         self.bring_up_monitor(ch)?;
-        // `NDN_8733B_TSSI=1` runs the full TSSI setup — the vendor's `halrf_do_tssi_8733b` port,
+        // The full TSSI setup — the vendor's `halrf_do_tssi_8733b` port,
         // including the efuse-derived DE — BEFORE `enable_tx`, and leaves the loop enabled.
         //
         // Ordering is the whole trick, and is why this was previously unusable. `tssi_setup` and
@@ -1443,16 +1456,24 @@ impl Rtl8733buBackend {
         // where the TSSI loop itself lives. Running TSSI first therefore keeps the loop configured
         // AND lets `enable_tx` establish the datapath on top.
         //
-        // Gated rather than default because it is unproven on air: every host-writable TXAGC control
-        // measured inert with TSSI off, and a register-diff against a captured vendor session showed
-        // the vendor runs with TSSI ENABLED — so this is the outstanding candidate, not a fix.
-        if std::env::var_os("NDN_8733B_TSSI").is_some() {
+        // ★ NOW THE DEFAULT (was `NDN_8733B_TSSI` opt-in). This part's efuse selects a TSSI regime
+        // (`0xc8[7:4]` = 4), so the TSSI loop is not an experiment here — it is the ONLY path that
+        // controls radiated power, and the whole TXAGC page is inert without it. Set
+        // `NDN_8733B_NO_TSSI=1` to skip it for register-level debugging.
+        //
+        // It must run HERE, before `enable_tx`, and cannot be deferred: MEASURED end-to-end through
+        // `RadioKnobs::set_tx_power`, a full sweep gives **19.6 dB** of monotonic range with this
+        // setup, and only **1.6 dB** if the loop is merely enabled afterwards by flipping 0x4318
+        // BIT30. An enabled-but-unconfigured loop gives the DE no authority — which reads exactly
+        // like a dead knob.
+        let tssi = std::env::var_os("NDN_8733B_NO_TSSI").is_none();
+        if tssi {
             self.tssi_setup(ch)?;
             let v = self.read32(0x4318)?;
             eprintln!("8733b: TSSI setup applied, 0x4318={v:08x} tssi_field={}", (v >> 28) & 0x7);
         }
         self.enable_tx(ch)?;
-        if std::env::var_os("NDN_8733B_TSSI").is_some() {
+        if tssi {
             // `enable_tx` re-tunes and re-applies the datapath; report whether the loop survived it.
             let v = self.read32(0x4318)?;
             eprintln!("8733b: after enable_tx, 0x4318={v:08x} tssi_field={}", (v >> 28) & 0x7);
@@ -3247,8 +3268,16 @@ impl Rtl8733buBackend {
     }
 
     /// Set the reference TX-power index (0..0x7f) for path A OFDM + CCK
-    /// (`config_phydm_write_txagc_ref`, reg 0x4308). Effective because this userspace
-    /// bring-up runs with tx-power-by-rate / power-limit disabled.
+    /// (`config_phydm_write_txagc_ref`, reg 0x4308).
+    ///
+    /// ⚠ **MEASURED INERT on this part — not a TX-power control.** The old claim here that it is
+    /// "effective because this bring-up runs with tx-power-by-rate / power-limit disabled" is
+    /// RETRACTED. This chip's efuse byte `0xc8` reads 0x40 => `power_track_type = 4`, and the
+    /// vendor's own `config_phydm_write_txagc_ref_8733b` opens with
+    /// `if (power_track_type >= 4 && <= 7) return false;` — it never writes this register on a
+    /// TSSI part. Sweeping it full-scale moved the received level 0.11 dB.
+    /// The working knob is [`set_tssi_de`](Self::set_tssi_de); [`RadioKnobs::set_tx_power`] uses it.
+    /// Retained only for parts/regimes where TXAGC *is* live, and for register-level bring-up work.
     pub fn set_tx_power_idx(&self, idx: u8) -> Result<(), FaceError> {
         let p = (idx & 0x7f) as u32;
         self.bb_set(0x4308, 0x0000_007f, p)?; // OFDM path A
@@ -3581,8 +3610,33 @@ impl RadioKnobs for Rtl8733buBackend {
         self.tune_channel(channel)?;
         self.set_bandwidth(bw)
     }
+    /// Back-off index below the part's ceiling, `0..=127`, **127 = full power**.
+    ///
+    /// Routed to the TSSI **DE** ([`set_tssi_de`](Rtl8733buBackend::set_tssi_de)), which is the only
+    /// control that moves radiated power on this chip. This used to call `set_tx_power_idx` (the
+    /// TXAGC reference at `0x4308`) — a register MEASURED inert here, because the efuse selects a
+    /// TSSI regime and the vendor driver itself refuses to write TXAGC on such a part. So this knob
+    /// was connected to a dead write: callers could set any index and nothing changed.
+    ///
+    /// MEASURED on air (a81a receiver, 1200 frames/arm), monotonic across all nine arms:
+    /// **19.6 dB** of range end-to-end through this call (−62.02 dBm at index 127 → −81.60 dBm at
+    /// index 0); a direct DE sweep on another run gave 14.4 dB with R^2 = 0.9964. So the scale is
+    /// **≈0.11–0.15 dB per index step and is NOT calibrated** — it varies run to run by ~35%, and
+    /// the absolute anchor is unknown (hence `tx_power_dbm: None`). Treat the index as "back off
+    /// roughly this much", not as a dB figure.
+    ///
+    /// ⚠ **Requires the TSSI loop to be SET UP at bring-up**, which `bring_up_tx` now does by
+    /// default. The lazy enable below is only a fallback for a radio brought up with
+    /// `NDN_8733B_NO_TSSI=1`: merely flipping 0x4318 BIT30 after the fact yields an
+    /// enabled-but-unconfigured loop, which MEASURED **1.6 dB** of range versus 19.6 dB — i.e. it
+    /// looks like a dead knob.
     fn set_tx_power(&self, idx: u32) -> Result<(), FaceError> {
-        self.set_tx_power_idx(idx.min(0x7f) as u8)
+        if self.read32(0x4318)? & (1 << 30) == 0 {
+            self.set_tssi_enabled(true)?;
+        }
+        // Higher index = more power (HAL convention); higher DE = LESS power (the DE offsets the
+        // loop's error term), so the scale is inverted here.
+        self.set_tssi_de((127 - idx.min(127)) as i8)
     }
     // set_tx_csd stays the default no-op: the 8731bu is 1x1 (single chain), so there is no
     // second chain to apply cyclic-shift diversity to.
@@ -3673,9 +3727,19 @@ impl RadioProfile for Rtl8733buBackend {
         // neither transmit nor receive, and cognition's rate selection and the worst-receiver cap
         // ([[worst-receiver-rate-adaptation]]) would have taken the advertisement at face value and
         // aimed undecodable traffic at it.
+        // `max_tx_power: 127` = the DE scale's full-power end (see `RadioKnobs::set_tx_power`),
+        // ~0.111 dB per step over a measured 14.39 dB.
+        //
+        // `tx_power_dbm` stays **None** deliberately, per this field's own rule that a fabricated
+        // range is worse than none. What is measured here is *relative* attenuation below the
+        // ceiling (R^2 = 0.9964); the ABSOLUTE anchor is not measured — the ~17 dBm @5G figure is a
+        // vendor datasheet maximum for the part, not this unit on this channel. To populate it
+        // honestly, measure conducted output at a known DE with a calibrated path (the B210 with a
+        // known-gain chain, or a receiver at known path loss) and anchor the curve to that.
         RadioCapability {
             bands: vec![Band::Band2_4GHz, Band::Band5GHz],
             rate: RateCapability::Wifi { max_mcs: 7, max_nss: 1, max_bw: 1 },
+            max_tx_power: 127,
             ..RadioCapability::wifi_monitor_5ghz(vec![
                 1, 6, 11, 36, 40, 44, 48, 149, 153, 157, 161,
             ])

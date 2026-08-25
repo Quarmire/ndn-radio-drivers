@@ -293,6 +293,8 @@ fn build_data_txdesc(
     frame_len: usize,
     rate: u8,
     seq: u16,
+    // `TXPWR_OFSET`, dw5[30:28] — see the write below.
+    pwr_ofs: u8,
     bcast: bool,
     flags: u8,
 ) -> [u8; DATA_TX_DESC_SIZE] {
@@ -315,10 +317,18 @@ fn build_data_txdesc(
     let stbc = (flags >> 2) & 1;
     let ldpc = flags & 1;
     let bw = (flags >> 3) & 1; // 0=20, 1=40 MHz
+    // dw5[30:28] = TXPWR_OFSET (`SET_TX_DESC_TXPWR_OFSET`, mask 0x7 shift 28) — a PER-FRAME transmit
+    // power offset the MAC applies on top of the TXAGC tables. The vendor drives it from `dpt_lv`,
+    // its dynamic-power-training level (`hal_dm.c`).
+    // ★ This driver has always left it 0. Every host-writable TXAGC register (reference 0x4308,
+    // per-rate table 0x3a00, datapath 0x1e4x, RF 0x01, swing 0x18a0) has now been measured inert for
+    // radiated power, so a per-frame descriptor field the MAC honours is the outstanding candidate —
+    // and it is reached per transmit rather than through the gain tables the MAC may never consult.
     let dw5 = ((sgi as u32) << 4)
         | ((bw as u32) << 5)
         | ((ldpc as u32) << 7)
-        | ((stbc as u32) << 8);
+        | ((stbc as u32) << 8)
+        | ((u32::from(pwr_ofs) & 0x7) << 28);
     d[20..24].copy_from_slice(&dw5.to_le_bytes());
     d[36..40].copy_from_slice(&(((seq as u32) & 0xFFF) << 12).to_le_bytes()); // dw9: SW_SEQ
     // Checksum over the FIRST 32 bytes (16 u16 words, dw0..dw7) with the field at 0x1C
@@ -413,6 +423,11 @@ pub struct Rtl8733buBackend {
     /// Clock domain of this device's TSF counter (unique per physical device, from the USB
     /// bus/address) — the identity every RX hardware stamp is keyed on.
     tsf_domain: ClockDomainId,
+    /// Whether the last [`Rtl8733buBackend::tune_channel`] saw the synth lock (RF `0xc5` BIT15) —
+    /// a candidate on-chip predictor of whether this boot will actually radiate.
+    synth_locked: AtomicBool,
+    /// Per-frame `TXPWR_OFSET` written into every TX descriptor's dw5[30:28] (0-7).
+    tx_pwr_ofs: std::sync::atomic::AtomicU8,
 }
 
 /// Guard for the background TX power-tracking thread started by
@@ -420,6 +435,14 @@ pub struct Rtl8733buBackend {
 pub struct PowerTracker {
     stop: Arc<AtomicBool>,
     handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl PowerTracker {
+    /// A tracker that owns no thread — returned when a hardware loop (TSSI) is doing the thermal
+    /// compensation instead, so callers keep the same RAII shape without a second controller.
+    pub fn inert() -> Self {
+        PowerTracker { stop: Arc::new(AtomicBool::new(true)), handle: None }
+    }
 }
 
 impl Drop for PowerTracker {
@@ -508,6 +531,8 @@ impl Rtl8733buBackend {
             tx_flags: std::sync::atomic::AtomicU8::new(0),
             rx_pump: crate::rx_pump::RxPumpState::new(),
             tsf_domain,
+            synth_locked: AtomicBool::new(false),
+            tx_pwr_ofs: std::sync::atomic::AtomicU8::new(0),
         })
     }
 
@@ -1180,6 +1205,12 @@ impl Rtl8733buBackend {
 
     /// Decode the header-encoded physical efuse into the logical map (1/2-byte-header
     /// block format; word_en bit=0 → word present).
+    /// Public wrapper over [`Self::decode_efuse`] so a diagnostic can print the raw logical map
+    /// next to the parse — a misparse is only obvious when the bytes are visible beside it.
+    pub fn decode_efuse_pub(phys: &[u8]) -> Vec<u8> {
+        Self::decode_efuse(phys)
+    }
+
     fn decode_efuse(phys: &[u8]) -> Vec<u8> {
         let mut logi = vec![0xffu8; 0x200];
         let mut i = 0usize;
@@ -1244,7 +1275,7 @@ impl Rtl8733buBackend {
     /// HwRate code (0x00 = 1M CCK, 0x04 = 6M OFDM). Run after [`init_trx`](Self::init_trx).
     pub fn inject_raw(&self, frame: &[u8], rate: u8, seq: u16) -> Result<(), FaceError> {
         let bcast = frame.len() > 4 && frame[4] & 0x01 != 0; // 802.11 addr1[0] group bit
-        let desc = build_data_txdesc(frame.len(), rate, seq, bcast, self.tx_flags.load(Ordering::Relaxed));
+        let desc = build_data_txdesc(frame.len(), rate, seq, self.tx_pwr_ofs.load(Ordering::Relaxed), bcast, self.tx_flags.load(Ordering::Relaxed));
         let mut pkt = Vec::with_capacity(desc.len() + frame.len() + 1);
         pkt.extend_from_slice(&desc);
         pkt.extend_from_slice(frame);
@@ -1322,8 +1353,28 @@ impl Rtl8733buBackend {
     /// relaunch the process until protocol-level delivery is confirmed (see
     /// `scripts/supervise_tx.sh`). Descriptor / firmware-MACID paths were ruled out as levers.
     pub fn bring_up_tx_tracked(self: &Arc<Self>, ch: u8) -> Result<PowerTracker, FaceError> {
-        self.bring_up_monitor(ch)?;
-        self.enable_tx(ch)?;
+        // Route through `bring_up_tx` rather than repeating monitor+enable_tx here, so the two paths
+        // cannot drift apart. They already had: the `NDN_8733B_TSSI` gate was added to `bring_up_tx`
+        // and this function silently bypassed it, so a run that asked for TSSI got the normal path
+        // and looked like a null result (2026-08-24).
+        self.bring_up_tx(ch)?;
+        // ★ Do NOT run the software power tracker when TSSI is on. `spawn_power_tracking` is our
+        // stand-in for the vendor's power-tracking DM (a `//[TBD]` stub on this chip): every 400 ms
+        // it reads the RF thermal meter and writes the OFDM swing `0x18a0`. TSSI is a HARDWARE loop
+        // doing that same thermal compensation — running both means two controllers fighting over
+        // the same quantity, on the same USB handle.
+        //
+        // ⚠ This is a PRINCIPLED change, NOT a measured fix — do not read it as one. An earlier
+        // comment here claimed the tracker caused a USB failure with TSSI on; that was refuted:
+        // running the tracker's exact operations (thermal read, swing read/modify/write, and both
+        // together) alongside an enabled TSSI loop passed 7/7 runs at ~8000 frames each. The single
+        // observed failure was intermittent and its cause is UNKNOWN.
+        // What remains true, and is why this stays: TSSI performs thermal compensation in hardware,
+        // so a software tracker writing the same quantity is redundant and semantically wrong.
+        if std::env::var_os("NDN_8733B_TSSI").is_some() {
+            eprintln!("8733b: TSSI enabled — skipping the software power tracker (hardware loop owns thermal)");
+            return Ok(PowerTracker::inert());
+        }
         Ok(self.spawn_power_tracking())
     }
 
@@ -1382,7 +1433,31 @@ impl Rtl8733buBackend {
     /// with a caller-side verify, or just retransmit at the protocol layer across re-inits.
     pub fn bring_up_tx(&self, ch: u8) -> Result<(), FaceError> {
         self.bring_up_monitor(ch)?;
-        self.enable_tx(ch)
+        // `NDN_8733B_TSSI=1` runs the full TSSI setup — the vendor's `halrf_do_tssi_8733b` port,
+        // including the efuse-derived DE — BEFORE `enable_tx`, and leaves the loop enabled.
+        //
+        // Ordering is the whole trick, and is why this was previously unusable. `tssi_setup` and
+        // `enable_tx` both write parts of the datapath (`0x1c38`, `0x1c84`, `0x1ca4`, `0x1e1c`), so
+        // running TSSI *after* `enable_tx` clobbers the datapath TXAGC that makes the chip radiate —
+        // that is the "kills output" warning on `enable_tx`. But `enable_tx` never touches `0x43xx`,
+        // where the TSSI loop itself lives. Running TSSI first therefore keeps the loop configured
+        // AND lets `enable_tx` establish the datapath on top.
+        //
+        // Gated rather than default because it is unproven on air: every host-writable TXAGC control
+        // measured inert with TSSI off, and a register-diff against a captured vendor session showed
+        // the vendor runs with TSSI ENABLED — so this is the outstanding candidate, not a fix.
+        if std::env::var_os("NDN_8733B_TSSI").is_some() {
+            self.tssi_setup(ch)?;
+            let v = self.read32(0x4318)?;
+            eprintln!("8733b: TSSI setup applied, 0x4318={v:08x} tssi_field={}", (v >> 28) & 0x7);
+        }
+        self.enable_tx(ch)?;
+        if std::env::var_os("NDN_8733B_TSSI").is_some() {
+            // `enable_tx` re-tunes and re-applies the datapath; report whether the loop survived it.
+            let v = self.read32(0x4318)?;
+            eprintln!("8733b: after enable_tx, 0x4318={v:08x} tssi_field={}", (v >> 28) & 0x7);
+        }
+        Ok(())
     }
 
     /// Reliable TX bring-up: re-run [`bring_up_tx`](Self::bring_up_tx) (full clean re-init,
@@ -1552,6 +1627,39 @@ struct IqkBackup {
     bb: [u32; 11],
     rf: [[u32; 2]; 5], // [reg][path]
 }
+/// The efuse **PG TX-power calibration** for this adapter: the per-channel-group gain-index
+/// bases the vendor derives its transmit power from, plus the per-rate/bandwidth diffs.
+///
+/// Ported from the vendor's `hal_load_pg_txpwr_info_path_{2g,5g}`
+/// (`hal/hal_com_phycfg.c`), parameterised by this chip's `rtl8733b_init_hal_spec` values:
+/// `pg_txpwr_saddr = 0x10` (block start), `pg_txgi_diff_factor = 2` (diffs are stored halved),
+/// `txgi_max = 127`, `txgi_pdbm = 4` (⇒ **4 index units per dB, 0.25 dB/step**).
+///
+/// Layout, per RF path, contiguous from 0x10 — 2.4 GHz block (18 B) then 5 GHz block (24 B), so
+/// path A is 0x10-0x21 / 0x22-0x39. That agrees with [`tssi_setup`](Self::tssi_setup), which
+/// already reads this chip's TSSI offsets from "0x10-0x1a ++ 0x22-0x2f" — the same two blocks.
+///
+/// 2.4 GHz (18 B): 6 CCK bases (one per CCK group) · 5 BW40 bases · 1 B `[BW20|OFDM]` diff for
+/// stream 0 · 3 × 2 B `[BW40|BW20]`,`[OFDM|CCK]` for streams 1-3.
+/// 5 GHz (24 B): 14 BW40 bases · then the same diff pattern.
+/// Diffs are **signed 4-bit nibbles**; a base above `txgi_max` or a diff outside -8..7 means the
+/// cell was never programmed and is reported as `None` rather than silently used as a number.
+#[derive(Debug, Clone)]
+pub struct TxPowerInfo {
+    /// CCK base per CCK group (ch 1-2, 3-5, 6-8, 9-11, 12-14, and ch14 alone).
+    pub cck_base_2g: [Option<u8>; 6],
+    /// BW40 base per 2.4 GHz group (ch 1-2, 3-5, 6-8, 9-11, 12-14).
+    pub bw40_base_2g: [Option<u8>; 5],
+    /// BW40 base per 5 GHz group (14 groups; see [`Rtl8733buBackend::pg_group_5g`]).
+    pub bw40_base_5g: [Option<u8>; 14],
+    /// Stream-0 diffs, ALREADY scaled by `pg_txgi_diff_factor` (2), in gain-index units.
+    pub ofdm_diff_2g: Option<i8>,
+    pub bw20_diff_2g: Option<i8>,
+    pub ofdm_diff_5g: Option<i8>,
+    pub bw20_diff_5g: Option<i8>,
+}
+
+
 
 /// IQK measurement results — the per-path TX/RX correction coefficients.
 #[derive(Default, Debug, Clone, Copy)]
@@ -1738,6 +1846,20 @@ impl Rtl8733buBackend {
     /// the efuse-DE/thermal fine-offsets (thermal table left at hardware default). Call
     /// after [`bring_up_monitor`](Self::bring_up_monitor) / [`tune_channel`](Self::tune_channel).
     pub fn tssi_setup(&self, ch: u8) -> Result<(), FaceError> {
+        self.tssi_setup_upto(ch, u8::MAX)
+    }
+
+    /// [`tssi_setup`](Self::tssi_setup) truncated after phase `upto` — for bisecting which phase
+    /// kills the USB endpoint.
+    ///
+    /// A controlled A/B on a stable bus (2026-08-24) showed the full sequence is fatal: the same
+    /// binary completes 8/8 sweep arms without it and 0/8 with it, dying on the first bulk transfer
+    /// after `tssi_setup` returns *success*. So the damage is done by one of the phases below, not by
+    /// the enable bit (setting `0x4318[30:28]=7` alone is harmless — measured separately).
+    ///
+    /// Phases: 1 efuse read · 2 anapar · 3 RF writes · 4 txpwr-bb-common · 5 43xx block ·
+    /// 6 tmeter · 7 DCK · 8 slope · 9 efuse-DE · 10 track+enable.
+    pub fn tssi_setup_upto(&self, ch: u8, upto: u8) -> Result<(), FaceError> {
         let band_5g = ch > 14;
         // ── efuse-DE prep: per-channel TSSI power offsets + thermal reference ──
         // (halrf_tssi_get_efuse: tssi_efuse[A] = logical 0x10-0x1a ++ 0x22-0x2f; thermal 0xBA).
@@ -1756,6 +1878,7 @@ impl Rtl8733buBackend {
         let ofdm_off = logi[ofdm_byte] as i8 as i32;
         let cck_off = logi[0x10 + cck_idx] as i8 as i32;
         let clamp8 = |v: i32| (v.clamp(-128, 127) & 0xff) as u32;
+        if upto < 2 { return Ok(()); }
         self.bb_set(0x4318, 0x7000_0000, 0x0)?; // disable tssi first
         // ── anapar (00_set_tssi_sys) ──
         self.bb_set(0x1860, 1 << 30, 0)?;
@@ -1768,9 +1891,11 @@ impl Rtl8733buBackend {
         self.bb_set(0x1e1c, 1 << 26, 1)?;
         self.bb_set(0x1ca4, 1 << 31, 1)?;
         self.bb_set(0x1e1c, 0x0000_F000, 0xB)?;
+        if upto < 3 { return Ok(()); }
         // ── rf-setting (path A; 1×1 part) ──
         self.rf_set(0, 0x7f, 1 << 8, 1)?;
         self.rf_set(0, 0x55, 1 << 7, 1)?; // enable RF power tracking at RFC
+        if upto < 4 { return Ok(()); }
         // ── txpwr-bb-common (02_ini_txpwr_ctrl_bb) ──
         for (a, m, v) in [
             (0x4300u16, 0x1Fu32, 0x00u32), (0x4300, 0x00FFFF00, 0x00ff), (0x4300, 0x07000000, 0x4), (0x4300, 0xF0000000, 0x4),
@@ -1790,18 +1915,21 @@ impl Rtl8733buBackend {
             (0x43a8, 0x0000001F, 0x00), (0x43a8, 0x00000F00, 0xd), (0x43a8, 0x0000F000, 0x0), (0x43a8, 0x00070000, 0x7), (0x43a8, 0x00380000, 0x0), (0x43a8, 0x03C00000, 0xd), (0x43a8, 0x7C000000, 0x1d),
             (0x43ac, 0x0000FFFF, 0x4040), (0x1ca4, 1 << 30, 0x1), (0x1c84, 0x0000FC00, 0x8), (0x1c84, 0x000003c0, 0x1),
         ] { self.bb_set(a, m, v)?; }
+        if upto < 5 { return Ok(()); }
         for (a, v) in [
             (0x4308u16, 0x5c545c50u32), (0x430c, 0x3f3f3f3f), (0x4310, 0x003f3f3f), (0x431c, 0x0076280a),
             (0x4324, 0x807f807f), (0x433c, 0), (0x4344, 0), (0x434c, 0), (0x4350, 0), (0x4354, 0), (0x4358, 0), (0x435c, 0),
             (0x4364, 0), (0x4368, 0), (0x436c, 0), (0x4374, 0), (0x4378, 0), (0x437c, 0), (0x4380, 0x00000002),
             (0x4384, 0x100000ff), (0x4388, 0), (0x43a0, 0),
         ] { self.write32(a, v)?; }
+        if upto < 6 { return Ok(()); }
         // ── tmeter table (03): thermal reference + zeroed compensation LUT (cal temp) ──
         self.bb_set(0x4380, 0x0000_0007, 0x3)?;
         self.bb_set(0x4380, 0x0000_0FF0, thermal)?;
         self.bb_set(0x4380, 0x000F_F000, 0x0)?;
         self.bb_set(0x4380, 0xFFF0_0000, 0x0)?;
         for i in (0..64u16).step_by(4) { self.write32(0x4200 + i, 0)?; }
+        if upto < 7 { return Ok(()); }
         // ── DCK (05, auto) ──
         self.bb_set(0x4328, 1 << 24, 0x1)?;
         self.bb_set(0x4328, 1 << 25, 0x1)?;
@@ -1811,6 +1939,7 @@ impl Rtl8733buBackend {
         self.write32(0x4368, 0x0000_0002)?;
         self.write32(0x4378, 0x0000_0002)?;
         self.write32(0x436c, 0)?;
+        if upto < 8 { return Ok(()); }
         // ── slope (06) + slope-cal (07) ──
         for (a, m, v) in [
             (0x4318u16, 0x70000000u32, 0x0u32), (0x4320, 0x0100_0000, 0x1), (0x4328, 0x00FFFFFF, 0x280200), (0x4320, 0x0000F000, 0x3),
@@ -1823,6 +1952,7 @@ impl Rtl8733buBackend {
         self.write32(0x4390, 0x8080_8080)?;
         self.write32(0x4398, 0x8080_8080)?;
         self.bb_set(0x439c, 1 << 0, 0x1)?;
+        if upto < 9 { return Ok(()); }
         // ── efuse-DE (halrf_tssi_set_efuse_de, path A): the calibrated TX-power offset ──
         let diff = 2i32;
         let tmp_ofdm = clamp8(ofdm_off);
@@ -1834,6 +1964,7 @@ impl Rtl8733buBackend {
         self.bb_set(0x43b0, 0x0000_FF00, tmp_ofdm)?; // RF40M OFDM 6M
         self.bb_set(0x43b0, 0x00FF_0000, tmp_ofdm)?; // RF40M OFDM 6M
         self.bb_set(0x433c, 0x0FF0_0000, tmp_cck)?; // CCK
+        if upto < 10 { return Ok(()); }
         // ── track (08) + ENABLE (0x4318[30:28]=7) + un-pause TSSI ──
         self.bb_set(0x4320, 1 << 24, 0x0)?;
         self.bb_set(0x439c, 0x0FFF_FFF0, 0x080080)?;
@@ -1867,13 +1998,27 @@ impl Rtl8733buBackend {
                 rf19 |= 1 << 18;
             }
         }
+        // Synth (LO) lock. The vendor retries the RF-0x18 write up to 20x waiting on RF 0xc5 BIT15,
+        // and so do we — but this used to fall through SILENTLY when the lock never came, returning
+        // Ok(()) from a tune that did not take. Bring-up then completed normally on an unlocked
+        // synth: a boot that looks perfectly healthy and never radiates.
+        // That is a candidate explanation for the long-standing "~62% of cold bring-ups radiate",
+        // and for the chip going quiet partway through a run (lock lost). The note that "no on-chip
+        // signal distinguishes a radiating boot from a dead one" predates anyone reading this bit.
+        let mut locked = false;
         for _ in 0..20 {
             self.rf_set(0, 0x18, RFREG_MASK, rf18)?;
             self.rf_set(1, 0x18, RFREG_MASK, rf18)?;
             std::thread::sleep(Duration::from_micros(250));
             if self.rf_get(0, 0xc5, 0x8000)? != 0 {
+                locked = true;
                 break; // channel-setting ready
             }
+        }
+        self.synth_locked.store(locked, Ordering::Relaxed);
+        if !locked {
+            // Loud on purpose: an unlocked synth is invisible until something measures the air.
+            eprintln!("8733b: SYNTH DID NOT LOCK on ch{ch} after 20 tries (RF 0xc5[15] stayed 0)");
         }
         self.rf_set(0, 0x19, RFREG_MASK, rf19)?;
         self.rf_set(1, 0x19, RFREG_MASK, rf19)?;
@@ -2846,7 +2991,7 @@ impl Rtl8733buBackend {
         let dot11 = frame::build_dot11(self.format, &frame_in)?;
         let seq = self.tx_seq.fetch_add(1, Ordering::Relaxed) & 0xFFF;
         let bcast = dot11.len() > 4 && dot11[4] & 0x01 != 0;
-        let desc = build_data_txdesc(dot11.len(), rate, seq, bcast, flags);
+        let desc = build_data_txdesc(dot11.len(), rate, seq, self.tx_pwr_ofs.load(Ordering::Relaxed), bcast, flags);
         let mut buf = Vec::with_capacity(desc.len() + dot11.len() + 1);
         buf.extend_from_slice(&desc);
         buf.extend_from_slice(&dot11);
@@ -2868,24 +3013,230 @@ impl Rtl8733buBackend {
     /// Set bandwidth / narrowband. 5 & 10 MHz narrowband (the vendor `narrowband`
     /// knob) are `0x9b0[7:6] = 1/2` on top of a 20 MHz channel; 20 vs 40 MHz is the
     /// BB path-width mode (`0x1900[3:0]` = 6/7 + the 40 MHz enables).
+    /// Set the channel bandwidth, including the **5 / 10 MHz narrowband** modes.
+    ///
+    /// The 5/10 MHz sequence is the vendor's, taken from `config_phydm_switch_bandwidth_8733b`
+    /// (`hal/phydm/rtl8733b/phydm_hal_api8733b.c`). Two things about it are load-bearing and were
+    /// both missing here before:
+    ///
+    /// 1. **The converter clocks must change.** Narrowband is not just the `0x9b0[7:6]` "small BW"
+    ///    field: the DAC (`0x9b4[10:8]`) and ADC (`0x9f0[3:0]`) clocks divide down with it, and the
+    ///    TX BPSK/QPSK band-edge (`0x81c[3:0]`) drops the 20 MHz SRRC shaping. Setting only the
+    ///    small-BW bit — which is all this function used to do — leaves the converters running at
+    ///    the 20 MHz rate, so `Nb5`/`Nb10` almost certainly never produced a narrower waveform.
+    /// 2. **They must be written AFTER the RF registers.** The vendor's own note, on the patch that
+    ///    made this work: *"Dirty patch: Set 5/10M BB regs after setting RF regs. The original code
+    ///    has correct MAC rate, but output nothing on RF, and I don't know why. Maybe it's a silicon
+    ///    bug."* In the upstream source the pre-RF copies of these writes are commented out.
+    ///    `RadioKnobs::set_channel` calls `tune_channel` (which writes RF `0x18`) before this, so
+    ///    that ordering already holds — do not reorder it.
+    ///
+    /// The driver's README documents narrowband as working for **injection** specifically ("set to
+    /// 20MHz channel first, then `echo <5/10> > /proc/net/rtl8733bu/<wlan0>/narrowband`"), with
+    /// "no narrowband AP/STA support (needs additional firmware)" — injection is exactly the mode
+    /// this backend runs in.
+    ///
+    /// ⚠ Written from the vendor source and register-verified, but the resulting **occupied
+    /// bandwidth is not yet confirmed on air** — that needs a spectrum view (the B210) or a second
+    /// narrowband-capable receiver, neither currently on the bench.
     pub fn set_bandwidth(&self, bw: Bandwidth) -> Result<(), FaceError> {
-        let nb = match bw {
-            Bandwidth::Nb5 => 1,
-            Bandwidth::Nb10 => 2,
-            _ => 0,
-        };
-        self.bb_set(0x09b0, 0xC0, nb)?;
         match bw {
-            Bandwidth::Bw40 | Bandwidth::Bw80 => {
+            // The vendor's `rtl8733b_init_hal_spec` gives this part `bw_cap = BW_CAP_20M|40M`;
+            // there is no 80 MHz. Previously Bw80 fell into the 40 MHz arm and transmitted at 40
+            // while telling the caller it had set 80 — a silent downgrade is worse than a refusal
+            // now that `capability()` honestly advertises `max_bw: 1`.
+            Bandwidth::Bw80 => {
+                return Err(FaceError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "RTL8733BU is a 20/40 MHz part (vendor bw_cap = 20M|40M): no 80 MHz",
+                )));
+            }
+            Bandwidth::Bw40 => {
+                self.bb_set(0x09b0, 0xC0, 0)?; // small BW off
                 self.bb_set(0x1900, 0xF, 7)?; // BW mode 40
                 self.bb_set(0x0c10, 1 << 9, 1)?;
                 self.bb_set(0x0db4, 1 << 0, 1)?;
                 self.bb_set(0x0818, 1 << 11, 1)?;
                 self.bb_set(0x1940, 1 << 31, 1)?;
             }
+            // 20 MHz and the two narrowband modes share the same MAC BW mode; they differ only in
+            // the small-BW field and the converter clocks below. (`small_bw`, `dac`, `adc`, `edge`)
             _ => {
-                self.bb_set(0x1900, 0xF, 6)?; // BW mode 20 (narrowband rides on top)
+                self.bb_set(0x1900, 0xF, 6)?; // BW mode 20 — narrowband rides on top of it
+                let (small_bw, dac, adc, edge) = match bw {
+                    Bandwidth::Nb5 => (0x1u32, 0x1u32, 0xau32, 0x0u32),
+                    Bandwidth::Nb10 => (0x2, 0x2, 0xb, 0x0),
+                    _ => (0x0, 0x3, 0xc, 0x9), // 20 MHz: full-rate converters, SRRC band edge
+                };
+                self.bb_set(0x09b0, 0xC0, small_bw)?; // small BW [7:6]
+                self.bb_set(0x09b4, 0x700, dac)?; // DAC clock  40 / 80 / 160 MHz
+                self.bb_set(0x09f0, 0xF, adc)?; // ADC clock  40 / 80 / 160 MHz
+                self.bb_set(0x081c, 0xF, edge)?; // TX BPSK/QPSK band edge
             }
+        }
+        // The vendor ends every bandwidth switch with these two, and the narrowband path needs them
+        // to latch the new converter clocks.
+        self.bb_reset()?;
+        self.igi_toggle()?;
+        Ok(())
+    }
+
+    /// 2.4 GHz PG group for a channel: `(bw40_group, cck_group)`. Ports `rtw_get_ch_group`.
+    /// ch14 gets its own CCK group (5) because its CCK spectral mask differs.
+    pub fn pg_group_2g(ch: u8) -> Option<(usize, usize)> {
+        let gp = match ch {
+            1..=2 => 0, 3..=5 => 1, 6..=8 => 2, 9..=11 => 3, 12..=14 => 4,
+            _ => return None,
+        };
+        Some((gp, if ch == 14 { 5 } else { gp }))
+    }
+
+    /// 5 GHz PG group for a channel. Ports `rtw_get_ch_group`'s 5 GHz arm (14 groups).
+    pub fn pg_group_5g(ch: u8) -> Option<usize> {
+        Some(match ch {
+            16..=42 => 0, 44..=48 => 1, 50..=58 => 2, 60..=98 => 3, 100..=106 => 4,
+            108..=114 => 5, 116..=122 => 6, 124..=130 => 7, 132..=138 => 8, 140..=144 => 9,
+            149..=155 => 10, 157..=161 => 11, 165..=171 => 12, 173..=253 => 13,
+            _ => return None,
+        })
+    }
+
+    /// Read and parse the efuse PG TX-power block for **path A** (the only 5 GHz path on this 1×1
+    /// part; `rfpath_num_5g = 1`).
+    ///
+    /// This is the calibration the driver has never used: every TX-power write so far has pushed a
+    /// FLAT index into the gain tables with no reference to what the chip was actually trimmed to.
+    /// On the 8812au that same omission turned out to mean the "full power" setting sat ~20 dB above
+    /// the calibrated point, driving the PA into compression instead of producing more output.
+    pub fn read_tx_power_info(&self) -> Result<TxPowerInfo, FaceError> {
+        const SADDR: usize = 0x10; // hal_spec.pg_txpwr_saddr
+        const DIFF_FACTOR: i8 = 2; // hal_spec.pg_txgi_diff_factor
+        const TXGI_MAX: u8 = 127; // hal_spec.txgi_max
+        let m = Self::decode_efuse(&self.read_efuse(512)?);
+        let at = |o: usize| -> u8 { m.get(o).copied().unwrap_or(0xff) };
+        // A base above txgi_max means "never programmed" (the vendor's IS_PG_TXPWR_BASE_INVALID).
+        let base = |o: usize| -> Option<u8> {
+            let v = at(o);
+            (v <= TXGI_MAX).then_some(v)
+        };
+        // Signed 4-bit nibbles; outside -8..7 means unprogrammed. Scale by DIFF_FACTOR here so
+        // callers always see gain-index units, matching hal_load_txpwr_info.
+        let nib = |v: u8, msb: bool| -> Option<i8> {
+            let n = if msb { (v & 0xf0) >> 4 } else { v & 0x0f } as i8;
+            let sx = if n & 0x8 != 0 { n | !0x0f } else { n };
+            (-8..=7).contains(&sx).then(|| sx.saturating_mul(DIFF_FACTOR))
+        };
+
+        let g2 = SADDR; // path-A 2.4 GHz block, 18 B
+        let g5 = SADDR + 18; // path-A 5 GHz block, 24 B
+        let mut cck_base_2g = [None; 6];
+        for (i, b) in cck_base_2g.iter_mut().enumerate() {
+            *b = base(g2 + i);
+        }
+        let mut bw40_base_2g = [None; 5];
+        for (i, b) in bw40_base_2g.iter_mut().enumerate() {
+            *b = base(g2 + 6 + i);
+        }
+        let mut bw40_base_5g = [None; 14];
+        for (i, b) in bw40_base_5g.iter_mut().enumerate() {
+            *b = base(g5 + i);
+        }
+        let d2 = at(g2 + 11); // stream-0 diff byte: [BW20 | OFDM]
+        let d5 = at(g5 + 14);
+        Ok(TxPowerInfo {
+            cck_base_2g,
+            bw40_base_2g,
+            bw40_base_5g,
+            bw20_diff_2g: nib(d2, true),
+            ofdm_diff_2g: nib(d2, false),
+            bw20_diff_5g: nib(d5, true),
+            ofdm_diff_5g: nib(d5, false),
+        })
+    }
+
+    /// The **calibrated OFDM gain index** for `ch` — base + the stream-0 diffs, i.e. what the vendor
+    /// would drive a 20 MHz OFDM transmit at. `None` where the efuse cell was never programmed.
+    ///
+    /// Units are gain index at `txgi_pdbm = 4` ⇒ 0.25 dB per step.
+    pub fn calibrated_ofdm_index(&self, ch: u8) -> Result<Option<u8>, FaceError> {
+        let info = self.read_tx_power_info()?;
+        let (base, bw20, ofdm) = if ch <= 14 {
+            let Some((gp, _)) = Self::pg_group_2g(ch) else { return Ok(None) };
+            (info.bw40_base_2g[gp], info.bw20_diff_2g, info.ofdm_diff_2g)
+        } else {
+            let Some(gp) = Self::pg_group_5g(ch) else { return Ok(None) };
+            (info.bw40_base_5g[gp], info.bw20_diff_5g, info.ofdm_diff_5g)
+        };
+        Ok(base.map(|b| {
+            let v = i32::from(b) + i32::from(bw20.unwrap_or(0)) + i32::from(ofdm.unwrap_or(0));
+            v.clamp(0, 127) as u8
+        }))
+    }
+
+    /// Set the **per-frame transmit power offset** carried in every TX descriptor (`TXPWR_OFSET`,
+    /// dw5[30:28], 0-7). The vendor uses this field as its dynamic-power-training level.
+    ///
+    /// Distinct from every knob measured inert so far: those are gain *tables* the MAC consults by
+    /// rate, whereas this rides in the descriptor of each frame, so it cannot be bypassed by the
+    /// rate/power-group selection (`RATE_ID`) the way a table lookup can.
+    pub fn set_tx_pwr_offset(&self, ofs: u8) {
+        self.tx_pwr_ofs.store(ofs & 0x7, Ordering::Relaxed);
+    }
+
+    /// Did the synth lock on the most recent [`tune_channel`](Self::tune_channel)?
+    ///
+    /// The flag latched during the tune (RF `0xc5` BIT15, the vendor's channel-setting-ready bit).
+    /// Offered as the on-chip radiation predictor this port has never had — `bring_up_tx_until`
+    /// currently requires external feedback (an ACK, a peer echo) because nothing on the chip was
+    /// known to separate a radiating boot from a dead one. **Correlate before relying on it.**
+    pub fn synth_locked(&self) -> bool {
+        self.synth_locked.load(Ordering::Relaxed)
+    }
+
+    /// Live read of the lock bit rather than the value latched at tune time — shows whether a
+    /// transmitter that started fine has since LOST lock, the candidate explanation for the chip
+    /// going silent partway through a run.
+    pub fn synth_locked_now(&self) -> Result<bool, FaceError> {
+        Ok(self.rf_get(0, 0xc5, 0x8000)? != 0)
+    }
+
+    /// Enable or disable the **TSSI** closed TX-power loop (`0x4318[30:28]`: 7 = on, 0 = off).
+    ///
+    /// TSSI measures transmitted signal strength and regulates output toward a setpoint. While it is
+    /// running it sits DOWNSTREAM of every host-writable gain register, so writing the TXAGC
+    /// reference, the per-rate table, the datapath block, the RF analog gain or the OFDM swing has no
+    /// lasting effect on radiated power — the loop pulls it back. That is the single explanation
+    /// consistent with all five of those controls measuring flat on 2026-08-24, including the
+    /// otherwise impossible result that RF `0x01[4:0] = 0` still transmitted at full strength.
+    ///
+    /// Exposed so a caller that needs an actually-effective power knob can take the loop out of the
+    /// path first. Note the cost: TSSI is what keeps output flat against temperature and per-channel
+    /// variation, so with it off the transmitter needs the driver's own power-tracking loop
+    /// ([`spawn_power_tracking`](Self::spawn_power_tracking)) to avoid thermal droop.
+    pub fn set_tssi_enabled(&self, on: bool) -> Result<(), FaceError> {
+        self.bb_set(0x4318, 0x7000_0000, if on { 0x7 } else { 0x0 })
+    }
+
+    /// Write a flat gain index into the **datapath per-rate TXAGC block** (`0x1e44`/`0x1e48`/
+    /// `0x1e50`/`0x1e54`) — the third and least-explored of this chip's three power controls.
+    ///
+    /// This block is what [`enable_tx`](Self::enable_tx) restores after calibration, and without it
+    /// nothing radiates at all, which makes it the strongest candidate for the gain the PHY actually
+    /// applies. Its default contents are an ascending per-rate ramp (`0x1e44 = 0x2824201c` →
+    /// 0x1c/0x20/0x24/0x28, `0x1e48` → 0x2c/0x30/0x34/0x38), i.e. four gain indices per register.
+    ///
+    /// Compare with the other two: [`set_tx_power_idx`](Self::set_tx_power_idx) writes the TXAGC
+    /// *reference* at `0x4308`, and [`set_txagc_table`](Self::set_txagc_table) the per-rate table at
+    /// `0x3a00`. Register readback shows all three are independent — writing one never disturbs the
+    /// others — so which of them the transmit path consults is an empirical question, not a
+    /// documentation one. (`0x1e58`/`0x1e5c`/`0x1e60` hold mixed non-gain fields and are left alone.)
+    ///
+    /// Flat rather than an offset on purpose: this exists to make a sweep maximally separable. A
+    /// production knob should preserve the per-rate ramp by applying a signed offset instead.
+    pub fn set_txagc_datapath(&self, idx: u8) -> Result<(), FaceError> {
+        let v = u32::from_le_bytes([idx & 0x7f; 4]);
+        for reg in [0x1e44u16, 0x1e48, 0x1e50, 0x1e54] {
+            self.write32(reg, v)?;
         }
         Ok(())
     }
@@ -2914,10 +3265,20 @@ impl Rtl8733buBackend {
         Ok(())
     }
 
-    /// Set the **RF TX AGC** (RF register `0x01[4:0]`, both paths) — the RF-side TX
-    /// gain. The vendor holds this at ~`0x1a`; if it idles at 0 the PA input is zero
-    /// and nothing radiates (confirmed via the OPi vendor RF dump). This is the final
-    /// TX-enable the digital TXAGC path doesn't set on its own.
+    /// Write RF register `0x01[4:0]` on both paths.
+    ///
+    /// ⚠ **NOT a working TX-power knob — the write does not stick.** MEASURED 2026-08-24 by
+    /// readback: after `bring_up_tx`, `RF 0x01` reads `0x1c` and stays `0x1c` whether you write
+    /// 0x00, 0x0a, 0x1a or 0x1f. The `rf_set` path itself is fine — `RF 0x18`, written the same way
+    /// by `tune_channel`, lands correctly (`0x11d24` on ch36; low byte 0x24 = channel 36). The
+    /// reason is already recorded in [`bring_up_monitor`](Self::bring_up_monitor): **the hardware
+    /// sets the TX AGC per-transmit**, so it overwrites this register continuously, and the vendor
+    /// reads 0 here at idle too.
+    ///
+    /// The previous comment claimed this was "the final TX-enable the digital TXAGC path doesn't set
+    /// on its own" and that 0 means nothing radiates. On air, setting 0 changed neither the frame
+    /// count (898/900 delivered) nor the received level (-65.11 vs -64.96 dBm at 0x1f). Retained
+    /// only because IQK/DPK reach RF registers through the same helper.
     pub fn set_rf_txagc(&self, val: u8) -> Result<(), FaceError> {
         self.rf_set(0, 0x01, 0x0001f, (val & 0x1f) as u32)?;
         self.rf_set(1, 0x01, 0x0001f, (val & 0x1f) as u32)?;
@@ -3165,6 +3526,25 @@ impl RadioKnobs for Rtl8733buBackend {
         // delivers a bounded transmit delay (no CSMA backoff); the ~1 ms bound covers the USB
         // inject + queue + airtime of one 6 Mbps MPDU.
         TxDiscipline::PromptBounded { max_delay_ns: 1_000_000 }
+    }
+
+    fn read_channel_activity(&self) -> Result<Option<u16>, FaceError> {
+        // BB **CCA-OFDM event count** (`0x2c08` high half) — free-running, bumped by the PHY every
+        // time it assesses the medium busy on the OFDM path, with no host decode involved. That is
+        // exactly what this knob is defined to return, and unlike a decoded-frame count it also
+        // counts energy that never demodulates.
+        //
+        // MEASURED 2026-08-24 on ch36: ~165-526/s ambient, rising to ~1380-1570/s while a
+        // ~1250 frame/s injection ran — it tracks offered activity.
+        //
+        // Deliberately NOT the vendor's `REG_RXERR_RPT` (0x0664) path, even though this chip has it
+        // and it is what the 8812au uses here: there the counter is chosen by a read-modify-WRITE of
+        // bits [31:28] *before* each read, so a sampler racing anything else that touches 0x664
+        // silently reads the other caller's counter. This knob takes `&self` and is called from a
+        // polling loop, so a pure read is the right primitive. (The 0x664 selector table — 0x0/0x1
+        // OFDM ok/err, 0x3/0x4/0x5 CCK ok/err/false-alarm, 0x6/0x7 HT ok/err, BIT26 = clear — is
+        // recorded in the port notes if per-format counts are ever wanted.)
+        Ok(Some((self.read32(0x2c08)? >> 16) as u16))
     }
 }
 

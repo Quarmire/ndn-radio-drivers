@@ -3369,6 +3369,43 @@ impl Rtl8733buBackend {
         q as f32 * 0.25 + 16.0
     }
 
+    /// **Hardware TX gate** — `REG_TXPAUSE` (`0x0522`), one bit per MAC transmit queue; a set bit
+    /// stops that queue being dequeued to the air. `0xff` pauses everything, `0x00` releases.
+    ///
+    /// This is the actuator the named airtime lease has been missing. #96 MEASURED that stock Wi-Fi
+    /// ignores the NAV in our injected frames, so a lease cannot be enforced by asking others to
+    /// defer — it has to be enforced locally. Until now "do not transmit" meant "do not call
+    /// `inject`", which is a userspace decision subject to scheduler latency; this stops the MAC
+    /// itself. Same actuator for the co-band time no-fly windows.
+    ///
+    /// MEASURED 2026-08-25 (a81a receiver, `examples/txpause8733b.rs`):
+    ///
+    /// * **It gates.** With `0xff` held for a whole arm, 300 inject attempts put only 67 frames on
+    ///   the air; the other 233 blocked at the host and were never transmitted.
+    /// * **It HOLDS, it does not drop.** Those 67 sat in the queue and flushed on release (the
+    ///   receiver counted 68 in that arm's bucket, all arriving after the gate opened). Queue depth
+    ///   is therefore ~67 frames of 300 B (~20 KB). **For a lease this is the dangerous part: up to
+    ///   a queue's worth of traffic bursts out when the window opens and spills into whatever comes
+    ///   next.** Closing the gate is not by itself suppression — stop feeding the queue too, or
+    ///   keep it drained.
+    /// * **Granularity floor ~252 us.** A gate write costs 126 us over USB, so a 50% duty cycle
+    ///   cannot be shaped with a half-period below roughly twice that. The limit is the control
+    ///   transfer, not the MAC.
+    /// * ⚠ **Airtime shaping is NOT demonstrated.** Duty-cycling at 20/5/1 ms delivered ~1196 of
+    ///   1200 frames in every arm: because the gate holds rather than drops, the delivered COUNT is
+    ///   conserved and only timing moves, so a count-based receiver cannot see shaping at all.
+    ///   Proving that needs a time-resolved measurement (per-frame RX timestamps), not this test.
+    /// * ⚠ A host-side inject timeout does NOT mean the frame was not sent: in the duty arms
+    ///   `injected + stalled = 1200` and ~1196 still reached the air.
+    pub fn set_tx_pause(&self, queues: u8) -> Result<(), FaceError> {
+        self.write8(0x0522, queues)
+    }
+
+    /// Read back [`set_tx_pause`](Self::set_tx_pause) (`REG_TXPAUSE`).
+    pub fn tx_pause(&self) -> Result<u8, FaceError> {
+        self.read8(0x0522)
+    }
+
     /// Write RF register `0x01[4:0]` on both paths.
     ///
     /// ⚠ **NOT a working TX-power knob — the write does not stick.** MEASURED 2026-08-24 by

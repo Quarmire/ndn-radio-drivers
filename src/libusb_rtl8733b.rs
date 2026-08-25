@@ -3530,10 +3530,29 @@ impl Rtl8733buBackend {
     /// * **Granularity floor ~252 us.** A gate write costs 126 us over USB, so a 50% duty cycle
     ///   cannot be shaped with a half-period below roughly twice that. The limit is the control
     ///   transfer, not the MAC.
-    /// * ⚠ **Airtime shaping is NOT demonstrated.** Duty-cycling at 20/5/1 ms delivered ~1196 of
-    ///   1200 frames in every arm: because the gate holds rather than drops, the delivered COUNT is
-    ///   conserved and only timing moves, so a count-based receiver cannot see shaping at all.
-    ///   Proving that needs a time-resolved measurement (per-frame RX timestamps), not this test.
+    /// * ✅ **Airtime shaping CONFIRMED** (2026-08-25), once measured with a receiver that can see
+    ///   it: a second f72b logging its per-frame hardware RX stamp, `examples/rxgaps8733b.rs`.
+    ///   Inter-arrival gaps, 15 s per arm:
+    ///
+    ///   ```text
+    ///                     p50     p99     max    gaps>=1ms   injected
+    ///   ungated          173us   531us   2.7ms    29 (0.1%)    20121
+    ///   gated 50% @20ms  173us  25.9ms  26.8ms   127 (4.2%)     2793
+    ///   ```
+    ///
+    ///   125 silent windows appear at the commanded scale where the control has none. Two costs a
+    ///   lease planner must budget for:
+    ///   - **Throughput falls to 13.9%** (1341 -> 186 f/s), not the 50% a 50% duty implies — the
+    ///     ~126 us gate write plus queue drain/refill dominate.
+    ///   - **The silent window OVERSHOOTS**: 20 ms commanded closed, ~26 ms observed (~30% longer).
+    ///     Close it late and you overrun the next window.
+    ///   Only ~33% of the 375 cycles produced a true silent gap, which is consistent with the
+    ///   hold-not-drop semantics above — the ~20 KB queue must drain before any silence appears —
+    ///   though that mechanism is inferred, not separately measured.
+    ///
+    /// * The earlier "delivered count is conserved" reading was an artefact of fixed-FRAME-COUNT
+    ///   arms, where gating only delays a fixed budget. With fixed-TIME arms the throughput loss is
+    ///   plainly visible. Both observations are correct; the first just could not see shaping.
     /// * ⚠ A host-side inject timeout does NOT mean the frame was not sent: in the duty arms
     ///   `injected + stalled = 1200` and ~1196 still reached the air.
     pub fn set_tx_pause(&self, queues: u8) -> Result<(), FaceError> {

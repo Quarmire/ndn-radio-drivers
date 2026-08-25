@@ -39,6 +39,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("gate toggle cost: {per:.1} us/write  (readback now 0x{:02x})", dev.tx_pause()?);
     println!("=> a 50% duty cycle cannot be shaped faster than ~{:.0} us half-period", per * 2.0);
 
+    // NDN_PAUSE_HALF_MS=<n> runs ONE arm at that half-period (0 = ungated control) for
+    // NDN_PAUSE_SECS seconds, so a time-resolved receiver measures one condition at a time
+    // instead of a blended histogram across six.
+    if let Ok(half) = std::env::var("NDN_PAUSE_HALF_MS") {
+        let half: u64 = half.parse().unwrap_or(0);
+        let secs: u64 = std::env::var("NDN_PAUSE_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(15);
+        let mut p = vec![0xC3u8; 300];
+        p[0] = 0;
+        p[1] = 3;
+        let f = InjectFrame {
+            payload: Bytes::from(p),
+            tx: TxIntent::CONSERVATIVE,
+            dst: BROADCAST,
+            src: [0x02, 0x50, 0x33, 0x02, 3, 0],
+            addr3: None,
+        };
+        dev.set_tx_pause(0x00)?;
+        let start = Instant::now();
+        let (mut sent, mut stalled, mut gated) = (0u32, 0u32, false);
+        while start.elapsed().as_secs() < secs {
+            if half > 0 {
+                let want = (start.elapsed().as_millis() as u64 / half) % 2 == 1;
+                if want != gated {
+                    dev.set_tx_pause(if want { 0xff } else { 0x00 })?;
+                    gated = want;
+                }
+            }
+            match tokio::time::timeout(std::time::Duration::from_millis(50), dev.inject(f.clone())).await {
+                Ok(Ok(())) => sent += 1,
+                Ok(Err(_)) => {}
+                Err(_) => stalled += 1,
+            }
+        }
+        dev.set_tx_pause(0x00)?;
+        println!("single arm: half_ms={half} secs={secs} injected={sent} stalled={stalled}");
+        return Ok(());
+    }
     let arms: [(&str, u64); 6] = [
         ("control (no gate)", 0),
         ("gate HELD on", 0),

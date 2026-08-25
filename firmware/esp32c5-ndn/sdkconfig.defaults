@@ -1,7 +1,9 @@
-# ESP32-C5 named-radio: raw 802.11 TX + promiscuous RX, no netstack join needed.
+# ESP32-C5 named-radio serial bridge: raw 802.11 TX + promiscuous RX, host-driven over USB-Serial-JTAG.
 CONFIG_ESP_WIFI_ENABLED=y
 CONFIG_ESP_WIFI_NVS_ENABLED=n
-# Log over the native USB-Serial-JTAG (the C5's 303a:1001 console).
+# Console stays bound to the USB-Serial-JTAG so esptool's auto reset-to-bootloader keeps working (no
+# BOOT/RST button dance to reflash) — but the log level is NONE so no ESP_LOG text corrupts the binary
+# BW16 protocol stream. (CONSOLE_NONE breaks both the output AND auto-reset; do not use it here.)
 CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
-CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
+CONFIG_LOG_DEFAULT_LEVEL_NONE=y
 CONFIG_ESP_TASK_WDT_INIT=n

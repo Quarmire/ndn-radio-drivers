@@ -462,6 +462,11 @@ pub struct Ath9kHtcBackend {
     /// its bandwidth argument. Injected frames then carry the `HAL_RATESERIES_2040` flag (keytype
     /// bit1) so the MCS rate is transmitted at 40 MHz. `false` = HT20 (the default).
     ht40: std::sync::atomic::AtomicBool,
+    /// High-power module (`txGainType==1` in the EEPROM) → `apply_initvals` streams the HIGH_POWER TX
+    /// gain table. MEASURED: HIGH table + the full `set_board_values` (antCtrl+XPA+ob/db) +
+    /// `set_txpower_4k` = a NORMAL ~+12 dBm link (max −18 dBm at 1 ft); NORMAL table left it ~50 dB low.
+    /// Set from the EEPROM in `open_ath9k`; `NDN_ATH9K_HIGHPWR` forces it on regardless.
+    high_power: std::sync::atomic::AtomicBool,
 }
 
 fn usb_err<E: std::fmt::Display>(what: &str, e: E) -> FaceError {
@@ -554,6 +559,7 @@ impl Ath9kHtcBackend {
             channel: std::sync::atomic::AtomicU8::new(0),
             cur_power: std::sync::atomic::AtomicU8::new(0),
             ht40: std::sync::atomic::AtomicBool::new(false),
+            high_power: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -1423,7 +1429,9 @@ impl Ath9kHtcBackend {
         // cal; applied standalone it misconfigures the drive. The real fix for the low output is the
         // OLPC/PDADC `set_board_values` port (per-rate target power) — the flag stays only to document
         // the dead end. Default (NORMAL) is the better of the two here.
-        let tx_gain = if std::env::var_os("NDN_ATH9K_HIGHPWR").is_some() {
+        let high_power = self.high_power.load(std::sync::atomic::Ordering::Relaxed)
+            || std::env::var_os("NDN_ATH9K_HIGHPWR").is_some();
+        let tx_gain = if high_power {
             AR9271MODES_HIGH_POWER_TX_GAIN_9271
         } else {
             AR9271MODES_NORMAL_POWER_TX_GAIN_9271
@@ -1619,6 +1627,25 @@ impl Ath9kHtcBackend {
     /// if the EEPROM checksum is bad (never program the PA from garbage). Call after `apply_initvals`.
     /// Returns the applied cal so a caller can verify + measure the TX-power change. M3 (the per-rate
     /// target-power / OLPC gain table) is still TODO — this is the analog config only.
+    /// Read `txGainType` (0=normal, 1=high power) from the 4k EEPROM (base header byte 31). Drives the
+    /// gain-table choice in [`apply_initvals`]. Retries the read (glitch-tolerant). Best-effort: returns
+    /// 0 if the EEPROM can't be validated (falls back to the normal table).
+    pub fn eeprom_tx_gain_type(&self) -> u8 {
+        for _ in 0..5 {
+            let s: Vec<u16> = (0..32).map(|w| (self.reg_read(0x2000 + (((w as u32) + 64) << 2)).unwrap_or(0) & 0xffff) as u16).collect();
+            // byte 31 = high byte of word 15.
+            if s[0] as usize >= 32 {
+                return (s[15] >> 8) as u8;
+            }
+        }
+        0
+    }
+
+    /// Mark this as a high-power module so [`apply_initvals`] streams the HIGH_POWER gain table.
+    pub fn set_high_power(&self, on: bool) {
+        self.high_power.store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
     pub fn set_board_values(&self) -> Result<BoardValues, FaceError> {
         // M1: read + XOR-validate the 4k EEPROM (word w = reg 0x2000 + ((w+64)<<2)). Retry the whole
         // read — a single glitched reg_read among 376 words fails the strict XOR, and the WMI reg path
@@ -1664,12 +1691,11 @@ impl Ath9kHtcBackend {
         let skip_gain = std::env::var_os("NDN_SB_SKIP_GAIN").is_some();
         let skip_obdb = std::env::var_os("NDN_SB_SKIP_OBDB").is_some();
 
-        // 1. antCtrlCommon → AR_PHY_SWITCH_COM (0x9964). ⚠ **DEFAULT-SKIPPED**: writing the EEPROM value
-        // (0x11111441) MEASURED-killed TX by ~40 dB (bisect: skipping it recovers full power) — it
-        // disconnects the RF T/R switch the initvals already configured working. Likely a parse/format
-        // issue (the raw le32 needs the same treatment ath9k's antCtrl handling gives it) — opt in with
-        // NDN_SB_ANT to debug. The initvals' switch config is what works; don't clobber it blind.
-        if std::env::var_os("NDN_SB_ANT").is_some() {
+        // 1. antCtrlCommon → AR_PHY_SWITCH_COM (0x9964) — routes TX to the external-PA path. ★ Applied
+        // by default: alone it kills TX ~40 dB (routes to the PA while the PA is OFF), but composed with
+        // the XPA enable below it is REQUIRED for full power — MEASURED: HIGH table + antCtrl + XPA =
+        // max −18 dBm at 1 ft (normal), vs −63 without antCtrl. NDN_SB_NO_ANT to isolate.
+        if std::env::var_os("NDN_SB_NO_ANT").is_none() {
             self.reg_write(0x9964, ant_ctrl_common)?;
         }
 

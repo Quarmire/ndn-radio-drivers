@@ -281,6 +281,14 @@ pub fn open_ath9k(channel: u8) -> Result<OpenRadio, FaceError> {
     let mut dev = Ath9kHtcBackend::open()?;
     dev.download_firmware(&fw)?;
     dev.htc_init()?;
+    // ★ TX-POWER FIX: read the EEPROM `txGainType` BEFORE hw_reset so `apply_initvals` streams the right
+    // gain table. A high-power module (txGainType==1) on the NORMAL table radiates ~50 dB low; the HIGH
+    // table + the full board/OLPC cal (applied after wmi_start) = a normal ~+12 dBm link (MEASURED: max
+    // −18 dBm at 1 ft, 4500× the frames). `NDN_ATH9K_HIGHPWR` forces high; `NDN_ATH9K_NORMPWR` forces
+    // normal (skips the fix). The reg path is up after htc_init (hw_reset itself uses it).
+    let high_power = std::env::var_os("NDN_ATH9K_HIGHPWR").is_some()
+        || (std::env::var_os("NDN_ATH9K_NORMPWR").is_none() && dev.eeprom_tx_gain_type() == 1);
+    dev.set_high_power(high_power);
     // Faithful ath9k_hw_reset (reset + initvals + cal) on the requested channel, then the post-reset
     // RX-start steps, matching `ath9k_htc_start`'s order. `NDN_ATH9K_HT40=1` brings the PHY up at
     // 40 MHz (HT40+) — EXPERIMENTAL, cal convergence unverified on this HT20-class part.
@@ -308,18 +316,20 @@ pub fn open_ath9k(channel: u8) -> Result<OpenRadio, FaceError> {
     // per-rate target power from the EEPROM). hw_reset skips the EEPROM cal, leaving the PA on the
     // initval-default gain; this programs the real target. Opt-in (still proving its on-air effect via
     // the two-radio link RSSI); a bad EEPROM read is non-fatal (leaves the default).
-    if std::env::var_os("NDN_ATH9K_SETBOARD").is_some() {
-        // `set_board_values`: the analog cal incl. the external-PA (XPA) enable timing — the candidate
-        // for the low radiated power (a high-power module's PA left off). antCtrl stays default-skipped.
+    // ★ Apply the full board + OLPC power cal — the AR9271 TX-power fix. `set_board_values` (antCtrl RF
+    // switch + XPA external-PA enable + ob/db bias) and `set_txpower_4k` (PDADC target→gain map +
+    // per-rate power) compose with the HIGH gain table to give a normal ~+12 dBm link. Default-ON for a
+    // high-power module (where it's the fix); `NDN_ATH9K_NORMPWR` / `NDN_ATH9K_NO_CAL` skip it.
+    if (high_power || std::env::var_os("NDN_ATH9K_SETBOARD").is_some())
+        && std::env::var_os("NDN_ATH9K_NO_CAL").is_none()
+    {
         match dev.set_board_values() {
-            Ok(bv) => eprintln!("open_ath9k: set_board_values applied (txGainType={} ob={:?})", bv.tx_gain_type, bv.ob),
-            Err(e) => eprintln!("open_ath9k: set_board_values skipped: {e}"),
+            Ok(bv) => eprintln!("open_ath9k: board cal applied (txGainType={} ob={:?})", bv.tx_gain_type, bv.ob),
+            Err(e) => eprintln!("open_ath9k: board cal skipped: {e}"),
         }
-    }
-    if std::env::var_os("NDN_ATH9K_SETPOWER").is_some() {
         match dev.set_txpower_4k(chan_mhz) {
-            Ok(peak) => eprintln!("open_ath9k: set_txpower_4k applied (peak target {} dBm)", peak / 2),
-            Err(e) => eprintln!("open_ath9k: set_txpower_4k skipped: {e}"),
+            Ok(peak) => eprintln!("open_ath9k: power cal applied (peak target {} dBm)", peak / 2),
+            Err(e) => eprintln!("open_ath9k: power cal skipped: {e}"),
         }
     }
 

@@ -15,6 +15,7 @@
 #include "freertos/task.h"
 #include "freertos/queue.h"
 #include "esp_wifi.h"
+#include "esp_private/wifi.h"  // esp_wifi_internal_set_fix_rate — pin the injected-frame PHY rate
 #include "esp_event.h"
 #include "nvs_flash.h"
 #include "driver/usb_serial_jtag.h"
@@ -91,11 +92,19 @@ static void serial_rx_loop(void) {
                 case T_CHANNEL: if (len >= 1) esp_wifi_set_channel(pl[0], WIFI_SECOND_CHAN_NONE); break;
                 case T_TXPOWER: if (len >= 1) esp_wifi_set_max_tx_power((int8_t)pl[0]); break;
                 case T_BW40: if (len >= 1) esp_wifi_set_bandwidth(WIFI_IF_STA, pl[0] ? WIFI_BW_HT40 : WIFI_BW_HT20); break;
+                case T_RATE: if (len >= 1) { // payload byte = wifi_phy_rate_t (1M_L=0x00, 6M=0x0B, 54M=0x0C, MCS0_LGI=0x10..)
+                    // MEASURED INERT for injection: esp_wifi_80211_tx always goes out at the 1 Mbps basic rate
+                    // regardless of these calls (mt76 radiotap confirms 1.0 Mb/s for every rate 1M/6M/MCS0). The
+                    // raw-inject path picks its own rate on this SoC (same as the BW16). Kept for any non-inject
+                    // TX and in case a future IDF honours it; the injected-frame rate is NOT a working knob here.
+                    esp_wifi_config_80211_tx_rate(WIFI_IF_STA, (wifi_phy_rate_t)pl[0]);
+                    esp_wifi_internal_set_fix_rate(WIFI_IF_STA, true, (wifi_phy_rate_t)pl[0]);
+                    break; }
                 case T_INJECT_ATTR: { // [npairs][o,v]*n[frame] — skip the attr pokes (no pkt_attrib on esp), inject the frame
                     if (len >= 1) { int np = pl[0]; int off = 1 + 2 * np; if (len > off) esp_wifi_80211_tx(WIFI_IF_STA, pl + off, len - off, true); }
                     break;
                 }
-                default: break; // T_RATE etc. — best-effort no-op for now (esp rate API differs)
+                default: break;
             }
             i += 5 + len;
         }

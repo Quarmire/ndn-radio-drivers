@@ -73,6 +73,10 @@ const T_BW40: u8 = 0x05; // wext_set_bw40_enable
 const T_INJECT_ATTR: u8 = 0x06; // poke pkt_attrib bytes, then inject
 const T_NAMEFILTER: u8 = 0x07; // load on-device Tier-0 masks: [enabled][n_masks][mask 16B]*
 const T_INJECT_AT: u8 = 0x09; // scheduled TX: [delay_us_le32][802.11 frame] (ESP32-C5 firmware only)
+const T_INJECT_ABS: u8 = 0x0A; // scheduled TX at an ABSOLUTE esp_timer µs: [target_us_le64][frame]
+const T_READCLOCK: u8 = 0x0B; // request the device's schedule clock; reply T_CLOCK [esp_timer_us_le64]
+const T_CLOCK: u8 = 0x85; // reply to T_READCLOCK: [esp_timer_us_le64]
+const T_TXTIME: u8 = 0x83; // scheduled-TX confirmation: [target_le64][actual_le64][tsf_le64]
 const T_RX: u8 = 0x81;
 const T_RX_TS: u8 = 0x82; // [rssi_i8][rx_ts_us_le32][802.11 frame] — RX + hardware µs stamp (ESP32-C5)
 
@@ -98,6 +102,12 @@ pub struct Bw16SerialBackend {
     tx: Arc<Mutex<Box<dyn serialport::SerialPort>>>,
     format: FrameFormat,
     rx: AsyncMutex<mpsc::UnboundedReceiver<CapturedFrame>>,
+    /// Device schedule-clock replies (`T_CLOCK` → esp_timer µs), routed here by the reader for
+    /// [`read_schedule_clock`](Self::read_schedule_clock). Empty on the BW16 (never replies).
+    clock_rx: AsyncMutex<mpsc::UnboundedReceiver<u64>>,
+    /// Scheduled-TX confirmations (`T_TXTIME` → (target, actual) esp_timer µs) — the actual on-air
+    /// instant of an [`inject_at_abs`](Self::inject_at_abs), for verifying slot placement.
+    txtime_rx: AsyncMutex<mpsc::UnboundedReceiver<(u64, u64)>>,
 }
 
 impl Bw16SerialBackend {
@@ -146,12 +156,16 @@ impl Bw16SerialBackend {
             .try_clone()
             .map_err(|e| io_err(format!("bw16 clone: {e}")))?;
         let (txch, rxch) = mpsc::unbounded_channel();
+        let (clkch, clk_rxch) = mpsc::unbounded_channel();
+        let (ttch, tt_rxch) = mpsc::unbounded_channel();
         let format = FrameFormat::default();
-        std::thread::spawn(move || reader_loop(reader, format, txch, dev_clock));
+        std::thread::spawn(move || reader_loop(reader, format, txch, clkch, ttch, dev_clock));
         Ok(Self {
             tx: Arc::new(Mutex::new(port)),
             format,
             rx: AsyncMutex::new(rxch),
+            clock_rx: AsyncMutex::new(clk_rxch),
+            txtime_rx: AsyncMutex::new(tt_rxch),
         })
     }
 
@@ -221,6 +235,36 @@ impl Bw16SerialBackend {
         self.send_framed(T_INJECT_AT, &payload)
     }
 
+    /// **Scheduled TX at an ABSOLUTE device-clock instant** (ESP32-C5, `T_INJECT_ABS`): place the frame
+    /// on air when the device's esp_timer reaches `target_us` — the slot-lease primitive. `target_us` is
+    /// in the device's schedule clock (the same µs domain the C5 reports for scheduling); the firmware
+    /// drops a stale/past or too-far-future target rather than firing late. This backs the HAL's
+    /// [`FrameIo::inject_at_clock`] so a scheduler can place a frame in its slot with no host jitter.
+    pub fn inject_at_abs(&self, frame_in: InjectFrame, target_us: u64) -> Result<(), FaceError> {
+        let dot11 = frame::build_dot11(self.format, &frame_in)?;
+        let mut payload = Vec::with_capacity(8 + dot11.len());
+        payload.extend_from_slice(&target_us.to_le_bytes());
+        payload.extend_from_slice(&dot11);
+        self.send_framed(T_INJECT_ABS, &payload)
+    }
+
+    /// **Read the device's schedule clock** (ESP32-C5 esp_timer µs) — the same domain [`inject_at_abs`]
+    /// targets, so a caller reads it, computes a slot instant, and schedules against it. Sends
+    /// `T_READCLOCK` and awaits the `T_CLOCK` reply. `None` on the BW16 (it has no such clock) or timeout.
+    pub async fn read_schedule_clock(&self) -> Option<u64> {
+        let mut rx = self.clock_rx.lock().await;
+        while rx.try_recv().is_ok() {} // drop any stale reply before requesting a fresh one
+        self.send_framed(T_READCLOCK, &[]).ok()?;
+        tokio::time::timeout(Duration::from_millis(300), rx.recv()).await.ok().flatten()
+    }
+
+    /// Await the next scheduled-TX confirmation `(target, actual)` esp_timer µs — the actual on-air
+    /// instant of an [`inject_at_abs`](Self::inject_at_abs), for verifying slot placement. `None` on timeout.
+    pub async fn recv_tx_confirm(&self) -> Option<(u64, u64)> {
+        let mut rx = self.txtime_rx.lock().await;
+        tokio::time::timeout(Duration::from_millis(500), rx.recv()).await.ok().flatten()
+    }
+
     /// Inject a complete 802.11 frame after poking `(offset, value)` bytes into the
     /// driver's `pkt_attrib` (Rust firmware, `T_INJECT_ATTR`). The RE harness for
     /// the TX-descriptor rate field: sweep the offset, set MGN_MCSx, watch the MCS.
@@ -242,6 +286,8 @@ fn reader_loop(
     mut port: Box<dyn serialport::SerialPort>,
     format: FrameFormat,
     tx: mpsc::UnboundedSender<CapturedFrame>,
+    clk: mpsc::UnboundedSender<u64>,
+    txtime: mpsc::UnboundedSender<(u64, u64)>,
     dev_clock: Option<ClockDomainId>,
 ) {
     let mut acc: Vec<u8> = Vec::new();
@@ -251,6 +297,20 @@ fn reader_loop(
             Ok(n) if n > 0 => {
                 acc.extend_from_slice(&tmp[..n]);
                 while let Some((ty, payload, consumed)) = deframe(&acc) {
+                    // T_CLOCK [esp_timer_us_le64] — the device's schedule clock reply; route to read_schedule_clock.
+                    if ty == T_CLOCK && payload.len() >= 8 {
+                        let t = u64::from_le_bytes(payload[0..8].try_into().unwrap());
+                        let _ = clk.send(t);
+                        acc.drain(..consumed);
+                        continue;
+                    }
+                    if ty == T_TXTIME && payload.len() >= 16 {
+                        let target = u64::from_le_bytes(payload[0..8].try_into().unwrap());
+                        let actual = u64::from_le_bytes(payload[8..16].try_into().unwrap());
+                        let _ = txtime.send((target, actual));
+                        acc.drain(..consumed);
+                        continue;
+                    }
                     // T_RX [rssi][frame] (BW16, no hardware timestamp → HostRecv stamp) and
                     // T_RX_TS [rssi][rx_ts_us_le32][frame] (ESP32-C5 → its free-run hardware RX stamp).
                     let parsed = if ty == T_RX && !payload.is_empty() {
@@ -405,6 +465,16 @@ impl Esp32SerialBackend {
     pub fn inject_at(&self, frame_in: InjectFrame, delay_us: u32) -> Result<(), FaceError> {
         self.inner.inject_at(frame_in, delay_us)
     }
+
+    /// Read the C5's schedule clock — see [`Bw16SerialBackend::read_schedule_clock`].
+    pub async fn read_schedule_clock(&self) -> Option<u64> {
+        self.inner.read_schedule_clock().await
+    }
+
+    /// Next scheduled-TX confirmation — see [`Bw16SerialBackend::recv_tx_confirm`].
+    pub async fn recv_tx_confirm(&self) -> Option<(u64, u64)> {
+        self.inner.recv_tx_confirm().await
+    }
 }
 
 #[async_trait]
@@ -414,6 +484,12 @@ impl FrameIo for Esp32SerialBackend {
     }
     async fn recv_frame(&self) -> Result<CapturedFrame, FaceError> {
         self.inner.recv_frame().await
+    }
+    /// Hardware scheduled placement: the C5 fires T_INJECT_ABS when its esp_timer reaches `target_tick`,
+    /// so a scheduler places the frame in its slot without host sleep+inject jitter. `target_tick` is a
+    /// value in the C5's schedule clock (esp_timer µs). See [`Bw16SerialBackend::inject_at_abs`].
+    async fn inject_at_clock(&self, frame: InjectFrame, target_tick: u64, _domain: ClockDomainId) -> Result<(), FaceError> {
+        self.inner.inject_at_abs(frame, target_tick)
     }
 }
 

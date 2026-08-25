@@ -405,9 +405,8 @@ pub struct PhyMetrics {
     pub snr_db: Option<i8>,
     /// Error-vector magnitude of the strongest path, dB (negative; closer to 0 is worse).
     pub evm_db: Option<i8>,
-    /// Carrier frequency offset of the transmitter relative to us, Hz. The per-frame frequency
-    /// sensor: pair it with a crystal trim to discipline clock RATE rather than repeatedly
-    /// re-correcting phase.
+    /// Carrier frequency offset **residual**, Hz — see the warning on the parse site: this is
+    /// `cfo_tail`, what is left AFTER the receiver's carrier tracking, not the static offset.
     pub cfo_hz: Option<i32>,
 }
 
@@ -455,6 +454,27 @@ pub trait FrameIo: Send + Sync + 'static {
             self.inject(f).await?;
         }
         Ok(())
+    }
+
+    /// **Place a frame on air at an absolute instant** on the clock `domain` — the hardware side of a
+    /// named airtime lease. `target_tick` is a value in `domain` (a clock the radio exposes via
+    /// [`RadioTime`]); the backend transmits when its own clock reaches it, so the frame lands in its
+    /// slot without the host's sleep+inject jitter. This is the write-once seam the scheduler
+    /// ([`FaceScheduler`]) actuates for any radio that offers hardware scheduling — the ESP32-C5 over
+    /// its `T_INJECT_ABS`, an ath9k over quiet-time, a PIO/optical face over its timer.
+    ///
+    /// **Default = inject now**, ignoring the schedule: a radio with no scheduled-TX engine relies on
+    /// the scheduler's software gate (sleep-until-slot) instead, so the default is correct for it — it
+    /// is only ever called after that gate has already waited. A backend advertises the hardware path
+    /// via [`RadioKnobs::tx_discipline`] returning [`TxDiscipline::ScheduledAt`]; the scheduler checks
+    /// that and skips its own sleep when the radio can place the frame itself.
+    async fn inject_at_clock(
+        &self,
+        frame: InjectFrame,
+        _target_tick: u64,
+        _domain: ClockDomainId,
+    ) -> Result<(), FaceError> {
+        self.inject(frame).await
     }
 
     /// Await the next frame captured on the medium. A node never hears its own

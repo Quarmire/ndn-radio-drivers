@@ -3677,9 +3677,25 @@ impl Rtl8733buBackend {
                 // 802.11n protocol badge, so the layout is `struct phy_sts_rpt_jgr3_type1`:
                 //   DW4 @16 `s8 rxevm[4]`   s(8,1)  -> dB = raw/2, and raw -128 means NOT MEASURED
                 //   DW5 @20 `s8 cfo_tail[4]` s(8,7) -> Hz = raw * 312500/128 (phydm_cfo's 312.5/2^7)
+                //           ⚠ RESIDUAL, NOT the static frequency offset — see below.
                 //   DW6 @24 `s8 rxsnr[4]`   s(8,1)  -> dB = raw>>1 (vendor: rx_snr[i] = val_s8 >> 1)
                 // The struct is 28 bytes, so this needs `drvinfo >= 28` — NOT the `>= 8` that
                 // guards RSSI (pwdb_a lives at byte 1). A shorter report carries no such fields.
+                //
+                // ⚠ `cfo_hz` IS NOT A FREQUENCY-DISCIPLINE SENSOR. It was added on the claim that it
+                // pairs with `set_crystal_cap` to null clock rate error; MEASURED 2026-08-25 on
+                // ch36, that is FALSE. Sweeping our own crystal +-40 cap steps (~+-26 ppm, ~+-135 kHz
+                // at 5 GHz) against a fixed co-located transmitter moved it NOT AT ALL — -2441 Hz
+                // (raw -1) at cap 70, 30 and 110 alike. The field is `cfo_tail`: the residual left
+                // AFTER the receiver's per-packet carrier tracking has converged, so a static offset
+                // is absorbed before it is reported. Corroborating: distant ambient traffic reads
+                // raw -5..-7 while one strong co-located transmitter reads -1, i.e. it tracks link
+                // quality, not frequency error. A real static-offset sensor would need the INITIAL
+                // estimate (`cfo_short`), which this report type does not carry, or TSF drift
+                // between two nodes.
+                //
+                // `snr_db` and `evm_db` DO behave as advertised: 20.8 dB / -29.9 dB on a strong
+                // co-located link vs 7..13 dB / -7..-11 dB on weak ambient traffic.
                 let phy = (drvinfo >= 28 && rx_rate >= 0x04 && off + 24 + 28 <= data.len()).then(|| {
                     let b = |i: usize| data[off + 24 + i] as i8;
                     let evm = b(16);

@@ -46,13 +46,17 @@ fn main() -> ExitCode {
     println!("  gap t={:.1}s", t0.elapsed().as_secs_f64());
     std::thread::sleep(Duration::from_secs(1));
 
-    // Apply the EEPROM analog cal.
-    match dev.set_board_values() {
-        Ok(bv) => println!(
-            "set_board_values ✓ checksum_ok={} txGainType={} antCtrlCommon={:#010x} ob={:?} db1={} db2={} txRxAtten={} rxTxMargin={}",
-            bv.checksum_ok, bv.tx_gain_type, bv.ant_ctrl_common, bv.ob, bv.db1_0, bv.db2_0, bv.tx_rx_atten, bv.rx_tx_margin
-        ),
-        Err(e) => { println!("set_board_values FAILED: {e}"); }
+    // Apply the EEPROM analog cal (M2) unless skipped.
+    if std::env::var_os("NDN_SKIP_BOARD").is_none() {
+        match dev.set_board_values() {
+            Ok(bv) => println!("set_board_values ✓ txGainType={} ob={:?} db1={} db2={}", bv.tx_gain_type, bv.ob, bv.db1_0, bv.db2_0),
+            Err(e) => println!("set_board_values FAILED: {e}"),
+        }
+    }
+    // ★ M3: the OLPC power cal (PDADC target→gain map + per-rate target power) — the actual lever.
+    match dev.set_txpower_4k(chan_mhz) {
+        Ok(peak) => println!("set_txpower_4k ✓ peak target = {} (0.5dB) = {} dBm", peak, peak / 2),
+        Err(e) => println!("set_txpower_4k FAILED: {e}"),
     }
 
     // PHASE 2: after board-values (PA biased from the OTP cal).

@@ -1705,6 +1705,198 @@ impl Ath9kHtcBackend {
         })
     }
 
+    /// ★★★ **OLPC power cal — M3 (the actual power lever).** Faithful port of
+    /// `ath9k_hw_set_4k_power_cal_table` + `set_4k_power_per_rate_table` for 2.4 GHz HT20. Without this
+    /// the PA runs ~40 dB low (the target→gain PDADC map is never programmed). Reads the 4k cal (M1) at
+    /// the M3a-anchored offsets, computes the PDADC table from the power-detector cal (calPierData2G) via
+    /// `get_gain_boundaries_pdadcs`/`fill_vpd_table`, programs `AR_PHY_TPCRG1/5` + the 128-byte PDADC
+    /// table, and writes the per-rate target power to `AR_PHY_POWER_TX_RATE1..9`. **Scoped to ch1/HT20**
+    /// (the AR9271's use): ch1 == cal pier 0, so no cross-pier interpolation; HT40/CTL-regulatory caps
+    /// are omitted (the EEPROM targets are already the regulatory targets). Call after apply_initvals.
+    pub fn set_txpower_4k(&self, chan_mhz: u16) -> Result<i16, FaceError> {
+        use crate::ath9k_reg::AR_PHY_BASE;
+        // M1 read + validate (retry).
+        let rd = |w: usize| (self.reg_read(0x2000 + (((w as u32) + 64) << 2)).unwrap_or(0xffff_ffff) & 0xffff) as u16;
+        let mut s: Vec<u16> = Vec::new();
+        for _ in 0..5 {
+            s = (0..400).map(rd).collect();
+            let len = (s[0] as usize).min(400);
+            if len >= 32 && (0..len).fold(0u16, |a, i| a ^ s[i]) == 0xffff {
+                break;
+            }
+            s.clear();
+        }
+        if s.is_empty() {
+            return Err(err("set_txpower_4k: EEPROM checksum invalid".into()));
+        }
+        let byte = |off: usize| -> u8 {
+            let w = s[off / 2];
+            if off & 1 == 0 { (w & 0xff) as u8 } else { (w >> 8) as u8 }
+        };
+
+        const NUM_PD: usize = 2; // AR5416_EEP4K_NUM_PD_GAINS
+        const ICEPTS: usize = 5; // AR5416_PD_GAIN_ICEPTS
+        const NUM_PDADC: usize = 128;
+        const MAX_RATE_POWER: i16 = 63;
+        let modal = 52usize;
+        let xpd_gain = byte(modal + 20);
+        let pd_gain_overlap = byte(modal + 24) as i16;
+
+        // ── numXpdGains from the xpdGain mask (AR5416_PD_GAINS_IN_MASK = 4) ──
+        let mut xpd_gain_values = [0u16; NUM_PD];
+        let mut num_xpd = 0usize;
+        for i in 1..=4u16 {
+            if (xpd_gain as u16 >> (4 - i)) & 1 == 1 {
+                if num_xpd >= NUM_PD {
+                    break;
+                }
+                xpd_gain_values[num_xpd] = 4 - i;
+                num_xpd += 1;
+            }
+        }
+        if num_xpd == 0 {
+            return Err(err(format!("set_txpower_4k: xpdGain mask {xpd_gain:#04x} has no gains")));
+        }
+
+        // ch1 (2412) == cal pier 0 (calFreqPier2G @120 = 0x70/0x8e/0xac). Use pier 0 directly (match).
+        // calPierData2G[0]: pwrPdg[2][5] @123, vpdPdg[2][5] @133.
+        let pwr = |g: usize, k: usize| byte(123 + g * ICEPTS + k);
+        let vpd = |g: usize, k: usize| byte(123 + NUM_PD * ICEPTS + g * ICEPTS + k);
+
+        // fill_vpd_table + get_gain_boundaries_pdadcs (match=true branch).
+        let mut vpd_i = [[0u8; 64]; NUM_PD]; // AR5416_MAX_PWR_RANGE_IN_HALF_DB = 64
+        let mut min_pwr = [0u8; NUM_PD];
+        let mut max_pwr = [0u8; NUM_PD];
+        for g in 0..num_xpd {
+            min_pwr[g] = pwr(g, 0);
+            max_pwr[g] = pwr(g, ICEPTS - 1);
+            let pwr_list: Vec<u8> = (0..ICEPTS).map(|k| pwr(g, k)).collect();
+            let vpd_list: Vec<u8> = (0..ICEPTS).map(|k| vpd(g, k)).collect();
+            fill_vpd_table(min_pwr[g], max_pwr[g], &pwr_list, &vpd_list, &mut vpd_i[g]);
+        }
+
+        // Build the 128-entry PDADC table + gain boundaries (the target→gain map).
+        let mut pdadc = [0u8; NUM_PDADC];
+        let mut boundaries = [0u16; 4]; // AR5416_PD_GAINS_IN_MASK
+        let mut k = 0usize;
+        for g in 0..num_xpd {
+            boundaries[g] = if g == num_xpd - 1 {
+                (max_pwr[g] as u16) / 2
+            } else {
+                (max_pwr[g] as u16 + min_pwr[g + 1] as u16) / 4
+            };
+            boundaries[g] = boundaries[g].min(MAX_RATE_POWER as u16);
+            // AR9271 is post-9280: ss = -(minPwr/2) for the first gain.
+            let mut ss: i16 = if g == 0 {
+                -((min_pwr[g] as i16) / 2)
+            } else {
+                (boundaries[g - 1] as i16) - (min_pwr[g] as i16 / 2) - pd_gain_overlap + 1
+            };
+            let vpd_step = ((vpd_i[g][1] as i16) - (vpd_i[g][0] as i16)).max(1);
+            while ss < 0 && k < NUM_PDADC - 1 {
+                let t = vpd_i[g][0] as i16 + ss * vpd_step;
+                pdadc[k] = t.max(0).min(255) as u8;
+                k += 1;
+                ss += 1;
+            }
+            let size_curr = ((max_pwr[g] - min_pwr[g]) / 2 + 1) as i16;
+            let tgt_index = boundaries[g] as i16 + pd_gain_overlap - (min_pwr[g] as i16 / 2);
+            let max_index = tgt_index.min(size_curr);
+            while ss < max_index && k < NUM_PDADC - 1 {
+                pdadc[k] = vpd_i[g][ss as usize];
+                k += 1;
+                ss += 1;
+            }
+            let vpd_step2 = ((vpd_i[g][size_curr as usize - 1] as i16) - (vpd_i[g][size_curr as usize - 2] as i16)).max(1);
+            if tgt_index >= max_index {
+                while ss <= tgt_index && k < NUM_PDADC - 1 {
+                    let t = vpd_i[g][size_curr as usize - 1] as i16 + (ss - max_index + 1) * vpd_step2;
+                    pdadc[k] = t.min(255) as u8;
+                    k += 1;
+                    ss += 1;
+                }
+            }
+        }
+        // Fill the rest: boundaries default 58 (4k), pdadc repeats last.
+        for b in num_xpd..4 {
+            boundaries[b] = 58;
+        }
+        while k < NUM_PDADC {
+            pdadc[k] = pdadc[k - 1];
+            k += 1;
+        }
+
+        // ── Program AR_PHY_TPCRG1 (num PD gains + gain values) ──
+        const AR_PHY_TPCRG1: u32 = 0xA258;
+        self.reg_rmw(AR_PHY_TPCRG1, ((num_xpd as u32 - 1) & 0x3) << 14, 0x0000_c000)?;
+        self.reg_rmw(AR_PHY_TPCRG1, (xpd_gain_values[0] as u32) << 16, 0x0003_0000)?;
+        self.reg_rmw(AR_PHY_TPCRG1, (xpd_gain_values[1] as u32) << 18, 0x000C_0000)?;
+        self.reg_rmw(AR_PHY_TPCRG1, 0, 0x0030_0000)?; // PD_GAIN_3 = 0
+
+        // ── AR_PHY_TPCRG5: PD gain overlap + boundaries ──
+        const AR_PHY_TPCRG5: u32 = 0xA26C;
+        let tpcrg5 = ((pd_gain_overlap as u32) & 0xF)
+            | ((boundaries[0] as u32 & 0x3F) << 4)
+            | ((boundaries[1] as u32 & 0x3F) << 10)
+            | ((boundaries[2] as u32 & 0x3F) << 16)
+            | ((boundaries[3] as u32 & 0x3F) << 22);
+        self.reg_write(AR_PHY_TPCRG5, tpcrg5)?;
+
+        // ── The 128-byte PDADC table at AR_PHY_BASE + (672<<2) = 0xA280 (32 words) ──
+        let pdadc_base = AR_PHY_BASE + (672 << 2);
+        for j in 0..32 {
+            let w = (pdadc[4 * j] as u32)
+                | ((pdadc[4 * j + 1] as u32) << 8)
+                | ((pdadc[4 * j + 2] as u32) << 16)
+                | ((pdadc[4 * j + 3] as u32) << 24);
+            self.reg_write(pdadc_base + (j as u32) * 4, w)?;
+        }
+
+        // ── Per-rate target power (ch1 = pier 0 direct). calTargetPower* @183/198/213 (bChannel + tPow2x). ──
+        // Legacy target tPow2x[4]; HT20 tPow2x[8]. Skip byte 0 (bChannel), read the tPow2x arrays.
+        let cck = |i: usize| byte(183 + 1 + i) as i16; // calTargetPowerCck[0].tPow2x[i]
+        let ofdm = |i: usize| byte(198 + 1 + i) as i16; // calTargetPower2G[0].tPow2x[i]
+        let ht20 = |i: usize| byte(213 + 1 + i) as i16; // calTargetPower2GHT20[0].tPow2x[i]
+
+        // ar5416 rate→target-group mapping (legacy). ratesArray indexed by the Ar5416_Rates enum.
+        let mut rates = [0i16; 24];
+        // OFDM: 6/9=[0] 12/18/24=[1] 36=[2] 48/54=[3]
+        rates[0] = ofdm(0); rates[1] = ofdm(0); // 6,9
+        rates[2] = ofdm(1); rates[3] = ofdm(1); // 12,18
+        rates[4] = ofdm(1); rates[5] = ofdm(2); // 24,36
+        rates[6] = ofdm(3); rates[7] = ofdm(3); // 48,54
+        // CCK: 1l=[0] 2l/2s=[1] 5.5=[2] 11=[3]  (indices rate1l=8..rate11s=14)
+        rates[8] = cck(0); rates[9] = cck(1); rates[10] = cck(1); // 1l,2l,2s
+        rates[11] = cck(2); rates[12] = cck(2); rates[13] = cck(3); rates[14] = cck(3); // 5.5l/s,11l/s
+        // HT20 MCS0-7 (indices rateHt20_0=16..23)
+        for m in 0..8 {
+            rates[16 + m] = ht20(m);
+        }
+        // Cap + apply the PWR_TABLE_OFFSET (-5 dB → +10 in 0.5 dB units).
+        let max_target = rates.iter().copied().max().unwrap_or(0);
+        for r in rates.iter_mut() {
+            if *r > MAX_RATE_POWER {
+                *r = MAX_RATE_POWER;
+            }
+            *r -= -5 * 2; // AR5416_PWR_TABLE_OFFSET_DB * 2
+        }
+        let pow_sm = |r: i16, sh: u32| ((r as u32) & 0x3f) << sh;
+        // OFDM
+        self.reg_write(0x9934, pow_sm(rates[3], 24) | pow_sm(rates[2], 16) | pow_sm(rates[1], 8) | pow_sm(rates[0], 0))?; // RATE1
+        self.reg_write(0x9938, pow_sm(rates[7], 24) | pow_sm(rates[6], 16) | pow_sm(rates[5], 8) | pow_sm(rates[4], 0))?; // RATE2
+        // CCK (RATE3: 2s,2l,xr,1l ; RATE4: 11s,11l,5.5s,5.5l)
+        self.reg_write(0xA234, pow_sm(rates[10], 24) | pow_sm(rates[9], 16) | pow_sm(0, 8) | pow_sm(rates[8], 0))?; // RATE3
+        self.reg_write(0xA238, pow_sm(rates[14], 24) | pow_sm(rates[13], 16) | pow_sm(rates[12], 8) | pow_sm(rates[11], 0))?; // RATE4
+        // HT20
+        self.reg_write(0xA38C, pow_sm(rates[19], 24) | pow_sm(rates[18], 16) | pow_sm(rates[17], 8) | pow_sm(rates[16], 0))?; // RATE5
+        self.reg_write(0xA390, pow_sm(rates[23], 24) | pow_sm(rates[22], 16) | pow_sm(rates[21], 8) | pow_sm(rates[20], 0))?; // RATE6
+        // TPC off → the per-rate table is the cap; PA drives to it via the PDADC map.
+        self.reg_write(0x993c, MAX_RATE_POWER as u32)?; // AR_PHY_POWER_TX_RATE_MAX (no TPC_ENABLE)
+
+        let _ = chan_mhz;
+        Ok(max_target) // the peak target power (0.5 dB units) — /2 = dBm
+    }
+
     // ── granular reset-tail helpers (shared by set_channel_and_cal + hw_reset) ──
 
     /// `ath9k_hw_set_rfmode` (hw.c:1967 → ar5008_hw_set_rfmode). For a 2.4 GHz
@@ -3036,6 +3228,48 @@ const TX_GAIN_LUT_TOP: [u32; 9] = [
 /// ⚠ This is ONE chip; true per-chip absolute dBm needs the OLPC/PDADC EEPROM cal. OFDM-only (CCK flat).
 const MEASURED_DBM_BY_LEVEL: [f32; 11] =
     [5.6, 6.0, 6.0, 6.4, 6.4, 7.5, 8.8, 11.4, 12.2, 12.9, 20.0];
+
+/// `ath9k_hw_fill_vpd_table` (+ inlined `get_lower_upper_index`): interpolate the power-detector VPD
+/// curve onto a dense 0.5-dB power grid — a step of the OLPC M3 PDADC computation ([`set_txpower_4k`]).
+fn fill_vpd_table(pwr_min: u8, pwr_max: u8, pwr_list: &[u8], vpd_list: &[u8], ret: &mut [u8; 64]) {
+    let n = pwr_list.len();
+    let get_lu = |target: u8| -> (usize, usize) {
+        if target <= pwr_list[0] {
+            return (0, 0);
+        }
+        if target >= pwr_list[n - 1] {
+            return (n - 1, n - 1);
+        }
+        for i in 0..n - 1 {
+            if pwr_list[i] == target {
+                return (i, i);
+            }
+            if target < pwr_list[i + 1] {
+                return (i, i + 1);
+            }
+        }
+        (0, 0)
+    };
+    let count = ((pwr_max.saturating_sub(pwr_min)) / 2) as usize;
+    let mut curr = pwr_min;
+    for i in 0..=count.min(63) {
+        let (mut il, mut ir) = get_lu(curr);
+        if ir < 1 {
+            ir = 1;
+        }
+        if il == n - 1 {
+            il = n - 2;
+        }
+        ret[i] = if pwr_list[il] == pwr_list[ir] {
+            vpd_list[il]
+        } else {
+            (((curr as i32 - pwr_list[il] as i32) * vpd_list[ir] as i32
+                + (pwr_list[ir] as i32 - curr as i32) * vpd_list[il] as i32)
+                / (pwr_list[ir] as i32 - pwr_list[il] as i32)) as u8
+        };
+        curr = curr.wrapping_add(2);
+    }
+}
 
 impl Ath9kHtcBackend {
     /// Write the top TX-gain LUT registers to ladder `level` (0 = min power, `LADDER.len()-1` = max /

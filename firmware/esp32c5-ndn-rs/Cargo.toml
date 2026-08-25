@@ -1,0 +1,28 @@
+# ESP32-C5 named-radio serial bridge — the Rust transcription of ../esp32c5-ndn.
+# Pure esp-idf-sys (NOT esp-idf-svc/hal): those crates lag ESP-IDF 5.5, which the C5 v1.0 silicon requires
+# (esp-idf-hal 0.46 fails to compile sdmmc_host_t against 5.5). esp-idf-sys itself builds clean against 5.5,
+# so we bind the raw WiFi/USB-JTAG calls directly. WIFI_INIT_CONFIG_DEFAULT is reproduced as a Rust struct
+# literal (the C5's wifi_init_config_t has no bitfields) — 100% Rust, no C shim, no esp-idf component.
+# Standalone — NOT part of the parent ndn-radio-drivers cargo workspace (different target/toolchain).
+[workspace]
+
+[package]
+name = "esp32c5-ndn-rs"
+version = "0.1.0"
+edition = "2021"
+resolver = "2"
+
+[[bin]]
+name = "esp32c5-ndn-rs"
+harness = false
+
+[profile.release]
+opt-level = "s"
+[profile.dev]
+opt-level = "z"
+
+[dependencies]
+esp-idf-sys = { version = "0.37", features = ["binstart"] }
+
+[build-dependencies]
+embuild = "0.33"

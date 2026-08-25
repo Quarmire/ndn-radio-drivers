@@ -1,0 +1,4 @@
+[toolchain]
+# The esp toolchain ships a precompiled std for the *-esp-espidf targets (no -Zbuild-std juggling).
+# RISC-V C5 target = riscv32imac-esp-espidf.
+channel = "esp"

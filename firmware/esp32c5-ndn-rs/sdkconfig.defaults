@@ -1,0 +1,8 @@
+# Match the C build: console on USB-Serial-JTAG (keeps esptool auto-reset) but logs OFF so the binary
+# BW16 protocol stream stays clean. WiFi enabled; task WDT off (the serial loop never yields to it).
+CONFIG_ESP_WIFI_ENABLED=y
+CONFIG_ESP_WIFI_NVS_ENABLED=n
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+CONFIG_LOG_DEFAULT_LEVEL_NONE=y
+CONFIG_ESP_TASK_WDT_INIT=n
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192

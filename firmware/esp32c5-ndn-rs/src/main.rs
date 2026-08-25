@@ -56,8 +56,10 @@ const T_INJECT_ATTR: u8 = 0x06;
 const T_NAMEFILTER: u8 = 0x07; // [enabled][n_masks][mask 16B]* — on-device Tier-0 prefix-set drop
 const T_INJECT_AT: u8 = 0x09; // [delay_us_le32][802.11 frame] — scheduled TX, delay from now
 const T_INJECT_ABS: u8 = 0x0A; // [target_us_le64][802.11 frame] — scheduled TX at an ABSOLUTE esp_timer µs (slot lease)
+const T_READCLOCK: u8 = 0x0B; // no payload — reply T_CLOCK with the current esp_timer (schedule clock)
 const T_RX_TS: u8 = 0x82; // [rssi_i8][rx_ts_us_le32][802.11 frame] — RX + hardware per-frame µs stamp
 const T_TXTIME: u8 = 0x83; // [target_le64][actual_le64][tsf_le64] — scheduling error report
+const T_CLOCK: u8 = 0x85; // [esp_timer_us_le64] — reply to T_READCLOCK
 const MAXFRAME: usize = 512;
 const MAX_MASKS: usize = 8;
 const SCHED_MAX_DELAY_US: i64 = 100_000; // cap the busy-wait to ~1 slot period (a hw timer would avoid the spin)
@@ -235,6 +237,11 @@ fn serial_rx_loop() -> ! {
                             rep[16..24].copy_from_slice(&sys::esp_wifi_get_tsf_time(sys::wifi_interface_t_WIFI_IF_STA).to_le_bytes());
                             send_framed(T_TXTIME, &rep);
                         }
+                    }
+                    T_READCLOCK => {
+                        // Reply with the current esp_timer (the clock T_INJECT_ABS schedules against), so
+                        // the host can place absolute slot targets and align two devices' clocks.
+                        send_framed(T_CLOCK, &sys::esp_timer_get_time().to_le_bytes());
                     }
                     T_NAMEFILTER if len >= 2 => {
                         // [enabled][n_masks][mask 16B]* — load host-computed Tier-0 masks.

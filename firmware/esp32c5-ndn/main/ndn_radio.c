@@ -41,6 +41,8 @@
 #define T_NAMEFILTER 0x07 // [enabled][n_masks][mask 16B]* — on-device Tier-0 prefix-set drop (§8.2)
 #define T_INJECT_AT  0x09 // [delay_us_le32][802.11 frame] — scheduled TX, delay from now
 #define T_INJECT_ABS 0x0A // [target_us_le64][802.11 frame] — scheduled TX at an ABSOLUTE esp_timer µs (slot lease)
+#define T_READCLOCK  0x0B // no payload — reply T_CLOCK with the current esp_timer (schedule clock)
+#define T_CLOCK      0x85 // [esp_timer_us_le64] — reply to T_READCLOCK
 #define T_RX         0x81 // [rssi_i8][802.11 frame] — used by the BW16; the C5 sends T_RX_TS instead
 #define T_RX_TS      0x82 // [rssi_i8][rx_ts_us_le32][802.11 frame] — RX + hardware per-frame µs stamp
 #define T_TXTIME     0x83 // [target_le64][actual_le64][tsf_le64] — scheduling error report for T_INJECT_AT
@@ -184,6 +186,11 @@ static void serial_rx_loop(void) {
                         }
                         send_framed(T_TXTIME, rep, 24);
                     }
+                    break; }
+                case T_READCLOCK: { // reply with the current esp_timer (the T_INJECT_ABS schedule clock)
+                    int64_t t = esp_timer_get_time();
+                    uint8_t c[8]; for (int k = 0; k < 8; k++) c[k] = (uint8_t)(t >> (8 * k));
+                    send_framed(T_CLOCK, c, 8);
                     break; }
                 case T_NAMEFILTER: if (len >= 2) { // [enabled][n_masks][mask 16B]* — load host-computed Tier-0 masks
                     uint8_t nm = pl[1]; if (nm > MAX_MASKS) nm = MAX_MASKS;

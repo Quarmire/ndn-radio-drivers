@@ -53,8 +53,28 @@ const T_TXPOWER: u8 = 0x03;
 const T_RATE: u8 = 0x04;
 const T_BW40: u8 = 0x05;
 const T_INJECT_ATTR: u8 = 0x06;
+const T_NAMEFILTER: u8 = 0x07; // [enabled][n_masks][mask 16B]* — on-device Tier-0 prefix-set drop
 const T_RX: u8 = 0x81;
 const MAXFRAME: usize = 512;
+const MAX_MASKS: usize = 8;
+
+// Reuse the LR2021 firmware's Tier-0 filter VERBATIM (no_std, dependency-free, golden-vector-pinned —
+// the very file the host tier0.rs was ported from). Both C5 firmwares share EXISTING pinned copies: the
+// C build compiles the AR9271's ndr_tier0.c, this one includes the LR2021's tier0.rs — no new copy to
+// drift. Only PrefixFilter::may_match is used on the RX side (the host computes masks), so the hashing
+// functions are unused here (hence allow(dead_code)).
+#[allow(dead_code)]
+#[path = "../../lr2021-nrf54l15-rs/src/tier0.rs"]
+mod tier0;
+
+// Tier-0 name-filter state. Host-computed masks; a frame whose in-address prefix-set matches none is
+// dropped in rx_cb before it crosses the USB-Serial-JTAG (the pre-USB drop, real because this fw is ours).
+struct NameFilter {
+    enabled: bool,
+    n: usize,
+    masks: [[u8; 16]; MAX_MASKS],
+}
+static NF: Mutex<NameFilter> = Mutex::new(NameFilter { enabled: false, n: 0, masks: [[0u8; 16]; MAX_MASKS] });
 
 // RX ring shared between the promiscuous callback (WiFi-task context) and the serial-TX loop (main).
 static RXQ: Mutex<VecDeque<(i8, Vec<u8>)>> = Mutex::new(VecDeque::new());
@@ -77,6 +97,17 @@ unsafe extern "C" fn rx_cb(buf: *mut core::ffi::c_void, ty: sys::wifi_promiscuou
     }
     if (((b[30] as u16) << 8) | b[31] as u16) != NDN_ETHERTYPE {
         return;
+    }
+    // Tier-0: drop off-prefix frames HERE, before they cross the serial link.
+    if let Ok(nf) = NF.lock() {
+        if nf.enabled && nf.n > 0 {
+            let mut fb = [0u8; 16];
+            fb.copy_from_slice(&b[4..20]); // addr1‖addr2‖addr3[0..4]
+            let frame = tier0::PrefixFilter(fb);
+            if !(0..nf.n).any(|i| frame.may_match(&tier0::PrefixFilter(nf.masks[i]))) {
+                return;
+            }
+        }
     }
     let rssi = (*p).rx_ctrl.rssi() as i8;
     if let Ok(mut q) = RXQ.lock() {
@@ -163,6 +194,19 @@ fn serial_rx_loop() -> ! {
                                 (len - off) as i32,
                                 true,
                             );
+                        }
+                    }
+                    T_NAMEFILTER if len >= 2 => {
+                        // [enabled][n_masks][mask 16B]* — load host-computed Tier-0 masks.
+                        if let Ok(mut nf) = NF.lock() {
+                            let nm = (pl[1] as usize).min(MAX_MASKS);
+                            if len >= 2 + nm * 16 {
+                                for m in 0..nm {
+                                    nf.masks[m].copy_from_slice(&pl[2 + m * 16..2 + m * 16 + 16]);
+                                }
+                                nf.n = nm;
+                                nf.enabled = pl[0] != 0;
+                            }
                         }
                     }
                     _ => {}

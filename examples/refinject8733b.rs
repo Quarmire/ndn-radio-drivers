@@ -25,6 +25,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let idx: u8 = a.next().and_then(|s| s.parse().ok()).unwrap_or(0);
     let count: usize = a.next().and_then(|s| s.parse().ok()).unwrap_or(1200);
     let size: usize = a.next().and_then(|s| s.parse().ok()).unwrap_or(300);
+    // radiotap RATE in 500 kbps units: 12 = 6 Mbps OFDM (matches the 8733b), 2 = 1 Mbps CCK.
+    let rate: u8 = a.next().and_then(|s| s.parse().ok()).unwrap_or(12);
 
     let fmt = FrameFormat::RawNdn { ethertype: ndn_radio_drivers::NDN_ETHERTYPE };
     let backend = AfPacketBackend::new(&iface, fmt)?;
@@ -42,7 +44,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Explicit legacy RATE header: `frame::build` would emit the HT TX header and the reference
     // would secretly transmit at a different rate than the DUT, which is the one thing this
     // measurement cannot tolerate.
-    let hdr = radiotap::build_tx_legacy(12); // 12 x 500 kbps = 6 Mbps OFDM
+    let hdr = radiotap::build_tx_legacy(rate);
     let dot11 = frame::build_dot11(fmt, &f)?;
     let mut buf = Vec::with_capacity(hdr.len() + dot11.len());
     buf.extend_from_slice(&hdr);
@@ -53,7 +55,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             sent += 1;
         }
     }
-    println!("  ref knob={knob} idx={idx}: sent={sent}/{count}");
+    println!("  ref knob={knob} idx={idx} rate={rate}(x500kbps): sent={sent}/{count}");
     Ok(())
 }
 

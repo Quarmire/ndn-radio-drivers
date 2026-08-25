@@ -428,6 +428,10 @@ pub struct Rtl8733buBackend {
     synth_locked: AtomicBool,
     /// Per-frame `TXPWR_OFSET` written into every TX descriptor's dw5[30:28] (0-7).
     tx_pwr_ofs: std::sync::atomic::AtomicU8,
+    /// Serialises the `REG_RXERR_RPT` (0x664) counter selector, which is chosen by a
+    /// read-modify-WRITE of bits [31:28] before each read — two concurrent readers would each
+    /// silently get the other's counter. See [`read_phy_counters`](Rtl8733buBackend::read_phy_counters).
+    phy_ctr_sel: std::sync::Mutex<()>,
 }
 
 /// Guard for the background TX power-tracking thread started by
@@ -533,6 +537,7 @@ impl Rtl8733buBackend {
             tsf_domain,
             synth_locked: AtomicBool::new(false),
             tx_pwr_ofs: std::sync::atomic::AtomicU8::new(0),
+            phy_ctr_sel: std::sync::Mutex::new(()),
         })
     }
 
@@ -3369,6 +3374,93 @@ impl Rtl8733buBackend {
         q as f32 * 0.25 + 16.0
     }
 
+    /// Per-format PHY receive counters (`REG_RXERR_RPT`, `0x664`) — what the single
+    /// [`read_channel_activity`](Self::read_channel_activity) occupancy number cannot tell you.
+    ///
+    /// That knob stays as it is: a pure read of the BB CCA-OFDM count (`0x2c08`), safe to poll.
+    ///
+    /// ⚠ **The per-format discrimination this was added for did NOT survive testing.** The intent
+    /// was to separate "decodable neighbour" from "foreign emitter" via the ok/err/false-alarm
+    /// triplets. MEASURED 2026-08-25 on ch11 (2.4 GHz, chosen so both modulations exist), driving
+    /// OFDM and then CCK traffic past the receiver from a second radio on the same host:
+    ///
+    /// * `ofdm_ok` / `ofdm_err` **work.**
+    /// * `cck_ok`, `cck_err`, `cck_fa`, `ht_ok`, `ht_err`, `ht_fa` and `ofdm_fa` read **ZERO for
+    ///   all 40 s** — including ambient, on a busy 2.4 GHz channel that certainly carried both CCK
+    ///   beacons and HT traffic. The selector itself is fine (`0x0` and `0x1` return different,
+    ///   live values), so these counters simply do not report on this part; the vendor table comes
+    ///   from a generic path with Jaguar-era branches and evidently does not transfer to 87xx.
+    ///   **Do not build on them.** They are kept in the struct because they are the register's own
+    ///   layout, and reading zero is the honest report.
+    ///
+    /// What IS worth having is sensitivity. Against the same stimulus:
+    ///
+    /// * `ofdm_ok`      75/s ambient -> 1167/s under load = **15.6x**
+    /// * `0x2c08` CCA  580/s ambient -> 1433/s under load = **2.5x**
+    ///
+    /// So `ofdm_ok` is a far sharper indicator of *decodable* OFDM traffic than the CCA count,
+    /// which also counts energy that never demodulates. Use CCA for "is the medium busy" and
+    /// `ofdm_ok` for "is there real, decodable Wi-Fi here" — that pair is the useful result, not
+    /// the format taxonomy this method was originally justified by.
+    ///
+    /// Selector table read out of the vendor's `rtw_get_mac_rx_counters` (`hal_com.c`), bits
+    /// [31:28], each counter in `[15:0]`:
+    /// `0x0/0x1/0x2` OFDM ok/err/FA · `0x3/0x4/0x5` CCK ok/err/FA · `0x6/0x7/0x9` HT ok/err/FA.
+    /// Only `0x0`/`0x1` produce data here — see the measurement above.
+    ///
+    /// ⚠ Selecting a counter is a read-modify-WRITE, so this is NOT safe to interleave with any
+    /// other user of `0x664`; the internal lock only protects concurrent calls to this method.
+    /// Counters are free-running 16-bit and wrap — take differences, and use
+    /// [`reset_phy_counters`](Self::reset_phy_counters) to zero them.
+    pub fn read_phy_counters(&self) -> Result<PhyCounters, FaceError> {
+        let _g = self.phy_ctr_sel.lock().unwrap_or_else(|e| e.into_inner());
+        let mut read = |sel: u32| -> Result<u16, FaceError> {
+            let v = self.read32(0x664)?;
+            self.write32(0x664, (v & 0x0FFF_FFFF) | (sel << 28))?;
+            Ok((self.read32(0x664)? & 0xffff) as u16)
+        };
+        Ok(PhyCounters {
+            ofdm_ok: read(0x0)?,
+            ofdm_err: read(0x1)?,
+            ofdm_fa: read(0x2)?,
+            cck_ok: read(0x3)?,
+            cck_err: read(0x4)?,
+            cck_fa: read(0x5)?,
+            ht_ok: read(0x6)?,
+            ht_err: read(0x7)?,
+            ht_fa: read(0x9)?,
+        })
+    }
+
+    /// Zero the [`read_phy_counters`](Self::read_phy_counters) counters (`RXERR_RPT_RST`, BIT27).
+    pub fn reset_phy_counters(&self) -> Result<(), FaceError> {
+        let _g = self.phy_ctr_sel.lock().unwrap_or_else(|e| e.into_inner());
+        let v = self.read32(0x664)?;
+        self.write32(0x664, v | (1 << 27))?;
+        self.write32(0x664, v & !(1 << 27))
+    }
+
+    /// **Cap how long someone else's decoded NAV may hold our transmitter** (`REG_NAV_UPPER`,
+    /// `0x0652`, unit 128 us).
+    ///
+    /// The complement to [`set_edcca_ignore`](RadioKnobs::set_edcca_ignore), and the other half of
+    /// the #96 finding. #96 measured that stock Wi-Fi ignores the NAV *we* advertise; this governs
+    /// how much we honour *theirs*. EDCCA-ignore stops us deferring on raw energy; this bounds
+    /// deferral from a decoded Duration field, so a neighbour cannot park a large NAV on the medium
+    /// and mute us for the length of our own lease window.
+    ///
+    /// On owned spectrum both belong under our control. A small value approaches "ignore the
+    /// medium entirely"; the vendor default is on the order of milliseconds. Saturates at
+    /// `0xff` * 128 us = 32.6 ms.
+    pub fn set_nav_upper_us(&self, us: u32) -> Result<(), FaceError> {
+        self.write8(0x0652, (us / 128).min(0xff) as u8)
+    }
+
+    /// Read back [`set_nav_upper_us`](Self::set_nav_upper_us), in microseconds.
+    pub fn nav_upper_us(&self) -> Result<u32, FaceError> {
+        Ok(u32::from(self.read8(0x0652)?) * 128)
+    }
+
     /// **Hardware TX gate** — `REG_TXPAUSE` (`0x0522`), one bit per MAC transmit queue; a set bit
     /// stops that queue being dequeued to the air. `0xff` pauses everything, `0x00` releases.
     ///
@@ -3720,6 +3812,37 @@ impl Rtl8733buBackend {
     fn port_tsf_domain(&self) -> ClockDomainId {
         ClockDomainId(self.tsf_domain.0 | 0x8000_0000)
     }
+}
+
+/// Per-format PHY receive counters from [`Rtl8733buBackend::read_phy_counters`].
+///
+/// Free-running 16-bit and wrapping — meaningful as differences over an interval, not as levels.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PhyCounters {
+    /// OFDM PPDUs that demodulated correctly.
+    pub ofdm_ok: u16,
+    /// OFDM PPDUs that demodulated with errors.
+    pub ofdm_err: u16,
+    /// OFDM false alarms. ⚠ MEASURED ZERO on this part — see `read_phy_counters`.
+    pub ofdm_fa: u16,
+    /// CCK PPDUs that demodulated correctly.
+    /// ⚠ MEASURED ZERO on this part — see `read_phy_counters`.
+    pub cck_ok: u16,
+    /// CCK PPDUs that demodulated with errors.
+    /// ⚠ MEASURED ZERO on this part — see `read_phy_counters`.
+    pub cck_err: u16,
+    /// CCK false alarms.
+    /// ⚠ MEASURED ZERO on this part — see `read_phy_counters`.
+    pub cck_fa: u16,
+    /// HT PPDUs that demodulated correctly.
+    /// ⚠ MEASURED ZERO on this part — see `read_phy_counters`.
+    pub ht_ok: u16,
+    /// HT PPDUs that demodulated with errors.
+    /// ⚠ MEASURED ZERO on this part — see `read_phy_counters`.
+    pub ht_err: u16,
+    /// HT false alarms.
+    /// ⚠ MEASURED ZERO on this part — see `read_phy_counters`.
+    pub ht_fa: u16,
 }
 
 /// Reference [`RadioTime`] implementation: this chip exposes the two link clocks the abstraction

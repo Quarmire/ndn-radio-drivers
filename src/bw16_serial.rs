@@ -36,6 +36,30 @@ fn host_stamp() -> LinkStamp {
     )
 }
 use ndn_radio_hal::{Bandwidth, OpenRadio, RadioKnobs, TxDiscipline};
+
+/// A device stamp from the ESP32-C5's free-running per-frame RX clock (`rx_ctrl.timestamp`): a µs
+/// counter, so `raw` is the µs value and the tick is 1000 ns (see [`RadioTimeSource::free_run_rx_stamp`]).
+/// Unlike [`host_stamp`] this is latched on the device at RX (no serial jitter) and is the same domain as
+/// the clock the C5 schedules TX on — the basis for common-view and frame-age.
+fn dev_rx_stamp(ts_us: u32, domain: ClockDomainId) -> LinkStamp {
+    LinkStamp::new(
+        ts_us as u64,
+        domain,
+        LatchPoint::MacDone.precision_floor_ns(),
+        LatchPoint::MacDone,
+    )
+}
+
+/// A per-device clock domain for a C5 on `path` (each device is its own physical counter). FNV-1a over
+/// the port path, tagged into the "C5" space so it never collides with the host-recv domain.
+fn c5_clock_domain(path: &str) -> ClockDomainId {
+    let mut h: u32 = 0x811c_9dc5;
+    for b in path.bytes() {
+        h ^= b as u32;
+        h = h.wrapping_mul(0x0100_0193);
+    }
+    ClockDomainId((h & 0x00ff_ffff) | 0x4335_0000) // "C5" tag in the top bytes
+}
 use ndn_transport::FaceError;
 use tokio::sync::{Mutex as AsyncMutex, mpsc};
 
@@ -50,6 +74,7 @@ const T_INJECT_ATTR: u8 = 0x06; // poke pkt_attrib bytes, then inject
 const T_NAMEFILTER: u8 = 0x07; // load on-device Tier-0 masks: [enabled][n_masks][mask 16B]*
 const T_INJECT_AT: u8 = 0x09; // scheduled TX: [delay_us_le32][802.11 frame] (ESP32-C5 firmware only)
 const T_RX: u8 = 0x81;
+const T_RX_TS: u8 = 0x82; // [rssi_i8][rx_ts_us_le32][802.11 frame] — RX + hardware µs stamp (ESP32-C5)
 
 /// BW16 fixed TX-rate codes for [`Bw16SerialBackend::set_tx_rate`]
 /// (`wifi_set_tx_data_rate`). CCK 0x00–0x03, OFDM 0x04–0x0b, HT MCS0–7 0x0c–0x13,
@@ -80,7 +105,7 @@ impl Bw16SerialBackend {
     /// reader that deframes captured 802.11 frames off the serial link. Pulses DTR→CEN to reset
     /// the board into our firmware so a freshly-flashed board comes up without a manual reset.
     pub fn open(path: &str) -> Result<Self, FaceError> {
-        Self::open_inner(path, true)
+        Self::open_inner(path, true, None)
     }
 
     /// Open a native-USB-Serial-JTAG ESP32 (e.g. the ESP32-C5) running the same serial-bridge
@@ -90,10 +115,16 @@ impl Bw16SerialBackend {
     /// chip free-runs the app it booted on power-up. (This was THE bug: `serialport` asserting RTS on
     /// open held the C5's EN low, so every inject went to a halted chip and nothing reached air.)
     pub fn open_no_reset(path: &str) -> Result<Self, FaceError> {
-        Self::open_inner(path, false)
+        Self::open_inner(path, false, None)
     }
 
-    fn open_inner(path: &str, reset_pulse: bool) -> Result<Self, FaceError> {
+    /// Like [`open_no_reset`](Self::open_no_reset) but the reader stamps `T_RX_TS` frames in the given
+    /// device clock `domain` (the ESP32-C5's hardware per-frame RX timestamp) rather than host-recv time.
+    pub fn open_no_reset_clocked(path: &str, domain: ClockDomainId) -> Result<Self, FaceError> {
+        Self::open_inner(path, false, Some(domain))
+    }
+
+    fn open_inner(path: &str, reset_pulse: bool, dev_clock: Option<ClockDomainId>) -> Result<Self, FaceError> {
         let mut port = serialport::new(path, BW16_BAUD)
             .timeout(Duration::from_millis(50))
             .open()
@@ -116,7 +147,7 @@ impl Bw16SerialBackend {
             .map_err(|e| io_err(format!("bw16 clone: {e}")))?;
         let (txch, rxch) = mpsc::unbounded_channel();
         let format = FrameFormat::default();
-        std::thread::spawn(move || reader_loop(reader, format, txch));
+        std::thread::spawn(move || reader_loop(reader, format, txch, dev_clock));
         Ok(Self {
             tx: Arc::new(Mutex::new(port)),
             format,
@@ -211,6 +242,7 @@ fn reader_loop(
     mut port: Box<dyn serialport::SerialPort>,
     format: FrameFormat,
     tx: mpsc::UnboundedSender<CapturedFrame>,
+    dev_clock: Option<ClockDomainId>,
 ) {
     let mut acc: Vec<u8> = Vec::new();
     let mut tmp = [0u8; 2048];
@@ -219,16 +251,24 @@ fn reader_loop(
             Ok(n) if n > 0 => {
                 acc.extend_from_slice(&tmp[..n]);
                 while let Some((ty, payload, consumed)) = deframe(&acc) {
-                    if ty == T_RX && !payload.is_empty() {
+                    // T_RX [rssi][frame] (BW16, no hardware timestamp → HostRecv stamp) and
+                    // T_RX_TS [rssi][rx_ts_us_le32][frame] (ESP32-C5 → its free-run hardware RX stamp).
+                    let parsed = if ty == T_RX && !payload.is_empty() {
                         let rssi = payload[0] as i8;
-                        // The board carries RSSI but no hardware timestamp, so stamp HostRecv
-                        // when the serial line delivered the frame (see RadioTime impl).
-                        if let Some(cap) =
-                            frame::parse_dot11(format, &payload[1..], Some(rssi), None, Some(host_stamp()))
-                        {
-                            if tx.send(cap).is_err() {
-                                return; // backend dropped
-                            }
+                        frame::parse_dot11(format, &payload[1..], Some(rssi), None, Some(host_stamp()))
+                    } else if ty == T_RX_TS && payload.len() >= 5 {
+                        let rssi = payload[0] as i8;
+                        let ts_us = u32::from_le_bytes([payload[1], payload[2], payload[3], payload[4]]);
+                        // A device stamp only if this backend was opened with a device clock domain (the
+                        // C5); else fall back to HostRecv so an un-clocked open still yields frames.
+                        let stamp = dev_clock.map(|d| dev_rx_stamp(ts_us, d)).unwrap_or_else(host_stamp);
+                        frame::parse_dot11(format, &payload[5..], Some(rssi), None, Some(stamp))
+                    } else {
+                        None
+                    };
+                    if let Some(cap) = parsed {
+                        if tx.send(cap).is_err() {
+                            return; // backend dropped
                         }
                     }
                     acc.drain(..consumed);
@@ -323,17 +363,20 @@ impl RadioProfile for Bw16SerialBackend {
 pub struct Esp32SerialBackend {
     inner: Bw16SerialBackend,
     capability: RadioCapability,
+    clock_domain: ClockDomainId,
 }
 
 impl Esp32SerialBackend {
     /// Open an ESP32-C5 running the `firmware/esp32c5-ndn` (or `-rs`) serial bridge on its native
-    /// USB-Serial-JTAG. Uses [`Bw16SerialBackend::open_no_reset`] — RTS/DTR map to EN/GPIO9 on the C5,
-    /// so they are never toggled (asserting RTS holds the chip in reset). Dual-band capability spans
-    /// 2.4 GHz (1/6/11) and 5 GHz (36/40/44/48).
+    /// USB-Serial-JTAG. Uses [`Bw16SerialBackend::open_no_reset_clocked`] — RTS/DTR map to EN/GPIO9 on
+    /// the C5, so they are never toggled (asserting RTS holds the chip in reset). Dual-band capability
+    /// spans 2.4 GHz (1/6/11) and 5 GHz (36/40/44/48). Frames are stamped in the C5's hardware RX clock.
     pub fn open_c5(path: &str) -> Result<Self, FaceError> {
+        let clock_domain = c5_clock_domain(path);
         Ok(Self {
-            inner: Bw16SerialBackend::open_no_reset(path)?,
+            inner: Bw16SerialBackend::open_no_reset_clocked(path, clock_domain)?,
             capability: RadioCapability::wifi_monitor_dual_1ss(vec![1, 6, 11, 36, 40, 44, 48]),
+            clock_domain,
         })
     }
 
@@ -392,10 +435,16 @@ impl RadioKnobs for Esp32SerialBackend {
 
 impl RadioTime for Esp32SerialBackend {
     fn time_sources(&self) -> Vec<RadioTimeSource> {
-        self.inner.time_sources()
+        // The C5's real link clock is its free-running per-frame RX stamp (rx_ctrl.timestamp, µs ticks),
+        // latched on the device — a genuine hardware stamp, unlike the BW16's host-recv fallback. (The
+        // 802.11 port TSF reads 0 while unassociated, so it is deliberately NOT advertised.)
+        vec![RadioTimeSource::free_run_rx_stamp(self.clock_domain, 1_000)]
     }
-    fn read_clock(&self, domain: ClockDomainId) -> Result<Option<u64>, FaceError> {
-        self.inner.read_clock(domain)
+    fn read_clock(&self, _domain: ClockDomainId) -> Result<Option<u64>, FaceError> {
+        // Latch-only: the free-run RX stamp has no read-now over the serial link. (A T_READCLOCK
+        // round-trip could expose esp_timer, but with serial jitter it would be worse than the per-frame
+        // latch it shares a domain with — so leave it None rather than advertise a jittery read-now.)
+        Ok(None)
     }
 }
 

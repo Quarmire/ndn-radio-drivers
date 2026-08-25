@@ -40,13 +40,14 @@
 #define T_INJECT_ATTR 0x06
 #define T_NAMEFILTER 0x07 // [enabled][n_masks][mask 16B]* — on-device Tier-0 prefix-set drop (§8.2)
 #define T_INJECT_AT  0x09 // [delay_us_le32][802.11 frame] — scheduled TX at TSF now+delay (airtime lease)
-#define T_RX         0x81
-#define T_TXTIME     0x83 // [target_tsf_le64][actual_tsf_le64] — scheduling error report for T_INJECT_AT
+#define T_RX         0x81 // [rssi_i8][802.11 frame] — used by the BW16; the C5 sends T_RX_TS instead
+#define T_RX_TS      0x82 // [rssi_i8][rx_ts_us_le32][802.11 frame] — RX + hardware per-frame µs stamp
+#define T_TXTIME     0x83 // [target_le64][actual_le64][tsf_le64] — scheduling error report for T_INJECT_AT
 #define MAXFRAME 512
 #define MAX_MASKS 8
 #define SCHED_MAX_DELAY_US 20000 // cap the busy-wait (this primitive spins; a slot lease would use a timer)
 
-typedef struct { int8_t rssi; uint16_t len; uint8_t buf[MAXFRAME]; } rxpkt_t;
+typedef struct { int8_t rssi; uint16_t len; uint32_t rxts; uint8_t buf[MAXFRAME]; } rxpkt_t;
 static QueueHandle_t rxq;
 
 // Tier-0 name-filter state. Host-computed masks (cognition derives them via the shared tier0.rs); the
@@ -82,6 +83,7 @@ static void rx_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
     rxpkt_t pk;
     pk.rssi = p->rx_ctrl.rssi;
     pk.len = len;
+    pk.rxts = p->rx_ctrl.timestamp;   // hardware per-frame RX stamp (µs, same domain as esp_timer)
     memcpy(pk.buf, f, len);
     BaseType_t hp = pdFALSE;
     xQueueSendFromISR(rxq, &pk, &hp); // drops if full — fine, promiscuous is best-effort
@@ -94,15 +96,19 @@ static void send_framed(uint8_t ty, const uint8_t *payload, uint16_t len) {
     if (len) usb_serial_jtag_write_bytes(payload, len, portMAX_DELAY);
 }
 
-// Drain the RX queue → serial as T_RX [rssi][frame].
+// Drain the RX queue → serial as T_RX_TS [rssi][rx_ts_us_le32][frame]: every C5 frame carries the
+// hardware per-frame RX timestamp, so the host can stamp it in the device's clock domain (common-view /
+// frame-age) instead of the coarse host-recv time. The 802.11 TSF is 0 unassociated, so this µs stamp
+// (rx_ctrl.timestamp, same domain as the esp_timer we schedule TX on) is the C5's real link clock.
 static void serial_tx_task(void *arg) {
-    static uint8_t out[1 + MAXFRAME];
+    static uint8_t out[5 + MAXFRAME];
     rxpkt_t pk;
     for (;;) {
         if (xQueueReceive(rxq, &pk, portMAX_DELAY) == pdTRUE) {
             out[0] = (uint8_t)pk.rssi;
-            memcpy(out + 1, pk.buf, pk.len);
-            send_framed(T_RX, out, pk.len + 1);
+            for (int k = 0; k < 4; k++) out[1 + k] = (uint8_t)(pk.rxts >> (8 * k));
+            memcpy(out + 5, pk.buf, pk.len);
+            send_framed(T_RX_TS, out, pk.len + 5);
         }
     }
 }

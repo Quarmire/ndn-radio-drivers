@@ -55,7 +55,7 @@ const T_BW40: u8 = 0x05;
 const T_INJECT_ATTR: u8 = 0x06;
 const T_NAMEFILTER: u8 = 0x07; // [enabled][n_masks][mask 16B]* — on-device Tier-0 prefix-set drop
 const T_INJECT_AT: u8 = 0x09; // [delay_us_le32][802.11 frame] — scheduled TX at a precise instant
-const T_RX: u8 = 0x81;
+const T_RX_TS: u8 = 0x82; // [rssi_i8][rx_ts_us_le32][802.11 frame] — RX + hardware per-frame µs stamp
 const T_TXTIME: u8 = 0x83; // [target_le64][actual_le64][tsf_le64] — scheduling error report
 const MAXFRAME: usize = 512;
 const MAX_MASKS: usize = 8;
@@ -80,7 +80,8 @@ struct NameFilter {
 static NF: Mutex<NameFilter> = Mutex::new(NameFilter { enabled: false, n: 0, masks: [[0u8; 16]; MAX_MASKS] });
 
 // RX ring shared between the promiscuous callback (WiFi-task context) and the serial-TX loop (main).
-static RXQ: Mutex<VecDeque<(i8, Vec<u8>)>> = Mutex::new(VecDeque::new());
+// (rssi, rx_ts_us, frame) — the µs timestamp is the C5's hardware per-frame RX stamp.
+static RXQ: Mutex<VecDeque<(i8, u32, Vec<u8>)>> = Mutex::new(VecDeque::new());
 
 // Promiscuous RX: queue each 0x8624 data frame (+ RSSI) for the serial-TX loop.
 unsafe extern "C" fn rx_cb(buf: *mut core::ffi::c_void, ty: sys::wifi_promiscuous_pkt_type_t) {
@@ -113,9 +114,10 @@ unsafe extern "C" fn rx_cb(buf: *mut core::ffi::c_void, ty: sys::wifi_promiscuou
         }
     }
     let rssi = (*p).rx_ctrl.rssi() as i8;
+    let ts_us = (*p).rx_ctrl.timestamp(); // hardware per-frame RX stamp (µs, same domain as esp_timer)
     if let Ok(mut q) = RXQ.lock() {
         if q.len() < 32 {
-            q.push_back((rssi, b.to_vec()));
+            q.push_back((rssi, ts_us, b.to_vec()));
         }
     }
 }
@@ -277,15 +279,16 @@ fn main() {
         .spawn(serial_rx_loop)
         .expect("spawn serial_rx_loop");
 
-    let mut out = Vec::with_capacity(1 + MAXFRAME);
+    let mut out = Vec::with_capacity(5 + MAXFRAME);
     loop {
         let item = { RXQ.lock().ok().and_then(|mut q| q.pop_front()) };
         match item {
-            Some((rssi, frame)) => {
+            Some((rssi, ts_us, frame)) => {
                 out.clear();
                 out.push(rssi as u8);
+                out.extend_from_slice(&ts_us.to_le_bytes()); // hardware per-frame RX stamp (µs)
                 out.extend_from_slice(&frame);
-                send_framed(T_RX, &out);
+                send_framed(T_RX_TS, &out);
             }
             None => std::thread::sleep(std::time::Duration::from_millis(2)),
         }

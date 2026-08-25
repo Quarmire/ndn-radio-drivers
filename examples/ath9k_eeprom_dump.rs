@@ -61,9 +61,26 @@ fn main() -> ExitCode {
     let obdb = byte(m + 25);
     println!("  ob_0={} ob_1={}  db1(byte)={:#04x}  xpaBiasLvl={}", obdb & 0xf, obdb >> 4, byte(m + 26), byte(m + 27));
 
-    println!("\n→ M1 DONE: the AR9271 cal EEPROM reads over libusb (checksum {}). The OLPC set_board_values",
-        if xsum == 0xffff { "valid" } else { "??" });
-    println!("  port now has its input: analog cfg (antCtrl/ob/db/gain) + the target-power tables follow.");
+    // ── M3a: locate the cal arrays empirically. modal @52 is ~68 B → calFreqPier2G ~byte 120.
+    // calFreqPier2G[3] = fbin channels (2.4G: freq = 2300 + fbin); calTargetPower* follow. Dump the
+    // cal region as bytes so the offsets can be anchored to real data, not a hand-computed struct size.
+    println!("\ncal region (bytes 116..300):");
+    for row in (116..300).step_by(16) {
+        let hex: Vec<String> = (row..(row + 16).min(300)).map(|b| format!("{:02x}", byte(b))).collect();
+        println!("  +{row:>3}: {}", hex.join(" "));
+    }
+    // Heuristic: the 3 fbin piers for 2.4 GHz are small bytes whose (2300+b) lands in 2400..2500.
+    println!("\nfbin→freq scan (bytes 116..140, freq=2300+b in 2400..2495 = a likely cal pier):");
+    for b in 116..140 {
+        let f = 2300u16 + byte(b) as u16;
+        if (2400..=2495).contains(&f) {
+            println!("  byte {b}: fbin={:#04x} → {f} MHz", byte(b));
+        }
+    }
+
+    println!("\n→ M1 valid ({}); M3a = anchor the cal-array offsets from the dump above, then port the",
+        if xsum == 0xffff { "checksum ok" } else { "??" });
+    println!("  target-power interpolation (fbin2freq + linear interp) + the PDADC table.");
     let _ = dev.detach();
     ExitCode::SUCCESS
 }

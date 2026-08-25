@@ -1693,6 +1693,29 @@ impl Ath9kHtcBackend {
             self.reg_rmw(0x782C, (db2_0 as u32) << 29, 0xE000_0000)?; // DB_2
         }
 
+        // 4. ★ RF-control tail incl. the **external-PA (XPA) enable timing** — the piece skipped before,
+        // and the strong candidate for the ~tens-of-dB radiated deficit (a high-power module's external
+        // PA never switched on). `AR_PHY_RF_CTL4` = when XPA-A/B turn on before / off after each frame.
+        // Default-ON; NDN_SB_NO_XPA to isolate. switchSettling@m+9, adcDesiredSize@m+12,
+        // txEndToXpaOff@m+15, txEndToRxOn@m+16, txFrameToXpaOn@m+17, txFrameToDataStart@m+28, txFrameToPaOn@m+29.
+        if std::env::var_os("NDN_SB_NO_XPA").is_none() {
+            let sw_settling = byte(m + 9) as u32;
+            let adc_desired = byte(m + 12) as u32;
+            let tx_end_xpa_off = byte(m + 15) as u32;
+            let tx_end_rx_on = byte(m + 16) as u32;
+            let tx_frame_xpa_on = byte(m + 17) as u32;
+            let tx_frame_data_start = byte(m + 28) as u32;
+            let tx_frame_pa_on = byte(m + 29) as u32;
+            self.reg_rmw(0x9844, sw_settling << 7, 0x0000_3F80)?; // AR_PHY_SETTLING SWITCH
+            self.reg_rmw(0x9850, adc_desired, 0x0000_00FF)?; //      AR_PHY_DESIRED_SZ ADC
+            // AR_PHY_RF_CTL4: XPAA_OFF(16) | XPAB_OFF(24) | XPAA_ON(0) | XPAB_ON(8) — write all 4 fields.
+            let rf_ctl4 = (tx_end_xpa_off << 16) | (tx_end_xpa_off << 24) | tx_frame_xpa_on | (tx_frame_xpa_on << 8);
+            self.reg_write(0x9834, rf_ctl4)?;
+            self.reg_rmw(0x9828, tx_end_rx_on << 16, 0x00FF_0000)?; // AR_PHY_RF_CTL3 TX_END_TO_A2_RX_ON
+            self.reg_rmw(0x9824, tx_frame_data_start, 0x0000_00FF)?; // AR_PHY_RF_CTL2 TX_END_DATA_START
+            self.reg_rmw(0x9824, tx_frame_pa_on << 8, 0x0000_FF00)?; // AR_PHY_RF_CTL2 TX_END_PA_ON
+        }
+
         Ok(BoardValues {
             checksum_ok,
             tx_gain_type,

@@ -308,6 +308,14 @@ pub fn open_ath9k(channel: u8) -> Result<OpenRadio, FaceError> {
     // per-rate target power from the EEPROM). hw_reset skips the EEPROM cal, leaving the PA on the
     // initval-default gain; this programs the real target. Opt-in (still proving its on-air effect via
     // the two-radio link RSSI); a bad EEPROM read is non-fatal (leaves the default).
+    if std::env::var_os("NDN_ATH9K_SETBOARD").is_some() {
+        // `set_board_values`: the analog cal incl. the external-PA (XPA) enable timing — the candidate
+        // for the low radiated power (a high-power module's PA left off). antCtrl stays default-skipped.
+        match dev.set_board_values() {
+            Ok(bv) => eprintln!("open_ath9k: set_board_values applied (txGainType={} ob={:?})", bv.tx_gain_type, bv.ob),
+            Err(e) => eprintln!("open_ath9k: set_board_values skipped: {e}"),
+        }
+    }
     if std::env::var_os("NDN_ATH9K_SETPOWER").is_some() {
         match dev.set_txpower_4k(chan_mhz) {
             Ok(peak) => eprintln!("open_ath9k: set_txpower_4k applied (peak target {} dBm)", peak / 2),

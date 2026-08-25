@@ -726,6 +726,17 @@ impl Rtl8733buBackend {
         // Set beacon head page and clear BCN_VALID (write-1-to-clear at +2 bit0).
         self.write8(REG_DWBCN0_CTRL + 1, pg_addr)?;
         self.write8(REG_DWBCN0_CTRL + 2, self.read8(REG_DWBCN0_CTRL + 2)? | 0x01)?;
+        // ★ DL_BCN_SEL — steer the beacon to PORT 0 by clearing `BIT_BCN_PORT_SEL_8733B` (BIT5) of
+        // `REG_CCK_CHECK_8733B` (0x0454). The vendor does this in `rtl8733b_sethwreg`'s
+        // HW_VAR_DL_BCN_SEL arm, immediately after clearing BCN_VALID and before the download; this
+        // port omitted it entirely. It is a candidate explanation for the long-standing M4.5
+        // blocker "the bulk write succeeds but BCN_VALID never asserts": the register we poll is
+        // DWBCN**0**_CTRL, so a beacon steered at the other port could never raise it.
+        // ⚠ It was NOT the blocker. MEASURED: BIT5 already reads 0 on both chips, so this write is
+        // a no-op (0x4d -> 0x4d), and the download succeeds with or without it. Kept only for
+        // parity with the vendor sequence, in case some other path ever sets the bit.
+        let cck = self.read8(0x0454)?;
+        self.write8(0x0454, cck & !(1 << 5))?;
         // Enable sw-beacon mode, mask the beacon queue (saved/restored).
         let cr1 = self.read8(REG_CR + 1)?;
         self.write8(REG_CR + 1, cr1 | 0x01)?;

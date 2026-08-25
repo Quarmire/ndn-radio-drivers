@@ -3484,12 +3484,28 @@ impl Rtl8733buBackend {
     /// `rxevm[4]` s(8,1) and `rxsnr[4]` s(8,1). So per-frame CFO, EVM and SNR are all sitting in
     /// bytes we already read and currently discard. NOT yet parsed; see the port notes.
     ///
-    /// MEASURED (`examples/xtalcfo8733b.rs`, regressing the port TSF against the host clock at each
-    /// cap): the trim moves the clock **~62 ppm across caps 22..117** — 61.4 ppm on one run and
-    /// 62.3 ppm on a repeat — i.e. **~0.65 ppm per step**, power-on cap 70. The total span
-    /// reproduces well; individual mid-points scatter by ~10 ppm and the sweep drifts ~5 ppm over
-    /// its ~70 s (caught by a return-to-baseline arm, -4.79 ppm). So this harness resolves the
-    /// RANGE but not a fine trim — disciplining at sub-ppm needs far longer integration per point.
+    /// MEASURED, twice, by two instruments of very different quality:
+    ///
+    /// * `examples/xtalcfo8733b.rs` (port TSF vs host clock): **~62 ppm across caps 22..117**,
+    ///   ~0.65 ppm/step. The span reproduced (61.4 / 62.3 ppm) but mid-points scattered ~10 ppm and
+    ///   the sweep drifted ~5 ppm — good enough for the range, useless for a fine trim.
+    /// * **Two-node COMMON VIEW** (`examples/rxseq8733b.rs`; both f72bs hardware-stamp the SAME
+    ///   frames from a third transmitter, so its clock cancels) — ~20k common frames per point,
+    ///   **std-err 0.0034 ppm**, i.e. ~3000x better than the host-clock method:
+    ///
+    ///   ```text
+    ///   cap    54      62      70      78      86
+    ///   ppm  -9.411  -5.414  -0.338  +5.028  +10.932      (this chip vs the other f72b)
+    ///   ```
+    ///
+    ///   Linear fit **0.6391 ppm/step, R^2 = 0.995** — but the residual is structure, not noise:
+    ///   per-segment slope climbs **0.500 -> 0.738 ppm/step (+48%)** across the range, so the trim
+    ///   is monotonic and NOT linear. Interpolate locally; do not extrapolate one global gain.
+    ///
+    /// ★ The limit is the ACTUATOR, not the sensor. Common view measures to 0.0034 ppm while one
+    /// trim step is ~0.64 ppm, so frequency discipline bottoms out at **~+-0.32 ppm (half a step)**
+    /// — actuator-limited by a factor of ~94. That inverts the assumption behind the removed
+    /// `read_cfo`: the missing piece was never a better frequency sensor.
     ///
     /// The vendor writes the cap TWICE into one field (`cap | (cap << 7)`), per
     /// `phydm_set_crystal_cap_reg`'s 8733B branch — two 7-bit copies at `[23:17]` and `[16:10]`.

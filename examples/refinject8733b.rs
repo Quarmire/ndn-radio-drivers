@@ -34,8 +34,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     p[0] = idx;
     p[1] = knob;
     p[2] = 0xC3;
+    // p[4..8] = little-endian frame sequence. Two receivers hearing the SAME transmission can then
+    // match frame-for-frame, which is what makes a common-view clock comparison possible: the
+    // transmitter's own clock cancels and only the ratio of the two receivers' crystals is left.
     let f = InjectFrame {
-        payload: Bytes::from(p),
+        payload: Bytes::from(p.clone()),
         tx: TxIntent::CONSERVATIVE,
         dst: BROADCAST,
         src: [0x02, 0x50, 0x33, 0x02, knob, idx],
@@ -51,7 +54,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     buf.extend_from_slice(&dot11);
     let mut sent = 0usize;
     let mut first_err = None;
-    for _ in 0..count {
+    for seq in 0..count {
+        // Rebuild per frame so the sequence advances; the radiotap+dot11 prefix is unchanged.
+        let mut pl = p.clone();
+        pl[4..8].copy_from_slice(&(seq as u32).to_le_bytes());
+        let fseq = InjectFrame { payload: Bytes::from(pl), ..f.clone() };
+        let dot11 = frame::build_dot11(fmt, &fseq)?;
+        let mut buf = Vec::with_capacity(hdr.len() + dot11.len());
+        buf.extend_from_slice(&hdr);
+        buf.extend_from_slice(&dot11);
         match backend.inject_raw(&buf).await {
             Ok(()) => sent += 1,
             // Report WHY, once. A bare "sent=0" is indistinguishable from a dead radio, and cost a

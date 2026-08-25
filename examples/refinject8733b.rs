@@ -59,7 +59,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut pl = p.clone();
         pl[4..8].copy_from_slice(&(seq as u32).to_le_bytes());
         let fseq = InjectFrame { payload: Bytes::from(pl), ..f.clone() };
-        let dot11 = frame::build_dot11(fmt, &fseq)?;
+        let mut dot11 = frame::build_dot11(fmt, &fseq)?;
+        // NDN_NAV_US sets the 802.11 Duration field (header bytes 2..4) so this can act as a NAV
+        // interferer: a receiver that honours a decoded NAV must defer for that long.
+        if let Ok(us) = std::env::var("NDN_NAV_US") {
+            let d: u16 = us.parse().unwrap_or(0);
+            if dot11.len() >= 4 {
+                dot11[2..4].copy_from_slice(&d.to_le_bytes());
+            }
+        }
         let mut buf = Vec::with_capacity(hdr.len() + dot11.len());
         buf.extend_from_slice(&hdr);
         buf.extend_from_slice(&dot11);

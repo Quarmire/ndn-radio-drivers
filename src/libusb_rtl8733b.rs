@@ -3453,9 +3453,33 @@ impl Rtl8733buBackend {
     /// deferral from a decoded Duration field, so a neighbour cannot park a large NAV on the medium
     /// and mute us for the length of our own lease window.
     ///
-    /// On owned spectrum both belong under our control. A small value approaches "ignore the
-    /// medium entirely"; the vendor default is on the order of milliseconds. Saturates at
-    /// `0xff` * 128 us = 32.6 ms.
+    /// Saturates at `0xff` * 128 us = 32.6 ms. Round-trip verified: 512 -> 512, 30000 -> 29952
+    /// (floored to 128 us units), 60000 -> 32640.
+    ///
+    /// ⚠ **MEASURED INERT for injected traffic — do not build a lease on it.** Against a co-channel
+    /// interferer flooding frames whose Duration field advertises a 30 ms NAV, with the DUT and the
+    /// interferer on SEPARATE hosts and the witness filtering by sender:
+    ///
+    /// ```text
+    ///                                   DUT injected   DUT delivered
+    /// control (no interferer)              16462          16459
+    /// big NAV, NAV_UPPER = 0     (no defer)   972            675
+    /// big NAV, NAV_UPPER = 32640 (max defer) 1018            673
+    /// ```
+    ///
+    /// Allowing 32.6 ms of NAV deferral versus allowing none changes delivery by 0.3% (675 vs 673),
+    /// with the injected count moving 4.7% the OTHER way. This chip does not defer on the NAV in
+    /// injected frames.
+    ///
+    /// ★ That is the mirror of #96, which measured that stock Wi-Fi ignores the NAV *we* advertise.
+    /// Both directions fail, so **NAV is not a usable coordination channel for injected traffic at
+    /// all** — neither to make a neighbour yield nor to stop ourselves yielding. The 17x suppression
+    /// above is real but is CONTENTION (energy/CCA), proven by its being identical with NAV
+    /// deferral disallowed and allowed. The lever that does work is self-enforcement via
+    /// [`set_tx_pause`](Self::set_tx_pause), which IS measured to shape airtime.
+    ///
+    /// Also note the bring-up default is already **0** — this port was never deferring on NAV.
+    /// Retained because it may matter for associated/normal traffic, which is not what we run.
     pub fn set_nav_upper_us(&self, us: u32) -> Result<(), FaceError> {
         self.write8(0x0652, (us / 128).min(0xff) as u8)
     }

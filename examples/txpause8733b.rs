@@ -28,6 +28,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let n: u32 = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(1500);
     let dev = Rtl8733buBackend::open()?;
     dev.bring_up_tx(ch)?;
+    // NDN_NAV_UPPER_US caps how long a DECODED NAV from someone else may hold our transmitter.
+    if let Ok(v) = std::env::var("NDN_NAV_UPPER_US") {
+        let us: u32 = v.parse().unwrap_or(0);
+        dev.set_nav_upper_us(us)?;
+        println!("NAV_UPPER set to {us} us -> reads {} us", dev.nav_upper_us()?);
+    } else {
+        println!("NAV_UPPER left at {} us (default)", dev.nav_upper_us()?);
+    }
 
     // --- Q3a: host-side cost of toggling the gate, before any on-air claim.
     let t0 = Instant::now();

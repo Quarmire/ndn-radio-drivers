@@ -42,7 +42,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if p.len() >= 8 && p[2] == 0xC3 {
                 if let Some(s) = f.stamp {
                     let seq = u32::from_le_bytes([p[4], p[5], p[6], p[7]]);
-                    println!("{seq} {}", s.raw);
+                    // Third column is the sender's knob tag, so a witness can separate traffic
+                    // sources. Counting every 0x8624 frame conflated a DUT with an interferer once.
+                    println!("{seq} {} {}", s.raw, p[1]);
                     n += 1;
                 }
             }

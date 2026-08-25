@@ -4161,6 +4161,21 @@ impl RadioProfile for Rtl8733buBackend {
             bands: vec![Band::Band2_4GHz, Band::Band5GHz],
             rate: RateCapability::Wifi { max_mcs: 7, max_nss: 1, max_bw: 1 },
             max_tx_power: 127,
+            // MEASURED on this part (`examples/retune8733b.rs`, 40 retunes per case) rather than
+            // inherited. `wifi_monitor_5ghz` supplies 16_000 us from a DIFFERENT radio (#97), and
+            // `can_hop`/`retune_overhead` divide by this — so a planner was sizing THIS radio's hop
+            // budget with another chip's timing, which is exactly what that field's
+            // "populate only from a real measurement" rule exists to prevent.
+            //
+            //   5 GHz same-band (36<->40)   p50 13126  p90 15448  max 16432 us
+            //   5 GHz wider hop (36<->161)  p50 13195  p90 14677  max 15063 us
+            //   cross-band      (36<->6)    p50 12812  p90 15248  max 16056 us
+            //
+            // p90 is the figure here: a hop budget is set by the tail, not the median. Worth noting
+            // for planners: a BAND switch costs no more than an adjacent-channel hop on this part.
+            // (The inherited 16_000 was, by coincidence, close to this radio's max — conservative
+            // rather than wrong. The provenance was the problem, not the magnitude.)
+            retune_us: Some(15_500),
             ..RadioCapability::wifi_monitor_5ghz(vec![
                 1, 6, 11, 36, 40, 44, 48, 149, 153, 157, 161,
             ])

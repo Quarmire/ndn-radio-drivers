@@ -1,0 +1,7 @@
+# ESP32-C5 named-radio: raw 802.11 TX + promiscuous RX, no netstack join needed.
+CONFIG_ESP_WIFI_ENABLED=y
+CONFIG_ESP_WIFI_NVS_ENABLED=n
+# Log over the native USB-Serial-JTAG (the C5's 303a:1001 console).
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
+CONFIG_ESP_TASK_WDT_INIT=n

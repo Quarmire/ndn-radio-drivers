@@ -35,7 +35,7 @@ use ndn_frame_io::{PhyMetrics,
     frame, CapturedFrame, ClockDomainId, FrameFormat, FrameIo, InjectFrame,
 };
 use crate::realtek_rx;
-use ndn_radio_hal::{
+use ndn_radio_hal::{ClockSteering,
     Band, Bandwidth, McsDescriptor, RadioCapability, RadioKnobs, RadioProfile, RadioTime,
     RadioTimeSource, RateCapability, TxDiscipline, };
 use ndn_transport::FaceError;
@@ -432,6 +432,9 @@ pub struct Rtl8733buBackend {
     /// read-modify-WRITE of bits [31:28] before each read — two concurrent readers would each
     /// silently get the other's counter. See [`read_phy_counters`](Rtl8733buBackend::read_phy_counters).
     phy_ctr_sel: std::sync::Mutex<()>,
+    /// Power-on crystal cap, latched the first time the clock is steered so `steer_clock_ppm` stays
+    /// relative to the factory calibration however many times it is called.
+    xtal_base: std::sync::OnceLock<u8>,
 }
 
 /// Guard for the background TX power-tracking thread started by
@@ -538,6 +541,7 @@ impl Rtl8733buBackend {
             synth_locked: AtomicBool::new(false),
             tx_pwr_ofs: std::sync::atomic::AtomicU8::new(0),
             phy_ctr_sel: std::sync::Mutex::new(()),
+            xtal_base: std::sync::OnceLock::new(),
         })
     }
 
@@ -3524,6 +3528,45 @@ impl Rtl8733buBackend {
         Ok(((self.read32(0x103c)? >> 10) & 0x7f) as u8)
     }
 
+    /// MEASURED crystal-trim curve as a function of **ABSOLUTE cap**, not of a delta: (cap, ppm
+    /// relative to cap 70). From the two-node common-view sweep (762c346), std-err 0.0034 ppm.
+    ///
+    /// ⚠ Indexing by absolute cap is the whole point. A first version keyed the curve on "steps
+    /// from base" and was WRONG on hardware — the per-step gain rises 0.500 -> 0.738 ppm across the
+    /// range, so eight steps down from cap 86 is -6.4 ppm while the same eight steps around cap 70
+    /// is -5.1. The delta model claimed -5.076 and the radio actually moved -6.408.
+    const XTAL_KNOTS: [(f32, f32); 5] =
+        [(54.0, -9.073), (62.0, -5.076), (70.0, 0.0), (78.0, 5.366), (86.0, 11.270)];
+
+    /// Rate offset (ppm, relative to cap 70) produced by an absolute crystal cap.
+    fn xtal_ppm_at_cap(cap: f32) -> f32 {
+        let k = &Self::XTAL_KNOTS;
+        let c = cap.clamp(k[0].0, k[k.len() - 1].0);
+        for w in k.windows(2) {
+            if c >= w[0].0 && c <= w[1].0 {
+                let t = (c - w[0].0) / (w[1].0 - w[0].0);
+                return w[0].1 + t * (w[1].1 - w[0].1);
+            }
+        }
+        0.0
+    }
+
+    /// The **factory** crystal cap, from efuse logical byte `0xB9`
+    /// (`EEPROM_XTAL_B9_8733B`; `0xFF` unprogrammed => the vendor default `0x3F`).
+    ///
+    /// This is the reference `steer_clock_ppm` steers *from*, and it must come from efuse rather
+    /// than from "whatever the register reads at startup": the cap is a hardware register that
+    /// PERSISTS ACROSS PROCESS RESTARTS, so a run that inherited a previous run's steer would
+    /// otherwise treat that as its zero. That bug was live and caught on air — the base latched as
+    /// 86 instead of 70 because the preceding sweep had left it there.
+    pub fn factory_crystal_cap(&self) -> Result<u8, FaceError> {
+        let log = Self::decode_efuse_pub(&self.read_efuse(512)?);
+        Ok(match log.get(0xb9).copied() {
+            Some(0xff) | None => 0x3f,
+            Some(v) => v & 0x7f,
+        })
+    }
+
     /// **Hardware TX gate** — `REG_TXPAUSE` (`0x0522`), one bit per MAC transmit queue; a set bit
     /// stops that queue being dequeued to the air. `0xff` pauses everything, `0x00` releases.
     ///
@@ -3985,6 +4028,44 @@ impl RadioTime for Rtl8733buBackend {
         ]
     }
 
+    fn clock_steering(&self) -> Option<ClockSteering> {
+        // Both numbers MEASURED, per that type's rule, and deliberately conservative:
+        //  * range: the common-view sweep covered caps 54..86 = -9.07..+11.27 ppm about cap 70, so
+        //    the symmetric guaranteed span is +-9.0. The register goes much further (~62 ppm end to
+        //    end) but that part of the curve is uncharacterised, and advertising it would invite a
+        //    steer nobody has verified.
+        //  * resolution: 0.64 ppm/step is the fitted centre; the true step runs 0.500..0.738 across
+        //    the span, so a caller must believe the RETURNED ppm, not its request.
+        Some(ClockSteering { range_ppm: 9.0, resolution_ppm: 0.64 })
+    }
+
+    fn steer_clock_ppm(&self, ppm: f32) -> Result<f32, FaceError> {
+        // Base is the FACTORY cap from efuse, cached — never the current register value, which may
+        // already carry a previous run's steer.
+        let base = match self.xtal_base.get() {
+            Some(b) => *b,
+            None => {
+                let b = self.factory_crystal_cap()?;
+                *self.xtal_base.get_or_init(|| b)
+            }
+        };
+        let target = Self::xtal_ppm_at_cap(f32::from(base)) + ppm;
+        // Pick the cap whose measured offset is closest to the target: the curve is non-linear, so
+        // search it rather than dividing by a nominal gain.
+        let (mut best, mut best_err) = (base, f32::INFINITY);
+        for c in 0u8..=127 {
+            let e = (Self::xtal_ppm_at_cap(f32::from(c)) - target).abs();
+            if e < best_err {
+                best_err = e;
+                best = c;
+            }
+        }
+        self.set_crystal_cap(best)?;
+        // Report what this cap ACTUALLY produces relative to the factory reference, so the caller's
+        // loop sees the quantisation instead of chasing a residual the hardware cannot express.
+        Ok(Self::xtal_ppm_at_cap(f32::from(best)) - Self::xtal_ppm_at_cap(f32::from(base)))
+    }
+
     fn read_clock(&self, domain: ClockDomainId) -> Result<Option<u64>, FaceError> {
         // Only the port TSF is readable on demand; the free-run RX stamp is latch-only.
         if domain == self.port_tsf_domain() {
@@ -4049,6 +4130,37 @@ impl RadioProfile for Rtl8733buBackend {
                 1, 6, 11, 36, 40, 44, 48, 149, 153, 157, 161,
             ])
         }
+    }
+}
+
+#[cfg(test)]
+mod xtal_curve {
+    use super::Rtl8733buBackend as B;
+
+    /// The measured trim curve must round-trip and stay monotonic. Guards the interpolation itself
+    /// (a sign slip or a bad segment would silently steer the wrong way, and a discipline loop
+    /// would then chase its own tail).
+    #[test]
+    fn curve_is_monotonic_in_absolute_cap() {
+        let mut last = f32::NEG_INFINITY;
+        for c in 54..=86 {
+            let ppm = B::xtal_ppm_at_cap(c as f32);
+            assert!(ppm > last, "not monotonic at cap {c}");
+            last = ppm;
+        }
+        assert!((B::xtal_ppm_at_cap(70.0)).abs() < 1e-6);
+        assert!((B::xtal_ppm_at_cap(78.0) - 5.366).abs() < 1e-3);
+        // Outside the measured span the curve CLAMPS rather than extrapolating into fiction.
+        assert_eq!(B::xtal_ppm_at_cap(0.0), B::xtal_ppm_at_cap(54.0));
+        assert_eq!(B::xtal_ppm_at_cap(127.0), B::xtal_ppm_at_cap(86.0));
+    }
+
+    /// The per-step gain is NOT constant — this is what broke the first, delta-indexed model.
+    #[test]
+    fn per_step_gain_varies_across_the_range() {
+        let low = B::xtal_ppm_at_cap(62.0) - B::xtal_ppm_at_cap(54.0);
+        let high = B::xtal_ppm_at_cap(86.0) - B::xtal_ppm_at_cap(78.0);
+        assert!(high > low * 1.3, "curvature lost: low={low} high={high}");
     }
 }
 

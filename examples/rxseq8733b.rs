@@ -23,6 +23,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         dev.set_crystal_cap(c)?;
         eprintln!("crystal cap set to {} (readback {})", c, dev.crystal_cap()?);
     }
+    // NDN_STEER_PPM exercises the HAL path rather than the raw register: ask RadioTime to steer by
+    // N ppm and print what it says it applied, so an independent common-view measurement can be
+    // checked against the driver's own claim.
+    if let Ok(v) = std::env::var("NDN_STEER_PPM") {
+        use ndn_radio_drivers::RadioTime;
+        let want: f32 = v.parse().unwrap_or(0.0);
+        let got = dev.steer_clock_ppm(want)?;
+        eprintln!("steer_clock_ppm({want}) -> applied {got:+.3} ppm (cap now {})", dev.crystal_cap()?);
+    }
     eprintln!("cap={} collecting {secs}s on ch{ch}", dev.crystal_cap()?);
     let _pump = dev.spawn_rx_pump(4);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);

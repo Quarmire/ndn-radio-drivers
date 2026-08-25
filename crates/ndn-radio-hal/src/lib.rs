@@ -718,12 +718,50 @@ pub trait RadioTime: Send + Sync {
         Vec::new()
     }
 
+    /// What this radio can do to its own clock RATE, if anything (`None` = no steering).
+    ///
+    /// Offset (phase) discipline is a software correction applied to readings. This is the other
+    /// axis: physically changing how fast the counter runs, so a corrected offset stays corrected
+    /// instead of re-accumulating. A radio with a crystal trim reports its measured range and
+    /// resolution here.
+    fn clock_steering(&self) -> Option<ClockSteering> {
+        None
+    }
+
+    /// Steer this radio's clock rate by `ppm` **relative to its power-on calibration**, returning
+    /// the ppm actually applied — which will differ from the request, because the trim is a
+    /// quantised, usually non-linear control. Believe the returned value.
+    ///
+    /// Relative, not absolute: a clock's rate has no meaning except against another clock, so the
+    /// caller owns the reference (e.g. a common-view comparison against a peer) and this only
+    /// applies the correction it asks for.
+    fn steer_clock_ppm(&self, _ppm: f32) -> Result<f32, FaceError> {
+        Err(FaceError::Io(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "radio exposes no clock-rate steering",
+        )))
+    }
+
     /// Read the current value of a `read_now` clock, selected by `domain`, if this radio has
     /// one. Returns `Ok(None)` when the domain is unknown or the radio has only per-frame
     /// stamps (no readable clock). The value is in that domain's raw ticks.
     fn read_clock(&self, _domain: ClockDomainId) -> Result<Option<u64>, FaceError> {
         Ok(None)
     }
+}
+
+/// What a radio can do to its own clock rate ([`RadioTime::clock_steering`]).
+///
+/// Populate from MEASUREMENT, not from a datasheet: both fields feed a discipline loop that will
+/// believe them. In particular `range_ppm` should be the span actually swept and verified — a trim
+/// register's full range is usually wider than the part of it anyone has characterised.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ClockSteering {
+    /// Usable steering range, +-ppm about the power-on calibration.
+    pub range_ppm: f32,
+    /// Smallest change the trim can make, ppm. The discipline floor is about half this, and if it
+    /// is far larger than the sensor's noise the loop is actuator-limited.
+    pub resolution_ppm: f32,
 }
 
 /// A face's named-time service profile (design §15) — **trait-derived, not a static table**.
@@ -735,7 +773,7 @@ pub trait RadioTime: Send + Sync {
 /// needs editing. The timekeeper reads this to decide what a face may contribute: whether it can
 /// source common-view (needs a shared-counter RX stamp), how tightly it stamps arrivals, and how
 /// bounded its transmit timing is.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct FaceTimeProfile {
     /// The best (tightest, best-first) link clock the face exposes, or `None` if it stamps
     /// nothing. A per-frame [`RadioClockKind::FreeRunRxStamp`] beats a gated [`RadioClockKind::PortTsf`]
@@ -751,6 +789,9 @@ pub struct FaceTimeProfile {
     /// event are differenced meaningfully. A host-recv-only face cannot (its stamp jitter swamps the
     /// inter-receiver offset).
     pub can_common_view: bool,
+    /// What the face can do to its own clock RATE, if anything. A face that can both observe
+    /// common-view offsets AND steer its rate can hold a correction rather than re-applying it.
+    pub steering: Option<ClockSteering>,
 }
 
 impl FaceTimeProfile {
@@ -772,6 +813,7 @@ impl FaceTimeProfile {
             stamp_precision_ns,
             tx_discipline,
             can_common_view,
+            steering: time.clock_steering(),
         }
     }
 }

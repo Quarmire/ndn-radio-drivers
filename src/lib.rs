@@ -304,6 +304,16 @@ pub fn open_ath9k(channel: u8) -> Result<OpenRadio, FaceError> {
     // Record the channel the PHY came up on so `RadioKnobs::set_channel` can validate cognition's
     // fixed-channel applies (a live retune is `hw_reset(&mut self)`, not yet on the `&self` path).
     dev.note_channel(channel);
+    // `NDN_ATH9K_SETPOWER=1`: apply the OLPC power cal (`set_txpower_4k` — PDADC target→gain map +
+    // per-rate target power from the EEPROM). hw_reset skips the EEPROM cal, leaving the PA on the
+    // initval-default gain; this programs the real target. Opt-in (still proving its on-air effect via
+    // the two-radio link RSSI); a bad EEPROM read is non-fatal (leaves the default).
+    if std::env::var_os("NDN_ATH9K_SETPOWER").is_some() {
+        match dev.set_txpower_4k(chan_mhz) {
+            Ok(peak) => eprintln!("open_ath9k: set_txpower_4k applied (peak target {} dBm)", peak / 2),
+            Err(e) => eprintln!("open_ath9k: set_txpower_4k skipped: {e}"),
+        }
+    }
 
     let dev = Arc::new(dev);
     // RX delivery: default to the on-demand path (`FrameIo::recv_frame` does a single blocking

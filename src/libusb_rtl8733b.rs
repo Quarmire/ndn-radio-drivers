@@ -3539,7 +3539,7 @@ impl Rtl8733buBackend {
         [(54.0, -9.073), (62.0, -5.076), (70.0, 0.0), (78.0, 5.366), (86.0, 11.270)];
 
     /// Rate offset (ppm, relative to cap 70) produced by an absolute crystal cap.
-    fn xtal_ppm_at_cap(cap: f32) -> f32 {
+    pub fn xtal_ppm_at_cap(cap: f32) -> f32 {
         let k = &Self::XTAL_KNOTS;
         let c = cap.clamp(k[0].0, k[k.len() - 1].0);
         for w in k.windows(2) {

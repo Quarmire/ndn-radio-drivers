@@ -28,6 +28,9 @@ mod libusb_rtl88xx;
 mod realtek_rx;
 /// Shared async-URB RX pump (bulk-IN pipelining) used by the USB backends.
 pub mod rx_pump;
+/// Closed-loop frequency discipline: spend the time layer's skew estimate on a radio's clock trim.
+pub mod freq_discipline;
+pub use freq_discipline::{FreqAction, FreqDiscipline};
 pub use libusb_rtl88xx::{
     CHIP_ID_8822E, ChannelBw, FwVersion, LibUsbRtl88xxBackend, REALTEK_VID, REG_SYS_CFG,
     RTL88XX_PIDS, RfPath,

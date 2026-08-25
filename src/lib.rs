@@ -136,12 +136,15 @@ pub fn open_named_radio(pid: u16, channel: u8) -> Result<OpenRadio, FaceError> {
     // `PowerTracker` guard is leaked deliberately so tracking outlives this function — the same lifetime
     // discipline `start_pump` uses for the RX pump.
     //
-    // ⚠ Per-boot analog variance: only ~62% of cold bring-ups radiate at all, and no on-chip signal
-    // distinguishes a radiating boot from a dead one (RX, cal results and registers read identically).
-    // A caller that must transmit therefore needs **external** feedback — verify delivery and relaunch,
-    // via `Rtl8733buBackend::bring_up_tx_until` or `scripts/supervise_tx.sh`. This opener cannot do that
-    // for you (it has no peer to hear it), so it brings the TX path up and reports success on the
-    // register path only. RX/monitor carries no such variance.
+    // ⚠ RETRACTED: this used to warn that "only ~62% of cold bring-ups radiate" and treat that as
+    // per-boot analog variance in the silicon. It is not a property of this chip. MEASURED 2026-08-24
+    // on a healthy bus, scored against a real receiver (a81a, not an airtime proxy): **20/20 sequential
+    // bring-ups radiated**, 98.9% delivery (77080/77964 frames) at -71.4 dBm, zero USB re-enumerations,
+    // and no downward trend across the run. The old figure was produced while a failing AX88179
+    // USB-Ethernet NIC on the same host was resetting the whole USB tree, and while the harness issued
+    // a `usbreset` before every boot. Remove both and bring-up is reliable.
+    // `bring_up_tx_until` / `scripts/supervise_tx.sh` are kept as insurance, not as a required
+    // workaround. See [[rtl8733b-port]] and [[lab-node-inventory]].
     if RTL8733B_PIDS.contains(&pid) {
         // No `DeviceSelect` arm: `Rtl8733buBackend::open` claims the first match and has no
         // `open_select` sibling. Fine while a host carries one f72b; a second would need it added.

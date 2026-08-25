@@ -1312,7 +1312,7 @@ impl Rtl8733buBackend {
     /// calibration and datapath TXAGC block, after which injected frames do radiate
     /// (verified against a witness radio). Use [`bring_up_tx`](Self::bring_up_tx) or
     /// [`bring_up_tx_tracked`](Self::bring_up_tx_tracked) for a transmitting radio; the
-    /// residual open item there is the ~62%/boot analog cold-start variance, not the
+    /// residual open item there is the (retracted, see `bring_up_tx`) cold-start question, not the
     /// register path. (An earlier revision of this comment claimed the RF never radiates
     /// — that was true before `enable_tx` landed and is no longer.)
     ///
@@ -1385,9 +1385,9 @@ impl Rtl8733buBackend {
     /// the rise over the cal reference, capped below the over-drive point — compensating the
     /// PA droop as it heats. Verified to hold TX for the full length of a long transmit
     /// (893 frames over 15 s) with no fade. Call after [`enable_tx`](Self::enable_tx); the
-    /// returned [`PowerTracker`] stops the loop when dropped. (Reliable *sustained* TX; the
-    /// per-boot analog variance that determines whether a boot radiates at all is separate —
-    /// gate on it with [`bring_up_tx_until`](Self::bring_up_tx_until) / a process supervisor.)
+    /// returned [`PowerTracker`] stops the loop when dropped. (This covers sustained TX. The
+    /// separate "does this boot radiate at all" worry is retracted — 20/20 measured; see
+    /// [`bring_up_tx`](Self::bring_up_tx).)
     pub fn spawn_power_tracking(self: &Arc<Self>) -> PowerTracker {
         let stop = Arc::new(AtomicBool::new(false));
         let dev = Arc::clone(self);
@@ -1428,9 +1428,9 @@ impl Rtl8733buBackend {
 
     /// One-shot TX bring-up: [`bring_up_monitor`](Self::bring_up_monitor) (self-resets the
     /// chip via card-disable) then [`enable_tx`](Self::enable_tx) (cal + datapath + grant).
-    /// After this, injected frames radiate — on ~62% of boots (the per-boot analog TX-path
-    /// variance). For reliable delivery, drive [`bring_up_tx_until`](Self::bring_up_tx_until)
-    /// with a caller-side verify, or just retransmit at the protocol layer across re-inits.
+    /// After this, injected frames radiate. (An older note here claimed only ~62% of boots
+    /// radiate; that was RETRACTED — measured 20/20 on a healthy bus, see `open_named_radio`.
+    /// The ~62% was an external USB fault plus per-boot `usbreset`s, not this chip.)
     pub fn bring_up_tx(&self, ch: u8) -> Result<(), FaceError> {
         self.bring_up_monitor(ch)?;
         // `NDN_8733B_TSSI=1` runs the full TSSI setup — the vendor's `halrf_do_tssi_8733b` port,
@@ -1460,14 +1460,19 @@ impl Rtl8733buBackend {
         Ok(())
     }
 
-    /// Reliable TX bring-up: re-run [`bring_up_tx`](Self::bring_up_tx) (full clean re-init,
-    /// ~62%/boot) until `verify(self)` returns `true` or `max_attempts` is reached. Returns
-    /// `Ok(true)` once verified, `Ok(false)` if exhausted.
+    /// Retrying TX bring-up: re-run [`bring_up_tx`](Self::bring_up_tx) (full clean re-init)
+    /// until `verify(self)` returns `true` or `max_attempts` is reached. Returns `Ok(true)`
+    /// once verified, `Ok(false)` if exhausted.
     ///
-    /// There is **no on-chip signal** that distinguishes a radiating boot from a dead one
-    /// (RX, self-reception, cal result, and registers are all identical) — so `verify` must
-    /// use **external feedback**: transmit a probe and confirm a response (an ACK, an NDN Data
-    /// for an Interest, a peer echo). At ~62%/boot this reaches ~99% within 5 attempts.
+    /// ⚠ This exists as INSURANCE, not because bring-up is unreliable. It was written when the
+    /// port believed only ~62% of boots radiate; that is retracted (20/20 measured — see
+    /// [`bring_up_tx`](Self::bring_up_tx)). Keep using it only where a missed transmit is
+    /// expensive and you have a cheap external check.
+    ///
+    /// If you do gate, `verify` must use **external feedback** — transmit a probe and confirm a
+    /// response (an ACK, an NDN Data for an Interest, a peer echo). No on-chip signal reports
+    /// radiated power on this part, which is a real and separate finding: the entire TXAGC page
+    /// is inert here, so registers cannot tell you how much RF left the antenna.
     pub fn bring_up_tx_until<F>(&self, ch: u8, max_attempts: u32, mut verify: F) -> Result<bool, FaceError>
     where
         F: FnMut(&Self) -> bool,

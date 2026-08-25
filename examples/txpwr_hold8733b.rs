@@ -3,7 +3,8 @@
 //! clock.
 //!
 //! One boot for the whole sweep, not one boot per index. Per-index boots were tried first and are
-//! unusable: only ~62% of cold bring-ups radiate at all, so ~40% of indices would score as "low
+//! unusable (PREMISE RETRACTED 2026-08-24 — measured 20/20; it was a bus fault, not the chip):
+//! only ~62% of cold bring-ups radiate at all, so ~40% of indices would score as "low
 //! power" purely because the chip was inert — a failure mode that manufactures a monotone-looking
 //! curve out of nothing. Within a single radiating boot the transmitter is reliable (measured: the
 //! a81a received 896-900 of 900 frames in all 24 arms of a one-boot sweep).

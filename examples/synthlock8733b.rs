@@ -1,5 +1,8 @@
 //! Does the synth-lock bit predict whether a boot will radiate?
 //!
+//! ⚠ PREMISE RETRACTED (2026-08-24): bring-up measured 20/20 on a healthy bus; the ~62% was an
+//! external USB fault (a failing AX88179 resetting the tree) plus per-boot `usbreset`s. This probe
+//! is kept because the synth-lock read it added is still useful. Original premise below.
 //! The port has long carried "~62% of cold bring-ups radiate, and there is NO on-chip signal that
 //! distinguishes a radiating boot from a dead one — verification must use external feedback". That
 //! note predates anyone reading RF `0xc5` BIT15, the vendor's channel-setting-ready (synth lock)

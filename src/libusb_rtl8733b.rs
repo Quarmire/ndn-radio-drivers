@@ -3472,10 +3472,17 @@ impl Rtl8733buBackend {
     /// chip, and it returned frozen nonsense (-250344 Hz identical across a full cap sweep). The
     /// reason is a generation mismatch that matters well beyond CFO: **`ODM_IC_JGR3_1SS =
     /// (ODM_RTL8733B)` — the PROTOCOL is 11n but the BASEBAND IP is Jaguar-3**, so `ic_ip_series`
-    /// is `PHYDM_IC_JGR3` and `phydm_get_cfo_info` falls through `default: break` — the vendor
-    /// reads no CFO on this chip at all. The 11n register file simply does not apply here. (Same
-    /// mismatch very likely explains the CCK/HT counters in `read_phy_counters` reading zero.)
-    /// So frequency error has to be estimated from successive TSF observations, not read directly.
+    /// is `PHYDM_IC_JGR3` and `phydm_get_cfo_info` falls through `default: break`. The 11n register
+    /// file simply does not apply here. (Same mismatch very likely explains the CCK/HT counters in
+    /// `read_phy_counters` reading zero.)
+    ///
+    /// ⚠ CORRECTION to an earlier version of this note, which said "the vendor reads no CFO on this
+    /// chip at all". It reads no CFO *from debug registers* — because on this generation CFO
+    /// arrives **per received frame in the PHY status**, which is a better source than a latched
+    /// global anyway. `struct phy_sts_rpt_jgr3_type1` — the same block this driver already parses
+    /// for RSSI (`pwdb_a`, drvinfo byte 1) — carries `cfo_tail[4]` s(8,7), and alongside it
+    /// `rxevm[4]` s(8,1) and `rxsnr[4]` s(8,1). So per-frame CFO, EVM and SNR are all sitting in
+    /// bytes we already read and currently discard. NOT yet parsed; see the port notes.
     ///
     /// MEASURED (`examples/xtalcfo8733b.rs`, regressing the port TSF against the host clock at each
     /// cap): the trim moves the clock **~62 ppm across caps 22..117** — 61.4 ppm on one run and

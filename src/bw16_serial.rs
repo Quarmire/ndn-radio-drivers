@@ -47,6 +47,7 @@ const T_TXPOWER: u8 = 0x03; // wext "txpower patha=N" power index
 const T_RATE: u8 = 0x04; // wifi_set_tx_data_rate code
 const T_BW40: u8 = 0x05; // wext_set_bw40_enable
 const T_INJECT_ATTR: u8 = 0x06; // poke pkt_attrib bytes, then inject
+const T_NAMEFILTER: u8 = 0x07; // load on-device Tier-0 masks: [enabled][n_masks][mask 16B]*
 const T_RX: u8 = 0x81;
 
 /// BW16 fixed TX-rate codes for [`Bw16SerialBackend::set_tx_rate`]
@@ -157,6 +158,22 @@ impl Bw16SerialBackend {
     /// Rust firmware, which reimplements the SDK's `#if 0`-disabled wifi_set_txpower.
     pub fn set_txpower(&self, idx: u8) -> Result<(), FaceError> {
         self.send_framed(T_TXPOWER, &[idx])
+    }
+
+    /// Load the on-device **Tier-0 name filter** (ESP32-C5 firmware only): up to 8 16-byte prefix-set
+    /// masks (cognition derives them via the shared `tier0` code). When `enabled` and at least one mask
+    /// is present, a received 0x8624 frame whose in-address prefix-set matches no mask is dropped ON THE
+    /// DEVICE — it never crosses the serial link, the §8.2 pre-USB drop. `enabled=false` (or no masks)
+    /// forwards everything (stock behaviour). Masks beyond the 8th are ignored (the firmware cap).
+    pub fn configure_name_filter(&self, enabled: bool, masks: &[[u8; 16]]) -> Result<(), FaceError> {
+        let n = masks.len().min(8);
+        let mut payload = Vec::with_capacity(2 + n * 16);
+        payload.push(enabled as u8);
+        payload.push(n as u8);
+        for m in &masks[..n] {
+            payload.extend_from_slice(m);
+        }
+        self.send_framed(T_NAMEFILTER, &payload)
     }
 
     /// Inject a complete 802.11 frame after poking `(offset, value)` bytes into the
@@ -319,6 +336,12 @@ impl Esp32SerialBackend {
         let time: Arc<dyn RadioTime> = dev.clone();
         let profile: Arc<dyn RadioProfile> = dev;
         Ok(OpenRadio { io, knobs: Some(knobs), time: Some(time), profile: Some(profile) })
+    }
+
+    /// Load the on-device Tier-0 name filter — see [`Bw16SerialBackend::configure_name_filter`]. On the
+    /// C5 this is a real pre-serial drop (the firmware is ours), unlike a commodity monitor NIC.
+    pub fn configure_name_filter(&self, enabled: bool, masks: &[[u8; 16]]) -> Result<(), FaceError> {
+        self.inner.configure_name_filter(enabled, masks)
     }
 }
 

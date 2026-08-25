@@ -33,7 +33,11 @@
  * The filter math is pure integer code with no firmware dependencies, so the same source builds
  * for the host self-test (which cross-checks it against the Rust implementation's vectors).
  */
-#ifdef NDR_HOST_TEST
+/* NDR_ESP: the ESP32-C5 (esp32c5-ndn) reuses this exact file for its on-device Tier-0 filter — the C5
+ * is the second Wi-Fi part whose firmware is ours (a rejected frame never crosses the USB-Serial-JTAG),
+ * so it shares the AR9271's C implementation rather than adding a fourth copy to drift. It wants the
+ * same stdint typedefs as the host self-test. */
+#if defined(NDR_HOST_TEST) || defined(NDR_ESP)
 #include <stdint.h>
 typedef uint8_t  a_uint8_t;
 typedef uint32_t a_uint32_t;

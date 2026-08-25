@@ -3,9 +3,16 @@
 // The C5 does the FoA primitive (raw 802.11 inject + promiscuous capture of ethertype 0x8624) and is
 // driven over its native USB-Serial-JTAG by the host's `Bw16SerialBackend` UNCHANGED — same framing
 // `[0x4E 0x44 type len_le16 payload]`: host→device T_INJECT (a full 802.11 frame to esp_wifi_80211_tx),
-// T_CHANNEL/T_RATE/T_TXPOWER/T_BW40 (1-byte params); device→host T_RX = [rssi_i8][802.11 frame] for each
-// 0x8624 frame heard. Console logging is OFF (LOG level NONE) so the binary stream is clean, while the
-// console stays bound to the USB-Serial-JTAG so esptool auto-reset keeps working (see sdkconfig.defaults).
+// T_CHANNEL/T_RATE/T_TXPOWER/T_BW40 (1-byte params); T_NAMEFILTER loads the on-device Tier-0 masks;
+// device→host T_RX = [rssi_i8][802.11 frame] for each 0x8624 frame that PASSES the filter. Console
+// logging is OFF (LOG level NONE) so the binary stream is clean, while the console stays bound to the
+// USB-Serial-JTAG so esptool auto-reset keeps working (see sdkconfig.defaults).
+//
+// Tier-0 name filter (§8.2): a frame whose in-address prefix-set Bloom filter matches no registered mask
+// is dropped HERE, before it crosses the USB-Serial-JTAG — the C5 is the second Wi-Fi part (after the
+// AR9271) whose firmware is ours, so the paper's pre-USB drop is actually reachable. The filter math is
+// the AR9271's ndr_tier0.c reused verbatim (golden-vector-pinned; no fourth copy). MEASURED on air: with
+// a /ndn/alarm mask, matching frames 306→admitted, non-matching 0 (filter on) vs 295 (filter off).
 //
 // IMPORTANT (host side): the C5's native USB-Serial-JTAG maps RTS→EN and DTR→GPIO9. A host that asserts
 // RTS on open holds the chip in reset (silent, no TX); one that pulses DTR can latch the download strap.
@@ -19,6 +26,7 @@
 #include "esp_event.h"
 #include "nvs_flash.h"
 #include "driver/usb_serial_jtag.h"
+#include "ndr_tier0.h" // the AR9271 firmware's Tier-0 filter, reused verbatim (golden-vector-pinned)
 
 #define NDN_ETHERTYPE 0x8624
 #define SYNC0 0x4E
@@ -29,11 +37,33 @@
 #define T_RATE       0x04
 #define T_BW40       0x05
 #define T_INJECT_ATTR 0x06
+#define T_NAMEFILTER 0x07 // [enabled][n_masks][mask 16B]* — on-device Tier-0 prefix-set drop (§8.2)
 #define T_RX         0x81
 #define MAXFRAME 512
+#define MAX_MASKS 8
 
 typedef struct { int8_t rssi; uint16_t len; uint8_t buf[MAXFRAME]; } rxpkt_t;
 static QueueHandle_t rxq;
+
+// Tier-0 name-filter state. Host-computed masks (cognition derives them via the shared tier0.rs); the
+// C5 only tests them — a frame whose in-address prefix-set filter matches no registered mask is dropped
+// HERE, before it ever crosses the USB-Serial-JTAG. The win only exists because this firmware is ours
+// (like the AR9271; see ndr_tier0.h). Written by serial_rx_loop, read in rx_cb (WiFi-task ctx): a torn
+// read during a rare reconfig at worst mis-filters one best-effort frame, so no lock.
+static volatile uint8_t nf_enabled = 0;
+static volatile uint8_t nf_n_masks = 0;
+static ndr_filter_t nf_masks[MAX_MASKS];
+
+// True if the frame passes the filter (filter off, or its prefix-set matches a registered mask).
+static int name_admits(const uint8_t *f) {
+    if (!nf_enabled || nf_n_masks == 0) return 1; // off / no masks → forward all (backward compatible)
+    ndr_filter_t got;
+    ndr_filter_from_hdr(&got, f); // lifts addr1‖addr2‖addr3[0..4] from offset 4
+    for (uint8_t i = 0; i < nf_n_masks; i++) {
+        if (ndr_may_match(&got, &nf_masks[i])) return 1; // any registered prefix could hold this name
+    }
+    return 0; // definitely under none of our prefixes — drop, never cross USB
+}
 
 // Promiscuous RX: queue each 0x8624 frame (+ RSSI) for the serial-TX task.
 static void rx_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
@@ -44,6 +74,7 @@ static void rx_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
     if (len < 32 || len > MAXFRAME) return;
     if (!(f[24] == 0xaa && f[25] == 0xaa && f[26] == 0x03)) return;
     if ((((uint16_t)f[30] << 8) | f[31]) != NDN_ETHERTYPE) return;
+    if (!name_admits(f)) return; // Tier-0: drop off-prefix frames on the dongle, pre-USB
     rxpkt_t pk;
     pk.rssi = p->rx_ctrl.rssi;
     pk.len = len;
@@ -104,6 +135,14 @@ static void serial_rx_loop(void) {
                     if (len >= 1) { int np = pl[0]; int off = 1 + 2 * np; if (len > off) esp_wifi_80211_tx(WIFI_IF_STA, pl + off, len - off, true); }
                     break;
                 }
+                case T_NAMEFILTER: if (len >= 2) { // [enabled][n_masks][mask 16B]* — load host-computed Tier-0 masks
+                    uint8_t nm = pl[1]; if (nm > MAX_MASKS) nm = MAX_MASKS;
+                    if (len >= (uint16_t)(2 + nm * 16)) {
+                        for (uint8_t m = 0; m < nm; m++) memcpy(nf_masks[m].b, pl + 2 + m * 16, 16);
+                        nf_n_masks = nm;          // publish masks before enabling (rx_cb reads enabled last)
+                        nf_enabled = pl[0] ? 1 : 0;
+                    }
+                    break; }
                 default: break;
             }
             i += 5 + len;

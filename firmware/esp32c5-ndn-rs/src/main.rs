@@ -283,9 +283,14 @@ fn main() {
         sys::esp_wifi_init(&cfg);
         sys::esp_wifi_set_storage(sys::wifi_storage_t_WIFI_STORAGE_RAM);
         sys::esp_wifi_set_mode(sys::wifi_mode_t_WIFI_MODE_STA);
+        // TX RATE (investigated, NOT inert-by-design): esp_wifi_set_protocols (drop 11AX), esp_wifi_set_config
+        // and esp_wifi_set_band_mode ALL succeed here, so the protocol/band controls actuate. But the
+        // documented rate actuator esp_wifi_config_80211_tx returns ESP_FAIL for every phymode/rate/sequence
+        // on this C5 + IDF 5.5.5, config_80211_tx_rate is blocked under 11AX, and esp_wifi_internal_set_fix_rate
+        // is ESP_ERR_NOT_SUPPORTED. The fn is in the net80211 blob (not a mis-call), so the raw
+        // esp_wifi_80211_tx path is likely fixed at the band basic rate on this SoC. NEXT AVENUE:
+        // esp_wifi_internal_tx (the rate-controlled data path) — a fresh investigation (frame-format differs).
         sys::esp_wifi_start();
-
-        // C5 dual-band: enable 2.4 + 5 GHz so a T_CHANNEL for a 5 GHz channel switches band via set_channel.
         sys::esp_wifi_set_band_mode(sys::wifi_band_mode_t_WIFI_BAND_MODE_AUTO);
         sys::esp_wifi_set_channel(1, sys::wifi_second_chan_t_WIFI_SECOND_CHAN_NONE);
         sys::esp_wifi_set_promiscuous_rx_cb(Some(rx_cb));

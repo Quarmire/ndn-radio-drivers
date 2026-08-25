@@ -54,12 +54,13 @@ const T_RATE: u8 = 0x04;
 const T_BW40: u8 = 0x05;
 const T_INJECT_ATTR: u8 = 0x06;
 const T_NAMEFILTER: u8 = 0x07; // [enabled][n_masks][mask 16B]* — on-device Tier-0 prefix-set drop
-const T_INJECT_AT: u8 = 0x09; // [delay_us_le32][802.11 frame] — scheduled TX at a precise instant
+const T_INJECT_AT: u8 = 0x09; // [delay_us_le32][802.11 frame] — scheduled TX, delay from now
+const T_INJECT_ABS: u8 = 0x0A; // [target_us_le64][802.11 frame] — scheduled TX at an ABSOLUTE esp_timer µs (slot lease)
 const T_RX_TS: u8 = 0x82; // [rssi_i8][rx_ts_us_le32][802.11 frame] — RX + hardware per-frame µs stamp
 const T_TXTIME: u8 = 0x83; // [target_le64][actual_le64][tsf_le64] — scheduling error report
 const MAXFRAME: usize = 512;
 const MAX_MASKS: usize = 8;
-const SCHED_MAX_DELAY_US: i64 = 20_000; // cap the busy-wait (a slot lease would use a hardware timer)
+const SCHED_MAX_DELAY_US: i64 = 100_000; // cap the busy-wait to ~1 slot period (a hw timer would avoid the spin)
 
 // Reuse the LR2021 firmware's Tier-0 filter VERBATIM (no_std, dependency-free, golden-vector-pinned —
 // the very file the host tier0.rs was ported from). Both C5 firmwares share EXISTING pinned copies: the
@@ -216,6 +217,24 @@ fn serial_rx_loop() -> ! {
                         rep[8..16].copy_from_slice(&actual.to_le_bytes());
                         rep[16..24].copy_from_slice(&tsf.to_le_bytes());
                         send_framed(T_TXTIME, &rep);
+                    }
+                    T_INJECT_ABS if len >= 8 => {
+                        // [target_us_le64][frame] — place TX at an ABSOLUTE esp_timer µs, so the frame lands
+                        // at a common-clock instant regardless of when the command arrived (the slot lease).
+                        let target = i64::from_le_bytes([pl[0], pl[1], pl[2], pl[3], pl[4], pl[5], pl[6], pl[7]]);
+                        let now = sys::esp_timer_get_time();
+                        // Guard: only honour a target within [now, now + cap] — a stale/past or far-future
+                        // target is dropped rather than blocking the dispatch or firing late.
+                        if target > now && target - now <= SCHED_MAX_DELAY_US {
+                            while sys::esp_timer_get_time() < target {}
+                            sys::esp_wifi_80211_tx(sys::wifi_interface_t_WIFI_IF_STA, pl.as_ptr().add(8) as *const _, (len - 8) as i32, true);
+                            let actual = sys::esp_timer_get_time();
+                            let mut rep = [0u8; 24];
+                            rep[0..8].copy_from_slice(&target.to_le_bytes());
+                            rep[8..16].copy_from_slice(&actual.to_le_bytes());
+                            rep[16..24].copy_from_slice(&sys::esp_wifi_get_tsf_time(sys::wifi_interface_t_WIFI_IF_STA).to_le_bytes());
+                            send_framed(T_TXTIME, &rep);
+                        }
                     }
                     T_NAMEFILTER if len >= 2 => {
                         // [enabled][n_masks][mask 16B]* — load host-computed Tier-0 masks.

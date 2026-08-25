@@ -82,6 +82,7 @@ struct NameFilter {
 }
 static NF: Mutex<NameFilter> = Mutex::new(NameFilter { enabled: false, n: 0, masks: [[0u8; 16]; MAX_MASKS] });
 
+
 // RX ring shared between the promiscuous callback (WiFi-task context) and the serial-TX loop (main).
 // (rssi, rx_ts_us, frame) — the µs timestamp is the C5's hardware per-frame RX stamp.
 static RXQ: Mutex<VecDeque<(i8, u32, Vec<u8>)>> = Mutex::new(VecDeque::new());
@@ -186,8 +187,10 @@ fn serial_rx_loop() -> ! {
                         sys::esp_wifi_set_bandwidth(sys::wifi_interface_t_WIFI_IF_STA, bw);
                     }
                     T_RATE if len >= 1 => {
-                        // MEASURED INERT for injection (see the C build); kept for parity.
-                        sys::esp_wifi_config_80211_tx_rate(
+                        // MEASURED INERT for association-free raw injection on the C5 (full evidence at the
+                        // init site: esp_wifi_80211_tx is locked to 1 Mbps, no rate API moves it). Kept as a
+                        // no-op so the host's rate lever has a stable sink and cognition degrades gracefully.
+                        let _ = sys::esp_wifi_config_80211_tx_rate(
                             sys::wifi_interface_t_WIFI_IF_STA,
                             pl[0] as sys::wifi_phy_rate_t,
                         );
@@ -283,15 +286,21 @@ fn main() {
         sys::esp_wifi_init(&cfg);
         sys::esp_wifi_set_storage(sys::wifi_storage_t_WIFI_STORAGE_RAM);
         sys::esp_wifi_set_mode(sys::wifi_mode_t_WIFI_MODE_STA);
-        // TX RATE (investigated, NOT inert-by-design): esp_wifi_set_protocols (drop 11AX), esp_wifi_set_config
-        // and esp_wifi_set_band_mode ALL succeed here, so the protocol/band controls actuate. But the
-        // documented rate actuator esp_wifi_config_80211_tx returns ESP_FAIL for every phymode/rate/sequence
-        // on this C5 + IDF 5.5.5, config_80211_tx_rate is blocked under 11AX, and esp_wifi_internal_set_fix_rate
-        // is ESP_ERR_NOT_SUPPORTED. The fn is in the net80211 blob (not a mis-call), so the raw
-        // esp_wifi_80211_tx path is likely fixed at the band basic rate on this SoC. NEXT AVENUE:
-        // esp_wifi_internal_tx (the rate-controlled data path) — a fresh investigation (frame-format differs).
+        // TX RATE — MEASURED INERT for association-free raw injection on the ESP32-C5 (ESP-IDF 5.5.5).
+        // esp_wifi_80211_tx always transmits at the 1 Mbps basic rate here, and NONE of the rate APIs move
+        // it (all on-air-verified against an mt76 monitor):
+        //   • esp_wifi_config_80211_tx_rate(): ESP_FAIL before start (dual-band AUTO can't drop 11AX — both
+        //     set_band and set_band_mode return NOT_STARTED, so the AX-blocked API can't be satisfied); it
+        //     returns OK after start but the TX path has already latched the rate → inert.
+        //   • esp_wifi_config_80211_tx() (the struct form the docs say to use under 11A/AC/AX): ESP_FAIL for
+        //     every phymode (11B/G/A, HT20/40, VHT20) — unimplemented for this target's net80211 blob.
+        //   • esp_wifi_internal_set_fix_rate(): returns OK (with AMPDU-TX off) but governs only the internal
+        //     data path, not raw 80211_tx — MCS7 still went out at 1 Mbps, on STA and on the AP interface.
+        //   • esp_wifi_internal_tx() (the rate-controlled data path): ESP_ERR_WIFI_CONN (0x3006) unassociated.
+        // The one rate-controllable path (internal_tx) needs association, which the named radio deliberately
+        // avoids. So on this silicon the bearer is a fixed-rate 1 Mbps channel — cognition's rate lever is a
+        // no-op here and must degrade gracefully (the host advertises WIFI_PHY_RATE fixed for this backend).
         sys::esp_wifi_start();
-        sys::esp_wifi_set_band_mode(sys::wifi_band_mode_t_WIFI_BAND_MODE_AUTO);
         sys::esp_wifi_set_channel(1, sys::wifi_second_chan_t_WIFI_SECOND_CHAN_NONE);
         sys::esp_wifi_set_promiscuous_rx_cb(Some(rx_cb));
         sys::esp_wifi_set_promiscuous(true);

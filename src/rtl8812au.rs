@@ -6359,6 +6359,7 @@ impl Rtl8812auBackend {
                             rssi_dbm,
                             mcs_index,
                             stamp,
+                            phy: None,
                         });
                     }
                 }

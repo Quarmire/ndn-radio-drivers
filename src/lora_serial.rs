@@ -701,6 +701,7 @@ fn handle_event(
                 rssi_dbm: Some(rssi.clamp(i8::MIN as i16, i8::MAX as i16) as i8),
                 mcs_index: None,
                 stamp: Some(host_stamp()),
+                phy: None,
             };
             let _ = tx.send(cap);
         }

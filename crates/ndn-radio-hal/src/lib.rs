@@ -388,6 +388,27 @@ pub struct CapturedFrame {
     /// software-timestamped or loopback frame). This is the named-time "Cut 1"
     /// seam — the input to time-transfer measurement.
     pub stamp: Option<LinkStamp>,
+    /// Per-frame PHY quality from the receiver's own status report, when the backend surfaces it.
+    ///
+    /// `rssi_dbm` says how LOUD the frame arrived; this says how CLEAN it was, which is what
+    /// actually predicts whether a rate decodes. `None` on backends that do not report it.
+    pub phy: Option<PhyMetrics>,
+}
+
+/// Per-frame PHY quality, read from the chip's own receive status report.
+///
+/// Every field is independently optional: a chip may report some and not others, and a field the
+/// hardware marks as "not measured" is `None` rather than a sentinel that reads like data.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PhyMetrics {
+    /// Signal-to-noise ratio of the strongest path, dB.
+    pub snr_db: Option<i8>,
+    /// Error-vector magnitude of the strongest path, dB (negative; closer to 0 is worse).
+    pub evm_db: Option<i8>,
+    /// Carrier frequency offset of the transmitter relative to us, Hz. The per-frame frequency
+    /// sensor: pair it with a crystal trim to discipline clock RATE rather than repeatedly
+    /// re-correcting phase.
+    pub cfo_hz: Option<i32>,
 }
 
 /// The radio behind a `MonitorWifiFace`: inject a frame at a chosen rate, and

@@ -125,6 +125,7 @@ impl FrameIo for LoopbackEndpoint {
                         // The loopback bus is a format-agnostic in-memory test
                         // double with no hardware clock — honestly unstamped.
                         stamp: None,
+                        phy: None,
                     });
                 }
                 // Own transmission — a radio does not hear itself.

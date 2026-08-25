@@ -22,6 +22,8 @@
 
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
+use std::time::Duration;
+
 use async_trait::async_trait;
 use ndn_transport::FaceError;
 use tokio::io::unix::AsyncFd;
@@ -123,12 +125,38 @@ impl AfPacketBackend {
     /// require a specific monitor-injection format (e.g. the rtl88x2eu cfg80211
     /// monitor path needs an exactly-14-byte radiotap + an 802.11 *Action* frame).
     pub async fn inject_raw(&self, buf: &[u8]) -> Result<(), FaceError> {
+        self.send_buf(buf).await
+    }
+
+    /// Overall deadline for one frame's send. A frame that cannot leave within
+    /// this window (sustained backpressure) is dropped rather than stalling the
+    /// shared TX task — for a broadcast radio a stale Interest/Data is worthless.
+    const SEND_DEADLINE: Duration = Duration::from_secs(2);
+    /// Cap on any single readiness wait. Bounds how long a *missing* EPOLLOUT
+    /// edge (see [`send_buf`](Self::send_buf)) can delay a retry.
+    const WRITABLE_POLL: Duration = Duration::from_millis(20);
+
+    /// Send one pre-built frame (radiotap ++ 802.11 ++ body), tolerant of the
+    /// AF_PACKET write-readiness quirk.
+    ///
+    /// Packet sockets do **not** reliably deliver an edge-triggered `EPOLLOUT`
+    /// write-space wakeup when their send buffer drains, so parking on
+    /// [`AsyncFd::writable`]`().await` after an `EAGAIN` can hang forever even
+    /// though the buffer empties within seconds and a plain retry would succeed.
+    /// (Root-caused 2026-08-25 with `examples/af_wedge_probe`: a bare socket
+    /// drains in ~5 s while the async waiter never wakes — which silently wedged
+    /// the whole radio face because one shared batcher task was blocked in this
+    /// `.await`.) So we send optimistically first, and on `WouldBlock` we cap the
+    /// readiness wait and retry the send regardless (level-triggered), giving up
+    /// only after [`SEND_DEADLINE`](Self::SEND_DEADLINE).
+    async fn send_buf(&self, buf: &[u8]) -> Result<(), FaceError> {
         let mut dst: libc::sockaddr_ll = unsafe { std::mem::zeroed() };
         dst.sll_family = libc::AF_PACKET as u16;
         dst.sll_protocol = ETH_P_ALL.to_be();
         dst.sll_ifindex = self.ifindex;
+
+        let deadline = tokio::time::Instant::now() + Self::SEND_DEADLINE;
         loop {
-            let mut guard = self.socket.writable().await.map_err(FaceError::Io)?;
             let fd: RawFd = self.socket.get_ref().as_raw_fd();
             let ret = unsafe {
                 libc::sendto(
@@ -144,11 +172,21 @@ impl AfPacketBackend {
                 return Ok(());
             }
             let err = std::io::Error::last_os_error();
-            if err.kind() == std::io::ErrorKind::WouldBlock {
-                guard.clear_ready();
-                continue;
+            if err.kind() != std::io::ErrorKind::WouldBlock {
+                return Err(FaceError::Io(err));
             }
-            return Err(FaceError::Io(err));
+            // Backpressured. Wait for a writable edge, but never trust it alone:
+            // cap the wait and retry the send anyway, so an omitted EPOLLOUT
+            // cannot park us past the deadline.
+            if tokio::time::Instant::now() >= deadline {
+                return Err(FaceError::Io(err));
+            }
+            let _ = tokio::time::timeout(Self::WRITABLE_POLL, async {
+                if let Ok(mut g) = self.socket.writable().await {
+                    g.clear_ready();
+                }
+            })
+            .await;
         }
     }
 }
@@ -163,34 +201,7 @@ impl crate::FrameIo for AfPacketBackend {
             None => crate::frame::build(self.format, &frame)?,
         };
 
-        let mut dst: libc::sockaddr_ll = unsafe { std::mem::zeroed() };
-        dst.sll_family = libc::AF_PACKET as u16;
-        dst.sll_protocol = ETH_P_ALL.to_be();
-        dst.sll_ifindex = self.ifindex;
-
-        loop {
-            let mut guard = self.socket.writable().await.map_err(FaceError::Io)?;
-            let fd: RawFd = self.socket.get_ref().as_raw_fd();
-            let ret = unsafe {
-                libc::sendto(
-                    fd,
-                    buf.as_ptr() as *const libc::c_void,
-                    buf.len(),
-                    0,
-                    &dst as *const libc::sockaddr_ll as *const libc::sockaddr,
-                    std::mem::size_of::<libc::sockaddr_ll>() as libc::socklen_t,
-                )
-            };
-            if ret >= 0 {
-                return Ok(());
-            }
-            let err = std::io::Error::last_os_error();
-            if err.kind() == std::io::ErrorKind::WouldBlock {
-                guard.clear_ready();
-                continue;
-            }
-            return Err(FaceError::Io(err));
-        }
+        self.send_buf(&buf).await
     }
 
     fn set_rate(&self, mcs: crate::McsDescriptor) -> Result<(), FaceError> {

@@ -31,7 +31,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use ndn_frame_io::{
+use ndn_frame_io::{PhyMetrics, 
     frame, CapturedFrame, ClockDomainId, FrameFormat, FrameIo, InjectFrame,
 };
 use crate::realtek_rx;
@@ -3672,18 +3672,38 @@ impl Rtl8733buBackend {
                     data[off + 23],
                 ]);
                 let stamp = Some(realtek_rx::rx_stamp(rxtsfl, self.tsf_domain));
+                // Per-frame PHY quality, from the SAME status block `rssi` above is read from.
+                // This part's baseband is Jaguar-3 (`ODM_IC_JGR3_1SS = ODM_RTL8733B`) despite the
+                // 802.11n protocol badge, so the layout is `struct phy_sts_rpt_jgr3_type1`:
+                //   DW4 @16 `s8 rxevm[4]`   s(8,1)  -> dB = raw/2, and raw -128 means NOT MEASURED
+                //   DW5 @20 `s8 cfo_tail[4]` s(8,7) -> Hz = raw * 312500/128 (phydm_cfo's 312.5/2^7)
+                //   DW6 @24 `s8 rxsnr[4]`   s(8,1)  -> dB = raw>>1 (vendor: rx_snr[i] = val_s8 >> 1)
+                // The struct is 28 bytes, so this needs `drvinfo >= 28` — NOT the `>= 8` that
+                // guards RSSI (pwdb_a lives at byte 1). A shorter report carries no such fields.
+                let phy = (drvinfo >= 28 && rx_rate >= 0x04 && off + 24 + 28 <= data.len()).then(|| {
+                    let b = |i: usize| data[off + 24 + i] as i8;
+                    let evm = b(16);
+                    PhyMetrics {
+                        snr_db: Some(b(24) >> 1),
+                        // -128 is the hardware's "no measurement" sentinel (the vendor substitutes
+                        // -25 dB); report None rather than a number that reads like data.
+                        evm_db: (evm != -128).then(|| evm / 2),
+                        cfo_hz: Some(i32::from(b(20)) * 312_500 / 128),
+                    }
+                });
                 if std::env::var("NDN_RX_META_DBG").is_ok() {
                     eprintln!(
-                        "RX len={pkt_len} drvinfo={drvinfo} rate=0x{rx_rate:02x} rssi={rssi:?} mcs={mcs:?} tsfl={rxtsfl}"
+                        "RX len={pkt_len} drvinfo={drvinfo} rate=0x{rx_rate:02x} rssi={rssi:?} mcs={mcs:?} tsfl={rxtsfl} phy={phy:?}"
                     );
                 }
-                if let Some(cap) = frame::parse_dot11(
+                if let Some(mut cap) = frame::parse_dot11(
                     self.format,
                     &data[fstart..fstart + pkt_len],
                     rssi,
                     mcs,
                     stamp,
                 ) {
+                    cap.phy = phy;
                     q.push(cap);
                 }
             }

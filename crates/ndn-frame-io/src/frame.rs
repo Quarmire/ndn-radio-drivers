@@ -416,6 +416,7 @@ pub fn parse_dot11(
                 rssi_dbm: rssi,
                 mcs_index: mcs,
                 stamp,
+                phy: None,
             })
         }
         FrameFormat::EspNow { oui } => {
@@ -455,6 +456,7 @@ pub fn parse_dot11(
                 rssi_dbm: rssi,
                 mcs_index: mcs,
                 stamp,
+                phy: None,
             })
         }
         FrameFormat::Raw80211 => {
@@ -482,6 +484,7 @@ pub fn parse_dot11(
                 rssi_dbm: rssi,
                 mcs_index: mcs,
                 stamp,
+                phy: None,
             })
         }
         _ => None,

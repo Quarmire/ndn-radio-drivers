@@ -5225,6 +5225,7 @@ impl LibUsbRtl88xxBackend {
                             rssi_dbm,
                             mcs_index,
                             stamp,
+                            phy: None,
                         });
                     }
                     p += (14 + len + 3) & !3; // next subframe (4-byte aligned)
@@ -5248,6 +5249,7 @@ impl LibUsbRtl88xxBackend {
                 rssi_dbm,
                 mcs_index,
                 stamp,
+                phy: None,
             }]
         })();
         Some((decoded, advance))

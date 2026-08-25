@@ -21,7 +21,7 @@ pub use event_id::EventId;
 /// here so every existing `ndn_frame_io::X` path and internal `crate::X`
 /// reference still resolves unchanged.
 pub use ndn_radio_hal::{
-    BROADCAST, CapturedFrame, ClockDomainId, DEFAULT_SRC, FaceError, FaceId, FrameIo, InjectFrame,
+    BROADCAST, CapturedFrame, ClockDomainId, DEFAULT_SRC, FaceError, FaceId, FrameIo, InjectFrame, PhyMetrics,
     CsiSupport, LatchPoint, LinkStamp, MAX_RELIABLE_MCS, McsDescriptor, McsPolicy, RadioCapability,
     RadioClockKind, RadioProfile, RadioTime, RadioTimeSource, Reach, Reliability, TxDiscipline,
     TxIntent, mcs_for_rssi, mcs_phy_rate_bps,

@@ -50,10 +50,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     buf.extend_from_slice(&hdr);
     buf.extend_from_slice(&dot11);
     let mut sent = 0usize;
+    let mut first_err = None;
     for _ in 0..count {
-        if backend.inject_raw(&buf).await.is_ok() {
-            sent += 1;
+        match backend.inject_raw(&buf).await {
+            Ok(()) => sent += 1,
+            // Report WHY, once. A bare "sent=0" is indistinguishable from a dead radio, and cost a
+            // debugging round when the monitor interface had simply been left DOWN.
+            Err(e) => {
+                first_err.get_or_insert(e.to_string());
+            }
         }
+    }
+    if let Some(e) = first_err {
+        eprintln!("  ref: {} of {count} injects failed, first error: {e}", count - sent);
     }
     println!("  ref knob={knob} idx={idx} rate={rate}(x500kbps): sent={sent}/{count}");
     Ok(())

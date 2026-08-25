@@ -3730,12 +3730,31 @@ impl RadioProfile for Rtl8733buBackend {
         // `max_tx_power: 127` = the DE scale's full-power end (see `RadioKnobs::set_tx_power`),
         // ~0.111 dB per step over a measured 14.39 dB.
         //
-        // `tx_power_dbm` stays **None** deliberately, per this field's own rule that a fabricated
-        // range is worse than none. What is measured here is *relative* attenuation below the
-        // ceiling (R^2 = 0.9964); the ABSOLUTE anchor is not measured — the ~17 dBm @5G figure is a
-        // vendor datasheet maximum for the part, not this unit on this channel. To populate it
-        // honestly, measure conducted output at a known DE with a calibrated path (the B210 with a
-        // known-gain chain, or a receiver at known path loss) and anchor the curve to that.
+        // `tx_power_dbm` stays **None**, now for a MEASURED reason rather than a missing anchor.
+        //
+        // The absolute anchor HAS been measured (2026-08-25), by substitution against an mt76x2u on
+        // the same host whose applied power nl80211 reports, injecting our own frame format at the
+        // same 6 Mbps OFDM rate into the same meter, so path loss + meter offset cancel:
+        //     K = P_ref - RSSI_ref = 75.97 dB (sd 0.59, bracket drift 0.54 dB)
+        //     TX_dut = RSSI_dut + K  =>  full power = +14.45 / +15.17 dBm at the two full arms
+        // The reference sweep doubled as the instrument check and PASSED — received level tracked
+        // commanded reference power at 1.002 and 0.978 dB/dB (R^2 ~ 0.99) over 15 dB, so neither
+        // the meter nor the reference is lying over this span. ~15 dBm also cross-checks against
+        // the part's <=17 dBm @5G datasheet maximum.
+        //
+        // ⚠ WHY THAT STILL DOES NOT LICENSE A dBm KNOB: the index -> dB mapping is NOT reproducible
+        // across bring-ups. Full-scale range measured 12.1 / 14.06 / 14.39 / 19.58 dB on four runs
+        // of the identical sweep. A fixed dBm table would therefore be several dB wrong on any
+        // given boot, and `set_tx_power_dbm` cannot honour a request it cannot repeat — exactly the
+        // "planner will believe it" failure this field warns about.
+        //
+        // Residual systematic on the anchor itself: the antenna/position difference between the
+        // reference dongle and this one does NOT cancel in an over-the-air substitution.
+        //
+        // To close the dBm axis: (a) conducted measurement through a cable to remove the antenna
+        // term, and (b) a per-boot calibration, because of the spread above. Note (b) cannot be
+        // done from the chip alone — the vendor driver exposes no TSSI achieved-power readback,
+        // only readbacks of the DE it just wrote.
         RadioCapability {
             bands: vec![Band::Band2_4GHz, Band::Band5GHz],
             rate: RateCapability::Wifi { max_mcs: 7, max_nss: 1, max_bw: 1 },

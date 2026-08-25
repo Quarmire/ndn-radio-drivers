@@ -39,13 +39,14 @@
 #define T_BW40       0x05
 #define T_INJECT_ATTR 0x06
 #define T_NAMEFILTER 0x07 // [enabled][n_masks][mask 16B]* — on-device Tier-0 prefix-set drop (§8.2)
-#define T_INJECT_AT  0x09 // [delay_us_le32][802.11 frame] — scheduled TX at TSF now+delay (airtime lease)
+#define T_INJECT_AT  0x09 // [delay_us_le32][802.11 frame] — scheduled TX, delay from now
+#define T_INJECT_ABS 0x0A // [target_us_le64][802.11 frame] — scheduled TX at an ABSOLUTE esp_timer µs (slot lease)
 #define T_RX         0x81 // [rssi_i8][802.11 frame] — used by the BW16; the C5 sends T_RX_TS instead
 #define T_RX_TS      0x82 // [rssi_i8][rx_ts_us_le32][802.11 frame] — RX + hardware per-frame µs stamp
 #define T_TXTIME     0x83 // [target_le64][actual_le64][tsf_le64] — scheduling error report for T_INJECT_AT
 #define MAXFRAME 512
 #define MAX_MASKS 8
-#define SCHED_MAX_DELAY_US 20000 // cap the busy-wait (this primitive spins; a slot lease would use a timer)
+#define SCHED_MAX_DELAY_US 100000 // cap the busy-wait to ~1 slot period (a hw timer would avoid the spin)
 
 typedef struct { int8_t rssi; uint16_t len; uint32_t rxts; uint8_t buf[MAXFRAME]; } rxpkt_t;
 static QueueHandle_t rxq;
@@ -163,6 +164,26 @@ static void serial_rx_loop(void) {
                         rep[16 + k] = (uint8_t)(tsf >> (8 * k));
                     }
                     send_framed(T_TXTIME, rep, 24); // [target][actual][tsf]: error = actual-target
+                    break; }
+                case T_INJECT_ABS: if (len >= 8) { // [target_us_le64][frame] — TX at an ABSOLUTE esp_timer µs (slot lease)
+                    int64_t target = 0;
+                    for (int k = 0; k < 8; k++) target |= ((int64_t)pl[k]) << (8 * k);
+                    int64_t now = esp_timer_get_time();
+                    // Honour only a target within [now, now+cap] — a stale/past or far-future one is dropped
+                    // rather than blocking the dispatch or firing late (the slot has already passed).
+                    if (target > now && target - now <= SCHED_MAX_DELAY_US) {
+                        while (esp_timer_get_time() < target) { /* spin to the scheduled instant */ }
+                        esp_wifi_80211_tx(WIFI_IF_STA, pl + 8, len - 8, true);
+                        int64_t actual = esp_timer_get_time();
+                        int64_t tsf = esp_wifi_get_tsf_time(WIFI_IF_STA);
+                        uint8_t rep[24];
+                        for (int k = 0; k < 8; k++) {
+                            rep[k] = (uint8_t)(target >> (8 * k));
+                            rep[8 + k] = (uint8_t)(actual >> (8 * k));
+                            rep[16 + k] = (uint8_t)(tsf >> (8 * k));
+                        }
+                        send_framed(T_TXTIME, rep, 24);
+                    }
                     break; }
                 case T_NAMEFILTER: if (len >= 2) { // [enabled][n_masks][mask 16B]* — load host-computed Tier-0 masks
                     uint8_t nm = pl[1]; if (nm > MAX_MASKS) nm = MAX_MASKS;

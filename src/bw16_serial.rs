@@ -35,7 +35,7 @@ fn host_stamp() -> LinkStamp {
         LatchPoint::HostRecv,
     )
 }
-use ndn_radio_hal::{Bandwidth, OpenRadio, RadioKnobs};
+use ndn_radio_hal::{Bandwidth, OpenRadio, RadioKnobs, TxDiscipline};
 use ndn_transport::FaceError;
 use tokio::sync::{Mutex as AsyncMutex, mpsc};
 
@@ -48,6 +48,7 @@ const T_RATE: u8 = 0x04; // wifi_set_tx_data_rate code
 const T_BW40: u8 = 0x05; // wext_set_bw40_enable
 const T_INJECT_ATTR: u8 = 0x06; // poke pkt_attrib bytes, then inject
 const T_NAMEFILTER: u8 = 0x07; // load on-device Tier-0 masks: [enabled][n_masks][mask 16B]*
+const T_INJECT_AT: u8 = 0x09; // scheduled TX: [delay_us_le32][802.11 frame] (ESP32-C5 firmware only)
 const T_RX: u8 = 0x81;
 
 /// BW16 fixed TX-rate codes for [`Bw16SerialBackend::set_tx_rate`]
@@ -174,6 +175,19 @@ impl Bw16SerialBackend {
             payload.extend_from_slice(m);
         }
         self.send_framed(T_NAMEFILTER, &payload)
+    }
+
+    /// **Scheduled TX** (ESP32-C5 firmware only): place a frame on air at `delay_us` from now, timed by
+    /// the device's always-running monotonic clock to within a few hundred µs — the airtime-lease
+    /// primitive (`TxDiscipline::ScheduledAt`). Ordinary [`inject`](Self::inject) leaves at request time
+    /// with host+OS+serial jitter (ms); this places TX at a precise instant. Delay is capped in firmware
+    /// (~20 ms; this is a busy-wait primitive, not yet a periodic slot lease). Measured error ≤ ~190 µs.
+    pub fn inject_at(&self, frame_in: InjectFrame, delay_us: u32) -> Result<(), FaceError> {
+        let dot11 = frame::build_dot11(self.format, &frame_in)?;
+        let mut payload = Vec::with_capacity(4 + dot11.len());
+        payload.extend_from_slice(&delay_us.to_le_bytes());
+        payload.extend_from_slice(&dot11);
+        self.send_framed(T_INJECT_AT, &payload)
     }
 
     /// Inject a complete 802.11 frame after poking `(offset, value)` bytes into the
@@ -343,6 +357,11 @@ impl Esp32SerialBackend {
     pub fn configure_name_filter(&self, enabled: bool, masks: &[[u8; 16]]) -> Result<(), FaceError> {
         self.inner.configure_name_filter(enabled, masks)
     }
+
+    /// Scheduled TX (the airtime-lease primitive) — see [`Bw16SerialBackend::inject_at`].
+    pub fn inject_at(&self, frame_in: InjectFrame, delay_us: u32) -> Result<(), FaceError> {
+        self.inner.inject_at(frame_in, delay_us)
+    }
 }
 
 #[async_trait]
@@ -362,6 +381,12 @@ impl RadioKnobs for Esp32SerialBackend {
     }
     fn set_tx_power(&self, idx: u32) -> Result<(), FaceError> {
         RadioKnobs::set_tx_power(&self.inner, idx)
+    }
+    fn tx_discipline(&self) -> TxDiscipline {
+        // The C5 firmware places T_INJECT_AT frames at a scheduled instant via its monotonic timer.
+        // Measured error ≤ ~190 µs (dominated by the esp_wifi_80211_tx submission latency), so declare
+        // a conservative 200 µs granularity — the scheduler learns the C5 can name an airtime slot.
+        TxDiscipline::ScheduledAt { granularity_ns: 200_000 }
     }
 }
 

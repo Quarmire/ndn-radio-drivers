@@ -54,9 +54,12 @@ const T_RATE: u8 = 0x04;
 const T_BW40: u8 = 0x05;
 const T_INJECT_ATTR: u8 = 0x06;
 const T_NAMEFILTER: u8 = 0x07; // [enabled][n_masks][mask 16B]* — on-device Tier-0 prefix-set drop
+const T_INJECT_AT: u8 = 0x09; // [delay_us_le32][802.11 frame] — scheduled TX at a precise instant
 const T_RX: u8 = 0x81;
+const T_TXTIME: u8 = 0x83; // [target_le64][actual_le64][tsf_le64] — scheduling error report
 const MAXFRAME: usize = 512;
 const MAX_MASKS: usize = 8;
+const SCHED_MAX_DELAY_US: i64 = 20_000; // cap the busy-wait (a slot lease would use a hardware timer)
 
 // Reuse the LR2021 firmware's Tier-0 filter VERBATIM (no_std, dependency-free, golden-vector-pinned —
 // the very file the host tier0.rs was ported from). Both C5 firmwares share EXISTING pinned copies: the
@@ -195,6 +198,22 @@ fn serial_rx_loop() -> ! {
                                 true,
                             );
                         }
+                    }
+                    T_INJECT_AT if len >= 4 => {
+                        // [delay_us_le32][frame] — place TX at a precise instant on esp_timer (the 802.11
+                        // TSF reads 0 while unassociated). Report [target][actual][tsf] for the error.
+                        let mut delay = (pl[0] as i64) | ((pl[1] as i64) << 8) | ((pl[2] as i64) << 16) | ((pl[3] as i64) << 24);
+                        if delay > SCHED_MAX_DELAY_US { delay = SCHED_MAX_DELAY_US; }
+                        let target = sys::esp_timer_get_time() + delay;
+                        while sys::esp_timer_get_time() < target {} // spin to the scheduled instant
+                        sys::esp_wifi_80211_tx(sys::wifi_interface_t_WIFI_IF_STA, pl.as_ptr().add(4) as *const _, (len - 4) as i32, true);
+                        let actual = sys::esp_timer_get_time();
+                        let tsf = sys::esp_wifi_get_tsf_time(sys::wifi_interface_t_WIFI_IF_STA);
+                        let mut rep = [0u8; 24];
+                        rep[0..8].copy_from_slice(&target.to_le_bytes());
+                        rep[8..16].copy_from_slice(&actual.to_le_bytes());
+                        rep[16..24].copy_from_slice(&tsf.to_le_bytes());
+                        send_framed(T_TXTIME, &rep);
                     }
                     T_NAMEFILTER if len >= 2 => {
                         // [enabled][n_masks][mask 16B]* — load host-computed Tier-0 masks.

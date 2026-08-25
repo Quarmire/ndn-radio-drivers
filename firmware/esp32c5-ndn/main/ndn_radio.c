@@ -26,6 +26,7 @@
 #include "esp_event.h"
 #include "nvs_flash.h"
 #include "driver/usb_serial_jtag.h"
+#include "esp_timer.h" // esp_timer_get_time — the always-running monotonic µs clock we schedule against
 #include "ndr_tier0.h" // the AR9271 firmware's Tier-0 filter, reused verbatim (golden-vector-pinned)
 
 #define NDN_ETHERTYPE 0x8624
@@ -38,9 +39,12 @@
 #define T_BW40       0x05
 #define T_INJECT_ATTR 0x06
 #define T_NAMEFILTER 0x07 // [enabled][n_masks][mask 16B]* — on-device Tier-0 prefix-set drop (§8.2)
+#define T_INJECT_AT  0x09 // [delay_us_le32][802.11 frame] — scheduled TX at TSF now+delay (airtime lease)
 #define T_RX         0x81
+#define T_TXTIME     0x83 // [target_tsf_le64][actual_tsf_le64] — scheduling error report for T_INJECT_AT
 #define MAXFRAME 512
 #define MAX_MASKS 8
+#define SCHED_MAX_DELAY_US 20000 // cap the busy-wait (this primitive spins; a slot lease would use a timer)
 
 typedef struct { int8_t rssi; uint16_t len; uint8_t buf[MAXFRAME]; } rxpkt_t;
 static QueueHandle_t rxq;
@@ -135,6 +139,25 @@ static void serial_rx_loop(void) {
                     if (len >= 1) { int np = pl[0]; int off = 1 + 2 * np; if (len > off) esp_wifi_80211_tx(WIFI_IF_STA, pl + off, len - off, true); }
                     break;
                 }
+                case T_INJECT_AT: if (len >= 4) { // [delay_us_le32][frame] — place TX at a precise instant
+                    uint32_t delay = pl[0] | ((uint32_t)pl[1] << 8) | ((uint32_t)pl[2] << 16) | ((uint32_t)pl[3] << 24);
+                    if (delay > SCHED_MAX_DELAY_US) delay = SCHED_MAX_DELAY_US;
+                    // Schedule against esp_timer (always-running µs); the 802.11 TSF reads 0 when the STA
+                    // is unassociated, so it can't be the schedule clock here — but report it too so the
+                    // host can see whether it's live (a future common-view lease would sync on it).
+                    int64_t target = esp_timer_get_time() + delay;
+                    while (esp_timer_get_time() < target) { /* spin to the scheduled instant */ }
+                    esp_wifi_80211_tx(WIFI_IF_STA, pl + 4, len - 4, true);
+                    int64_t actual = esp_timer_get_time();
+                    int64_t tsf = esp_wifi_get_tsf_time(WIFI_IF_STA);
+                    uint8_t rep[24];
+                    for (int k = 0; k < 8; k++) {
+                        rep[k] = (uint8_t)(target >> (8 * k));
+                        rep[8 + k] = (uint8_t)(actual >> (8 * k));
+                        rep[16 + k] = (uint8_t)(tsf >> (8 * k));
+                    }
+                    send_framed(T_TXTIME, rep, 24); // [target][actual][tsf]: error = actual-target
+                    break; }
                 case T_NAMEFILTER: if (len >= 2) { // [enabled][n_masks][mask 16B]* — load host-computed Tier-0 masks
                     uint8_t nm = pl[1]; if (nm > MAX_MASKS) nm = MAX_MASKS;
                     if (len >= (uint16_t)(2 + nm * 16)) {

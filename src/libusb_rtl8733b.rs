@@ -3461,6 +3461,46 @@ impl Rtl8733buBackend {
         Ok(u32::from(self.read8(0x0652)?) * 128)
     }
 
+    /// **Crystal trim** — the frequency actuator (`0x103c[23:10]`, 7-bit cap, 0..=127).
+    ///
+    /// The TSF common-view work measures and corrects clock **offset** (phase); this corrects
+    /// **rate**, so two nodes can be held on the same frequency instead of repeatedly re-nulling a
+    /// phase error that keeps re-accumulating.
+    ///
+    /// ⚠ **There is no CFO sensor to pair this with on this part.** A `read_cfo` was written
+    /// against the 11n CFO registers (`0xdac`/`0xdb0`/...) on the reasoning that this is an 802.11n
+    /// chip, and it returned frozen nonsense (-250344 Hz identical across a full cap sweep). The
+    /// reason is a generation mismatch that matters well beyond CFO: **`ODM_IC_JGR3_1SS =
+    /// (ODM_RTL8733B)` — the PROTOCOL is 11n but the BASEBAND IP is Jaguar-3**, so `ic_ip_series`
+    /// is `PHYDM_IC_JGR3` and `phydm_get_cfo_info` falls through `default: break` — the vendor
+    /// reads no CFO on this chip at all. The 11n register file simply does not apply here. (Same
+    /// mismatch very likely explains the CCK/HT counters in `read_phy_counters` reading zero.)
+    /// So frequency error has to be estimated from successive TSF observations, not read directly.
+    ///
+    /// MEASURED (`examples/xtalcfo8733b.rs`, regressing the port TSF against the host clock at each
+    /// cap): the trim moves the clock **~62 ppm across caps 22..117** — 61.4 ppm on one run and
+    /// 62.3 ppm on a repeat — i.e. **~0.65 ppm per step**, power-on cap 70. The total span
+    /// reproduces well; individual mid-points scatter by ~10 ppm and the sweep drifts ~5 ppm over
+    /// its ~70 s (caught by a return-to-baseline arm, -4.79 ppm). So this harness resolves the
+    /// RANGE but not a fine trim — disciplining at sub-ppm needs far longer integration per point.
+    ///
+    /// The vendor writes the cap TWICE into one field (`cap | (cap << 7)`), per
+    /// `phydm_set_crystal_cap_reg`'s 8733B branch — two 7-bit copies at `[23:17]` and `[16:10]`.
+    /// The power-on value comes from efuse and is the calibrated centre; move away from it only as
+    /// far as a measurement justifies.
+    pub fn set_crystal_cap(&self, cap: u8) -> Result<(), FaceError> {
+        let c = u32::from(cap & 0x7f);
+        self.write32(
+            0x103c,
+            (self.read32(0x103c)? & !0x00FF_FC00) | ((c | (c << 7)) << 10),
+        )
+    }
+
+    /// Read back [`set_crystal_cap`](Self::set_crystal_cap) (the low of the two 7-bit copies).
+    pub fn crystal_cap(&self) -> Result<u8, FaceError> {
+        Ok(((self.read32(0x103c)? >> 10) & 0x7f) as u8)
+    }
+
     /// **Hardware TX gate** — `REG_TXPAUSE` (`0x0522`), one bit per MAC transmit queue; a set bit
     /// stops that queue being dequeued to the air. `0xff` pauses everything, `0x00` releases.
     ///
@@ -3855,7 +3895,15 @@ impl RadioTime for Rtl8733buBackend {
             RadioTimeSource::free_run_rx_stamp(self.tsf_domain, 1_000),
             // The port-0 beacon TSF: readable via read_clock, but only advances under
             // set_tsf_run and is beacon-resynced (not monotonic) — its own domain.
-            RadioTimeSource::port_tsf(self.port_tsf_domain()),
+            //
+            // ⚠ `RadioTimeSource::port_tsf` hardcodes `tick_ns: 1_000`, which is right for a
+            // standard 802.11 microsecond TSF and WRONG here. MEASURED 2026-08-25 by regressing
+            // this counter against the host monotonic clock over 8 s x 60 samples, twice:
+            // 0.250008506 and 0.250009897 ticks per host microsecond => **4.00 us per tick**,
+            // reproducible to six decimals. Left uncorrected, every consumer converting this
+            // domain's ticks to real time is off by 4x. The RX-stamp clock above is unaffected
+            // (it declares its own 1_000 explicitly and is a different physical counter).
+            RadioTimeSource { tick_ns: 4_000, ..RadioTimeSource::port_tsf(self.port_tsf_domain()) },
         ]
     }
 

@@ -35,7 +35,7 @@ fn host_stamp() -> LinkStamp {
         LatchPoint::HostRecv,
     )
 }
-use ndn_radio_hal::{Bandwidth, RadioKnobs};
+use ndn_radio_hal::{Bandwidth, OpenRadio, RadioKnobs};
 use ndn_transport::FaceError;
 use tokio::sync::{Mutex as AsyncMutex, mpsc};
 
@@ -304,6 +304,21 @@ impl Esp32SerialBackend {
             inner: Bw16SerialBackend::open_no_reset(path)?,
             capability: RadioCapability::wifi_monitor_dual_1ss(vec![1, 6, 11, 36, 40, 44, 48]),
         })
+    }
+
+    /// Open the C5 and bundle it as an [`OpenRadio`] — io + knobs + time + profile all backed by the
+    /// same instance. This is the capability-carrying path for `MonitorWifiFace::from_open`: the
+    /// dual-band [`RadioProfile`] survives into the engine (the scheduler gets the channel knob, the
+    /// planner the real bands), whereas `MonitorWifiFace::new(io)` would invent a placeholder cap.
+    pub fn open_c5_radio(path: &str) -> Result<OpenRadio, FaceError> {
+        let dev = Arc::new(Self::open_c5(path)?);
+        // Explicit trait-object bindings: Arc<Self> → Arc<dyn Trait> unsize coercion (one instance,
+        // four views). `as` can't spell this — the coercion is implicit, via the annotated `let`.
+        let io: Arc<dyn FrameIo> = dev.clone();
+        let knobs: Arc<dyn RadioKnobs> = dev.clone();
+        let time: Arc<dyn RadioTime> = dev.clone();
+        let profile: Arc<dyn RadioProfile> = dev;
+        Ok(OpenRadio { io, knobs: Some(knobs), time: Some(time), profile: Some(profile) })
     }
 }
 

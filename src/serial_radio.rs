@@ -206,6 +206,13 @@ impl SerialRadioBackend {
         self.send_framed(T_RATE, &[code])
     }
 
+    /// Pin an explicit `phymode` (1=11B 2=11G 3=11A 4=HT20 6=HE20) + HE reach flags (bit0=DCM, bit1=ER-SU)
+    /// alongside the rate `code`. The C5 firmware feeds these to `ic_set_80211_tx_rate_config`. Used for the
+    /// HE reach levers (phymode HE20 + DCM/ER-SU); the plain [`set_tx_rate`](Self::set_tx_rate) stays HT.
+    pub fn set_tx_rate_ex(&self, code: u8, phymode: u8, he_flags: u8) -> Result<(), FaceError> {
+        self.send_framed(T_RATE, &[code, phymode, he_flags])
+    }
+
     /// Enable/disable 40 MHz channel bandwidth (`wext_set_bw40_enable`).
     pub fn set_bw40(&self, enable: bool) -> Result<(), FaceError> {
         self.send_framed(T_BW40, &[enable as u8])
@@ -474,7 +481,9 @@ impl Esp32SerialBackend {
         let clock_domain = c5_clock_domain(path);
         Ok(Self {
             inner: SerialRadioBackend::open_no_reset_clocked(path, clock_domain)?,
-            capability: RadioCapability::wifi_monitor_dual_1ss(vec![1, 6, 11, 36, 40, 44, 48]),
+            // .with_he(): the C5 is Wi-Fi 6 — it transmits real HE (verified on air, RX cur_bb_format=HE_SU),
+            // so it advertises the HE reach levers (ER-SU + DCM) that for_intent(MostRobust) and set_rate use.
+            capability: RadioCapability::wifi_monitor_dual_1ss(vec![1, 6, 11, 36, 40, 44, 48]).with_he(),
             clock_domain,
         })
     }
@@ -546,8 +555,14 @@ impl FrameIo for Esp32SerialBackend {
     /// from it. (SGI/VHT/2SS aren't exposed by this bearer; index is clamped to the 1-stream HT range. This
     /// overrides the shared BW16 `set_rate`, whose T_RATE byte is an RTL8720DN rate code, not a phy_rate_t.)
     fn set_rate(&self, mcs: McsDescriptor) -> Result<(), FaceError> {
-        let code = 0x10u8 + mcs.index.min(7); // WIFI_PHY_RATE_MCS{0..7}_LGI
-        self.inner.set_tx_rate(code)
+        let code = 0x10u8 + mcs.index.min(7); // WIFI_PHY_RATE_MCS{0..7}_LGI (HT and HE share the MCS codes)
+        if mcs.he {
+            // 802.11ax reach path: phymode HE20 (6) + the DCM / ER-SU flags. Verified on air (RX HE_SU/HE_ERSU).
+            let flags = (mcs.dcm as u8) | ((mcs.er_su as u8) << 1);
+            self.inner.set_tx_rate_ex(code, 6, flags)
+        } else {
+            self.inner.set_tx_rate(code) // HT (phymode auto-derived by the firmware)
+        }
     }
 }
 

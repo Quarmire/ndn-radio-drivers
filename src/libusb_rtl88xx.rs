@@ -4859,7 +4859,7 @@ impl LibUsbRtl88xxBackend {
         let n = frames.len().min(0xff) as u8;
         let mut buf = Vec::new();
         for (i, f) in frames.iter().enumerate() {
-            let mcs = crate::McsDescriptor::for_intent(&f.tx, crate::MAX_RELIABLE_MCS, true);
+            let mcs = crate::McsDescriptor::for_intent(&f.tx, crate::MAX_RELIABLE_MCS, true, false);
             let unit = self.build_tx(f, mcs, Some((n, i == 0)))?;
             buf.extend_from_slice(&unit);
             while buf.len() % 8 != 0 {
@@ -5416,7 +5416,7 @@ impl LibUsbRtl88xxBackend {
         self.cur_mcs
             .lock()
             .unwrap()
-            .unwrap_or_else(|| crate::McsDescriptor::for_intent(&frame.tx, crate::MAX_RELIABLE_MCS, true))
+            .unwrap_or_else(|| crate::McsDescriptor::for_intent(&frame.tx, crate::MAX_RELIABLE_MCS, true, false))
     }
 
     /// A-MSDU-bundle maximal runs sharing dst/src/**rate** into one MPDU, bounded by

@@ -1429,6 +1429,6 @@ impl Rtl8821cuBackend {
         self.cur_mcs
             .lock()
             .unwrap()
-            .unwrap_or_else(|| crate::McsDescriptor::for_intent(&frame.tx, crate::MAX_RELIABLE_MCS, true))
+            .unwrap_or_else(|| crate::McsDescriptor::for_intent(&frame.tx, crate::MAX_RELIABLE_MCS, true, false))
     }
 }

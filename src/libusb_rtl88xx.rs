@@ -60,7 +60,7 @@ use crate::McsDescriptor;
 use crate::frame::LLC_SNAP_PREFIX;
 use crate::{CapturedFrame, FrameFormat, InjectFrame, FrameIo};
 use ndn_frame_io::ClockDomainId;
-use ndn_radio_hal::{RadioCapability, RadioProfile, RadioTime, RadioTimeSource};
+use ndn_radio_hal::{RadioCapability, RadioProfile, RadioTime, RadioTimeSource, RateCapability};
 
 /// Realtek USB vendor request: `bRequest` for register I/O, and the IN/OUT
 /// `bmRequestType`s (vendor, device). The register address rides in `wValue`,
@@ -5367,8 +5367,27 @@ impl RadioTime for LibUsbRtl88xxBackend {
 
 impl RadioProfile for LibUsbRtl88xxBackend {
     fn capability(&self) -> RadioCapability {
-        // RTL8812EU / RTL8822E: 2-stream 5 GHz 11ac (our data radio).
-        RadioCapability::wifi_monitor_5ghz(vec![36, 40, 44, 48, 149, 153, 157, 161])
+        // RTL8812EU / RTL8822E, 5 GHz 11ac — but declared from what the USERSPACE bring-up actually
+        // does, not from the part's datasheet.
+        //
+        // ⚠ This inherited `wifi_monitor_5ghz`'s `max_mcs: 9, max_nss: 2` (2-stream VHT). That is
+        // contradicted by a MEASURED field failure (2026-08-13): this bring-up raises ONE RX chain,
+        // so it decodes single-stream HT (MCS 0-7) and legacy and CANNOT decode 2-stream MCS 8-15 at
+        // any index. It caused a real one-way link — drone->GCS perfect, GCS->drone nothing but
+        // legacy 6M — because the peer transmitted 2-stream MCS9 in good faith.
+        //
+        // The truth was already being told to PEERS (`SINGLE_STREAM_HT_RX_MCS = 7`, advertised in
+        // the reception report) while this local capability kept claiming 2x2 MCS9 — the same radio
+        // describing itself two different ways. Since #83 de-globalised the rate ceiling, a radio's
+        // declared `max_mcs` is authoritative for rate selection, so the stale claim is now
+        // load-bearing rather than cosmetic.
+        //
+        // `max_bw` drops to 1 (40 MHz) for the same reason: 80 MHz is a datasheet capability of the
+        // part, not a validated capability of this bring-up.
+        RadioCapability {
+            rate: RateCapability::Wifi { max_mcs: 7, max_nss: 1, max_bw: 1 },
+            ..RadioCapability::wifi_monitor_5ghz(vec![36, 40, 44, 48, 149, 153, 157, 161])
+        }
     }
 }
 

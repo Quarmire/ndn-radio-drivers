@@ -1153,6 +1153,20 @@ impl RadioCapability {
         }
     }
 
+    /// ⚠ **THESE ARE ONE PART'S NUMBERS. A backend that inherits them is claiming another radio's
+    /// measurements as its own** — silently, because the result looks like a plausible value rather
+    /// than a wrong one. `retune_us` here was measured on a single radio (#97); `max_tx_power` and
+    /// the `rate` ceiling are generic. Since #83 de-globalised the rate ceiling, a radio's declared
+    /// `max_mcs`/`max_nss` is AUTHORITATIVE for rate selection, so inheriting them is load-bearing.
+    ///
+    /// Audited 2026-08-25. Overriding with their own measurements: the RTL8733BU (`retune_us`
+    /// 15_500 measured, rate 1x1 HT7) and the RTL8812EU/8822E (rate 1x1 HT7 — it had inherited
+    /// 2-stream MCS9, contradicting a MEASURED field failure where one RX chain caused a one-way
+    /// link). Explicitly declaring their own rate: mt7612 (9, legitimate 2x2), rtl8821c.
+    /// STILL INHERITING and unverified: rtl8812au's 2x2 MCS9 claim, and `retune_us`/`max_tx_power`
+    /// on every Wi-Fi backend except the 8733b.
+    ///
+    /// If you add a backend: measure, or inherit knowingly and say so.
     /// A commodity 5 GHz Wi-Fi monitor radio (our RTL8812EU/8822E data radio).
     pub fn wifi_monitor_5ghz(channels: Vec<u8>) -> Self {
         Self {

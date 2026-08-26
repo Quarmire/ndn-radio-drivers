@@ -16,7 +16,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use ndn_frame_io::{
     CapturedFrame, ClockDomainId, FrameFormat, FrameIo, InjectFrame, LatchPoint, LinkStamp,
-    RadioCapability, RadioProfile, RadioTime, RadioTimeSource, frame,
+    McsDescriptor, RadioCapability, RadioProfile, RadioTime, RadioTimeSource, frame,
 };
 
 /// Host monotonic clock domain — shared by every host-stamped frame in this process (the serial
@@ -490,6 +490,16 @@ impl FrameIo for Esp32SerialBackend {
     /// value in the C5's schedule clock (esp_timer µs). See [`Bw16SerialBackend::inject_at_abs`].
     async fn inject_at_clock(&self, frame: InjectFrame, target_tick: u64, _domain: ClockDomainId) -> Result<(), FaceError> {
         self.inner.inject_at_abs(frame, target_tick)
+    }
+    /// Actuate cognition's rate lever. The C5 firmware decodes T_RATE as a `wifi_phy_rate_t` and calls the
+    /// blob-internal `ic_set_80211_tx_rate_config` directly (the public wrapper ESP_FAILs in the C5's boot
+    /// HE20 mode) — MEASURED on air up to MCS7/65 Mbps. The C5 is single-stream HT, so map the descriptor's
+    /// MCS index (0–7) to the HT long-GI code `MCS0_LGI(0x10) + index`; the firmware derives HT20 phymode
+    /// from it. (SGI/VHT/2SS aren't exposed by this bearer; index is clamped to the 1-stream HT range. This
+    /// overrides the shared BW16 `set_rate`, whose T_RATE byte is an RTL8720DN rate code, not a phy_rate_t.)
+    fn set_rate(&self, mcs: McsDescriptor) -> Result<(), FaceError> {
+        let code = 0x10u8 + mcs.index.min(7); // WIFI_PHY_RATE_MCS{0..7}_LGI
+        self.inner.set_tx_rate(code)
     }
 }
 

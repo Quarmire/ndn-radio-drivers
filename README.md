@@ -19,7 +19,7 @@ The repo expects the `ndn-rs` checkout as a sibling (`../ndn-rs`) for its
 | `crates/` | The radio foundation crates, moved here from ndn-rs `crates/core` in P2/D5 (history there up to `df454d63`): **ndn-radio-hal** (the data-plane radio contract: `TxIntent`, MCS descriptors/policy, the `FrameIo`/`WifiRadio` traits — pure types, no I/O), **ndn-frame-io** (backend-agnostic link-layer frame I/O: on-air framing per `FrameFormat`, AF_PACKET + loopback backends), **ndn-env** (the classified `NDN_*` environment surface, #81). |
 | `firmware/` | Per-board device firmware, each an independent embedded sub-workspace with its own toolchain (table below). `build-bw16-rs.sh` builds and links the BW16 image. |
 | `fw/` | Vendor firmware blobs and extracted BB/RF register tables (RTL8822E, RTL8821C, MT7612, RTL8733B, RTL8812AU). Byte-exact provenance for every blob: [`fw/README.md`](fw/README.md). |
-| `examples/` | 40+ hardware probe / bring-up binaries. They need a radio on the USB bus to be useful and are deliberately **not** built in CI. BW16 and LoRa examples are feature-gated (`--features bw16` / `--features lora`). |
+| `examples/` | 40+ hardware probe / bring-up binaries. They need a radio on the USB bus to be useful and are deliberately **not** built in CI. Serial-radio (BW16/ESP32-C5) and LoRa examples are feature-gated (`--features serial-radio` / `--features lora`). |
 | `docs/` | Measured findings that outlived their campaign: EDCCA contention (#37), frame-free sensing (#30), the scalable LoRa MAC design (#52). |
 | `golden/` | Captured golden state from the kernel drivers: rtw88 usbmon register traces per channel (the 8812au bring-up oracle) and `tier0/vectors.txt` (the shared Tier-0 filter vectors). |
 | `tests/` | `tier0_golden.rs` — the three-way Tier-0 wire gate: the LR2021 firmware copy (mounted via `#[path]`, so the bytes that ship are the bytes tested) checked against the golden vectors ndn-ext's `tier0.rs` generates; the ath9k C copy is checked by `firmware/ath9k-htc-ndr/tools`. |
@@ -59,12 +59,12 @@ kept as records — not polished manuals. One-line status of each:
 ```sh
 cargo check                      # host crate + crates/ (needs libusb-1.0 + pkg-config, and ../ndn-rs)
 cargo test --lib --test tier0_golden   # what CI runs; plain `cargo test` also builds every example
-cargo check --features bw16,lora # include the serial-bridged backends
+cargo check --features serial-radio,lora # include the serial-bridged backends
 ```
 
 - **Examples** are hardware probes: they need the matching radio on the USB bus
   (and often root / detached kernel drivers). Build them explicitly; several
-  require `--features bw16` or `--features lora`.
+  require `--features serial-radio` or `--features lora`.
 - **Firmware** builds are independent sub-workspaces with their own cross
   toolchains (thumbv8m / Xtensa / nRF54) — build inside each directory per its
   README; the BW16 image via `firmware/build-bw16-rs.sh`.

@@ -4090,6 +4090,27 @@ pub struct PhyCounters {
     pub ht_fa: u16,
 }
 
+/// ⚠ **This part cannot source named-time's common view.** It stamps RX per frame but has NO
+/// per-frame TX timestamp: the vendor tree exposes only `TX_RPT_MAX_MACID` (a config) and RX-side
+/// TSF offsets, and the 8192E-class C2H TX report carries `QUEUE_TIME` in 256 us units — queue
+/// dwell, not a TSF, and three orders of magnitude too coarse.
+///
+/// That places it with the RTL8822E ("can only insert a TSF from its beacon engine"), not the
+/// AR9271, whose `AR_SendTimestamp` reaches `ds_txstat.ts_tstamp` for EVERY frame and is what makes
+/// the measured 1.05 us two-node common view possible — riding ordinary named data, with no beacon
+/// and no timekeeper role.
+///
+/// The consequence is structural, not a porting gap: named-time's transfer is a PTP two-step —
+/// frame N airs, hardware reports WHEN, frame N+1 carries "index N left at TSF T". Without a TX
+/// report there is nothing to put in frame N+1. Two of these radios therefore cannot common-view
+/// off each other's traffic; they can only stamp a THIRD party's ordinary frames, which is free in
+/// a network of >=3 nodes and needs no dedicated timing source. Substituting a dedicated tick
+/// transmitter for that third node is a crutch, and reintroduces exactly the beacon-shaped shared
+/// clock the design removed.
+///
+/// So: use the AR9271 for time transfer. Use this part for the things it measurably does well —
+/// TX power (14 dB), the airtime gate (99% slot confinement), per-frame SNR/EVM, RX stamps.
+///
 /// Reference [`RadioTime`] implementation: this chip exposes the two link clocks the abstraction
 /// was designed around — an always-on free-run per-frame RX stamp (RXTSFL) and the gated,
 /// beacon-resynced, read-on-demand port TSF.

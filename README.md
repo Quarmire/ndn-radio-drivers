@@ -37,7 +37,7 @@ The repo expects the `ndn-rs` checkout as a sibling (`../ndn-rs`) for its
 | RTL8812AU | `rtl8812au` | Carries the sensing seams: EDCCA knobs, frame-free occupancy (`PhySense`), IQK. |
 | RTL8731BU / RTL8733BU | `libusb_rtl8733b` | Ground-up halmac_87xx (1x1 11ac) port, at M1: open + register I/O + chip version. |
 | AR9271 | `ath9k_htc` | The one Wi-Fi part whose *firmware* is ours (see `firmware/ath9k-htc-ndr`). Host side at L1: USB transport + firmware download + HTC handshake + WMI. Does not yet replace kernel `ath9k_htc`. |
-| BW16 (RTL8720DN) | `bw16_serial` (feature `bw16`) | Dual-band 802.11 injector/capturer bridged over USB-serial to the BW16 firmware; same HAL contract as the USB drivers. |
+| BW16 (RTL8720DN) | `serial_radio` (feature `serial-radio`) | Dual-band 802.11 injector/capturer bridged over USB-serial to the BW16 firmware; same HAL contract as the USB drivers. |
 | Waveshare USB-TO-LoRa (SX1262) | `lora_serial` (feature `lora`) | Sub-GHz serial modem: transparent-mode byte pipe, host-supplied framing, AT-programmed radio params. |
 
 ## Firmware by board (`firmware/`)
@@ -52,7 +52,7 @@ kept as records — not polished manuals. One-line status of each:
 | Waveshare USB-TO-LoRa (GD32F103C8 + SX1262) | `waveshare-lora-rs` | Open Rust firmware replacing the closed factory firmware; speaks plain standard LoRa, interop verified bidirectionally against an SX1276 peer. |
 | Heltec WiFi LoRa 32 V2 (ESP32 + SX1276) | `heltec-lora-rs` | Node-C modem (#54): host-driven over the same `7E A5` serial protocol as `waveshare-lora-rs`, so `LoraSerialBackend` drives it unchanged. |
 | BW16 (RTL8720DN) | `bw16-rs` + `bw16-rs-sketch` | Rust `no_std` firmware core for the named-radio serial bridge, linked into the Ameba image by `build-bw16-rs.sh` via the C++ FFI shim in `bw16-rs-sketch` (which is load-bearing, not a duplicate). Knob reality (what inject can and cannot control) in `bw16-rs/FINDINGS.md`. |
-| BW16 (RTL8720DN) | `bw16-ndn-bridge` | The self-contained Arduino sketch version of the same serial bridge (host counterpart: `Bw16SerialBackend`). |
+| BW16 (RTL8720DN) | `bw16-ndn-bridge` | The self-contained Arduino sketch version of the same serial bridge (host counterpart: `SerialRadioBackend`). |
 
 ## Building
 

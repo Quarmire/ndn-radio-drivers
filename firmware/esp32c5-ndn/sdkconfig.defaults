@@ -1,6 +1,20 @@
-# ESP32-C5 named-radio serial bridge: raw 802.11 TX + promiscuous RX, host-driven over USB-Serial-JTAG.
+# ESP32-C5 named-radio serial bridge — ONE firmware, ALL bearers (Wi-Fi + BLE), host-driven over USB-JTAG.
 CONFIG_ESP_WIFI_ENABLED=y
 CONFIG_ESP_WIFI_NVS_ENABLED=n
+# BLE bearer: NimBLE with BLE 5 extended advertising + scanning (the 245-byte payload path — legacy 31B
+# can't carry NDN). Broadcaster + observer only (connectionless — no GATT peripheral/central).
+CONFIG_BT_ENABLED=y
+CONFIG_BT_NIMBLE_ENABLED=y
+CONFIG_BT_NIMBLE_EXT_ADV=y
+CONFIG_BT_NIMBLE_MAX_EXT_ADV_INSTANCES=1
+CONFIG_BT_NIMBLE_ROLE_BROADCASTER=y
+CONFIG_BT_NIMBLE_ROLE_OBSERVER=y
+CONFIG_BT_NIMBLE_ROLE_PERIPHERAL=n
+CONFIG_BT_NIMBLE_ROLE_CENTRAL=n
+CONFIG_BT_NIMBLE_MAX_EXT_ADV_DATA_LEN=254
+# Wi-Fi + BLE software coexistence — time-share the one radio between promiscuous Wi-Fi RX and BLE scan.
+CONFIG_ESP_COEX_SW_COEXIST_ENABLE=y
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
 # Console stays bound to the USB-Serial-JTAG so esptool's auto reset-to-bootloader keeps working (no
 # BOOT/RST button dance to reflash) — but the log level is NONE so no ESP_LOG text corrupts the binary
 # BW16 protocol stream. (CONSOLE_NONE breaks both the output AND auto-reset; do not use it here.)

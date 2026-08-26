@@ -28,6 +28,13 @@
 #include "driver/usb_serial_jtag.h"
 #include "esp_timer.h" // esp_timer_get_time — the always-running monotonic µs clock we schedule against
 #include "ndr_tier0.h" // the AR9271 firmware's Tier-0 filter, reused verbatim (golden-vector-pinned)
+// ── BLE bearer (NimBLE) — one firmware, all bearers (the named radio is bearer-agnostic) ──
+#include "nimble/nimble_port.h"
+#include "nimble/nimble_port_freertos.h"
+#include "host/ble_hs.h"
+#include "host/util/util.h"
+#include "host/ble_gap.h"
+#include "os/os_mbuf.h"
 
 #define NDN_ETHERTYPE 0x8624
 #define SYNC0 0x4E
@@ -48,7 +55,13 @@
 #define T_RX_TS      0x82 // [rssi_i8][noise_i8][rate_code][phy_flags][rx_ts_us_le32][802.11 frame]
                           // — RX + hardware µs stamp + per-frame PHY metadata (radiotap-equiv)
 #define T_TXTIME     0x83 // [target_le64][actual_le64][tsf_le64] — scheduling error report for T_INJECT_AT
+// BLE bearer messages (same wire protocol, distinct types so one firmware serves Wi-Fi + BLE at once):
+#define T_BLE_ADV    0x30 // host→device: [payload] — advertise as a BLE 5 extended advertisement
+#define T_BLE_RX     0x88 // device→host: [rssi_i8][addr6][payload] — a scanned advertisement carrying our magic
 #define MAXFRAME 512
+#define BLE_MAXPAY 240
+#define BLE_ADV_MAGIC_LO 0x44 // manufacturer company id 0x4E44 ("ND"), LE on air — the BLE analog of 0x8624
+#define BLE_ADV_MAGIC_HI 0x4E
 
 // Blob-internal rate setters (libpp.a). The public esp_wifi_config_80211_tx[_rate] wrappers ESP_FAIL on
 // the dual-band C5 because it boots in HE20 (phymode 6) and they refuse to set a rate in HE mode; these
@@ -140,12 +153,100 @@ static void send_framed(uint8_t ty, const uint8_t *payload, uint16_t len) {
 // hardware per-frame RX timestamp, so the host can stamp it in the device's clock domain (common-view /
 // frame-age) instead of the coarse host-recv time. The 802.11 TSF is 0 unassociated, so this µs stamp
 // (rx_ctrl.timestamp, same domain as the esp_timer we schedule TX on) is the C5's real link clock.
+// ── BLE bearer (NimBLE ext-adv + scan) — the second bearer of the one unified firmware ──
+static uint8_t s_ble_addr_type;
+static uint8_t s_ble_addr[6];
+static QueueHandle_t bleq;          // scanned reports -> serial-TX task
+static volatile bool s_ble_ready;
+typedef struct { int8_t rssi; uint8_t addr[6]; uint8_t len; uint8_t buf[BLE_MAXPAY]; } blerep_t;
+
+// Scan an adv payload for our manufacturer AD (0xFF, company 0x4E44); return the inner named payload len.
+static int ble_find_named(const uint8_t *d, int n, const uint8_t **out) {
+    int i = 0;
+    while (i + 2 <= n) {
+        int adlen = d[i];
+        if (adlen < 1 || i + 1 + adlen > n) break;
+        if (d[i + 1] == 0xFF && adlen >= 3 && d[i + 2] == BLE_ADV_MAGIC_LO && d[i + 3] == BLE_ADV_MAGIC_HI) {
+            *out = &d[i + 4];
+            return adlen - 3;
+        }
+        i += 1 + adlen;
+    }
+    return 0;
+}
+
+static int ble_gap_event(struct ble_gap_event *ev, void *arg) {
+    if (ev->type == BLE_GAP_EVENT_EXT_DISC) {
+        const struct ble_gap_ext_disc_desc *dsc = &ev->ext_disc;
+        if (memcmp(dsc->addr.val, s_ble_addr, 6) == 0) return 0; // ignore our own reflected ads
+        const uint8_t *pay = NULL;
+        int plen = ble_find_named(dsc->data, dsc->length_data, &pay);
+        if (plen > 0 && plen <= BLE_MAXPAY) {
+            blerep_t r;
+            r.rssi = dsc->rssi;
+            memcpy(r.addr, dsc->addr.val, 6);
+            r.len = (uint8_t)plen;
+            memcpy(r.buf, pay, plen);
+            BaseType_t hp = pdFALSE;
+            xQueueSendFromISR(bleq, &r, &hp);
+            if (hp) portYIELD_FROM_ISR();
+        }
+    }
+    return 0;
+}
+
+// T_BLE_ADV: wrap the host payload in our manufacturer AD and burst-advertise it (fire-and-forget).
+static void ble_advertise(const uint8_t *payload, int len) {
+    if (!s_ble_ready || len <= 0 || len > BLE_MAXPAY) return;
+    struct os_mbuf *m = os_msys_get_pkthdr(len + 4, 0);
+    if (!m) return;
+    uint8_t hdr[4] = { (uint8_t)(len + 3), 0xFF, BLE_ADV_MAGIC_LO, BLE_ADV_MAGIC_HI };
+    os_mbuf_append(m, hdr, 4);
+    os_mbuf_append(m, payload, len);
+    ble_gap_ext_adv_stop(0);
+    if (ble_gap_ext_adv_set_data(0, m) == 0) ble_gap_ext_adv_start(0, 0, 3);
+    else os_mbuf_free_chain(m);
+}
+
+static void ble_on_sync(void) {
+    ble_hs_util_ensure_addr(0);
+    ble_hs_id_infer_auto(0, &s_ble_addr_type);
+    ble_hs_id_copy_addr(s_ble_addr_type, s_ble_addr, NULL);
+    struct ble_gap_ext_adv_params p;
+    memset(&p, 0, sizeof(p));
+    p.own_addr_type = s_ble_addr_type; // non-connectable, non-scannable, extended PDU
+    p.primary_phy = BLE_HCI_LE_PHY_1M;
+    p.secondary_phy = BLE_HCI_LE_PHY_2M;
+    p.itvl_min = 0x30;
+    p.itvl_max = 0x30;
+    p.tx_power = 127;
+    int8_t sel;
+    ble_gap_ext_adv_configure(0, &p, &sel, ble_gap_event, NULL);
+    struct ble_gap_ext_disc_params up;
+    memset(&up, 0, sizeof(up));
+    // Duty-cycled scan (~12%: 20ms window / 160ms interval) — a fully-open BLE scan starves the concurrent
+    // promiscuous Wi-Fi RX via software coex (both want the one radio). A modest scan window leaves Wi-Fi
+    // the radio most of the time; BLE ads are burst-repeated so a duty-cycled scan still catches them.
+    up.itvl = 0x100;   // 256 * 0.625ms = 160ms
+    up.window = 0x20;  // 32 * 0.625ms = 20ms
+    up.passive = 1;
+    ble_gap_ext_disc(s_ble_addr_type, 0, 0, 0, 0, 0, &up, NULL, ble_gap_event, NULL);
+    s_ble_ready = true;
+}
+
+static void ble_host_task(void *param) {
+    nimble_port_run();
+    nimble_port_freertos_deinit();
+}
+
 static void serial_tx_task(void *arg) {
     static uint8_t out[8 + MAXFRAME];
+    static uint8_t bout[7 + BLE_MAXPAY];
     rxpkt_t pk;
+    blerep_t br;
     int64_t last_occ = esp_timer_get_time();
     for (;;) {
-        // 100 ms timeout so the loop wakes to emit T_OCC even when no frames are queued.
+        // 100 ms timeout so the loop wakes to emit T_OCC / drain BLE even when no Wi-Fi frames are queued.
         if (xQueueReceive(rxq, &pk, pdMS_TO_TICKS(100)) == pdTRUE) {
             out[0] = (uint8_t)pk.rssi;
             out[1] = (uint8_t)pk.noise;      // noise floor (dBm)
@@ -154,6 +255,13 @@ static void serial_tx_task(void *arg) {
             for (int k = 0; k < 4; k++) out[4 + k] = (uint8_t)(pk.rxts >> (8 * k));
             memcpy(out + 8, pk.buf, pk.len);
             send_framed(T_RX_TS, out, pk.len + 8);
+        }
+        // Drain scanned BLE advertisements -> T_BLE_RX [rssi][addr6][payload].
+        while (bleq && xQueueReceive(bleq, &br, 0) == pdTRUE) {
+            bout[0] = (uint8_t)br.rssi;
+            memcpy(bout + 1, br.addr, 6);
+            memcpy(bout + 7, br.buf, br.len);
+            send_framed(T_BLE_RX, bout, 7 + br.len);
         }
         int64_t now = esp_timer_get_time();
         if (now - last_occ >= 200000) { // ~5×/s: emit the free-running activity counter
@@ -183,6 +291,7 @@ static void serial_rx_loop(void) {
             uint8_t *pl = acc + i + 5;
             switch (ty) {
                 case T_INJECT: esp_wifi_80211_tx(WIFI_IF_STA, pl, len, true); break;
+                case T_BLE_ADV: ble_advertise(pl, len); break; // the BLE bearer, same firmware
                 case T_CHANNEL: if (len >= 1) { esp_wifi_set_channel(pl[0], WIFI_SECOND_CHAN_NONE); s_cur_chan = pl[0]; } break;
                 case T_TXPOWER: if (len >= 1) esp_wifi_set_max_tx_power((int8_t)pl[0]); break;
                 case T_BW40: if (len >= 1) esp_wifi_set_bandwidth(WIFI_IF_STA, pl[0] ? WIFI_BW_HT40 : WIFI_BW_HT20); break;
@@ -281,6 +390,14 @@ void app_main(void) {
     ESP_ERROR_CHECK(esp_wifi_set_promiscuous(true));
 
     rxq = xQueueCreate(32, sizeof(rxpkt_t));
+    bleq = xQueueCreate(24, sizeof(blerep_t));
+
+    // BLE bearer (NimBLE) alongside Wi-Fi — one firmware, all bearers. Software coex (CONFIG_ESP_COEX_SW_
+    // COEXIST_ENABLE, auto-on with BT+Wi-Fi) time-shares the radio between promiscuous Wi-Fi RX and BLE scan.
+    ESP_ERROR_CHECK(nimble_port_init());
+    ble_hs_cfg.sync_cb = ble_on_sync;
+    nimble_port_freertos_init(ble_host_task);
+
     xTaskCreate(serial_tx_task, "ser_tx", 4096, NULL, 5, NULL);
     serial_rx_loop(); // never returns
 }

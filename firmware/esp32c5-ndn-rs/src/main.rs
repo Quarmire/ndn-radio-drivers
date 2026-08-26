@@ -106,6 +106,7 @@ const T_RX_TS: u8 = 0x82; // [rssi_i8][noise_i8][rate_code u8][phy_flags u8][rx_
                           // — RX + hardware µs stamp + the ESP's per-frame PHY metadata (radiotap-equiv)
 const T_TXTIME: u8 = 0x83; // [target_le64][actual_le64][tsf_le64] — scheduling error report
 const T_CLOCK: u8 = 0x85; // [esp_timer_us_le64] — reply to T_READCLOCK
+const T_OCC: u8 = 0x86; // [activity_count_le32] — periodic free-running channel-activity counter (occupancy)
 const MAXFRAME: usize = 512;
 const MAX_MASKS: usize = 8;
 const SCHED_MAX_DELAY_US: i64 = 100_000; // cap the busy-wait to ~1 slot period (a hw timer would avoid the spin)
@@ -135,8 +136,14 @@ static NF: Mutex<NameFilter> = Mutex::new(NameFilter { enabled: false, n: 0, mas
 // sig_mode(bits0-1) | sgi(bit2) | cwb40(bit3). ts is the hardware per-frame RX stamp (µs, esp_timer domain).
 static RXQ: Mutex<VecDeque<(i8, i8, u8, u8, u32, Vec<u8>)>> = Mutex::new(VecDeque::new());
 
+// Free-running channel-activity counter: every promiscuous frame the radio decodes, of ANY type — the
+// frame-free occupancy proxy the host reads via T_OCC (RadioKnobs::read_channel_activity). Two reads
+// differenced over a window give a frames/s rate → channel-busy%.
+static ACTIVITY: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 // Promiscuous RX: queue each 0x8624 data frame (+ RSSI) for the serial-TX loop.
 unsafe extern "C" fn rx_cb(buf: *mut core::ffi::c_void, ty: sys::wifi_promiscuous_pkt_type_t) {
+    ACTIVITY.fetch_add(1, std::sync::atomic::Ordering::Relaxed); // count ALL activity, before any filter
     if ty != sys::wifi_promiscuous_pkt_type_t_WIFI_PKT_DATA {
         return;
     }
@@ -373,6 +380,7 @@ fn main() {
         .expect("spawn serial_rx_loop");
 
     let mut out = Vec::with_capacity(5 + MAXFRAME);
+    let mut last_occ = unsafe { sys::esp_timer_get_time() };
     loop {
         let item = { RXQ.lock().ok().and_then(|mut q| q.pop_front()) };
         match item {
@@ -387,6 +395,13 @@ fn main() {
                 send_framed(T_RX_TS, &out);
             }
             None => std::thread::sleep(std::time::Duration::from_millis(2)),
+        }
+        // Emit the free-running activity counter ~5×/s so the host's read_channel_activity has a fresh value.
+        let now = unsafe { sys::esp_timer_get_time() };
+        if now - last_occ >= 200_000 {
+            last_occ = now;
+            let c = ACTIVITY.load(std::sync::atomic::Ordering::Relaxed);
+            send_framed(T_OCC, &c.to_le_bytes());
         }
     }
 }

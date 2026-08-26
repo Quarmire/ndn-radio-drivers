@@ -43,6 +43,7 @@
 #define T_INJECT_ABS 0x0A // [target_us_le64][802.11 frame] — scheduled TX at an ABSOLUTE esp_timer µs (slot lease)
 #define T_READCLOCK  0x0B // no payload — reply T_CLOCK with the current esp_timer (schedule clock)
 #define T_CLOCK      0x85 // [esp_timer_us_le64] — reply to T_READCLOCK
+#define T_OCC        0x86 // [activity_count_le32] — periodic free-running channel-activity counter (occupancy)
 #define T_RX         0x81 // [rssi_i8][802.11 frame] — used by the BW16; the C5 sends T_RX_TS instead
 #define T_RX_TS      0x82 // [rssi_i8][noise_i8][rate_code][phy_flags][rx_ts_us_le32][802.11 frame]
                           // — RX + hardware µs stamp + per-frame PHY metadata (radiotap-equiv)
@@ -98,8 +99,13 @@ static int name_admits(const uint8_t *f) {
     return 0; // definitely under none of our prefixes — drop, never cross USB
 }
 
+// Free-running channel-activity counter (every promiscuous frame of any type) — the occupancy proxy the
+// host reads via T_OCC (read_channel_activity). Written in WiFi-task ctx, read in serial_tx_task.
+static volatile uint32_t s_activity = 0;
+
 // Promiscuous RX: queue each 0x8624 frame (+ RSSI) for the serial-TX task.
 static void rx_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
+    s_activity++; // count ALL activity, before any filter
     if (type != WIFI_PKT_DATA) return;
     const wifi_promiscuous_pkt_t *p = (wifi_promiscuous_pkt_t *)buf;
     const uint8_t *f = p->payload;
@@ -136,8 +142,10 @@ static void send_framed(uint8_t ty, const uint8_t *payload, uint16_t len) {
 static void serial_tx_task(void *arg) {
     static uint8_t out[8 + MAXFRAME];
     rxpkt_t pk;
+    int64_t last_occ = esp_timer_get_time();
     for (;;) {
-        if (xQueueReceive(rxq, &pk, portMAX_DELAY) == pdTRUE) {
+        // 100 ms timeout so the loop wakes to emit T_OCC even when no frames are queued.
+        if (xQueueReceive(rxq, &pk, pdMS_TO_TICKS(100)) == pdTRUE) {
             out[0] = (uint8_t)pk.rssi;
             out[1] = (uint8_t)pk.noise;      // noise floor (dBm)
             out[2] = pk.rate_code;           // legacy rate or MCS (per flags sig_mode)
@@ -145,6 +153,14 @@ static void serial_tx_task(void *arg) {
             for (int k = 0; k < 4; k++) out[4 + k] = (uint8_t)(pk.rxts >> (8 * k));
             memcpy(out + 8, pk.buf, pk.len);
             send_framed(T_RX_TS, out, pk.len + 8);
+        }
+        int64_t now = esp_timer_get_time();
+        if (now - last_occ >= 200000) { // ~5×/s: emit the free-running activity counter
+            last_occ = now;
+            uint32_t a = s_activity;
+            uint8_t c[4];
+            for (int k = 0; k < 4; k++) c[k] = (uint8_t)(a >> (8 * k));
+            send_framed(T_OCC, c, 4);
         }
     }
 }

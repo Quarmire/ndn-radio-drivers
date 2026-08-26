@@ -559,6 +559,9 @@ impl RadioKnobs for Esp32SerialBackend {
     fn configure_name_filter(&self, enabled: bool, key: &[u8; 16], masks: &[[u8; 16]]) -> Result<(), FaceError> {
         RadioKnobs::configure_name_filter(&self.inner, enabled, key, masks)
     }
+    fn read_channel_activity(&self) -> Result<Option<u16>, FaceError> {
+        RadioKnobs::read_channel_activity(&self.inner)
+    }
 }
 
 impl RadioTime for Esp32SerialBackend {

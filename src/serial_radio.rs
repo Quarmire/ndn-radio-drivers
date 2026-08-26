@@ -17,6 +17,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use ndn_frame_io::{
     CapturedFrame, ClockDomainId, FrameFormat, FrameIo, InjectFrame, LatchPoint, LinkStamp,
     McsDescriptor, PhyMetrics, RadioCapability, RadioProfile, RadioTime, RadioTimeSource, frame,
@@ -83,6 +84,12 @@ const T_TXTIME: u8 = 0x83; // scheduled-TX confirmation: [target_le64][actual_le
 const T_RX: u8 = 0x81;
 const T_OCC: u8 = 0x86; // [activity_count_le32] — periodic free-running channel-activity counter
 const T_RX_TS: u8 = 0x82; // [rssi_i8][noise_i8][rate_code][phy_flags][rx_ts_us_le32][frame] — RX + hardware
+// BLE bearer (the UNIFIED esp32c5-ndn firmware serves Wi-Fi + BLE from one image over this one port, so the
+// BLE bearer gets its own message types — this backend then demuxes both from the single reader, making it
+// the SHARED MUX one host connection uses for both FrameIo (Wi-Fi) and the BLE AdvBackend).
+const T_BLE_ADV: u8 = 0x30; // host->device: advertise this payload (BLE 5 ext-adv)
+const T_COEX: u8 = 0x31; // host->device: [scan_window_le16][scan_itvl_le16] — the BLE<->Wi-Fi radio-time split
+const T_BLE_RX: u8 = 0x88; // device->host: [rssi_i8][addr6][payload] — a scanned advertisement
                           // µs stamp + the ESP's per-frame PHY metadata (radiotap-equiv): RX rate/MCS + SNR
 
 /// BW16 fixed TX-rate codes for [`SerialRadioBackend::set_tx_rate`]
@@ -116,6 +123,19 @@ pub struct SerialRadioBackend {
     /// Latest free-running channel-activity counter (`T_OCC`, ~5×/s from the C5), for
     /// [`RadioKnobs::read_channel_activity`]. `u32::MAX` = no report yet (e.g. the BW16, which never emits).
     activity: Arc<std::sync::atomic::AtomicU32>,
+    /// Scanned BLE advertisements (`T_BLE_RX` → (rssi, addr6, payload)) from the unified firmware's BLE
+    /// bearer, routed here by the one reader so the SAME port connection also drives a BLE `AdvBackend`
+    /// (see [`ble_next_scanned`](Self::ble_next_scanned)). Empty on the BW16 (Wi-Fi only, no BLE).
+    ble_rx: AsyncMutex<mpsc::UnboundedReceiver<(i8, [u8; 6], Bytes)>>,
+    /// Running count of scanned BLE advertisements — the BLE **demand** signal, incremented by the reader
+    /// independently of the `ble_rx` channel so [`spawn_demand_coex`](Self::spawn_demand_coex) can measure
+    /// BLE traffic without stealing frames from the face (mirrors `wifi_frames` = the Wi-Fi demand signal).
+    ble_activity: Arc<std::sync::atomic::AtomicU32>,
+    /// Running count of Wi-Fi frames FORWARDED to the face (`T_RX`/`T_RX_TS` that passed the named-radio
+    /// filter) — the Wi-Fi **demand** signal, the symmetric counterpart of `ble_activity`. Distinct from
+    /// `activity` (`T_OCC`), which is raw channel energy (ambient included) → the interference/channel lever,
+    /// not this bearer's named-traffic demand. The coex split balances the two NAMED demands, not occupancy.
+    wifi_frames: Arc<std::sync::atomic::AtomicU32>,
 }
 
 impl SerialRadioBackend {
@@ -166,10 +186,20 @@ impl SerialRadioBackend {
         let (txch, rxch) = mpsc::unbounded_channel();
         let (clkch, clk_rxch) = mpsc::unbounded_channel();
         let (ttch, tt_rxch) = mpsc::unbounded_channel();
+        let (blech, ble_rxch) = mpsc::unbounded_channel();
         let format = FrameFormat::default();
         let activity = Arc::new(std::sync::atomic::AtomicU32::new(u32::MAX));
+        let ble_activity = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let wifi_frames = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let act_reader = activity.clone();
-        std::thread::spawn(move || reader_loop(reader, format, txch, clkch, ttch, act_reader, dev_clock));
+        let ble_act_reader = ble_activity.clone();
+        let wifi_fr_reader = wifi_frames.clone();
+        std::thread::spawn(move || {
+            reader_loop(
+                reader, format, txch, clkch, ttch, blech, act_reader, ble_act_reader, wifi_fr_reader,
+                dev_clock,
+            )
+        });
         Ok(Self {
             tx: Arc::new(Mutex::new(port)),
             format,
@@ -177,6 +207,9 @@ impl SerialRadioBackend {
             clock_rx: AsyncMutex::new(clk_rxch),
             txtime_rx: AsyncMutex::new(tt_rxch),
             activity,
+            ble_rx: AsyncMutex::new(ble_rxch),
+            ble_activity,
+            wifi_frames,
         })
     }
 
@@ -216,6 +249,91 @@ impl SerialRadioBackend {
     /// Enable/disable 40 MHz channel bandwidth (`wext_set_bw40_enable`).
     pub fn set_bw40(&self, enable: bool) -> Result<(), FaceError> {
         self.send_framed(T_BW40, &[enable as u8])
+    }
+
+    // --- BLE bearer (the unified esp32c5-ndn firmware serves Wi-Fi + BLE from this one port) ---
+    // These make the ONE `SerialRadioBackend`/serial connection the SHARED MUX for both bearers: it is a
+    // Wi-Fi `FrameIo` (inject/recv_frame above) *and* the source of a BLE `AdvBackend` — the reader demuxes
+    // T_RX_TS (Wi-Fi) and T_BLE_RX (BLE) off the same stream, so a node opens the port once and gets both.
+
+    /// Broadcast `payload` as a BLE 5 extended advertisement (the unified C5 firmware wraps it in the ND
+    /// manufacturer AD and burst-advertises it, fire-and-forget). The BLE analog of [`inject`](FrameIo::inject).
+    pub fn ble_broadcast(&self, payload: &[u8]) -> Result<(), FaceError> {
+        self.send_framed(T_BLE_ADV, payload)
+    }
+
+    /// Await the next scanned BLE advertisement — `(rssi_dbm, addr6, payload)`. The BLE analog of
+    /// [`recv_frame`](FrameIo::recv_frame); returns `Err(Closed)` if the reader thread has exited.
+    pub async fn ble_next_scanned(&self) -> Result<(i8, [u8; 6], Bytes), FaceError> {
+        let mut rx = self.ble_rx.lock().await;
+        rx.recv().await.ok_or(FaceError::Closed)
+    }
+
+    /// Set this radio's **BLE share** of airtime: `fraction` (0.0–1.0) of the scan interval spent scanning
+    /// for BLE, the rest left to the concurrent promiscuous Wi-Fi RX (both bearers share one radio via coex).
+    /// The NDR way to split the two — **not** a firmware constant but a lever cognition drives from measured
+    /// per-bearer demand (see [`auto_coex_share`](Self::auto_coex_share)). `itvl` is the scan interval in
+    /// 0.625 ms units (256 ≈ 160 ms); window = `fraction·itvl`, clamped to [4, itvl].
+    pub fn set_ble_share(&self, fraction: f32, itvl: u16) -> Result<(), FaceError> {
+        let window = ((fraction.clamp(0.0, 1.0) * itvl as f32) as u16).clamp(4, itvl.max(4));
+        let mut p = window.to_le_bytes().to_vec();
+        p.extend_from_slice(&itvl.to_le_bytes());
+        self.send_framed(T_COEX, &p)
+    }
+
+    /// Running count of scanned BLE advertisements since open — the BLE demand signal (take deltas).
+    pub fn ble_scan_count(&self) -> u32 {
+        self.ble_activity.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Running count of Wi-Fi frames forwarded to the face (named-radio traffic) — the Wi-Fi demand signal,
+    /// the symmetric counterpart of [`ble_scan_count`](Self::ble_scan_count) (take deltas). This is *named*
+    /// traffic, not raw channel energy — see [`wifi_activity_count`](Self::wifi_activity_count) for the latter.
+    pub fn wifi_frame_count(&self) -> u32 {
+        self.wifi_frames.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Latest Wi-Fi channel-**occupancy** counter (`T_OCC`), or `0` if the device hasn't reported yet — raw
+    /// energy on the channel (ambient included). This drives the interference/channel lever, NOT the coex
+    /// split (that balances the two bearers' *named* demand — see [`wifi_frame_count`](Self::wifi_frame_count)).
+    pub fn wifi_activity_count(&self) -> u32 {
+        match self.activity.load(std::sync::atomic::Ordering::Relaxed) {
+            u32::MAX => 0,
+            v => v,
+        }
+    }
+
+    /// Spawn the **demand-driven coex** loop: it drives [`set_ble_share`](Self::set_ble_share) from measured
+    /// per-bearer demand instead of a constant — the NDR airtime split as a CLOSED LOOP. Every `period` it
+    /// samples both bearers' *named*-traffic counters (Wi-Fi frames forwarded, BLE ads scanned), takes their
+    /// deltas, and sets BLE's share of the scan interval to BLE's share of total named traffic, `[floor,ceil]`
+    /// so neither bearer is fully starved. The `floor` also keeps enough scan airtime to notice a BLE burst
+    /// (else a low share is self-reinforcing — the one caveat; a real system would periodically probe wider).
+    /// Returns the task handle — abort it to stop. `itvl` = scan interval in 0.625 ms units.
+    pub fn spawn_demand_coex(
+        self: Arc<Self>,
+        period: Duration,
+        floor: f32,
+        ceil: f32,
+        itvl: u16,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let mut prev_w = self.wifi_frame_count();
+            let mut prev_b = self.ble_scan_count();
+            loop {
+                tokio::time::sleep(period).await;
+                let w = self.wifi_frame_count();
+                let b = self.ble_scan_count();
+                let dw = w.wrapping_sub(prev_w) as f32;
+                let db = b.wrapping_sub(prev_b) as f32;
+                prev_w = w;
+                prev_b = b;
+                let total = dw + db;
+                // Idle on both bearers → hold the midpoint so each stays reachable; else split by demand.
+                let share = if total < 1.0 { (floor + ceil) * 0.5 } else { (db / total).clamp(floor, ceil) };
+                let _ = self.set_ble_share(share, itvl);
+            }
+        })
     }
 
     /// Set the TX power index (wext `txpower patha=<idx>`). Only reachable on the
@@ -306,7 +424,10 @@ fn reader_loop(
     tx: mpsc::UnboundedSender<CapturedFrame>,
     clk: mpsc::UnboundedSender<u64>,
     txtime: mpsc::UnboundedSender<(u64, u64)>,
+    ble: mpsc::UnboundedSender<(i8, [u8; 6], Bytes)>,
     activity: Arc<std::sync::atomic::AtomicU32>,
+    ble_activity: Arc<std::sync::atomic::AtomicU32>,
+    wifi_frames: Arc<std::sync::atomic::AtomicU32>,
     dev_clock: Option<ClockDomainId>,
 ) {
     let mut acc: Vec<u8> = Vec::new();
@@ -336,6 +457,18 @@ fn reader_loop(
                         acc.drain(..consumed);
                         continue;
                     }
+                    // T_BLE_RX [rssi_i8][addr6][payload] — a scanned BLE advertisement from the unified
+                    // firmware's BLE bearer; route to ble_next_scanned (drives the BLE AdvBackend on this
+                    // same port). The dedup lives on-device (scan filter_duplicates), so pass it straight up.
+                    if ty == T_BLE_RX && payload.len() >= 7 {
+                        let rssi = payload[0] as i8;
+                        let mut addr = [0u8; 6];
+                        addr.copy_from_slice(&payload[1..7]);
+                        ble_activity.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let _ = ble.send((rssi, addr, Bytes::copy_from_slice(&payload[7..])));
+                        acc.drain(..consumed);
+                        continue;
+                    }
                     // T_RX [rssi][frame] (BW16, no hardware timestamp → HostRecv stamp) and
                     // T_RX_TS [rssi][noise][rate_code][phy_flags][rx_ts_us_le32][frame] (ESP32-C5: hardware
                     // RX stamp + the ESP's per-frame PHY metadata — its "radiotap": RX rate/MCS + SNR).
@@ -362,6 +495,7 @@ fn reader_loop(
                         None
                     };
                     if let Some(cap) = parsed {
+                        wifi_frames.fetch_add(1, std::sync::atomic::Ordering::Relaxed); // Wi-Fi demand signal
                         if tx.send(cap).is_err() {
                             return; // backend dropped
                         }
@@ -467,7 +601,9 @@ impl RadioProfile for SerialRadioBackend {
 /// and delegates everything else. A distinct type (not a config flag) so C5-specific behaviour — 5 GHz
 /// knobs, a hardware-TSF clock — has a home as it diverges from the BW16.
 pub struct Esp32SerialBackend {
-    inner: SerialRadioBackend,
+    // Arc so the SAME underlying port/reader (the shared mux) can also back a BLE `AdvBackend` — one host
+    // connection, both bearers. See [`shared_mux`](Esp32SerialBackend::shared_mux).
+    inner: Arc<SerialRadioBackend>,
     capability: RadioCapability,
     clock_domain: ClockDomainId,
 }
@@ -480,7 +616,7 @@ impl Esp32SerialBackend {
     pub fn open_c5(path: &str) -> Result<Self, FaceError> {
         let clock_domain = c5_clock_domain(path);
         Ok(Self {
-            inner: SerialRadioBackend::open_no_reset_clocked(path, clock_domain)?,
+            inner: Arc::new(SerialRadioBackend::open_no_reset_clocked(path, clock_domain)?),
             // .with_he(): the C5 is Wi-Fi 6 — it transmits real HE (verified on air, RX cur_bb_format=HE_SU),
             // so it advertises the HE reach levers (ER-SU + DCM) that for_intent(MostRobust) and set_rate use.
             capability: RadioCapability::wifi_monitor_dual_1ss(vec![1, 6, 11, 36, 40, 44, 48]).with_he(),
@@ -501,6 +637,14 @@ impl Esp32SerialBackend {
         let time: Arc<dyn RadioTime> = dev.clone();
         let profile: Arc<dyn RadioProfile> = dev;
         Ok(OpenRadio { io, knobs: Some(knobs), time: Some(time), profile: Some(profile) })
+    }
+
+    /// The shared-mux handle: the `Arc<SerialRadioBackend>` behind this Wi-Fi view, whose BLE methods
+    /// (`ble_broadcast`/`ble_next_scanned`/`set_ble_share`/`spawn_demand_coex`) drive the **BLE bearer of
+    /// the same port/reader**. Pass this to `ndn-face-ble-adv`'s shared-mux `AdvBackend` so ONE host
+    /// connection carries both bearers of the unified C5 firmware (the reader demuxes Wi-Fi and BLE).
+    pub fn shared_mux(&self) -> Arc<SerialRadioBackend> {
+        self.inner.clone()
     }
 
     /// Load the on-device Tier-0 name filter — see [`SerialRadioBackend::configure_name_filter`]. On the
@@ -571,10 +715,10 @@ impl FrameIo for Esp32SerialBackend {
 impl RadioKnobs for Esp32SerialBackend {
     fn set_channel(&self, channel: u8, bw: Bandwidth) -> Result<(), FaceError> {
         // FQ call: SerialRadioBackend has an inherent 1-arg `set_channel` that would shadow this.
-        RadioKnobs::set_channel(&self.inner, channel, bw)
+        RadioKnobs::set_channel(self.inner.as_ref(), channel, bw)
     }
     fn set_tx_power(&self, idx: u32) -> Result<(), FaceError> {
-        RadioKnobs::set_tx_power(&self.inner, idx)
+        RadioKnobs::set_tx_power(self.inner.as_ref(), idx)
     }
     fn tx_discipline(&self) -> TxDiscipline {
         // The C5 firmware places T_INJECT_AT frames at a scheduled instant via its monotonic timer.
@@ -583,10 +727,10 @@ impl RadioKnobs for Esp32SerialBackend {
         TxDiscipline::ScheduledAt { granularity_ns: 200_000 }
     }
     fn configure_name_filter(&self, enabled: bool, key: &[u8; 16], masks: &[[u8; 16]]) -> Result<(), FaceError> {
-        RadioKnobs::configure_name_filter(&self.inner, enabled, key, masks)
+        RadioKnobs::configure_name_filter(self.inner.as_ref(), enabled, key, masks)
     }
     fn read_channel_activity(&self) -> Result<Option<u16>, FaceError> {
-        RadioKnobs::read_channel_activity(&self.inner)
+        RadioKnobs::read_channel_activity(self.inner.as_ref())
     }
 }
 

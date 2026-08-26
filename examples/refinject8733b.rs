@@ -27,6 +27,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let size: usize = a.next().and_then(|s| s.parse().ok()).unwrap_or(300);
     // radiotap RATE in 500 kbps units: 12 = 6 Mbps OFDM (matches the 8733b), 2 = 1 Mbps CCK.
     let rate: u8 = a.next().and_then(|s| s.parse().ok()).unwrap_or(12);
+    // Microseconds between frames. 0 = flood. A LOW-RATE tick matters when this is used as a shared
+    // clock source: a flooding source saturates the medium it is meant to time, which silently
+    // turns a MAC experiment into an interference experiment.
+    let pace_us: u64 = a.next().and_then(|s| s.parse().ok()).unwrap_or(0);
 
     let fmt = FrameFormat::RawNdn { ethertype: ndn_radio_drivers::NDN_ETHERTYPE };
     let backend = AfPacketBackend::new(&iface, fmt)?;
@@ -71,6 +75,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut buf = Vec::with_capacity(hdr.len() + dot11.len());
         buf.extend_from_slice(&hdr);
         buf.extend_from_slice(&dot11);
+        if pace_us > 0 {
+            tokio::time::sleep(std::time::Duration::from_micros(pace_us)).await;
+        }
         match backend.inject_raw(&buf).await {
             Ok(()) => sent += 1,
             // Report WHY, once. A bare "sent=0" is indistinguishable from a dead radio, and cost a

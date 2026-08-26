@@ -4090,26 +4090,25 @@ pub struct PhyCounters {
     pub ht_fa: u16,
 }
 
-/// ⚠ **This part cannot source named-time's common view.** It stamps RX per frame but has NO
-/// per-frame TX timestamp: the vendor tree exposes only `TX_RPT_MAX_MACID` (a config) and RX-side
-/// TSF offsets, and the 8192E-class C2H TX report carries `QUEUE_TIME` in 256 us units — queue
-/// dwell, not a TSF, and three orders of magnitude too coarse.
+/// ⚠ **RETRACTED, and the retraction matters.** An earlier version of this note claimed this part
+/// "cannot source named-time's common view". That is FALSE and was measured false by this very
+/// port hours earlier: two of these radios, both hardware-RX-stamping the same third-party frames,
+/// gave **0.0034 ppm with 0.4 us residual** (762c346). Common view is an **RX-only** technique —
+/// both receivers stamp the SAME frame and the transmitter's clock cancels in the difference — so a
+/// TX timestamp is not required for it and never was. #41 says so in its own title: "hardware RX
+/// TSF ... tracks a shared beacon to ~0.4 us".
 ///
-/// That places it with the RTL8822E ("can only insert a TSF from its beacon engine"), not the
-/// AR9271, whose `AR_SendTimestamp` reaches `ds_txstat.ts_tstamp` for EVERY frame and is what makes
-/// the measured 1.05 us two-node common view possible — riding ordinary named data, with no beacon
-/// and no timekeeper role.
+/// What this part genuinely lacks is a DIFFERENT mechanism: the AR9271's per-frame TX timestamp
+/// (`AR_SendTimestamp` -> `ds_txstat.ts_tstamp`), which lets a node be a time SOURCE from its own
+/// ordinary transmissions via a PTP two-step. The vendor tree exposes no equivalent here — only
+/// `TX_RPT_MAX_MACID` and RX-side TSF offsets, with the 8192E-class C2H report carrying
+/// `QUEUE_TIME` in 256 us units (queue dwell, not a TSF). So this part sits with the RTL8822E for
+/// SOURCING time, while remaining perfectly capable of CONSUMING common view.
 ///
-/// The consequence is structural, not a porting gap: named-time's transfer is a PTP two-step —
-/// frame N airs, hardware reports WHEN, frame N+1 carries "index N left at TSF T". Without a TX
-/// report there is nothing to put in frame N+1. Two of these radios therefore cannot common-view
-/// off each other's traffic; they can only stamp a THIRD party's ordinary frames, which is free in
-/// a network of >=3 nodes and needs no dedicated timing source. Substituting a dedicated tick
-/// transmitter for that third node is a crutch, and reintroduces exactly the beacon-shaped shared
-/// clock the design removed.
-///
-/// So: use the AR9271 for time transfer. Use this part for the things it measurably does well —
-/// TX power (14 dB), the airtime gate (99% slot confinement), per-frame SNR/EVM, RX stamps.
+/// The practical difference: two of these radios cannot time each other directly (a node never
+/// hears its own transmission, so no frame is stamped by both), but any mutually-heard third
+/// transmitter's ORDINARY traffic closes it — which costs nothing in a network of >=3 nodes and is
+/// exactly what the design intends. A dedicated paced tick is the crutch, not the third party.
 ///
 /// Reference [`RadioTime`] implementation: this chip exposes the two link clocks the abstraction
 /// was designed around — an always-on free-run per-frame RX stamp (RXTSFL) and the gated,

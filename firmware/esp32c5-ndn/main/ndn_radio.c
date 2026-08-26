@@ -158,8 +158,10 @@ static void send_framed(uint8_t ty, const uint8_t *payload, uint16_t len) {
 static uint8_t s_ble_addr_type;
 static uint8_t s_ble_addr[6];
 static QueueHandle_t bleq;          // scanned reports -> serial-TX task
+static QueueHandle_t advq;          // pending advertisements -> paced adv task
 static volatile bool s_ble_ready;
 typedef struct { int8_t rssi; uint8_t addr[6]; uint8_t len; uint8_t buf[BLE_MAXPAY]; } blerep_t;
+typedef struct { uint8_t len; uint8_t buf[BLE_MAXPAY]; } advreq_t;
 
 // Scan an adv payload for our manufacturer AD (0xFF, company 0x4E44); return the inner named payload len.
 static int ble_find_named(const uint8_t *d, int n, const uint8_t **out) {
@@ -225,7 +227,10 @@ static void ble_start_scan(void) {
     up.itvl = s_ble_scan_itvl;
     up.window = s_ble_scan_win;
     up.passive = 1;
-    ble_gap_ext_disc(s_ble_addr_type, 0, 0, 0, 0, 0, &up, NULL, ble_gap_event, NULL);
+    // filter_duplicates=1: the 3-event adv burst re-sends each fragment, and the NDNts reassembler would
+    // append the duplicate continuations and corrupt the packet — dedup them at the controller. A scan
+    // PERIOD (2 * 1.28s) resets the dedup list so a re-broadcast can still recover a lost fragment.
+    ble_gap_ext_disc(s_ble_addr_type, 0, 2 /*period*/, 1 /*filter_dup*/, 0, 0, &up, NULL, ble_gap_event, NULL);
 }
 
 static void ble_on_sync(void) {
@@ -249,6 +254,19 @@ static void ble_on_sync(void) {
 static void ble_host_task(void *param) {
     nimble_port_run();
     nimble_port_freertos_deinit();
+}
+
+// Paced advertiser: each queued payload (e.g. one LP fragment) gets its full burst on air before the next
+// replaces it. Without this, back-to-back T_BLE_ADV (a multi-fragment packet) overwrite the adv data before
+// it radiates and only the last fragment is transmitted — reassembly then never completes.
+static void ble_adv_task(void *arg) {
+    advreq_t req;
+    for (;;) {
+        if (xQueueReceive(advq, &req, portMAX_DELAY) == pdTRUE) {
+            ble_advertise(req.buf, req.len);
+            vTaskDelay(pdMS_TO_TICKS(110)); // 3 adv events @ 30ms ≈ 90ms — let the burst radiate
+        }
+    }
 }
 
 static void serial_tx_task(void *arg) {
@@ -303,7 +321,10 @@ static void serial_rx_loop(void) {
             uint8_t *pl = acc + i + 5;
             switch (ty) {
                 case T_INJECT: esp_wifi_80211_tx(WIFI_IF_STA, pl, len, true); break;
-                case T_BLE_ADV: ble_advertise(pl, len); break; // the BLE bearer, same firmware
+                case T_BLE_ADV: if (advq && len > 0 && len <= BLE_MAXPAY) { // enqueue -> paced adv task
+                    advreq_t rq; rq.len = (uint8_t)len; memcpy(rq.buf, pl, len);
+                    xQueueSend(advq, &rq, 0); // drop if full (broadcast is best-effort)
+                } break;
                 case T_COEX: if (len >= 4 && s_ble_ready) { // cognition sets the BLE↔Wi-Fi radio-time split
                     s_ble_scan_win = pl[0] | (pl[1] << 8);
                     s_ble_scan_itvl = pl[2] | (pl[3] << 8);
@@ -409,6 +430,7 @@ void app_main(void) {
 
     rxq = xQueueCreate(32, sizeof(rxpkt_t));
     bleq = xQueueCreate(24, sizeof(blerep_t));
+    advq = xQueueCreate(16, sizeof(advreq_t)); // holds a few multi-fragment packets in flight
 
     // BLE bearer (NimBLE) alongside Wi-Fi — one firmware, all bearers. Software coex (CONFIG_ESP_COEX_SW_
     // COEXIST_ENABLE, auto-on with BT+Wi-Fi) time-shares the radio between promiscuous Wi-Fi RX and BLE scan.
@@ -417,5 +439,6 @@ void app_main(void) {
     nimble_port_freertos_init(ble_host_task);
 
     xTaskCreate(serial_tx_task, "ser_tx", 4096, NULL, 5, NULL);
+    xTaskCreate(ble_adv_task, "ble_adv", 4096, NULL, 5, NULL);
     serial_rx_loop(); // never returns
 }

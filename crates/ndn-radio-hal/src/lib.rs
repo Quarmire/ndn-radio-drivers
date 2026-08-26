@@ -699,6 +699,18 @@ pub trait RadioKnobs: Send + Sync {
         )))
     }
 
+    /// Per-format OFDM PPDU counters `(ok, err)`, if the radio reports them. Default: `None`.
+    ///
+    /// The receive-side loss a frame count cannot show. A missing frame is invisible from the RX
+    /// side — it simply never arrives — so "17% did not turn up" cannot distinguish a collision
+    /// from a marginal link from a transmitter that never sent. `err` counts PPDUs the PHY BEGAN to
+    /// demodulate and failed, which is exactly the collision/marginal-decode signature.
+    ///
+    /// Free-running and wrapping: take differences over an interval, never absolute values.
+    fn read_ofdm_counters(&self) -> Result<Option<(u16, u16)>, FaceError> {
+        Ok(None)
+    }
+
     /// **Hold or release transmissions at the MAC**, if the radio can. Default: no-op.
     ///
     /// The hardware side of a slot MAC. A software gate can only stop *us calling inject*; frames

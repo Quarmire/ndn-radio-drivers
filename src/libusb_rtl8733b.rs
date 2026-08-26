@@ -3971,6 +3971,14 @@ impl RadioKnobs for Rtl8733buBackend {
     }
     // set_tx_csd stays the default no-op: the 8731bu is 1x1 (single chain), so there is no
     // second chain to apply cyclic-shift diversity to.
+    fn read_ofdm_counters(&self) -> Result<Option<(u16, u16)>, FaceError> {
+        // Only the OFDM pair reports on this part — the CCK/HT/false-alarm selectors measured ZERO
+        // (5da2fdf), so exposing just these two is the honest surface rather than a struct whose
+        // other fields are permanently zero.
+        let c = self.read_phy_counters()?;
+        Ok(Some((c.ofdm_ok, c.ofdm_err)))
+    }
+
     fn set_tx_hold(&self, hold: bool) -> Result<(), FaceError> {
         // All eight transmit queues, or none. See `set_tx_pause` for the measured semantics the
         // trait doc summarises — in particular that this HOLDS rather than drops.

@@ -530,6 +530,15 @@ impl FrameIo for Esp32SerialBackend {
     async fn inject_at_clock(&self, frame: InjectFrame, target_tick: u64, _domain: ClockDomainId) -> Result<(), FaceError> {
         self.inner.inject_at_abs(frame, target_tick)
     }
+    /// Relative hardware scheduling (T_INJECT_AT): the C5 fires the frame `delay_us` after it receives the
+    /// command, on its own esp_timer — so the scheduler's slot_wait drives it with no clock reconcile.
+    async fn inject_after(&self, frame: InjectFrame, delay_us: u64) -> Result<(), FaceError> {
+        if delay_us == 0 {
+            self.inner.inject(frame).await
+        } else {
+            self.inner.inject_at(frame, delay_us.min(u32::MAX as u64) as u32)
+        }
+    }
     /// Actuate cognition's rate lever. The C5 firmware decodes T_RATE as a `wifi_phy_rate_t` and calls the
     /// blob-internal `ic_set_80211_tx_rate_config` directly (the public wrapper ESP_FAILs in the C5's boot
     /// HE20 mode) — MEASURED on air up to MCS7/65 Mbps. The C5 is single-stream HT, so map the descriptor's

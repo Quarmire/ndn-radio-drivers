@@ -477,6 +477,16 @@ pub trait FrameIo: Send + Sync + 'static {
         self.inject(frame).await
     }
 
+    /// **Place a frame on air `delay_us` from now**, timed on the *device's own* clock — the relative,
+    /// reconcile-free sibling of [`inject_at_clock`](Self::inject_at_clock). Because the delay is applied
+    /// against the radio's own timebase, no host↔device clock-offset conversion is needed, which is what
+    /// lets [`FaceScheduler::slot_wait`] drive a hardware-scheduled bearer directly. `delay_us == 0` is
+    /// inject-now. **Default = inject now** (a radio with no scheduled-TX engine ignores the delay; the
+    /// scheduler's software gate has already waited for it). The ESP32-C5 backs it with its `T_INJECT_AT`.
+    async fn inject_after(&self, frame: InjectFrame, _delay_us: u64) -> Result<(), FaceError> {
+        self.inject(frame).await
+    }
+
     /// Await the next frame captured on the medium. A node never hears its own
     /// transmissions (half-duplex radio); the backend filters those.
     async fn recv_frame(&self) -> Result<CapturedFrame, FaceError>;

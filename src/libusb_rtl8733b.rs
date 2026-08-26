@@ -4075,8 +4075,19 @@ pub struct PhyCounters {
 impl RadioTime for Rtl8733buBackend {
     fn time_sources(&self) -> Vec<RadioTimeSource> {
         vec![
-            // The per-frame RX stamp every CapturedFrame is latched from — µs ticks, always on.
-            RadioTimeSource::free_run_rx_stamp(self.tsf_domain, 1_000),
+            // The per-frame RX stamp every CapturedFrame is latched from — always on.
+            //
+            // ⚠ 4_000 ns per tick, NOT the 1_000 this declared. MEASURED 2026-08-25 by bracketing a
+            // capture between its first and last stamped frame and comparing to the host clock:
+            // 3677038 ticks across 14.71 s = **3999.7 ns/tick**. Same 4x scale error as the port
+            // TSF (8e95608) — the two counters share it, and fixing one did not fix the other.
+            //
+            // It matters: every DURATION derived from RX stamps was 4x short. It is what made the
+            // TXPAUSE shaping figures inconsistent with the throughput measured alongside them —
+            // "26 ms windows at 50% duty" cannot coexist with 13.9% throughput, and under the
+            // correct scale (~104 ms of silence per cycle) the two agree. Ratios are unaffected,
+            // so the common-view ppm results (762c346) stand: a common scale cancels there.
+            RadioTimeSource::free_run_rx_stamp(self.tsf_domain, 4_000),
             // The port-0 beacon TSF: readable via read_clock, but only advances under
             // set_tsf_run and is beacon-resynced (not monotonic) — its own domain.
             //

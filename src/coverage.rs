@@ -121,7 +121,7 @@ pub const COVERAGE: &[Row] = &[
         profile: Provided,
     },
     Row {
-        backend: "Bw16SerialBackend (RTL8720DN)",
+        backend: "SerialRadioBackend (RTL8720DN)",
         pids: &[], // serial bridge — no USB PID dispatch; opened by device path
         campaign: false,
         frame_io: Provided,
@@ -226,14 +226,14 @@ mod tests {
         claim!(is_frame_io::<crate::Ath9kHtcBackend>);
         claim!(is_time::<crate::Ath9kHtcBackend>);
         claim!(is_profile::<crate::Ath9kHtcBackend>);
-        #[cfg(feature = "bw16")]
+        #[cfg(feature = "serial-radio")]
         {
-            claim!(is_frame_io::<crate::Bw16SerialBackend>);
-            claim!(is_knobs::<crate::Bw16SerialBackend>);
-            claim!(is_time::<crate::Bw16SerialBackend>);
-            claim!(is_profile::<crate::Bw16SerialBackend>);
+            claim!(is_frame_io::<crate::SerialRadioBackend>);
+            claim!(is_knobs::<crate::SerialRadioBackend>);
+            claim!(is_time::<crate::SerialRadioBackend>);
+            claim!(is_profile::<crate::SerialRadioBackend>);
         }
-        #[cfg(not(feature = "bw16"))]
+        #[cfg(not(feature = "serial-radio"))]
         {
             n += 4;
         }

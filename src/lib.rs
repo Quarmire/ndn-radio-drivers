@@ -69,13 +69,13 @@ pub use libusb_rtl8733b::{
     ChipVersion, FW_NIC_8733B, FwHeader, PowerTracker, RTL8733B_PIDS, Rtl8733buBackend,
 };
 
-// BW16 (RTL8720DN) serial-bridged backend — a dual-band 802.11 injector/capturer
-// driven over USB-serial (firmware/bw16-ndn-bridge), implementing the same
-// FrameIo/WifiRadio/RadioKnobs contract as the USB drivers.
-#[cfg(feature = "bw16")]
-mod bw16_serial;
-#[cfg(feature = "bw16")]
-pub use bw16_serial::{BW16_BAUD, Bw16SerialBackend, Esp32SerialBackend};
+// Serial-bridged 802.11 backend — a raw injector/capturer driven over USB-serial (the ND wire protocol),
+// backing a BW16 (RTL8720DN, firmware/bw16-ndn-bridge) or an ESP32-C5 (firmware/esp32c5-ndn), implementing
+// the same FrameIo/WifiRadio/RadioKnobs contract as the USB drivers.
+#[cfg(feature = "serial-radio")]
+mod serial_radio;
+#[cfg(feature = "serial-radio")]
+pub use serial_radio::{SERIAL_RADIO_BAUD, SerialRadioBackend, Esp32SerialBackend};
 
 // Waveshare USB-TO-LoRa (SX1262) serial-bridged sub-GHz backend: a transparent-mode byte pipe with
 // host-supplied framing and AT-programmed radio params, implementing the same FrameIo/RadioTime/

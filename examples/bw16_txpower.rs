@@ -1,7 +1,7 @@
 //! Verify the reimplemented TX-power knob on the Rust firmware: sweep the power
 //! index, inject marked frames, and read back the mean RSSI the RTL8812EU sees.
 //! A monotonic RSSI change proves `txpower patha=N` reaches the radio.
-//!   cargo run --features bw16 --example bw16_txpower -- /dev/cu.usbserial-1110 149
+//!   cargo run --features serial-radio --example bw16_txpower -- /dev/cu.usbserial-1110 149
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::runtime::Builder::new_multi_thread()

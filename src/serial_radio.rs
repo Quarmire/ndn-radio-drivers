@@ -1,13 +1,16 @@
-//! BW16 (RTL8720DN) serial-bridged monitor-mode backend.
+//! Serial-bridged 802.11 monitor-mode backend (the `[4E 44 …]` "ND" wire protocol).
 //!
-//! A BW16 running the `firmware/bw16-ndn-bridge` sketch is a dual-band 802.11
-//! injector/capturer driven over USB-serial. The host builds the *same* 802.11
-//! frame (`ndn_frame_io::frame::build_dot11`) the USB drivers build, ships the
-//! bytes to the board to inject raw, and parses captured frames back — so a
-//! `MonitorWifiFace` over a BW16 is just another [`FrameIo`] backend, and the
-//! NAN engine / cognition above it are none the wiser. The proof that the HAL
-//! seam accommodates a radically different radio (an ARM Cortex-M board on a
-//! serial tether, not a USB host driver).
+//! A microcontroller running our bridge firmware is a raw 802.11 injector/capturer driven over a serial
+//! link. Two chipsets speak this exact protocol behind [`SerialRadioBackend`]: the **BW16 (RTL8720DN)**
+//! (`firmware/bw16-ndn-bridge`) and the **ESP32-C5** (`firmware/esp32c5-ndn[-rs]`, via its native
+//! USB-Serial-JTAG) — hence the chipset-neutral name. The host builds the *same* 802.11 frame
+//! (`ndn_frame_io::frame::build_dot11`) the USB drivers build, ships the bytes to the board to inject raw,
+//! and parses captured frames back — so a `MonitorWifiFace` over either board is just another [`FrameIo`]
+//! backend, and the NAN engine / cognition above it are none the wiser. The proof that the HAL seam
+//! accommodates a radically different radio (an MCU on a serial tether, not a USB host driver).
+//!
+//! [`Esp32SerialBackend`] is a thin newtype over this that supplies C5-specific surface (dual-band
+//! capability, hardware scheduled TX, the free-run RX clock, the `wifi_phy_rate_t` rate mapping).
 
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
@@ -81,7 +84,7 @@ const T_RX: u8 = 0x81;
 const T_RX_TS: u8 = 0x82; // [rssi_i8][noise_i8][rate_code][phy_flags][rx_ts_us_le32][frame] — RX + hardware
                           // µs stamp + the ESP's per-frame PHY metadata (radiotap-equiv): RX rate/MCS + SNR
 
-/// BW16 fixed TX-rate codes for [`Bw16SerialBackend::set_tx_rate`]
+/// BW16 fixed TX-rate codes for [`SerialRadioBackend::set_tx_rate`]
 /// (`wifi_set_tx_data_rate`). CCK 0x00–0x03, OFDM 0x04–0x0b, HT MCS0–7 0x0c–0x13,
 /// `0xFF` = auto rate adaptation.
 pub mod rate {
@@ -96,10 +99,10 @@ pub mod rate {
 
 /// Baud the firmware opens `Serial` at — the RTL8720 LOG UART's native rate,
 /// shared with WiFi-driver debug (the deframer picks our SYNC'd frames out).
-pub const BW16_BAUD: u32 = 115_200;
+pub const SERIAL_RADIO_BAUD: u32 = 115_200;
 
 /// A BW16 reached over its USB-serial port.
-pub struct Bw16SerialBackend {
+pub struct SerialRadioBackend {
     tx: Arc<Mutex<Box<dyn serialport::SerialPort>>>,
     format: FrameFormat,
     rx: AsyncMutex<mpsc::UnboundedReceiver<CapturedFrame>>,
@@ -111,7 +114,7 @@ pub struct Bw16SerialBackend {
     txtime_rx: AsyncMutex<mpsc::UnboundedReceiver<(u64, u64)>>,
 }
 
-impl Bw16SerialBackend {
+impl SerialRadioBackend {
     /// Open the BW16 (RTL8720DN) at `path` (e.g. `/dev/tty.usbserial-XXXX`) and spawn the RX
     /// reader that deframes captured 802.11 frames off the serial link. Pulses DTR→CEN to reset
     /// the board into our firmware so a freshly-flashed board comes up without a manual reset.
@@ -136,7 +139,7 @@ impl Bw16SerialBackend {
     }
 
     fn open_inner(path: &str, reset_pulse: bool, dev_clock: Option<ClockDomainId>) -> Result<Self, FaceError> {
-        let mut port = serialport::new(path, BW16_BAUD)
+        let mut port = serialport::new(path, SERIAL_RADIO_BAUD)
             .timeout(Duration::from_millis(50))
             .open()
             .map_err(|e| io_err(format!("bw16 open {path}: {e}")))?;
@@ -373,7 +376,7 @@ fn deframe(buf: &[u8]) -> Option<(u8, Vec<u8>, usize)> {
 }
 
 #[async_trait]
-impl FrameIo for Bw16SerialBackend {
+impl FrameIo for SerialRadioBackend {
     async fn inject(&self, frame_in: InjectFrame) -> Result<(), FaceError> {
         // Build the 802.11 frame on the host — identical to the USB backends —
         // then hand the raw bytes to the board to inject (it adds FCS + seq).
@@ -390,9 +393,9 @@ impl FrameIo for Bw16SerialBackend {
 // Marker only: the Ameba board's management-TX path picks its own rate, so `set_rate`
 // (the FrameIo default no-op) and the derived `inject_at` both just inject.
 
-impl RadioKnobs for Bw16SerialBackend {
+impl RadioKnobs for SerialRadioBackend {
     fn set_channel(&self, channel: u8, bw: Bandwidth) -> Result<(), FaceError> {
-        Bw16SerialBackend::set_channel(self, channel)?;
+        SerialRadioBackend::set_channel(self, channel)?;
         // Map the HAL bandwidth to the board's 40 MHz enable (the widest this SDK
         // exposes): Bw20 → off, wider → on.
         self.set_bw40(!matches!(bw, Bandwidth::Bw20))
@@ -407,7 +410,7 @@ impl RadioKnobs for Bw16SerialBackend {
 /// Reference [`RadioTime`] for the `HostRecv` clock kind: the serial board reports no hardware
 /// timestamp, so its only honest link clock is the host monotonic clock read when the serial
 /// line delivered the frame. It is readable on demand, so `read_clock` returns it.
-impl RadioTime for Bw16SerialBackend {
+impl RadioTime for SerialRadioBackend {
     fn time_sources(&self) -> Vec<RadioTimeSource> {
         vec![RadioTimeSource::host_recv(HOST_CLOCK_DOMAIN)]
     }
@@ -417,7 +420,7 @@ impl RadioTime for Bw16SerialBackend {
     }
 }
 
-impl RadioProfile for Bw16SerialBackend {
+impl RadioProfile for SerialRadioBackend {
     fn capability(&self) -> RadioCapability {
         // RTL8720DN (BW16): single-chain 2.4 GHz 11n over the serial bridge.
         RadioCapability::wifi_monitor_2ghz_1ss(vec![1, 6, 11])
@@ -425,27 +428,27 @@ impl RadioProfile for Bw16SerialBackend {
 }
 
 /// **ESP32-C5 serial-bridge backend** — the C5 speaks the *same* BW16 wire protocol over its native
-/// USB-Serial-JTAG, so transport, framing, and knobs are the RTL8720DN [`Bw16SerialBackend`] verbatim.
+/// USB-Serial-JTAG, so transport, framing, and knobs are the RTL8720DN [`SerialRadioBackend`] verbatim.
 /// It differs in exactly one thing that matters to the planner: it is **dual-band** (2.4 + 5 GHz, both
 /// validated on air), whereas the BW16 profile is 2.4-only — so cognition driving a C5 through the BW16
 /// identity would never pick a 5 GHz channel. This newtype supplies the dual-band [`RadioCapability`]
 /// and delegates everything else. A distinct type (not a config flag) so C5-specific behaviour — 5 GHz
 /// knobs, a hardware-TSF clock — has a home as it diverges from the BW16.
 pub struct Esp32SerialBackend {
-    inner: Bw16SerialBackend,
+    inner: SerialRadioBackend,
     capability: RadioCapability,
     clock_domain: ClockDomainId,
 }
 
 impl Esp32SerialBackend {
     /// Open an ESP32-C5 running the `firmware/esp32c5-ndn` (or `-rs`) serial bridge on its native
-    /// USB-Serial-JTAG. Uses [`Bw16SerialBackend::open_no_reset_clocked`] — RTS/DTR map to EN/GPIO9 on
+    /// USB-Serial-JTAG. Uses [`SerialRadioBackend::open_no_reset_clocked`] — RTS/DTR map to EN/GPIO9 on
     /// the C5, so they are never toggled (asserting RTS holds the chip in reset). Dual-band capability
     /// spans 2.4 GHz (1/6/11) and 5 GHz (36/40/44/48). Frames are stamped in the C5's hardware RX clock.
     pub fn open_c5(path: &str) -> Result<Self, FaceError> {
         let clock_domain = c5_clock_domain(path);
         Ok(Self {
-            inner: Bw16SerialBackend::open_no_reset_clocked(path, clock_domain)?,
+            inner: SerialRadioBackend::open_no_reset_clocked(path, clock_domain)?,
             capability: RadioCapability::wifi_monitor_dual_1ss(vec![1, 6, 11, 36, 40, 44, 48]),
             clock_domain,
         })
@@ -466,23 +469,23 @@ impl Esp32SerialBackend {
         Ok(OpenRadio { io, knobs: Some(knobs), time: Some(time), profile: Some(profile) })
     }
 
-    /// Load the on-device Tier-0 name filter — see [`Bw16SerialBackend::configure_name_filter`]. On the
+    /// Load the on-device Tier-0 name filter — see [`SerialRadioBackend::configure_name_filter`]. On the
     /// C5 this is a real pre-serial drop (the firmware is ours), unlike a commodity monitor NIC.
     pub fn configure_name_filter(&self, enabled: bool, masks: &[[u8; 16]]) -> Result<(), FaceError> {
         self.inner.configure_name_filter(enabled, masks)
     }
 
-    /// Scheduled TX (the airtime-lease primitive) — see [`Bw16SerialBackend::inject_at`].
+    /// Scheduled TX (the airtime-lease primitive) — see [`SerialRadioBackend::inject_at`].
     pub fn inject_at(&self, frame_in: InjectFrame, delay_us: u32) -> Result<(), FaceError> {
         self.inner.inject_at(frame_in, delay_us)
     }
 
-    /// Read the C5's schedule clock — see [`Bw16SerialBackend::read_schedule_clock`].
+    /// Read the C5's schedule clock — see [`SerialRadioBackend::read_schedule_clock`].
     pub async fn read_schedule_clock(&self) -> Option<u64> {
         self.inner.read_schedule_clock().await
     }
 
-    /// Next scheduled-TX confirmation — see [`Bw16SerialBackend::recv_tx_confirm`].
+    /// Next scheduled-TX confirmation — see [`SerialRadioBackend::recv_tx_confirm`].
     pub async fn recv_tx_confirm(&self) -> Option<(u64, u64)> {
         self.inner.recv_tx_confirm().await
     }
@@ -498,7 +501,7 @@ impl FrameIo for Esp32SerialBackend {
     }
     /// Hardware scheduled placement: the C5 fires T_INJECT_ABS when its esp_timer reaches `target_tick`,
     /// so a scheduler places the frame in its slot without host sleep+inject jitter. `target_tick` is a
-    /// value in the C5's schedule clock (esp_timer µs). See [`Bw16SerialBackend::inject_at_abs`].
+    /// value in the C5's schedule clock (esp_timer µs). See [`SerialRadioBackend::inject_at_abs`].
     async fn inject_at_clock(&self, frame: InjectFrame, target_tick: u64, _domain: ClockDomainId) -> Result<(), FaceError> {
         self.inner.inject_at_abs(frame, target_tick)
     }
@@ -516,7 +519,7 @@ impl FrameIo for Esp32SerialBackend {
 
 impl RadioKnobs for Esp32SerialBackend {
     fn set_channel(&self, channel: u8, bw: Bandwidth) -> Result<(), FaceError> {
-        // FQ call: Bw16SerialBackend has an inherent 1-arg `set_channel` that would shadow this.
+        // FQ call: SerialRadioBackend has an inherent 1-arg `set_channel` that would shadow this.
         RadioKnobs::set_channel(&self.inner, channel, bw)
     }
     fn set_tx_power(&self, idx: u32) -> Result<(), FaceError> {

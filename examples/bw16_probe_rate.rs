@@ -3,7 +3,7 @@
 //! (0x87) and read back the MCS the RTL8812EU captures. The offset that turns the
 //! frame into an HT MCS frame is the `rate` field — the key to a rate-controllable
 //! inject. One 8812EU open for the whole sweep.
-//!   cargo run --features bw16 --example bw16_probe_rate -- /dev/cu.usbserial-1110 149
+//!   cargo run --features serial-radio --example bw16_probe_rate -- /dev/cu.usbserial-1110 149
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::runtime::Builder::new_multi_thread()

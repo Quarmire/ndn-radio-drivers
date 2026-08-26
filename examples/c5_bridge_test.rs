@@ -5,7 +5,7 @@
 //! then drains `recv_frame` (the C5 forwards every 0x8624 frame it hears, e.g. from the mt76 injector).
 //!
 //! ```sh
-//! cargo run --example c5_bridge_test --features bw16 -- /dev/cu.usbmodem1101
+//! cargo run --example c5_bridge_test --features serial-radio -- /dev/cu.usbmodem1101
 //! ```
 use std::time::Duration;
 

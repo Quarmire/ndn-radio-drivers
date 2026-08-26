@@ -2,14 +2,14 @@
 //! test broadcast NDN frame, and print captured frames for ~5 s.
 //!
 //! Flash `firmware/bw16-ndn-bridge` first, then:
-//!   cargo run --features bw16 --example bw16_probe -- /dev/cu.usbserial-1110 6
+//!   cargo run --features serial-radio --example bw16_probe -- /dev/cu.usbserial-1110 6
 
-#[cfg(feature = "bw16")]
+#[cfg(feature = "serial-radio")]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::runtime::Runtime::new()?.block_on(run())
 }
 
-#[cfg(feature = "bw16")]
+#[cfg(feature = "serial-radio")]
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     use bytes::Bytes;
     use ndn_frame_io::{FrameIo, InjectFrame, TxIntent};
@@ -52,7 +52,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-#[cfg(not(feature = "bw16"))]
+#[cfg(not(feature = "serial-radio"))]
 fn main() {
-    eprintln!("rebuild with --features bw16");
+    eprintln!("rebuild with --features serial-radio");
 }

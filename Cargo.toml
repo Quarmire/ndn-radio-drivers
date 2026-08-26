@@ -26,8 +26,9 @@ serialport = { version = "4", optional = true, default-features = false }
 
 [features]
 default = []
-# The BW16 (RTL8720DN) serial-bridged monitor-mode backend.
-bw16 = ["dep:serialport"]
+# The serial-bridged 802.11 monitor-mode backend (SerialRadioBackend / Esp32SerialBackend), speaking the
+# `[4E 44 …]` ND wire protocol to a BW16 (RTL8720DN) or an ESP32-C5 over USB-serial.
+serial-radio = ["dep:serialport"]
 # The Waveshare USB-TO-LoRa (SX1262) serial-bridged sub-GHz backend (raw libc termios, no serialport).
 lora = []
 
@@ -35,19 +36,19 @@ lora = []
 # (default features) skips them instead of failing on the unresolved import.
 [[example]]
 name = "bw16_probe"
-required-features = ["bw16"]
+required-features = ["serial-radio"]
 
 [[example]]
 name = "bw16_probe_rate"
-required-features = ["bw16"]
+required-features = ["serial-radio"]
 
 [[example]]
 name = "bw16_txpower"
-required-features = ["bw16"]
+required-features = ["serial-radio"]
 
 [[example]]
 name = "bw16_knobs"
-required-features = ["bw16"]
+required-features = ["serial-radio"]
 
 [[example]]
 name = "lora_link"

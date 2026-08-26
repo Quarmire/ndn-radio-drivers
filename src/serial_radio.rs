@@ -555,13 +555,15 @@ impl FrameIo for Esp32SerialBackend {
     /// from it. (SGI/VHT/2SS aren't exposed by this bearer; index is clamped to the 1-stream HT range. This
     /// overrides the shared BW16 `set_rate`, whose T_RATE byte is an RTL8720DN rate code, not a phy_rate_t.)
     fn set_rate(&self, mcs: McsDescriptor) -> Result<(), FaceError> {
-        let code = 0x10u8 + mcs.index.min(7); // WIFI_PHY_RATE_MCS{0..7}_LGI (HT and HE share the MCS codes)
         if mcs.he {
-            // 802.11ax reach path: phymode HE20 (6) + the DCM / ER-SU flags. Verified on air (RX HE_SU/HE_ERSU).
+            // 802.11ax reach path: phymode HE20 (6) + the DCM / ER-SU flags. Verified on air (RX HE_SU / HE_ERSU).
+            // ★ HE ER-SU is only valid at MCS 0–2 (802.11ax) — the PHY silently drops the frame otherwise
+            // (measured: MCS4+ER-SU → nothing on air), so clamp the index when ER-SU is requested.
+            let idx = if mcs.er_su { mcs.index.min(2) } else { mcs.index.min(7) };
             let flags = (mcs.dcm as u8) | ((mcs.er_su as u8) << 1);
-            self.inner.set_tx_rate_ex(code, 6, flags)
+            self.inner.set_tx_rate_ex(0x10 + idx, 6, flags)
         } else {
-            self.inner.set_tx_rate(code) // HT (phymode auto-derived by the firmware)
+            self.inner.set_tx_rate(0x10 + mcs.index.min(7)) // HT (phymode auto-derived by the firmware)
         }
     }
 }

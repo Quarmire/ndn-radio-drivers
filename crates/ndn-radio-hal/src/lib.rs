@@ -62,6 +62,20 @@ pub struct McsDescriptor {
     /// the HT-SIG / VHT-SIG; the receiver must support LDPC RX (the kernel
     /// rtl8812eu does). Independent of `stbc` — they compose.
     pub ldpc: bool,
+    /// Transmit as **802.11ax (HE)** instead of HT/VHT — the mode that unlocks the two HE reach levers
+    /// below. Selected like [`vht`](Self::vht) selects 11ac; a non-HE bearer ignores it (falls back to
+    /// its best mode). Only meaningful when the radio advertises [`RateCapability::he_cap`].
+    pub he: bool,
+    /// **HE Dual-Carrier Modulation** — map each data bit onto two widely-spaced subcarriers. Halves the
+    /// rate but buys frequency diversity + ~a few dB of robustness against narrowband fades: a pure
+    /// reach/robustness lever for the un-ACKed broadcast channel, the HE sibling of [`stbc`](Self::stbc).
+    /// Requires [`he`](Self::he); ignored otherwise.
+    pub dcm: bool,
+    /// **HE Extended-Range Single-User (ER-SU)** — a long-range HE PPDU with a repeated, 3 dB-boosted
+    /// preamble for ~2–4 dB better receiver sensitivity. The strongest single-frame reach mode an HE PHY
+    /// offers, above HT+STBC+LDPC. Requires [`he`](Self::he). Only an HE receiver can decode it (like VHT
+    /// vs 11n), so it is a lever cognition opts into for a known-HE reach, not a broadcast default.
+    pub er_su: bool,
 }
 
 impl McsDescriptor {
@@ -73,6 +87,9 @@ impl McsDescriptor {
         nss: 1,
         stbc: false,
         ldpc: false,
+        he: false,
+        dcm: false,
+        er_su: false,
     };
 
     /// An 802.11n (HT) rate at `index`, long GI (index 8–15 = 2 streams).
@@ -84,6 +101,9 @@ impl McsDescriptor {
             nss: 1,
             stbc: false,
             ldpc: false,
+            he: false,
+            dcm: false,
+            er_su: false,
         }
     }
 
@@ -96,6 +116,9 @@ impl McsDescriptor {
             nss: 1,
             stbc: false,
             ldpc: false,
+            he: false,
+            dcm: false,
+            er_su: false,
         }
     }
 
@@ -108,6 +131,9 @@ impl McsDescriptor {
             nss: 2,
             stbc: false,
             ldpc: false,
+            he: false,
+            dcm: false,
+            er_su: false,
         }
     }
 
@@ -122,6 +148,37 @@ impl McsDescriptor {
     /// `McsDescriptor::vht(7).with_ldpc()`.
     pub const fn with_ldpc(mut self) -> Self {
         self.ldpc = true;
+        self
+    }
+
+    /// An **802.11ax (HE)** single-stream rate at `index`, long GI — the base for the HE reach levers.
+    pub const fn he(index: u8) -> Self {
+        McsDescriptor {
+            index,
+            short_gi: false,
+            vht: false,
+            nss: 1,
+            stbc: false,
+            ldpc: false,
+            he: true,
+            dcm: false,
+            er_su: false,
+        }
+    }
+
+    /// Enable HE [`dcm`](Self::dcm) (dual-carrier modulation — frequency-diversity reach). Forces
+    /// [`he`](Self::he). Chainable: `McsDescriptor::he(0).with_dcm()`.
+    pub const fn with_dcm(mut self) -> Self {
+        self.he = true;
+        self.dcm = true;
+        self
+    }
+
+    /// Enable HE [`er_su`](Self::er_su) (extended-range single-user — the strongest single-frame reach
+    /// mode). Forces [`he`](Self::he). Chainable: `McsDescriptor::he(0).with_er_su()`.
+    pub const fn with_er_su(mut self) -> Self {
+        self.he = true;
+        self.er_su = true;
         self
     }
 }
@@ -207,8 +264,14 @@ impl McsDescriptor {
     /// This is the 802.11 mapping of the transmit intent; another bearer maps it
     /// differently. An exact WiFi rate (fixed-rate benches, the cognitive face)
     /// travels the [`WifiRadio::inject_at`] path instead — not on the seam.
-    pub fn for_intent(intent: &TxIntent, max_index: u8, vht_cap: bool) -> McsDescriptor {
+    ///
+    /// `he_cap` unlocks the two 802.11ax reach levers for `MostRobust`: on an HE radio the base rate goes
+    /// out as **HE ER-SU + DCM** (~2–4 dB more reach than HT+STBC+LDPC). Since only an HE receiver can
+    /// decode ER-SU (as only 11ac decodes VHT), pass `he_cap` `true` only for a known-HE reach; the
+    /// worst-overheard-receiver legacy gate still forces legacy when a legacy-only RX is advertised.
+    pub fn for_intent(intent: &TxIntent, max_index: u8, vht_cap: bool, he_cap: bool) -> McsDescriptor {
         match intent.reliability {
+            Reliability::MostRobust if he_cap => McsDescriptor::he(0).with_er_su().with_dcm(),
             Reliability::MostRobust => McsDescriptor::ht(0).with_stbc().with_ldpc(),
             Reliability::Balanced => McsDescriptor::CONSERVATIVE,
             Reliability::Throughput => {
@@ -979,6 +1042,10 @@ pub struct RadioCapability {
     /// [`max_nss`](Self::max_nss) / [`max_bw`](Self::max_bw); the LoRa span via
     /// [`sf_range`](Self::sf_range).
     pub rate: RateCapability,
+    /// This Wi-Fi radio can transmit **802.11ax (HE)**, unlocking the HE reach levers (ER-SU + DCM) in
+    /// [`McsDescriptor::for_intent`] and the `he`/`dcm`/`er_su` descriptor flags. `false` on HT/VHT-only
+    /// parts and every non-Wi-Fi bearer. Set via [`with_he`](Self::with_he); read via [`he_cap`](Self::he_cap).
+    pub he_cap: bool,
     /// Channels this radio may use.
     pub channels: Vec<u8>,
     /// Max TX-power index (chip TXAGC scale) = the *calibrated/regulatory ceiling*.
@@ -1093,6 +1160,19 @@ impl RadioCapability {
     pub fn with_tx_power_dbm(mut self, range: DbmRange) -> Self {
         self.tx_power_dbm = Some(range);
         self
+    }
+
+    /// Declare 802.11ax (HE) transmit capability — chainable on a Wi-Fi preset (e.g. the ESP32-C5:
+    /// `wifi_monitor_dual_1ss(chs).with_he()`). Unlocks the HE reach levers (ER-SU + DCM). Leave it off
+    /// for HT/VHT-only parts so `for_intent(MostRobust)` keeps the universally-decodable HT+STBC+LDPC path.
+    pub fn with_he(mut self) -> Self {
+        self.he_cap = true;
+        self
+    }
+
+    /// Whether this radio can transmit 802.11ax (HE) — the gate for the ER-SU / DCM reach levers.
+    pub fn he_cap(&self) -> bool {
+        self.he_cap
     }
 
     /// The best (furthest-reaching / most-penetrating) band-rank this radio can use — the max
@@ -1224,7 +1304,7 @@ impl RadioCapability {
     pub fn wifi_monitor_5ghz(channels: Vec<u8>) -> Self {
         Self {
             kind: RadioKind::WifiMonitor,
-            bands: vec![Band::Band5GHz],
+            he_cap: false,            bands: vec![Band::Band5GHz],
             rate: RateCapability::Wifi {
                 max_mcs: 9,
                 max_nss: 2,
@@ -1249,7 +1329,7 @@ impl RadioCapability {
     pub fn wifi_monitor_2ghz(channels: Vec<u8>) -> Self {
         Self {
             kind: RadioKind::WifiMonitor,
-            bands: vec![Band::Band2_4GHz],
+            he_cap: false,            bands: vec![Band::Band2_4GHz],
             rate: RateCapability::Wifi {
                 max_mcs: 7,
                 max_nss: 2,
@@ -1322,7 +1402,7 @@ impl RadioCapability {
     pub fn wifi_halow_s1g(channels: Vec<u8>) -> Self {
         Self {
             kind: RadioKind::WifiMonitor,
-            bands: vec![Band::Sub1GHz],
+            he_cap: false,            bands: vec![Band::Sub1GHz],
             rate: RateCapability::Wifi {
                 max_mcs: 10, // S1G MCS0–10 (MCS10 = 1 MHz-only rep-coded BPSK)
                 max_nss: 1,
@@ -1346,7 +1426,7 @@ impl RadioCapability {
     pub fn lora(channels: Vec<u8>) -> Self {
         Self {
             kind: RadioKind::Lora,
-            bands: vec![Band::Sub1GHz],
+            he_cap: false,            bands: vec![Band::Sub1GHz],
             // SX126x spreading-factor span 7–12 (the reach↔rate range).
             rate: RateCapability::Lora {
                 min_sf: 7,
@@ -1372,7 +1452,7 @@ impl RadioCapability {
     pub fn sdr_sensor(channels: Vec<u8>) -> Self {
         Self {
             kind: RadioKind::Sdr,
-            bands: vec![Band::Band5GHz],
+            he_cap: false,            bands: vec![Band::Band5GHz],
             rate: RateCapability::None, // RX-only instrument — no transmit rate
             channels,
             max_tx_power: 0,
@@ -1449,24 +1529,24 @@ mod ceiling_tests {
         // it advertises — because of a constant calibrated on a Realtek part.
         let mt = RadioCapability::wifi_monitor_5ghz(vec![36]);
         assert_eq!(mt.max_mcs(), 9, "fixture: this constructor declares 9");
-        let d = McsDescriptor::for_intent(&throughput, mt.max_mcs(), true);
+        let d = McsDescriptor::for_intent(&throughput, mt.max_mcs(), true, false);
         assert_eq!(d.index, 8, "VHT 1SS tops at MCS8 (9 needs >=40 MHz), NOT at the 8812EU's 7");
         assert!(d.vht);
 
         // Without VHT the structural HT limit still binds — this is the part of the old clamp that
         // was doing real work, and it is a property of 802.11, not of any chip.
-        let d = McsDescriptor::for_intent(&throughput, 9, false);
+        let d = McsDescriptor::for_intent(&throughput, 9, false, false);
         assert_eq!(d.index, 7, "single-stream HT has no rate above MCS7");
         assert!(!d.vht);
 
         // A part that genuinely validates lower keeps its lower ceiling: the capability is
         // authoritative in both directions, which is the whole point of de-globalising it.
-        let d = McsDescriptor::for_intent(&throughput, 4, true);
+        let d = McsDescriptor::for_intent(&throughput, 4, true, false);
         assert_eq!(d.index, 4, "a conservative radio must not be pushed up to the mode ceiling");
 
         // Robust/Balanced are rate-class decisions, not ceiling decisions, and are unaffected.
         let robust = TxIntent { reliability: Reliability::MostRobust, reach: Reach::Broadcast };
-        assert_eq!(McsDescriptor::for_intent(&robust, 9, true).index, 0);
+        assert_eq!(McsDescriptor::for_intent(&robust, 9, true, false).index, 0);
     }
 
     #[test]

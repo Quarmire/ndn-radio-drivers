@@ -78,14 +78,16 @@ fn phymode_for_rate(rate: u8, chan: u8) -> sys::wifi_phy_mode_t {
 
 /// Fix the raw-injection TX rate by calling the blob's internal config setter directly (the public
 /// esp_wifi_config_80211_tx wrapper ESP_FAILs because the C5 boots in HE20). `phymode==0` derives it.
-unsafe fn set_fix_rate(rate: u8, phymode: u8) {
+unsafe fn set_fix_rate(rate: u8, phymode: u8, dcm: bool, ersu: bool) {
     let pm = if phymode == 0 {
         phymode_for_rate(rate, CUR_CHAN.load(std::sync::atomic::Ordering::Relaxed))
     } else {
         phymode as sys::wifi_phy_mode_t
     };
     ic_set_80211_tx_rate(sys::wifi_interface_t_WIFI_IF_STA as u32, rate as u32);
-    let cfg = sys::wifi_tx_rate_config_t { phymode: pm, rate: rate as sys::wifi_phy_rate_t, ersu: false, dcm: false };
+    // dcm/ersu are the 802.11ax reach levers (HE Dual-Carrier Modulation, HE Extended-Range SU); only
+    // meaningful when pm is HE20 — the blob ignores them otherwise.
+    let cfg = sys::wifi_tx_rate_config_t { phymode: pm, rate: rate as sys::wifi_phy_rate_t, ersu, dcm };
     ic_set_80211_tx_rate_config(sys::wifi_interface_t_WIFI_IF_STA as u32, &cfg);
 }
 
@@ -253,14 +255,19 @@ fn serial_rx_loop() -> ! {
                         };
                         sys::esp_wifi_set_bandwidth(sys::wifi_interface_t_WIFI_IF_STA, bw);
                     }
+                    T_RATE if len >= 3 => {
+                        // [rate][phymode][he_flags] — explicit phymode (…6=HE20) + HE reach levers
+                        // (bit0=DCM, bit1=ER-SU). The 802.11ax reach path.
+                        set_fix_rate(pl[0], pl[1], pl[2] & 1 != 0, pl[2] & 2 != 0);
+                    }
                     T_RATE if len >= 2 => {
                         // [rate][phymode] — explicit phymode override (1=11B 2=11G 3=11A 4=HT20).
-                        set_fix_rate(pl[0], pl[1]);
+                        set_fix_rate(pl[0], pl[1], false, false);
                     }
                     T_RATE if len >= 1 => {
                         // [rate] — phymode auto-derived from the rate code + current band. rate is a
                         // wifi_phy_rate_t: 0x00=1M, 0x09=24M, 0x0C=54M, 0x10=MCS0, 0x17=MCS7. On air ✔.
-                        set_fix_rate(pl[0], 0);
+                        set_fix_rate(pl[0], 0, false, false);
                     }
                     T_INJECT_ATTR if len >= 1 => {
                         let np = pl[0] as usize;
@@ -361,7 +368,7 @@ fn main() {
         // via T_RATE; the host maps cognition's rate lever onto it. Default below = 6 Mbps OFDM (robust).
         sys::esp_wifi_start();
         sys::esp_wifi_set_channel(1, sys::wifi_second_chan_t_WIFI_SECOND_CHAN_NONE);
-        set_fix_rate(sys::wifi_phy_rate_t_WIFI_PHY_RATE_6M as u8, 0); // OFDM 6M — beats the 1 Mbps basic default
+        set_fix_rate(sys::wifi_phy_rate_t_WIFI_PHY_RATE_6M as u8, 0, false, false); // OFDM 6M default
         sys::esp_wifi_set_promiscuous_rx_cb(Some(rx_cb));
         sys::esp_wifi_set_promiscuous(true);
 

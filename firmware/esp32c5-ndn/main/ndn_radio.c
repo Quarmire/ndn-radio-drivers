@@ -66,11 +66,12 @@ static wifi_phy_mode_t phymode_for_rate(uint8_t rate, uint8_t chan) {
     return WIFI_PHY_MODE_11B;                                    // CCK
 }
 
-// Fix the raw-injection TX rate. phymode==0 => auto-derive from the rate code + current band.
-static void set_fix_rate(uint8_t rate, uint8_t phymode) {
+// Fix the raw-injection TX rate. phymode==0 => auto-derive from the rate code + current band. dcm/ersu are
+// the 802.11ax reach levers (HE Dual-Carrier Modulation, HE Extended-Range SU); only apply for phymode HE20.
+static void set_fix_rate(uint8_t rate, uint8_t phymode, bool dcm, bool ersu) {
     wifi_phy_mode_t pm = phymode ? (wifi_phy_mode_t)phymode : phymode_for_rate(rate, s_cur_chan);
     ic_set_80211_tx_rate(WIFI_IF_STA, rate);
-    wifi_tx_rate_config_t cfg = { .phymode = pm, .rate = (wifi_phy_rate_t)rate, .ersu = false, .dcm = false };
+    wifi_tx_rate_config_t cfg = { .phymode = pm, .rate = (wifi_phy_rate_t)rate, .ersu = ersu, .dcm = dcm };
     ic_set_80211_tx_rate_config(WIFI_IF_STA, &cfg);
 }
 #define MAX_MASKS 8
@@ -188,8 +189,10 @@ static void serial_rx_loop(void) {
                 case T_RATE:
                     // [rate] (phymode auto-derived from rate code + band) or [rate][phymode] override.
                     // rate = wifi_phy_rate_t (1M_L=0x00, 24M=0x09, 54M=0x0C, MCS0_LGI=0x10, MCS7_LGI=0x17).
-                    if (len >= 2)      set_fix_rate(pl[0], pl[1]);
-                    else if (len >= 1) set_fix_rate(pl[0], 0);
+                    // [rate] | [rate][phymode] | [rate][phymode][he_flags: bit0=DCM bit1=ER-SU]
+                    if (len >= 3)      set_fix_rate(pl[0], pl[1], pl[2] & 1, pl[2] & 2);
+                    else if (len >= 2) set_fix_rate(pl[0], pl[1], false, false);
+                    else if (len >= 1) set_fix_rate(pl[0], 0, false, false);
                     break;
                 case T_INJECT_ATTR: { // [npairs][o,v]*n[frame] — skip the attr pokes (no pkt_attrib on esp), inject the frame
                     if (len >= 1) { int np = pl[0]; int off = 1 + 2 * np; if (len > off) esp_wifi_80211_tx(WIFI_IF_STA, pl + off, len - off, true); }
@@ -273,7 +276,7 @@ void app_main(void) {
     // switches band automatically via esp_wifi_set_channel. Best-effort — older blobs may lack it.
     esp_wifi_set_band_mode(WIFI_BAND_MODE_AUTO);
     ESP_ERROR_CHECK(esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE));
-    set_fix_rate(WIFI_PHY_RATE_6M, 0); // OFDM 6M default — beats the 1 Mbps basic rate for raw injection
+    set_fix_rate(WIFI_PHY_RATE_6M, 0, false, false); // OFDM 6M default — beats the 1 Mbps basic rate
     ESP_ERROR_CHECK(esp_wifi_set_promiscuous_rx_cb(rx_cb));
     ESP_ERROR_CHECK(esp_wifi_set_promiscuous(true));
 

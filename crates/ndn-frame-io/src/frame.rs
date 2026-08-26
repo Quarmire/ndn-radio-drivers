@@ -163,7 +163,7 @@ pub fn build(format: FrameFormat, frame: &InjectFrame) -> Result<Vec<u8>, FaceEr
     // conservative default capability is right for a header-only hint), then
     // build. The exact-rate path ([`build_at`]) is used when a caller has already
     // resolved a rate (the cognitive face, fixed-rate benches).
-    let mcs = crate::McsDescriptor::for_intent(&frame.tx, crate::MAX_RELIABLE_MCS, false);
+    let mcs = crate::McsDescriptor::for_intent(&frame.tx, crate::MAX_RELIABLE_MCS, false, false);
     build_at(format, frame, mcs)
 }
 

@@ -99,7 +99,7 @@ impl FrameIo for LoopbackEndpoint {
             .unwrap()
             .map(|m| m.index)
             .unwrap_or_else(|| {
-                crate::McsDescriptor::for_intent(&frame.tx, crate::MAX_RELIABLE_MCS, false).index
+                crate::McsDescriptor::for_intent(&frame.tx, crate::MAX_RELIABLE_MCS, false, false).index
             });
         self.emit(frame.dst, frame.src, frame.addr3, frame.payload, idx);
         Ok(())

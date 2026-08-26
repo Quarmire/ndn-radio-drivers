@@ -57,6 +57,7 @@
 #define T_TXTIME     0x83 // [target_le64][actual_le64][tsf_le64] — scheduling error report for T_INJECT_AT
 // BLE bearer messages (same wire protocol, distinct types so one firmware serves Wi-Fi + BLE at once):
 #define T_BLE_ADV    0x30 // host→device: [payload] — advertise as a BLE 5 extended advertisement
+#define T_COEX       0x31 // host→device: [scan_window_le16][scan_itvl_le16] — the BLE↔Wi-Fi radio-time split
 #define T_BLE_RX     0x88 // device→host: [rssi_i8][addr6][payload] — a scanned advertisement carrying our magic
 #define MAXFRAME 512
 #define BLE_MAXPAY 240
@@ -208,6 +209,25 @@ static void ble_advertise(const uint8_t *payload, int len) {
     else os_mbuf_free_chain(m);
 }
 
+// BLE↔Wi-Fi radio-time split, as a scan window/interval. This is NOT a fixed MAC parameter — it is the
+// airtime allocation between the two bearers of the one radio, which the NDR MAC allocates by measured
+// demand (host/cognition drives it via T_COEX). The boot values are only a **fallback** so the radio comes
+// up balanced before cognition speaks; a fully-open scan (window==itvl) starves the promiscuous Wi-Fi RX,
+// so the fallback duty-cycles (~12%). Both bearers report activity (T_OCC = Wi-Fi frames; BLE hit rate is
+// observable at the host) so the split can track which bearer actually has named traffic.
+static uint16_t s_ble_scan_win = 0x20;   // fallback: 20ms window …
+static uint16_t s_ble_scan_itvl = 0x100; // … / 160ms interval
+
+static void ble_start_scan(void) {
+    ble_gap_disc_cancel(); // no-op if not scanning
+    struct ble_gap_ext_disc_params up;
+    memset(&up, 0, sizeof(up));
+    up.itvl = s_ble_scan_itvl;
+    up.window = s_ble_scan_win;
+    up.passive = 1;
+    ble_gap_ext_disc(s_ble_addr_type, 0, 0, 0, 0, 0, &up, NULL, ble_gap_event, NULL);
+}
+
 static void ble_on_sync(void) {
     ble_hs_util_ensure_addr(0);
     ble_hs_id_infer_auto(0, &s_ble_addr_type);
@@ -222,15 +242,7 @@ static void ble_on_sync(void) {
     p.tx_power = 127;
     int8_t sel;
     ble_gap_ext_adv_configure(0, &p, &sel, ble_gap_event, NULL);
-    struct ble_gap_ext_disc_params up;
-    memset(&up, 0, sizeof(up));
-    // Duty-cycled scan (~12%: 20ms window / 160ms interval) — a fully-open BLE scan starves the concurrent
-    // promiscuous Wi-Fi RX via software coex (both want the one radio). A modest scan window leaves Wi-Fi
-    // the radio most of the time; BLE ads are burst-repeated so a duty-cycled scan still catches them.
-    up.itvl = 0x100;   // 256 * 0.625ms = 160ms
-    up.window = 0x20;  // 32 * 0.625ms = 20ms
-    up.passive = 1;
-    ble_gap_ext_disc(s_ble_addr_type, 0, 0, 0, 0, 0, &up, NULL, ble_gap_event, NULL);
+    ble_start_scan();
     s_ble_ready = true;
 }
 
@@ -292,6 +304,12 @@ static void serial_rx_loop(void) {
             switch (ty) {
                 case T_INJECT: esp_wifi_80211_tx(WIFI_IF_STA, pl, len, true); break;
                 case T_BLE_ADV: ble_advertise(pl, len); break; // the BLE bearer, same firmware
+                case T_COEX: if (len >= 4 && s_ble_ready) { // cognition sets the BLE↔Wi-Fi radio-time split
+                    s_ble_scan_win = pl[0] | (pl[1] << 8);
+                    s_ble_scan_itvl = pl[2] | (pl[3] << 8);
+                    if (s_ble_scan_itvl < s_ble_scan_win) s_ble_scan_itvl = s_ble_scan_win; // window ≤ interval
+                    ble_start_scan();
+                } break;
                 case T_CHANNEL: if (len >= 1) { esp_wifi_set_channel(pl[0], WIFI_SECOND_CHAN_NONE); s_cur_chan = pl[0]; } break;
                 case T_TXPOWER: if (len >= 1) esp_wifi_set_max_tx_power((int8_t)pl[0]); break;
                 case T_BW40: if (len >= 1) esp_wifi_set_bandwidth(WIFI_IF_STA, pl[0] ? WIFI_BW_HT40 : WIFI_BW_HT20); break;

@@ -44,6 +44,51 @@ fn wifi_init_config_default() -> sys::wifi_init_config_t {
     }
 }
 
+// Blob-internal rate setter (libpp.a). The public esp_wifi_config_80211_tx_rate is just a validator in
+// front of this: it refuses (ESP_FAIL) unless the interface phymode byte is ≤ 4 (LR/11B/11G/11A/HT20),
+// and the dual-band C5 boots in HE20 (phymode 6) → the wrapper never reaches the setter. We call the
+// setter directly, bypassing that gate. Signature confirmed by disassembly: (ifx, wifi_phy_rate_t).
+extern "C" {
+    fn ic_set_80211_tx_rate(ifx: u32, rate: u32) -> i32;
+    // The struct setter behind esp_wifi_config_80211_tx. In the pp descriptor-build, the tx_rate_config's
+    // rate OVERRIDES the scalar rate at descriptor offset 12, and its phymode picks the HE vs legacy TX
+    // path — so the config, with an explicit legacy phymode, is the actual lever for raw injection.
+    fn ic_set_80211_tx_rate_config(ifx: u32, cfg: *const sys::wifi_tx_rate_config_t) -> i32;
+}
+
+/// Last channel set via T_CHANNEL (for deriving the OFDM phymode: 2.4 GHz→11G, 5 GHz→11A).
+static CUR_CHAN: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(1);
+
+/// The phymode a `wifi_phy_rate_t` implies. CCK codes (<0x08) → 11B; OFDM (0x08..0x10) → 11G on 2.4 GHz,
+/// 11A on 5 GHz; MCS (≥0x10) → HT20. This is what the pp descriptor-build needs to pick the legacy/HT TX
+/// path instead of the C5's default HE20 (which forces the basic rate for raw injection).
+fn phymode_for_rate(rate: u8, chan: u8) -> sys::wifi_phy_mode_t {
+    if rate >= 0x10 {
+        sys::wifi_phy_mode_t_WIFI_PHY_MODE_HT20
+    } else if rate >= 0x08 {
+        if chan <= 14 {
+            sys::wifi_phy_mode_t_WIFI_PHY_MODE_11G
+        } else {
+            sys::wifi_phy_mode_t_WIFI_PHY_MODE_11A
+        }
+    } else {
+        sys::wifi_phy_mode_t_WIFI_PHY_MODE_11B
+    }
+}
+
+/// Fix the raw-injection TX rate by calling the blob's internal config setter directly (the public
+/// esp_wifi_config_80211_tx wrapper ESP_FAILs because the C5 boots in HE20). `phymode==0` derives it.
+unsafe fn set_fix_rate(rate: u8, phymode: u8) {
+    let pm = if phymode == 0 {
+        phymode_for_rate(rate, CUR_CHAN.load(std::sync::atomic::Ordering::Relaxed))
+    } else {
+        phymode as sys::wifi_phy_mode_t
+    };
+    ic_set_80211_tx_rate(sys::wifi_interface_t_WIFI_IF_STA as u32, rate as u32);
+    let cfg = sys::wifi_tx_rate_config_t { phymode: pm, rate: rate as sys::wifi_phy_rate_t, ersu: false, dcm: false };
+    ic_set_80211_tx_rate_config(sys::wifi_interface_t_WIFI_IF_STA as u32, &cfg);
+}
+
 const NDN_ETHERTYPE: u16 = 0x8624;
 const SYNC0: u8 = 0x4E;
 const SYNC1: u8 = 0x44;
@@ -174,6 +219,7 @@ fn serial_rx_loop() -> ! {
                     }
                     T_CHANNEL if len >= 1 => {
                         sys::esp_wifi_set_channel(pl[0], sys::wifi_second_chan_t_WIFI_SECOND_CHAN_NONE);
+                        CUR_CHAN.store(pl[0], std::sync::atomic::Ordering::Relaxed);
                     }
                     T_TXPOWER if len >= 1 => {
                         sys::esp_wifi_set_max_tx_power(pl[0] as i8);
@@ -186,14 +232,14 @@ fn serial_rx_loop() -> ! {
                         };
                         sys::esp_wifi_set_bandwidth(sys::wifi_interface_t_WIFI_IF_STA, bw);
                     }
+                    T_RATE if len >= 2 => {
+                        // [rate][phymode] — explicit phymode override (1=11B 2=11G 3=11A 4=HT20).
+                        set_fix_rate(pl[0], pl[1]);
+                    }
                     T_RATE if len >= 1 => {
-                        // MEASURED INERT for association-free raw injection on the C5 (full evidence at the
-                        // init site: esp_wifi_80211_tx is locked to 1 Mbps, no rate API moves it). Kept as a
-                        // no-op so the host's rate lever has a stable sink and cognition degrades gracefully.
-                        let _ = sys::esp_wifi_config_80211_tx_rate(
-                            sys::wifi_interface_t_WIFI_IF_STA,
-                            pl[0] as sys::wifi_phy_rate_t,
-                        );
+                        // [rate] — phymode auto-derived from the rate code + current band. rate is a
+                        // wifi_phy_rate_t: 0x00=1M, 0x09=24M, 0x0C=54M, 0x10=MCS0, 0x17=MCS7. On air ✔.
+                        set_fix_rate(pl[0], 0);
                     }
                     T_INJECT_ATTR if len >= 1 => {
                         let np = pl[0] as usize;
@@ -286,22 +332,15 @@ fn main() {
         sys::esp_wifi_init(&cfg);
         sys::esp_wifi_set_storage(sys::wifi_storage_t_WIFI_STORAGE_RAM);
         sys::esp_wifi_set_mode(sys::wifi_mode_t_WIFI_MODE_STA);
-        // TX RATE — MEASURED INERT for association-free raw injection on the ESP32-C5 (ESP-IDF 5.5.5).
-        // esp_wifi_80211_tx always transmits at the 1 Mbps basic rate here, and NONE of the rate APIs move
-        // it (all on-air-verified against an mt76 monitor):
-        //   • esp_wifi_config_80211_tx_rate(): ESP_FAIL before start (dual-band AUTO can't drop 11AX — both
-        //     set_band and set_band_mode return NOT_STARTED, so the AX-blocked API can't be satisfied); it
-        //     returns OK after start but the TX path has already latched the rate → inert.
-        //   • esp_wifi_config_80211_tx() (the struct form the docs say to use under 11A/AC/AX): ESP_FAIL for
-        //     every phymode (11B/G/A, HT20/40, VHT20) — unimplemented for this target's net80211 blob.
-        //   • esp_wifi_internal_set_fix_rate(): returns OK (with AMPDU-TX off) but governs only the internal
-        //     data path, not raw 80211_tx — MCS7 still went out at 1 Mbps, on STA and on the AP interface.
-        //   • esp_wifi_internal_tx() (the rate-controlled data path): ESP_ERR_WIFI_CONN (0x3006) unassociated.
-        // The one rate-controllable path (internal_tx) needs association, which the named radio deliberately
-        // avoids. So on this silicon the bearer is a fixed-rate 1 Mbps channel — cognition's rate lever is a
-        // no-op here and must degrade gracefully (the host advertises WIFI_PHY_RATE fixed for this backend).
+        // TX RATE — actuated. The public rate APIs (esp_wifi_config_80211_tx_rate / _tx) all ESP_FAIL on the
+        // dual-band C5 because it boots in HE20 (phymode 6) and their wrapper refuses to set a rate in HE
+        // mode. But those wrappers are only validators in front of the blob-internal ic_set_80211_tx_rate_
+        // config, which we call directly (see set_fix_rate) with an explicit legacy/HT phymode. MEASURED on
+        // air vs an mt76: 11G/24M→24, 11G/54M→54, HT20/MCS7→65 (MCS7), HT20/MCS4→39 (MCS4). Driven per-frame
+        // via T_RATE; the host maps cognition's rate lever onto it. Default below = 6 Mbps OFDM (robust).
         sys::esp_wifi_start();
         sys::esp_wifi_set_channel(1, sys::wifi_second_chan_t_WIFI_SECOND_CHAN_NONE);
+        set_fix_rate(sys::wifi_phy_rate_t_WIFI_PHY_RATE_6M as u8, 0); // OFDM 6M — beats the 1 Mbps basic default
         sys::esp_wifi_set_promiscuous_rx_cb(Some(rx_cb));
         sys::esp_wifi_set_promiscuous(true);
 

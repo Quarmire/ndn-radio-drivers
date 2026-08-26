@@ -3630,16 +3630,22 @@ impl Rtl8733buBackend {
     ///
     ///   ```text
     ///                     p50     p99     max    gaps>=1ms   injected
-    ///   ungated          173us   531us   2.7ms    29 (0.1%)    20121
-    ///   gated 50% @20ms  173us  25.9ms  26.8ms   127 (4.2%)     2793
+    ///   ungated          692us   2.1ms  10.9ms    29 (0.1%)    20121
+    ///   gated 50% @20ms  692us  104ms   107ms    127 (4.2%)     2793
     ///   ```
+    ///   (Figures corrected: RX stamps are 4 us/tick, not 1 — the raw numbers were 4x short. The
+    ///   correction is what makes them consistent with the 13.9% throughput measured alongside;
+    ///   26 ms windows at a nominal 50% duty never were.)
     ///
     ///   125 silent windows appear at the commanded scale where the control has none. Two costs a
     ///   lease planner must budget for:
     ///   - **Throughput falls to 13.9%** (1341 -> 186 f/s), not the 50% a 50% duty implies — the
     ///     ~126 us gate write plus queue drain/refill dominate.
-    ///   - **The silent window OVERSHOOTS**: 20 ms commanded closed, ~26 ms observed (~30% longer).
-    ///     Close it late and you overrun the next window.
+    ///   - **The silent window far exceeds the command** when the queue is kept full: 20 ms
+    ///     commanded, ~104 ms observed, because the backlog must drain before silence begins. With
+    ///     the injector ALSO gated (the slot-MAC case) the window tracks the command closely —
+    ///     p99 21.7 ms for a 20 ms close. Which behaviour you get depends on whether you keep
+    ///     feeding the queue while it is shut.
     ///   Only ~33% of the 375 cycles produced a true silent gap, which is consistent with the
     ///   hold-not-drop semantics above — the ~20 KB queue must drain before any silence appears —
     ///   though that mechanism is inferred, not separately measured.

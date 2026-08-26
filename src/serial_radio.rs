@@ -81,6 +81,7 @@ const T_READCLOCK: u8 = 0x0B; // request the device's schedule clock; reply T_CL
 const T_CLOCK: u8 = 0x85; // reply to T_READCLOCK: [esp_timer_us_le64]
 const T_TXTIME: u8 = 0x83; // scheduled-TX confirmation: [target_le64][actual_le64][tsf_le64]
 const T_RX: u8 = 0x81;
+const T_OCC: u8 = 0x86; // [activity_count_le32] — periodic free-running channel-activity counter
 const T_RX_TS: u8 = 0x82; // [rssi_i8][noise_i8][rate_code][phy_flags][rx_ts_us_le32][frame] — RX + hardware
                           // µs stamp + the ESP's per-frame PHY metadata (radiotap-equiv): RX rate/MCS + SNR
 
@@ -112,6 +113,9 @@ pub struct SerialRadioBackend {
     /// Scheduled-TX confirmations (`T_TXTIME` → (target, actual) esp_timer µs) — the actual on-air
     /// instant of an [`inject_at_abs`](Self::inject_at_abs), for verifying slot placement.
     txtime_rx: AsyncMutex<mpsc::UnboundedReceiver<(u64, u64)>>,
+    /// Latest free-running channel-activity counter (`T_OCC`, ~5×/s from the C5), for
+    /// [`RadioKnobs::read_channel_activity`]. `u32::MAX` = no report yet (e.g. the BW16, which never emits).
+    activity: Arc<std::sync::atomic::AtomicU32>,
 }
 
 impl SerialRadioBackend {
@@ -163,13 +167,16 @@ impl SerialRadioBackend {
         let (clkch, clk_rxch) = mpsc::unbounded_channel();
         let (ttch, tt_rxch) = mpsc::unbounded_channel();
         let format = FrameFormat::default();
-        std::thread::spawn(move || reader_loop(reader, format, txch, clkch, ttch, dev_clock));
+        let activity = Arc::new(std::sync::atomic::AtomicU32::new(u32::MAX));
+        let act_reader = activity.clone();
+        std::thread::spawn(move || reader_loop(reader, format, txch, clkch, ttch, act_reader, dev_clock));
         Ok(Self {
             tx: Arc::new(Mutex::new(port)),
             format,
             rx: AsyncMutex::new(rxch),
             clock_rx: AsyncMutex::new(clk_rxch),
             txtime_rx: AsyncMutex::new(tt_rxch),
+            activity,
         })
     }
 
@@ -292,6 +299,7 @@ fn reader_loop(
     tx: mpsc::UnboundedSender<CapturedFrame>,
     clk: mpsc::UnboundedSender<u64>,
     txtime: mpsc::UnboundedSender<(u64, u64)>,
+    activity: Arc<std::sync::atomic::AtomicU32>,
     dev_clock: Option<ClockDomainId>,
 ) {
     let mut acc: Vec<u8> = Vec::new();
@@ -312,6 +320,12 @@ fn reader_loop(
                         let target = u64::from_le_bytes(payload[0..8].try_into().unwrap());
                         let actual = u64::from_le_bytes(payload[8..16].try_into().unwrap());
                         let _ = txtime.send((target, actual));
+                        acc.drain(..consumed);
+                        continue;
+                    }
+                    if ty == T_OCC && payload.len() >= 4 {
+                        let c = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
+                        activity.store(c, std::sync::atomic::Ordering::Relaxed);
                         acc.drain(..consumed);
                         continue;
                     }
@@ -409,6 +423,12 @@ impl RadioKnobs for SerialRadioBackend {
         // The C5/BW16 firmware compares masks against the frame's pre-encoded address octets (the
         // transmitter baked the prefix-set in), so no on-device re-hash → the `key` is unused here.
         SerialRadioBackend::configure_name_filter(self, enabled, masks)
+    }
+    fn read_channel_activity(&self) -> Result<Option<u16>, FaceError> {
+        // The C5 emits its free-running frame counter as T_OCC ~5×/s; the reader caches the latest.
+        // u32::MAX = no report yet (the BW16 firmware never emits) → honestly None.
+        let v = self.activity.load(std::sync::atomic::Ordering::Relaxed);
+        Ok((v != u32::MAX).then_some(v as u16))
     }
 }
 

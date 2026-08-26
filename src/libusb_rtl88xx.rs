@@ -5384,8 +5384,22 @@ impl RadioProfile for LibUsbRtl88xxBackend {
         //
         // `max_bw` drops to 1 (40 MHz) for the same reason: 80 MHz is a datasheet capability of the
         // part, not a validated capability of this bring-up.
+        //
+        // `retune_us` is MEASURED here too (`examples/retune88xx.rs`, 40 retunes per case) rather
+        // than inherited, and unlike the 8733b's case the inherited figure was WRONG in the
+        // dangerous direction:
+        //
+        //   5 GHz same-band (36<->40)   p50 19308  p90 24643  max 25833 us
+        //   5 GHz wider hop (36<->161)  p50 18273  p90 26436  max 27171 us
+        //
+        // The generic helper claims 16_000 us. This radio's p90 is ~26 ms, ~60% slower. Since
+        // `can_hop(dwell)` requires retune*4 <= dwell, the inherited number approved hop plans at
+        // 64 ms dwell that in fact need ~104 ms, and `retune_overhead` understated the cost by the
+        // same margin. An optimistic inherited value is worse than a pessimistic one, and neither
+        // ever looks wrong on inspection.
         RadioCapability {
             rate: RateCapability::Wifi { max_mcs: 7, max_nss: 1, max_bw: 1 },
+            retune_us: Some(26_000),
             ..RadioCapability::wifi_monitor_5ghz(vec![36, 40, 44, 48, 149, 153, 157, 161])
         }
     }

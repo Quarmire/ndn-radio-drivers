@@ -4008,11 +4008,26 @@ impl RadioKnobs for Rtl8733buBackend {
         // doctrine signal, not an implementation detail, and is why the beacon path was dropped as
         // the scheduled-TX candidate in favour of this one.
         //
-        // Unproven, and the open questions are concrete: how a frame reaches the CPU management
-        // queue from our bulk-OUT path (a TX-descriptor QSEL, presumably), whether the on-chip CPU
-        // must participate (our port does boot the firmware, M5), and what jitter it achieves. The
-        // instrument to answer the last one already exists — per-frame hardware RX stamps on a
-        // second f72b (`examples/rxgaps8733b.rs`), which resolved the TXPAUSE gate to ~252 us.
+        // ⚠ COST RE-ASSESSED 2026-08-25, DOWNWARD. An earlier version of this note implied the
+        // work was wiring with a few named unknowns. It is not: **nothing in the vendor tree ever
+        // programs these registers.** They are present in `halmac_reg_8733b.h` and the bit file,
+        // and that is all — the only `REG_TIMER0_SRC_SEL` use is inter-port TSF sync, unrelated,
+        // and the only CPU-MGQ use is beacon-poll recovery. So there is NO reference sequence for:
+        // how a frame enters the CPU management queue (QSLT_CMD = 0x13 is the plausible selector,
+        // untested), whether the on-chip firmware must dequeue it, or the timer's units and
+        // trigger semantics. That is reverse engineering, not integration.
+        //
+        // Not attempted blind: this part has previously been wedged for weeks by poking an
+        // undocumented control (the `pltfm_reset` pulse), so the bar for speculative register
+        // writes here is high and a low-prior guess does not clear it.
+        //
+        // The unblock is a REFERENCE, not more staring: a Realtek tree for a chip that actually
+        // drives these — NAN/Wi-Fi-Aware support is the likely place, since a discovery window is
+        // exactly a TSF-scheduled transmit. Find that and this becomes integration again.
+        //
+        // The measuring instrument is ready either way: per-frame hardware RX stamps on a second
+        // f72b (`examples/rxgaps8733b.rs`, `rxseq8733b.rs`), which resolved the TXPAUSE gate to
+        // ~252 us and the slot gate to 99% confinement.
         TxDiscipline::PromptBounded { max_delay_ns: 1_000_000 }
     }
 

@@ -3427,6 +3427,16 @@ impl RadioKnobs for Ath9kHtcBackend {
     fn tx_discipline(&self) -> ndn_radio_hal::TxDiscipline {
         ndn_radio_hal::TxDiscipline::ScheduledAt { granularity_ns: 1_000 }
     }
+    fn configure_name_filter(&self, enabled: bool, key: &[u8; 16], masks: &[[u8; 16]]) -> Result<(), FaceError> {
+        // The AR9271 firmware re-derives each frame's prefix filter from its NAME via ndr_name_hash(key,…),
+        // so the key is load-bearing here (unlike the C5). Enable = load key+masks with drop-foreign;
+        // disable = restore the stock pass-all filter.
+        if enabled {
+            Ath9kHtcBackend::configure_name_filter(self, true, key, masks)
+        } else {
+            self.set_name_filter(false, false)
+        }
+    }
 }
 
 /// The AR9271 IQ-mismatch fixed-point correction (`ar9002_hw_iqcalibrate`,

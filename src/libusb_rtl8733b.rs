@@ -3965,6 +3965,12 @@ impl RadioKnobs for Rtl8733buBackend {
     }
     // set_tx_csd stays the default no-op: the 8731bu is 1x1 (single chain), so there is no
     // second chain to apply cyclic-shift diversity to.
+    fn set_tx_hold(&self, hold: bool) -> Result<(), FaceError> {
+        // All eight transmit queues, or none. See `set_tx_pause` for the measured semantics the
+        // trait doc summarises — in particular that this HOLDS rather than drops.
+        self.set_tx_pause(if hold { 0xff } else { 0x00 })
+    }
+
     fn set_edcca_ignore(&self, on: bool) -> Result<(), FaceError> {
         // EDCCA low-to-high / high-to-low thresholds live in BB reg 0x84c: L2H at [23:16],
         // H2L at [31:24], offset-binary (0x80 = 0 dBm). To ignore EDCCA, raise both to the

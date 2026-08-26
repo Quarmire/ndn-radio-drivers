@@ -626,6 +626,29 @@ pub trait RadioKnobs: Send + Sync {
         )))
     }
 
+    /// **Hold or release transmissions at the MAC**, if the radio can. Default: no-op.
+    ///
+    /// The hardware side of a slot MAC. A software gate can only stop *us calling inject*; frames
+    /// already queued in the MAC still go out, and land in whoever owns the next slot — the exact
+    /// bleed a slot schedule exists to prevent, charged to a name that did not cause it.
+    ///
+    /// ⚠ MEASURED SEMANTICS on the RTL8733BU (`REG_TXPAUSE`), which a caller must design around:
+    ///
+    /// * It **HOLDS, it does not drop.** A held queue drains when released — ~20 KB on that part —
+    ///   so this is only safe where the burst lands in a window you own. In a slot MAC that is
+    ///   exactly right (hold while waiting, release at the start of our own turn); as a general
+    ///   "be quiet now" it is not, because the quiet is repaid with interest.
+    /// * **~126 us per write** over USB, so it shapes windows, not microslots. Against a 20 ms
+    ///   slot that is 0.6%; against a 250 us one it is most of the budget.
+    /// * Throughput under a 50% duty cycle measured **13.9%**, not 50% — queue drain and refill
+    ///   dominate. Budget from the measurement, not from the duty.
+    ///
+    /// A radio with no such gate leaves the default and relies on the scheduler's software wait,
+    /// which is correct for it — the default must never be "pretend it worked".
+    fn set_tx_hold(&self, _hold: bool) -> Result<(), FaceError> {
+        Ok(())
+    }
+
     /// Enable cyclic-shift diversity on the second chain (1-stream robustness via
     /// antenna diversity). Default: no-op (not supported / single-chain).
     fn set_tx_csd(&self, _on: bool) -> Result<(), FaceError> {
@@ -676,6 +699,26 @@ pub trait RadioKnobs: Send + Sync {
     /// the decoded-frame rate ~1:1.
     fn read_channel_activity(&self) -> Result<Option<u16>, FaceError> {
         Ok(None)
+    }
+
+    /// Load the **Tier-0 name pre-filter** onto the radio (§8.2): `enabled`, the 16-byte siphash `key`
+    /// the masks were built with, and up to 8 prefix-set Bloom `masks` (16 bytes each, one per registered
+    /// prefix, computed by cognition). A frame whose name-prefix set matches none of the masks is dropped
+    /// **on the radio, before it reaches the host** — the pre-USB / pre-serial drop that saves a transfer
+    /// and a host wakeup. This is the uniform seam: a face holding `dyn RadioKnobs` pushes the same masks to
+    /// any backend, with a no-op default for radios that do no on-device filtering (host filters in software).
+    ///
+    /// The `key` is used only by backends whose firmware re-derives the frame's filter from the packet
+    /// **name** (the ath9k, `ndr_name_hash(key, …)`); a backend where the transmitter pre-encodes the
+    /// prefix-set into the frame's **address octets** (the ESP32-C5) matches masks directly and ignores it.
+    /// No-op default. Implemented on the two bearers whose firmware is ours (ath9k + the serial radios).
+    fn configure_name_filter(
+        &self,
+        _enabled: bool,
+        _key: &[u8; 16],
+        _masks: &[[u8; 16]],
+    ) -> Result<(), FaceError> {
+        Ok(())
     }
 }
 
@@ -1426,5 +1469,27 @@ mod ceiling_tests {
 
         // Asking a LoRa radio for an MCS is a category error, not a number to guess at.
         assert_eq!(RadioCapability::lora(vec![0]).mcs_for_rssi(-40), None);
+    }
+}
+
+#[cfg(test)]
+mod tx_hold_default {
+    use super::*;
+
+    struct Bare;
+    impl RadioKnobs for Bare {
+        fn set_channel(&self, _c: u8, _bw: Bandwidth) -> Result<(), FaceError> {
+            Ok(())
+        }
+    }
+
+    /// A radio with no transmit gate must accept the call and do nothing — never error, and never
+    /// report success for a hold it cannot perform. The scheduler relies on that: it closes the
+    /// gate unconditionally and falls back to its software wait for radios that have none.
+    #[test]
+    fn default_tx_hold_is_a_no_op() {
+        let b = Bare;
+        assert!(b.set_tx_hold(true).is_ok());
+        assert!(b.set_tx_hold(false).is_ok());
     }
 }

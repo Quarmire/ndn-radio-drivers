@@ -405,6 +405,11 @@ impl RadioKnobs for SerialRadioBackend {
         // into a byte for the wext command.
         self.set_txpower(idx.min(u8::MAX as u32) as u8)
     }
+    fn configure_name_filter(&self, enabled: bool, _key: &[u8; 16], masks: &[[u8; 16]]) -> Result<(), FaceError> {
+        // The C5/BW16 firmware compares masks against the frame's pre-encoded address octets (the
+        // transmitter baked the prefix-set in), so no on-device re-hash → the `key` is unused here.
+        SerialRadioBackend::configure_name_filter(self, enabled, masks)
+    }
 }
 
 /// Reference [`RadioTime`] for the `HostRecv` clock kind: the serial board reports no hardware
@@ -530,6 +535,9 @@ impl RadioKnobs for Esp32SerialBackend {
         // Measured error ≤ ~190 µs (dominated by the esp_wifi_80211_tx submission latency), so declare
         // a conservative 200 µs granularity — the scheduler learns the C5 can name an airtime slot.
         TxDiscipline::ScheduledAt { granularity_ns: 200_000 }
+    }
+    fn configure_name_filter(&self, enabled: bool, key: &[u8; 16], masks: &[[u8; 16]]) -> Result<(), FaceError> {
+        RadioKnobs::configure_name_filter(&self.inner, enabled, key, masks)
     }
 }
 

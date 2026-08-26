@@ -102,7 +102,8 @@ const T_NAMEFILTER: u8 = 0x07; // [enabled][n_masks][mask 16B]* — on-device Ti
 const T_INJECT_AT: u8 = 0x09; // [delay_us_le32][802.11 frame] — scheduled TX, delay from now
 const T_INJECT_ABS: u8 = 0x0A; // [target_us_le64][802.11 frame] — scheduled TX at an ABSOLUTE esp_timer µs (slot lease)
 const T_READCLOCK: u8 = 0x0B; // no payload — reply T_CLOCK with the current esp_timer (schedule clock)
-const T_RX_TS: u8 = 0x82; // [rssi_i8][rx_ts_us_le32][802.11 frame] — RX + hardware per-frame µs stamp
+const T_RX_TS: u8 = 0x82; // [rssi_i8][noise_i8][rate_code u8][phy_flags u8][rx_ts_us_le32][802.11 frame]
+                          // — RX + hardware µs stamp + the ESP's per-frame PHY metadata (radiotap-equiv)
 const T_TXTIME: u8 = 0x83; // [target_le64][actual_le64][tsf_le64] — scheduling error report
 const T_CLOCK: u8 = 0x85; // [esp_timer_us_le64] — reply to T_READCLOCK
 const MAXFRAME: usize = 512;
@@ -129,8 +130,10 @@ static NF: Mutex<NameFilter> = Mutex::new(NameFilter { enabled: false, n: 0, mas
 
 
 // RX ring shared between the promiscuous callback (WiFi-task context) and the serial-TX loop (main).
-// (rssi, rx_ts_us, frame) — the µs timestamp is the C5's hardware per-frame RX stamp.
-static RXQ: Mutex<VecDeque<(i8, u32, Vec<u8>)>> = Mutex::new(VecDeque::new());
+// (rssi, noise_floor, rate_code, phy_flags, rx_ts_us, frame) — the ESP's per-frame PHY metadata (its
+// "radiotap"): rate_code is the legacy rate (sig_mode 0) or the MCS (HT/VHT); phy_flags packs
+// sig_mode(bits0-1) | sgi(bit2) | cwb40(bit3). ts is the hardware per-frame RX stamp (µs, esp_timer domain).
+static RXQ: Mutex<VecDeque<(i8, i8, u8, u8, u32, Vec<u8>)>> = Mutex::new(VecDeque::new());
 
 // Promiscuous RX: queue each 0x8624 data frame (+ RSSI) for the serial-TX loop.
 unsafe extern "C" fn rx_cb(buf: *mut core::ffi::c_void, ty: sys::wifi_promiscuous_pkt_type_t) {
@@ -162,11 +165,22 @@ unsafe extern "C" fn rx_cb(buf: *mut core::ffi::c_void, ty: sys::wifi_promiscuou
             }
         }
     }
+    // The C5's HE-MAC rxctrl (MAC v3) is its "radiotap": rssi, noise_floor, the L-SIG `rate`, the PHY
+    // format `cur_bb_format` (0=11B 1=11G/A 2=HT 3=VHT 4+=HE), and `he_siga1` (= HT-SIG / VHT-SIG / HE-SIGA
+    // — the MCS source). For an HT frame the HT-SIG MCS is the low 7 bits of he_siga1; legacy uses `rate`.
     let rssi = (*p).rx_ctrl.rssi() as i8;
+    let noise = (*p).rx_ctrl.noise_floor() as i8; // → host computes SNR = rssi - noise_floor
+    let fmt = (*p).rx_ctrl.cur_bb_format() as u8; // RX_BB_FORMAT_*
+    let rate_code = if fmt >= 2 {
+        ((*p).rx_ctrl.he_siga1 & 0x7f) as u8 // HT-SIG/VHT-SIG/HE-SIGA MCS (HT: low 7 bits)
+    } else {
+        (*p).rx_ctrl.rate() as u8 // legacy: L-SIG rate code
+    };
+    let flags = fmt & 0x0f; // carry the PHY format so the host knows MCS-vs-legacy
     let ts_us = (*p).rx_ctrl.timestamp(); // hardware per-frame RX stamp (µs, same domain as esp_timer)
     if let Ok(mut q) = RXQ.lock() {
         if q.len() < 32 {
-            q.push_back((rssi, ts_us, b.to_vec()));
+            q.push_back((rssi, noise, rate_code, flags, ts_us, b.to_vec()));
         }
     }
 }
@@ -362,9 +376,12 @@ fn main() {
     loop {
         let item = { RXQ.lock().ok().and_then(|mut q| q.pop_front()) };
         match item {
-            Some((rssi, ts_us, frame)) => {
+            Some((rssi, noise, rate_code, flags, ts_us, frame)) => {
                 out.clear();
                 out.push(rssi as u8);
+                out.push(noise as u8); // noise floor (dBm) → SNR = rssi - noise
+                out.push(rate_code); // legacy rate or MCS (per flags sig_mode)
+                out.push(flags); // sig_mode(0-1) | sgi(2) | cwb40(3)
                 out.extend_from_slice(&ts_us.to_le_bytes()); // hardware per-frame RX stamp (µs)
                 out.extend_from_slice(&frame);
                 send_framed(T_RX_TS, &out);

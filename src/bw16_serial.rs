@@ -16,7 +16,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use ndn_frame_io::{
     CapturedFrame, ClockDomainId, FrameFormat, FrameIo, InjectFrame, LatchPoint, LinkStamp,
-    McsDescriptor, RadioCapability, RadioProfile, RadioTime, RadioTimeSource, frame,
+    McsDescriptor, PhyMetrics, RadioCapability, RadioProfile, RadioTime, RadioTimeSource, frame,
 };
 
 /// Host monotonic clock domain — shared by every host-stamped frame in this process (the serial
@@ -78,7 +78,8 @@ const T_READCLOCK: u8 = 0x0B; // request the device's schedule clock; reply T_CL
 const T_CLOCK: u8 = 0x85; // reply to T_READCLOCK: [esp_timer_us_le64]
 const T_TXTIME: u8 = 0x83; // scheduled-TX confirmation: [target_le64][actual_le64][tsf_le64]
 const T_RX: u8 = 0x81;
-const T_RX_TS: u8 = 0x82; // [rssi_i8][rx_ts_us_le32][802.11 frame] — RX + hardware µs stamp (ESP32-C5)
+const T_RX_TS: u8 = 0x82; // [rssi_i8][noise_i8][rate_code][phy_flags][rx_ts_us_le32][frame] — RX + hardware
+                          // µs stamp + the ESP's per-frame PHY metadata (radiotap-equiv): RX rate/MCS + SNR
 
 /// BW16 fixed TX-rate codes for [`Bw16SerialBackend::set_tx_rate`]
 /// (`wifi_set_tx_data_rate`). CCK 0x00–0x03, OFDM 0x04–0x0b, HT MCS0–7 0x0c–0x13,
@@ -312,17 +313,27 @@ fn reader_loop(
                         continue;
                     }
                     // T_RX [rssi][frame] (BW16, no hardware timestamp → HostRecv stamp) and
-                    // T_RX_TS [rssi][rx_ts_us_le32][frame] (ESP32-C5 → its free-run hardware RX stamp).
+                    // T_RX_TS [rssi][noise][rate_code][phy_flags][rx_ts_us_le32][frame] (ESP32-C5: hardware
+                    // RX stamp + the ESP's per-frame PHY metadata — its "radiotap": RX rate/MCS + SNR).
                     let parsed = if ty == T_RX && !payload.is_empty() {
                         let rssi = payload[0] as i8;
                         frame::parse_dot11(format, &payload[1..], Some(rssi), None, Some(host_stamp()))
-                    } else if ty == T_RX_TS && payload.len() >= 5 {
+                    } else if ty == T_RX_TS && payload.len() >= 8 {
                         let rssi = payload[0] as i8;
-                        let ts_us = u32::from_le_bytes([payload[1], payload[2], payload[3], payload[4]]);
+                        let noise = payload[1] as i8;
+                        let rate_code = payload[2]; // MCS (bb_format ≥ HT) or the L-SIG rate (legacy)
+                        let bb_format = payload[3] & 0x0f; // RX_BB_FORMAT_*: 0=11B 1=11G/A 2=HT 3=VHT 4+=HE
+                        let ts_us = u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]);
+                        // MCS index is meaningful only for HT/VHT/HE; a legacy (11b/g/a) rate is not an MCS.
+                        let mcs = (bb_format >= 2).then_some(rate_code);
                         // A device stamp only if this backend was opened with a device clock domain (the
                         // C5); else fall back to HostRecv so an un-clocked open still yields frames.
                         let stamp = dev_clock.map(|d| dev_rx_stamp(ts_us, d)).unwrap_or_else(host_stamp);
-                        frame::parse_dot11(format, &payload[5..], Some(rssi), None, Some(stamp))
+                        frame::parse_dot11(format, &payload[8..], Some(rssi), mcs, Some(stamp)).map(|mut c| {
+                            // rssi says how loud; SNR (rssi − noise floor) says how clean — the decode predictor.
+                            c.phy = Some(PhyMetrics { snr_db: Some(rssi.saturating_sub(noise)), evm_db: None, cfo_hz: None });
+                            c
+                        })
                     } else {
                         None
                     };

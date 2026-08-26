@@ -44,13 +44,38 @@
 #define T_READCLOCK  0x0B // no payload — reply T_CLOCK with the current esp_timer (schedule clock)
 #define T_CLOCK      0x85 // [esp_timer_us_le64] — reply to T_READCLOCK
 #define T_RX         0x81 // [rssi_i8][802.11 frame] — used by the BW16; the C5 sends T_RX_TS instead
-#define T_RX_TS      0x82 // [rssi_i8][rx_ts_us_le32][802.11 frame] — RX + hardware per-frame µs stamp
+#define T_RX_TS      0x82 // [rssi_i8][noise_i8][rate_code][phy_flags][rx_ts_us_le32][802.11 frame]
+                          // — RX + hardware µs stamp + per-frame PHY metadata (radiotap-equiv)
 #define T_TXTIME     0x83 // [target_le64][actual_le64][tsf_le64] — scheduling error report for T_INJECT_AT
 #define MAXFRAME 512
+
+// Blob-internal rate setters (libpp.a). The public esp_wifi_config_80211_tx[_rate] wrappers ESP_FAIL on
+// the dual-band C5 because it boots in HE20 (phymode 6) and they refuse to set a rate in HE mode; these
+// underlying setters, called with an explicit legacy/HT phymode, actuate the raw-injection rate. The
+// tx_rate_config's rate+phymode reach the descriptor (offset 12 + the HE-vs-legacy branch) in the pp
+// TX-build path. MEASURED on air: 11G/24M->24, 11G/54M->54, HT20/MCS7->65, HT20/MCS4->39.
+extern int ic_set_80211_tx_rate(uint32_t ifx, uint32_t rate);
+extern int ic_set_80211_tx_rate_config(uint32_t ifx, const wifi_tx_rate_config_t *cfg);
+
+static uint8_t s_cur_chan = 1; // last T_CHANNEL, for deriving the OFDM phymode (2.4G->11G, 5G->11A)
+
+static wifi_phy_mode_t phymode_for_rate(uint8_t rate, uint8_t chan) {
+    if (rate >= 0x10) return WIFI_PHY_MODE_HT20;                 // MCS
+    if (rate >= 0x08) return chan <= 14 ? WIFI_PHY_MODE_11G : WIFI_PHY_MODE_11A; // OFDM
+    return WIFI_PHY_MODE_11B;                                    // CCK
+}
+
+// Fix the raw-injection TX rate. phymode==0 => auto-derive from the rate code + current band.
+static void set_fix_rate(uint8_t rate, uint8_t phymode) {
+    wifi_phy_mode_t pm = phymode ? (wifi_phy_mode_t)phymode : phymode_for_rate(rate, s_cur_chan);
+    ic_set_80211_tx_rate(WIFI_IF_STA, rate);
+    wifi_tx_rate_config_t cfg = { .phymode = pm, .rate = (wifi_phy_rate_t)rate, .ersu = false, .dcm = false };
+    ic_set_80211_tx_rate_config(WIFI_IF_STA, &cfg);
+}
 #define MAX_MASKS 8
 #define SCHED_MAX_DELAY_US 100000 // cap the busy-wait to ~1 slot period (a hw timer would avoid the spin)
 
-typedef struct { int8_t rssi; uint16_t len; uint32_t rxts; uint8_t buf[MAXFRAME]; } rxpkt_t;
+typedef struct { int8_t rssi; int8_t noise; uint8_t rate_code; uint8_t flags; uint16_t len; uint32_t rxts; uint8_t buf[MAXFRAME]; } rxpkt_t;
 static QueueHandle_t rxq;
 
 // Tier-0 name-filter state. Host-computed masks (cognition derives them via the shared tier0.rs); the
@@ -85,6 +110,11 @@ static void rx_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
     if (!name_admits(f)) return; // Tier-0: drop off-prefix frames on the dongle, pre-USB
     rxpkt_t pk;
     pk.rssi = p->rx_ctrl.rssi;
+    pk.noise = p->rx_ctrl.noise_floor;              // → host SNR = rssi - noise
+    uint8_t fmt = p->rx_ctrl.cur_bb_format;         // 0=11B 1=11G/A 2=HT 3=VHT 4+=HE
+    // HT-SIG/VHT-SIG/HE-SIGA MCS (HT: low 7 bits of he_siga1) for a coded frame; else the L-SIG rate.
+    pk.rate_code = fmt >= 2 ? (uint8_t)(p->rx_ctrl.he_siga1 & 0x7f) : (uint8_t)p->rx_ctrl.rate;
+    pk.flags = fmt & 0x0f;                          // carry the PHY format (MCS-vs-legacy) to the host
     pk.len = len;
     pk.rxts = p->rx_ctrl.timestamp;   // hardware per-frame RX stamp (µs, same domain as esp_timer)
     memcpy(pk.buf, f, len);
@@ -104,14 +134,17 @@ static void send_framed(uint8_t ty, const uint8_t *payload, uint16_t len) {
 // frame-age) instead of the coarse host-recv time. The 802.11 TSF is 0 unassociated, so this µs stamp
 // (rx_ctrl.timestamp, same domain as the esp_timer we schedule TX on) is the C5's real link clock.
 static void serial_tx_task(void *arg) {
-    static uint8_t out[5 + MAXFRAME];
+    static uint8_t out[8 + MAXFRAME];
     rxpkt_t pk;
     for (;;) {
         if (xQueueReceive(rxq, &pk, portMAX_DELAY) == pdTRUE) {
             out[0] = (uint8_t)pk.rssi;
-            for (int k = 0; k < 4; k++) out[1 + k] = (uint8_t)(pk.rxts >> (8 * k));
-            memcpy(out + 5, pk.buf, pk.len);
-            send_framed(T_RX_TS, out, pk.len + 5);
+            out[1] = (uint8_t)pk.noise;      // noise floor (dBm)
+            out[2] = pk.rate_code;           // legacy rate or MCS (per flags sig_mode)
+            out[3] = pk.flags;               // sig_mode(0-1) | sgi(2) | cwb40(3)
+            for (int k = 0; k < 4; k++) out[4 + k] = (uint8_t)(pk.rxts >> (8 * k));
+            memcpy(out + 8, pk.buf, pk.len);
+            send_framed(T_RX_TS, out, pk.len + 8);
         }
     }
 }
@@ -133,17 +166,15 @@ static void serial_rx_loop(void) {
             uint8_t *pl = acc + i + 5;
             switch (ty) {
                 case T_INJECT: esp_wifi_80211_tx(WIFI_IF_STA, pl, len, true); break;
-                case T_CHANNEL: if (len >= 1) esp_wifi_set_channel(pl[0], WIFI_SECOND_CHAN_NONE); break;
+                case T_CHANNEL: if (len >= 1) { esp_wifi_set_channel(pl[0], WIFI_SECOND_CHAN_NONE); s_cur_chan = pl[0]; } break;
                 case T_TXPOWER: if (len >= 1) esp_wifi_set_max_tx_power((int8_t)pl[0]); break;
                 case T_BW40: if (len >= 1) esp_wifi_set_bandwidth(WIFI_IF_STA, pl[0] ? WIFI_BW_HT40 : WIFI_BW_HT20); break;
-                case T_RATE: if (len >= 1) { // payload byte = wifi_phy_rate_t (1M_L=0x00, 6M=0x0B, 54M=0x0C, MCS0_LGI=0x10..)
-                    // MEASURED INERT for injection: esp_wifi_80211_tx always goes out at the 1 Mbps basic rate
-                    // regardless of these calls (mt76 radiotap confirms 1.0 Mb/s for every rate 1M/6M/MCS0). The
-                    // raw-inject path picks its own rate on this SoC (same as the BW16). Kept for any non-inject
-                    // TX and in case a future IDF honours it; the injected-frame rate is NOT a working knob here.
-                    esp_wifi_config_80211_tx_rate(WIFI_IF_STA, (wifi_phy_rate_t)pl[0]);
-                    esp_wifi_internal_set_fix_rate(WIFI_IF_STA, true, (wifi_phy_rate_t)pl[0]);
-                    break; }
+                case T_RATE:
+                    // [rate] (phymode auto-derived from rate code + band) or [rate][phymode] override.
+                    // rate = wifi_phy_rate_t (1M_L=0x00, 24M=0x09, 54M=0x0C, MCS0_LGI=0x10, MCS7_LGI=0x17).
+                    if (len >= 2)      set_fix_rate(pl[0], pl[1]);
+                    else if (len >= 1) set_fix_rate(pl[0], 0);
+                    break;
                 case T_INJECT_ATTR: { // [npairs][o,v]*n[frame] — skip the attr pokes (no pkt_attrib on esp), inject the frame
                     if (len >= 1) { int np = pl[0]; int off = 1 + 2 * np; if (len > off) esp_wifi_80211_tx(WIFI_IF_STA, pl + off, len - off, true); }
                     break;
@@ -226,6 +257,7 @@ void app_main(void) {
     // switches band automatically via esp_wifi_set_channel. Best-effort — older blobs may lack it.
     esp_wifi_set_band_mode(WIFI_BAND_MODE_AUTO);
     ESP_ERROR_CHECK(esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE));
+    set_fix_rate(WIFI_PHY_RATE_6M, 0); // OFDM 6M default — beats the 1 Mbps basic rate for raw injection
     ESP_ERROR_CHECK(esp_wifi_set_promiscuous_rx_cb(rx_cb));
     ESP_ERROR_CHECK(esp_wifi_set_promiscuous(true));
 

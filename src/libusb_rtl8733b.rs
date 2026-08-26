@@ -3979,6 +3979,28 @@ impl RadioKnobs for Rtl8733buBackend {
         // On owned spectrum with EDCCA-ignore + single-frame userspace injection this part
         // delivers a bounded transmit delay (no CSMA backoff); the ~1 ms bound covers the USB
         // inject + queue + airtime of one 6 Mbps MPDU.
+        // ⚠ Could plausibly be `ScheduledAt` instead. ASSESSED 2026-08-25, NOT implemented: this
+        // chip has a TSF-referenced transmit timer that is NOT the beacon engine, which is what
+        // `FrameIo::inject_at_clock` wants to bind to —
+        //
+        //   REG_CPUMGQ_TIMER_CTRL_8733B              0x04F4
+        //   REG_PS_TIMER_ABC_CPUMGQ_TIMER_CRTL_8733B 0x1510  BIT31 = CPUMGQ_TIMER_EN,
+        //                                                    [26:24] = CPUMGQ_TIMER_TSF_SEL
+        //   REG_PS_TIMER0/1/2_8733B                  0x0580/0x0584/0x0588  (A/B/C targets)
+        //   REG_TIMER0_SRC_SEL_8733B                 0x05B4
+        //   ISR: BIT_CPUMGQ_TX_TIMER_INT / _EARLY_INT
+        //
+        // A queue plus a TSF-referenced timer, with no AP/BSSID identity anywhere — unlike the
+        // beacon engine, whose remaining blockers are precisely "configure REG_MACID / REG_BSSID /
+        // net_type = AP", i.e. the host-identity apparatus this stack's doctrine rejects. That is a
+        // doctrine signal, not an implementation detail, and is why the beacon path was dropped as
+        // the scheduled-TX candidate in favour of this one.
+        //
+        // Unproven, and the open questions are concrete: how a frame reaches the CPU management
+        // queue from our bulk-OUT path (a TX-descriptor QSEL, presumably), whether the on-chip CPU
+        // must participate (our port does boot the firmware, M5), and what jitter it achieves. The
+        // instrument to answer the last one already exists — per-frame hardware RX stamps on a
+        // second f72b (`examples/rxgaps8733b.rs`), which resolved the TXPAUSE gate to ~252 us.
         TxDiscipline::PromptBounded { max_delay_ns: 1_000_000 }
     }
 

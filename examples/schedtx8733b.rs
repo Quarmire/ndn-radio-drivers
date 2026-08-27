@@ -173,6 +173,7 @@ fn run(
         "qtx" => queued_tx(dev),
         "diag" => diag(dev),
         "poll" => poll_kick(dev),
+        "when" => when_does_it_air(dev),
         other => Err(format!("unknown NDN_SCHED_PHASE={other}").into()),
     }
 }
@@ -698,4 +699,127 @@ fn poll_kick(dev: &Rtl8733buBackend) -> Result<String, Box<dyn std::error::Error
         dev.read32(0x041C)?, dev.read16(0x041A)?,
         dev.read16(0x1472)?, dev.read16(0x1478)?, dev.read8(0x1470)?, dev.read8(0x1471)?
     ) + "\n  per-rep: " + &per_rep.join("  "))
+}
+
+/// ★★★ IS THE SINGLE FRAME ACTUALLY *SCHEDULED*? The comparator-armed path airs exactly one frame
+/// per bring-up. Two readings fit that equally well: the timer released it at the target, or the
+/// kick escaped before `TIMER_EN` took hold. Only the frame's TIMING separates them — and this
+/// needs no witness and no cross-clock comparison at all.
+///
+/// Arm with target = now + D, kick, then poll the BB TX_EN counter and record the host elapsed
+/// time at the instant it increments. The USB control read is ~250 us, which is nothing against
+/// D values of tens to hundreds of milliseconds. If the measured latency TRACKS D, the hardware
+/// scheduled it. If it is ~0 regardless of D, the kick simply raced the arm.
+///
+/// One measurement per process, because the queue latches after the first transmit.
+fn when_does_it_air(dev: &Rtl8733buBackend) -> Result<String, Box<dyn std::error::Error>> {
+    let page = env_u32("NDN_SCHED_PAGE", 0xf6) as u8;
+    let d_ms = env_u32("NDN_SCHED_D", 200) as u64;
+    let armed = env_u32("NDN_SCHED_ARMED", 1) != 0;
+    let knob = env_u32("NDN_SCHED_KNOB", 7) as u8;
+
+    let mut pl = vec![0xC3u8; 96];
+    pl[0] = 0; pl[1] = knob; pl[2] = 0xC3;
+    let f = InjectFrame {
+        payload: Bytes::from(pl),
+        tx: TxIntent::CONSERVATIVE,
+        dst: BROADCAST,
+        src: [0x02, 0x50, 0x33, 0x07, knob, 0],
+        addr3: None, addr4: None, htc: None,
+    };
+    let dot11 = frame::build_dot11(
+        FrameFormat::RawNdn { ethertype: ndn_radio_drivers::NDN_ETHERTYPE }, &f)?;
+    dev.dl_rsvd_page(page, &dot11)?;
+    let info0 = dev.read32(0x041C)?;
+    dev.write32(0x041C, (info0 & !0xff) | u32::from(page))?;
+
+    // TSF ticks per ms, measured (this chip counts 4 us per tick).
+    let t0 = dev.read_tsf()?;
+    let w0 = Instant::now();
+    std::thread::sleep(Duration::from_millis(200));
+    let tps = (dev.read_tsf()?.wrapping_sub(t0)) as f64 / w0.elapsed().as_secs_f64();
+    let target_ticks = (tps * (d_ms as f64) / 1000.0) as u32;
+
+    // ★ JITTER MODE. The kick airs a pre-staged frame in ~0.5 ms; for a slot MAC the number that
+    // matters is not the mean but the SPREAD. Unarmed (the comparator only breaks the queue), so
+    // all N kicks work and we get a distribution rather than a single sample.
+    let jitter_n = env_u32("NDN_SCHED_JITTER", 0);
+    if jitter_n > 0 {
+        // ⚠ The BB-counter poll is USB-control-limited (~250 us per read), so the latency it
+        // reports is a floor, not the hardware's. NDN_SCHED_PACE_MS instead kicks on a FIXED host
+        // cadence and leaves the timing to the witness's 4 us RX stamps: the spread of the stamp
+        // intervals about the cadence is the real jitter of the whole host+kick path.
+        let pace_ms = env_u32("NDN_SCHED_PACE_MS", 0) as u64;
+        let mut lat = Vec::new();
+        let start = Instant::now();
+        for i in 0..jitter_n {
+            let pre = dev.read16(0x2de0)?;
+            if pace_ms > 0 {
+                let next = start + Duration::from_millis(pace_ms * i as u64);
+                while Instant::now() < next {
+                    std::hint::spin_loop();
+                }
+            }
+            let t = Instant::now();
+            let v = dev.read32(0x041C)?;
+            dev.write32(0x041C, v | (1 << 29))?;
+            if pace_ms == 0 {
+                while t.elapsed() < Duration::from_millis(200) {
+                    if dev.read16(0x2de0)? != pre {
+                        lat.push(t.elapsed().as_secs_f64() * 1e6);
+                        break;
+                    }
+                }
+            } else {
+                lat.push(0.0);
+            }
+            let v = dev.read32(0x041C)?;
+            dev.write32(0x041C, (v | (1 << 27)) & !(1 << 29))?;
+            let v = dev.read32(0x041C)?;
+            dev.write32(0x041C, v & !(1 << 27))?;
+            dev.dl_rsvd_page(page, &dot11)?;
+        }
+        dev.write32(0x041C, info0)?;
+        if lat.is_empty() {
+            return Ok("jitter: no transmits".into());
+        }
+        lat.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let n = lat.len();
+        let mean = lat.iter().sum::<f64>() / n as f64;
+        return Ok(format!(
+            "kick->air latency over {n}/{jitter_n} kicks: min {:.0} us  p50 {:.0} us  p90 {:.0} us  \
+             max {:.0} us  mean {mean:.0} us  (spread {:.0} us)",
+            lat[0], lat[n / 2], lat[n * 9 / 10], lat[n - 1], lat[n - 1] - lat[0]
+        ));
+    }
+
+    let pre = dev.read16(0x2de0)?;
+    if armed {
+        dev.write32(REG_FTISR, FTISR_FIRE | FTISR_EARLY)?;
+        let now = dev.read_tsf()?;
+        dev.write32(REG_TX_TIMER, (now as u32).wrapping_add(target_ticks))?;
+        dev.write32(REG_CTRL, TIMER_EN | TX_EN)?;
+    }
+    let t_kick = Instant::now();
+    let v = dev.read32(0x041C)?;
+    dev.write32(0x041C, v | (1 << 29))?;
+
+    // Poll until the baseband actually transmits.
+    let mut aired_ms = f64::NAN;
+    let deadline = Duration::from_millis(d_ms * 3 + 1500);
+    while t_kick.elapsed() < deadline {
+        if dev.read16(0x2de0)? != pre {
+            aired_ms = t_kick.elapsed().as_secs_f64() * 1e3;
+            break;
+        }
+    }
+    let isr = dev.read32(REG_FTISR)?;
+    dev.write32(REG_CTRL, 0)?;
+    dev.write32(0x041C, info0)?;
+    Ok(format!(
+        "when(armed={armed}, D={d_ms} ms): aired at {:.1} ms after the kick  \
+         (isr={isr:#x}, target={target_ticks} ticks, {:.0} ticks/s)\n  \
+         => latency ~D means SCHEDULED; latency ~0 regardless of D means the kick raced the arm",
+        aired_ms, tps
+    ))
 }

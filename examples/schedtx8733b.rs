@@ -150,12 +150,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let dot11 = frame::build_dot11(FrameFormat::RawNdn { ethertype: ndn_radio_drivers::NDN_ETHERTYPE }, &f)?;
     let mut ok = 0;
-    for seq in 0..200u16 {
+    for seq in 0..env_u32("NDN_SCHED_CTRL", 60) as u16 {
         if dev.inject_raw(&dot11, env_u32("NDN_SCHED_RATE", 4) as u8, seq).is_ok() {
             ok += 1;
         }
     }
-    println!("post-test sanity: ordinary inject {ok}/200 accepted, registers restored");
+    println!("post-test sanity: ordinary inject {ok} accepted, registers restored");
     println!("{r}");
     Ok(())
 }

@@ -30,8 +30,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ];
 
     let mode = std::env::args().nth(1).unwrap_or_else(|| "dump".into());
-    let secs: u64 = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(60);
-    let ch: u8 = std::env::var("RP_CH").ok().and_then(|s| s.parse().ok()).unwrap_or(6);
+    let secs: u64 = std::env::args()
+        .nth(2)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(60);
+    let ch: u8 = std::env::var("RP_CH")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(6);
 
     let b = std::sync::Arc::new(Rtl8812auBackend::open()?);
     b.power_on()?;
@@ -62,7 +68,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!();
     }
 
-    println!("{:>7}  {:>12}  {:>12}   {}", "reg", "actual", "reference", "meaning");
+    println!(
+        "{:>7}  {:>12}  {:>12}   {}",
+        "reg", "actual", "reference", "meaning"
+    );
     for &(addr, refval, note) in refs {
         let got = b.read32(addr)?;
         let flag = if got == refval { "ok" } else { "<< DIFF" };

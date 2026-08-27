@@ -9,7 +9,9 @@
 use ndn_radio_drivers::LoraSerialBackend;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let path = std::env::args().nth(1).unwrap_or_else(|| "/dev/ttyACM0".into());
+    let path = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "/dev/ttyACM0".into());
     let dev = LoraSerialBackend::open(&path)?;
     dev.enter_bootloader()?;
     println!("[{path}] CMD_ENTER_BOOTLOADER sent — dongle is now in the ROM UART bootloader.");

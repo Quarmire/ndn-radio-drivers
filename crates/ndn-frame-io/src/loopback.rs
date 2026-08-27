@@ -25,6 +25,10 @@ struct AirFrame {
     src: [u8; 6],
     /// 802.11 `addr3` (the ephemeral nonce under the Tier-0 layout), if the injector set it.
     addr3: Option<[u8; 6]>,
+    /// Wide-profile `addr4` (extra Blur) and HT Control (fingerprint + marker), when the
+    /// injector emitted a 4-address wide frame. `None` on a base 3-address frame.
+    addr4: Option<[u8; 6]>,
+    htc: Option<[u8; 4]>,
     payload: Bytes,
     /// MCS the sender injected at — surfaced to receivers as the captured MCS,
     /// mirroring radiotap reporting the RX rate.
@@ -77,12 +81,24 @@ pub struct LoopbackEndpoint {
 impl LoopbackEndpoint {
     /// Put a frame on the simulated air at a resolved MCS index. No subscribers
     /// is not an error on a broadcast medium (the frame is simply lost).
-    fn emit(&self, dst: [u8; 6], src: [u8; 6], addr3: Option<[u8; 6]>, payload: Bytes, mcs_index: u8) {
+    #[allow(clippy::too_many_arguments)]
+    fn emit(
+        &self,
+        dst: [u8; 6],
+        src: [u8; 6],
+        addr3: Option<[u8; 6]>,
+        addr4: Option<[u8; 6]>,
+        htc: Option<[u8; 4]>,
+        payload: Bytes,
+        mcs_index: u8,
+    ) {
         let _ = self.tx.send(Arc::new(AirFrame {
             sender: self.node_id,
             dst,
             src,
             addr3,
+            addr4,
+            htc,
             payload,
             mcs_index,
         }));
@@ -99,9 +115,12 @@ impl FrameIo for LoopbackEndpoint {
             .unwrap()
             .map(|m| m.index)
             .unwrap_or_else(|| {
-                crate::McsDescriptor::for_intent(&frame.tx, crate::MAX_RELIABLE_MCS, false, false).index
+                crate::McsDescriptor::for_intent(&frame.tx, crate::MAX_RELIABLE_MCS, false, false)
+                    .index
             });
-        self.emit(frame.dst, frame.src, frame.addr3, frame.payload, idx);
+        self.emit(
+            frame.dst, frame.src, frame.addr3, frame.addr4, frame.htc, frame.payload, idx,
+        );
         Ok(())
     }
 
@@ -120,6 +139,8 @@ impl FrameIo for LoopbackEndpoint {
                         addr: Some(air.src),
                         group: Some(air.dst),
                         addr3: air.addr3,
+                        addr4: air.addr4,
+                        htc: air.htc,
                         rssi_dbm: Some(self.observed_rssi_dbm),
                         mcs_index: Some(air.mcs_index),
                         // The loopback bus is a format-agnostic in-memory test
@@ -158,6 +179,8 @@ mod tests {
             dst,
             src,
             addr3: None,
+            addr4: None,
+            htc: None,
         }
     }
 

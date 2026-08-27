@@ -36,7 +36,11 @@ fn main() -> ExitCode {
         }
     };
     let chan_mhz: u16 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(2412);
-    println!("firmware: {} ({} bytes), channel {chan_mhz} MHz", args[1], fw.len());
+    println!(
+        "firmware: {} ({} bytes), channel {chan_mhz} MHz",
+        args[1],
+        fw.len()
+    );
 
     let mut dev = match Ath9kHtcBackend::open() {
         Ok(d) => d,
@@ -54,7 +58,10 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
     let (credits, credit_size) = dev.credits();
-    println!("[transport] HTC up: {credits} credits of {credit_size} B, FW {:?}", dev.fw_version());
+    println!(
+        "[transport] HTC up: {credits} credits of {credit_size} B, FW {:?}",
+        dev.fw_version()
+    );
     let _ = dev.drain_events(500);
 
     let rc = run(&mut dev, chan_mhz);
@@ -79,7 +86,10 @@ fn run(dev: &mut Ath9kHtcBackend, chan_mhz: u16) -> ExitCode {
         eprintln!("[step0] AR_SREV degenerate ({srev:#010x}) — reg primitive not proven, STOP");
         return ExitCode::FAILURE;
     }
-    println!("[step0] AR_SREV={srev:#010x} (sig {:#04x}) — reg primitive OK", (srev >> 16) & 0xff);
+    println!(
+        "[step0] AR_SREV={srev:#010x} (sig {:#04x}) — reg primitive OK",
+        (srev >> 16) & 0xff
+    );
 
     // ── the faithful ath9k_hw_reset() spine (cal runs last) ──
     if let Err(e) = dev.hw_reset(chan_mhz) {

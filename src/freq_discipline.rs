@@ -36,7 +36,10 @@ pub enum FreqAction {
     /// Residual is inside the deadband; the hardware cannot express a smaller correction.
     Held { residual_ppm: f32 },
     /// Steered. `applied_ppm` is what the radio reported it actually did, not what was asked.
-    Steered { requested_ppm: f32, applied_ppm: f32 },
+    Steered {
+        requested_ppm: f32,
+        applied_ppm: f32,
+    },
     /// The correction needed exceeds the radio's advertised range; applied what was possible.
     Saturated { wanted_ppm: f32, applied_ppm: f32 },
 }
@@ -100,16 +103,24 @@ impl FreqDiscipline {
     /// overshoot.
     pub fn update(&mut self, measured_skew_ppm: f32) -> Result<FreqAction, FaceError> {
         if measured_skew_ppm.abs() <= self.deadband_ppm {
-            return Ok(FreqAction::Held { residual_ppm: measured_skew_ppm });
+            return Ok(FreqAction::Held {
+                residual_ppm: measured_skew_ppm,
+            });
         }
         let wanted = self.applied_ppm - measured_skew_ppm;
         let clamped = wanted.clamp(-self.limits.range_ppm, self.limits.range_ppm);
         let applied = self.radio.steer_clock_ppm(clamped)?;
         self.applied_ppm = applied;
         Ok(if (clamped - wanted).abs() > f32::EPSILON {
-            FreqAction::Saturated { wanted_ppm: wanted, applied_ppm: applied }
+            FreqAction::Saturated {
+                wanted_ppm: wanted,
+                applied_ppm: applied,
+            }
         } else {
-            FreqAction::Steered { requested_ppm: clamped, applied_ppm: applied }
+            FreqAction::Steered {
+                requested_ppm: clamped,
+                applied_ppm: applied,
+            }
         })
     }
 
@@ -136,7 +147,10 @@ mod tests {
             vec![]
         }
         fn clock_steering(&self) -> Option<ClockSteering> {
-            Some(ClockSteering { range_ppm: self.range, resolution_ppm: self.step })
+            Some(ClockSteering {
+                range_ppm: self.range,
+                resolution_ppm: self.step,
+            })
         }
         fn steer_clock_ppm(&self, ppm: f32) -> Result<f32, FaceError> {
             let q = (ppm / self.step).round() * self.step;
@@ -150,7 +164,12 @@ mod tests {
     }
 
     fn loop_for(step: f32, range: f32) -> FreqDiscipline {
-        FreqDiscipline::new(Arc::new(FakeRadio { step, range, cap: Mutex::new(0.0) })).unwrap()
+        FreqDiscipline::new(Arc::new(FakeRadio {
+            step,
+            range,
+            cap: Mutex::new(0.0),
+        }))
+        .unwrap()
     }
 
     #[test]

@@ -22,7 +22,10 @@ fn main() -> ExitCode {
     let fw = std::fs::read(args.get(1).expect("usage: <fw> [chan_mhz]")).expect("read fw");
     let chan_mhz: u16 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(2412);
     let secs: u64 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(60);
-    println!("firmware {} B, ch {chan_mhz} MHz, {secs}s raw-RX ceiling probe", fw.len());
+    println!(
+        "firmware {} B, ch {chan_mhz} MHz, {secs}s raw-RX ceiling probe",
+        fw.len()
+    );
 
     let mut dev = match Ath9kHtcBackend::open() {
         Ok(d) => d,
@@ -38,7 +41,10 @@ fn main() -> ExitCode {
     // Confirm WHICH firmware is running (instrument-trap guard): the RX-pool-slack build sets minor=80.
     println!("running firmware version: {:?}", dev.fw_version());
     // Same bring-up as open_ath9k (order: wmi_start before start_receive; filter off).
-    if let Err(e) = dev.hw_reset(chan_mhz).and_then(|_| dev.connect_data_services()) {
+    if let Err(e) = dev
+        .hw_reset(chan_mhz)
+        .and_then(|_| dev.connect_data_services())
+    {
         eprintln!("bring-up FAILED: {e}");
         return ExitCode::FAILURE;
     }

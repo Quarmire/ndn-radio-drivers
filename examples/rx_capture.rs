@@ -19,22 +19,31 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     // Raw80211: recv_frame returns *every* captured 802.11 frame verbatim, so a
     // non-zero total means the RX path works; a marker hit means we heard the peer.
-    let dev =
-        std::sync::Arc::new(LibUsbRtl88xxBackend::open_monitor(ch)?.with_format(FrameFormat::Raw80211));
+    let dev = std::sync::Arc::new(
+        LibUsbRtl88xxBackend::open_monitor(ch)?.with_format(FrameFormat::Raw80211),
+    );
     let _pumps = dev.spawn_rx_pump(8); // full-rate background RX
     println!("RTL8812EU monitor on ch{ch} (Raw80211, pumped); capturing 20s, flagging {marker:?}…");
 
     let deadline = Instant::now() + Duration::from_secs(20);
     let (mut total, mut hits) = (0u32, 0u32);
     while Instant::now() < deadline {
-        if let Ok(Ok(f)) = tokio::time::timeout(Duration::from_millis(500), dev.recv_frame()).await {
+        if let Ok(Ok(f)) = tokio::time::timeout(Duration::from_millis(500), dev.recv_frame()).await
+        {
             total += 1;
             let hit = f.payload.windows(mk.len()).any(|w| w == mk);
             if hit {
                 hits += 1;
-                let txt: String = String::from_utf8_lossy(&f.payload).chars().take(40).collect();
-                println!("  ✅ HIT #{hits}: {}B rssi={:?} src={:?} payload={txt:?}",
-                         f.payload.len(), f.rssi_dbm, f.addr);
+                let txt: String = String::from_utf8_lossy(&f.payload)
+                    .chars()
+                    .take(40)
+                    .collect();
+                println!(
+                    "  ✅ HIT #{hits}: {}B rssi={:?} src={:?} payload={txt:?}",
+                    f.payload.len(),
+                    f.rssi_dbm,
+                    f.addr
+                );
             }
         }
     }

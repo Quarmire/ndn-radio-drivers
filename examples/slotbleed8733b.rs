@@ -17,9 +17,18 @@ use std::time::Instant;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let ch: u8 = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(36);
-    let half_ms: u64 = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(20);
-    let secs: u64 = std::env::args().nth(3).and_then(|s| s.parse().ok()).unwrap_or(12);
+    let ch: u8 = std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(36);
+    let half_ms: u64 = std::env::args()
+        .nth(2)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(20);
+    let secs: u64 = std::env::args()
+        .nth(3)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(12);
     let hw_gate = std::env::var("NDN_HW_GATE").is_ok();
     let dev = Rtl8733buBackend::open()?;
     dev.bring_up_tx(ch)?;
@@ -34,9 +43,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         dst: BROADCAST,
         src: [0x02, 0x50, 0x33, 0x02, if hw_gate { 2 } else { 1 }, 0],
         addr3: None,
+        addr4: None,
+        htc: None,
     };
-    println!("arm: {} (half-period {half_ms} ms, {secs}s)",
-             if hw_gate { "software + HARDWARE gate" } else { "software gating only" });
+    println!(
+        "arm: {} (half-period {half_ms} ms, {secs}s)",
+        if hw_gate {
+            "software + HARDWARE gate"
+        } else {
+            "software gating only"
+        }
+    );
 
     let start = Instant::now();
     let (mut sent, mut closed_now) = (0u32, false);

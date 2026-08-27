@@ -105,9 +105,15 @@ fn run(dev: &mut Ath9kHtcBackend) -> ExitCode {
     let sig_ok = ((srev >> 16) & 0xff) == 0x14;
     println!(
         "[step0] AR9271 signature {}",
-        if sig_ok { "present ✓ (0x14)" } else { "ABSENT ✗ — is this really an AR9271?" }
+        if sig_ok {
+            "present ✓ (0x14)"
+        } else {
+            "ABSENT ✗ — is this really an AR9271?"
+        }
     );
-    let degenerate = reads.iter().any(|&v| v == 0 || v == 0xffff_ffff || v == AR_SREV)
+    let degenerate = reads
+        .iter()
+        .any(|&v| v == 0 || v == 0xffff_ffff || v == AR_SREV)
         || reads[0] != reads[1]
         || reads[1] != reads[2];
     if degenerate {
@@ -173,7 +179,10 @@ fn run(dev: &mut Ath9kHtcBackend) -> ExitCode {
         println!("[M1.2] initvals VERIFIED ✓ (every sentinel read back its written value)");
         ExitCode::SUCCESS
     } else {
-        eprintln!("[M1.2] initvals verify INCOMPLETE — {} sentinel(s) mismatched", iv.mismatches.len());
+        eprintln!(
+            "[M1.2] initvals verify INCOMPLETE — {} sentinel(s) mismatched",
+            iv.mismatches.len()
+        );
         // Not a hard failure of the primitive: report and let the operator judge.
         ExitCode::SUCCESS
     }

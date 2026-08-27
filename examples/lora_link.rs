@@ -56,7 +56,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     Ok(f) => {
                         let body = String::from_utf8_lossy(&f.payload);
                         let age = f.stamp.map(|s| s.raw).unwrap_or(0);
-                        let rssi = f.rssi_dbm.map(|r| format!("{r} dBm")).unwrap_or_else(|| "?".into());
+                        let rssi = f
+                            .rssi_dbm
+                            .map(|r| format!("{r} dBm"))
+                            .unwrap_or_else(|| "?".into());
                         println!("RX [{} B, {rssi}, host_ns={age}] {body}", f.payload.len());
                     }
                     Err(e) => {
@@ -71,7 +74,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     if role != "rx" {
         for seq in 0u32.. {
             let body = format!("LORA-NDN node={node} seq={seq}");
-            let frame = InjectFrame::broadcast(body.clone().into_bytes().into(), TxIntent::CONSERVATIVE);
+            let frame =
+                InjectFrame::broadcast(body.clone().into_bytes().into(), TxIntent::CONSERVATIVE);
             match dev.inject(frame).await {
                 Ok(()) => println!("TX {body}"),
                 Err(e) => eprintln!("inject err: {e:?}"),

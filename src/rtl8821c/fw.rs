@@ -225,7 +225,11 @@ impl Rtl8821cuBackend {
     fn send_firmware_pkt(&self, chunk: &[u8]) -> Result<(), FaceError> {
         let mut size = chunk.len();
         // USB +1 pad when (size + desc) is an exact multiple of 512.
-        let pad = if (size + TX_DESC_SIZE).is_multiple_of(512) { 1 } else { 0 };
+        let pad = if (size + TX_DESC_SIZE).is_multiple_of(512) {
+            1
+        } else {
+            0
+        };
 
         let mut pkt = vec![0u8; TX_DESC_SIZE + size + pad];
         size += pad;
@@ -266,7 +270,13 @@ impl Rtl8821cuBackend {
     /// Trigger a DDMA CH0 copy and wait for it to release ownership.
     fn iddma(&self, src: u32, dst: u32, len: u32, first: bool) -> Result<(), FaceError> {
         // wait ready
-        self.poll32(REG_DDMA_CH0CTRL, BIT_DDMACH0_OWN, 0, 1000, Duration::from_micros(10))?;
+        self.poll32(
+            REG_DDMA_CH0CTRL,
+            BIT_DDMACH0_OWN,
+            0,
+            1000,
+            Duration::from_micros(10),
+        )?;
         let mut ctrl = BIT_DDMACH0_CHKSUM_EN | BIT_DDMACH0_OWN | (len & DDMACH0_DLEN_MASK);
         if !first {
             ctrl |= BIT_DDMACH0_CHKSUM_CONT;
@@ -274,14 +284,24 @@ impl Rtl8821cuBackend {
         self.write32(REG_DDMA_CH0SA, src)?;
         self.write32(REG_DDMA_CH0DA, dst)?;
         self.write32(REG_DDMA_CH0CTRL, ctrl)?;
-        self.poll32(REG_DDMA_CH0CTRL, BIT_DDMACH0_OWN, 0, 1000, Duration::from_micros(10))
+        self.poll32(
+            REG_DDMA_CH0CTRL,
+            BIT_DDMACH0_OWN,
+            0,
+            1000,
+            Duration::from_micros(10),
+        )
     }
 
     /// Verify the region's hardware checksum and latch the DW/CHKSUM-OK bits.
     fn check_fw_checksum(&self, dst: u32) -> Result<(), FaceError> {
         let mut mcu = self.read8(REG_MCUFW_CTRL)?;
         let is_imem = dst < 0x0020_0000; // OCPBASE_DMEM threshold
-        let (dw_ok, chk_ok) = if is_imem { (0x08u8, 0x10u8) } else { (0x20u8, 0x40u8) };
+        let (dw_ok, chk_ok) = if is_imem {
+            (0x08u8, 0x10u8)
+        } else {
+            (0x20u8, 0x40u8)
+        };
         if self.read32(REG_DDMA_CH0CTRL)? & BIT_DDMACH0_CHKSUM_STS != 0 {
             // checksum failed: set DW_OK, clear CHKSUM_OK
             mcu = (mcu | dw_ok) & !chk_ok;
@@ -311,8 +331,12 @@ impl Rtl8821cuBackend {
         }
         let dbg = self.read32(REG_FW_DBG7)? & FW_KEY_MASK;
         if dbg == ILLEGAL_KEY_GROUP {
-            return Err(init_err("8821cu fw not ready: invalid fw key (wrong firmware)".into()));
+            return Err(init_err(
+                "8821cu fw not ready: invalid fw key (wrong firmware)".into(),
+            ));
         }
-        Err(init_err("8821cu fw not ready (download_firmware_validate timeout)".into()))
+        Err(init_err(
+            "8821cu fw not ready (download_firmware_validate timeout)".into(),
+        ))
     }
 }

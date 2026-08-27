@@ -102,8 +102,14 @@ impl Rtl8821cuBackend {
             RfSet::Btg => {
                 reg |= B_BTG_SWITCH;
                 reg &= !(B_CTRL_SWITCH | B_WL_SWITCH | B_WLG_SWITCH | B_WLA_SWITCH);
-                self.write32(REG_ENRXCCA, ins(self.read32(REG_ENRXCCA)?, 0x00ff_0000, 0x0e))?; // BTG_CCA
-                self.write32(REG_ENTXCCK, ins(self.read32(REG_ENTXCCK)?, 0x0000_ffff, 0xfc84))?; // BTG_LNA
+                self.write32(
+                    REG_ENRXCCA,
+                    ins(self.read32(REG_ENRXCCA)?, 0x00ff_0000, 0x0e),
+                )?; // BTG_CCA
+                self.write32(
+                    REG_ENTXCCK,
+                    ins(self.read32(REG_ENTXCCK)?, 0x0000_ffff, 0xfc84),
+                )?; // BTG_LNA
             }
             RfSet::Wla => {
                 reg |= B_WL_SWITCH | B_WLA_SWITCH;
@@ -112,8 +118,14 @@ impl Rtl8821cuBackend {
             RfSet::Wlg => {
                 reg |= B_WL_SWITCH | B_WLG_SWITCH;
                 reg &= !(B_BTG_SWITCH | B_CTRL_SWITCH | B_WLA_SWITCH);
-                self.write32(REG_ENRXCCA, ins(self.read32(REG_ENRXCCA)?, 0x00ff_0000, 0x12))?; // WLG_CCA
-                self.write32(REG_ENTXCCK, ins(self.read32(REG_ENTXCCK)?, 0x0000_ffff, 0x7532))?; // WLG_LNA
+                self.write32(
+                    REG_ENRXCCA,
+                    ins(self.read32(REG_ENRXCCA)?, 0x00ff_0000, 0x12),
+                )?; // WLG_CCA
+                self.write32(
+                    REG_ENTXCCK,
+                    ins(self.read32(REG_ENTXCCK)?, 0x0000_ffff, 0x7532),
+                )?; // WLG_LNA
             }
         }
         self.write32(REG_RFECTL, reg)
@@ -137,7 +149,10 @@ impl Rtl8821cuBackend {
             } else {
                 let p = *self.ch_param.lock().unwrap();
                 self.write32(0x0a24, p[0])?;
-                self.write32(0x0a28, ins(self.read32(0x0a28)?, 0x0000_ffff, p[1] & 0xffff))?;
+                self.write32(
+                    0x0a28,
+                    ins(self.read32(0x0a28)?, 0x0000_ffff, p[1] & 0xffff),
+                )?;
                 self.write32(0x0aac, p[2])?;
             }
         } else {
@@ -217,7 +232,9 @@ impl Rtl8821cuBackend {
             }
             std::thread::sleep(Duration::from_millis(20));
         }
-        Err(init_err("8821cu IQK timeout (firmware not running?)".into()))
+        Err(init_err(
+            "8821cu IQK timeout (firmware not running?)".into(),
+        ))
     }
 
     fn send_iqk_h2c(&self) -> Result<(), FaceError> {

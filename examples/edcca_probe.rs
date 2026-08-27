@@ -118,7 +118,11 @@ fn tx(b: &Arc<Rtl8812auBackend>, n: u32, rate: u64) -> Result<(), Box<dyn std::e
             "phase {phase}: sent-ok={ok} deferral-stalls={stalled} in {wall:.2}s  \
              (on-air ok {:.0}/s){}",
             ok as f64 / wall,
-            if stalled > 0 { "  ← gate is holding TX off" } else { "" }
+            if stalled > 0 {
+                "  ← gate is holding TX off"
+            } else {
+                ""
+            }
         );
         std::thread::sleep(Duration::from_millis(500)); // phase gap
     }
@@ -148,15 +152,21 @@ fn rx(b: &Arc<Rtl8812auBackend>, secs: u64) -> Result<(), Box<dyn std::error::Er
             println!("    phase{p}: {c}");
         }
     }
-    println!("  → divide by the TX's frames-per-phase for delivery ratio; a honored\n  \
-              phase above phase0 ⇒ carrier-sense cut contention loss.");
+    println!(
+        "  → divide by the TX's frames-per-phase for delivery ratio; a honored\n  \
+              phase above phase0 ⇒ carrier-sense cut contention loss."
+    );
     Ok(())
 }
 
 /// Scan ambient load across 2.4 GHz channels on ONE bring-up (hop + count all
 /// frames per channel). Finds a mid-load channel — the regime where EDCCA's
 /// cliff should become a usable knob (ch6 ≈saturated, ch14 ≈quiet).
-fn amb(b: &Arc<Rtl8812auBackend>, chans: &[u8], secs: u64) -> Result<(), Box<dyn std::error::Error>> {
+fn amb(
+    b: &Arc<Rtl8812auBackend>,
+    chans: &[u8],
+    secs: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
     b.set_rx_group_filter(None)?; // promiscuous — count everything on air
     println!("ambient scan: {secs}s per channel");
     let mut buf = vec![0u8; 16384];
@@ -187,10 +197,16 @@ fn amb(b: &Arc<Rtl8812auBackend>, chans: &[u8], secs: u64) -> Result<(), Box<dyn
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mode = std::env::args().nth(1).unwrap_or_else(|| "rx".into());
-    let ch: u8 = std::env::var("EDCCA_CH").ok().and_then(|s| s.parse().ok()).unwrap_or(6);
+    let ch: u8 = std::env::var("EDCCA_CH")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(6);
     // Ambient scan brings up once on ch1 then hops; do it before the ch-specific arms.
     if mode == "amb" {
-        let secs: u64 = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(4);
+        let secs: u64 = std::env::args()
+            .nth(2)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(4);
         let chans: Vec<u8> = std::env::args()
             .nth(3)
             .map(|s| s.split(',').filter_map(|x| x.parse().ok()).collect())
@@ -202,12 +218,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let b = bring_up(ch)?;
     match mode.as_str() {
         "tx" => {
-            let n: u32 = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(400);
-            let rate: u64 = std::env::args().nth(3).and_then(|s| s.parse().ok()).unwrap_or(300);
+            let n: u32 = std::env::args()
+                .nth(2)
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(400);
+            let rate: u64 = std::env::args()
+                .nth(3)
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(300);
             tx(&b, n, rate)?;
         }
         "rx" => {
-            let secs: u64 = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(40);
+            let secs: u64 = std::env::args()
+                .nth(2)
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(40);
             rx(&b, secs)?;
         }
         _ => {

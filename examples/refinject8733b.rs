@@ -16,11 +16,13 @@
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     use bytes::Bytes;
-    use ndn_radio_drivers::{BROADCAST, FrameFormat, InjectFrame, TxIntent, frame, radiotap};
     use ndn_frame_io::AfPacketBackend;
+    use ndn_radio_drivers::{BROADCAST, FrameFormat, InjectFrame, TxIntent, frame, radiotap};
 
     let mut a = std::env::args().skip(1);
-    let iface = a.next().ok_or("usage: refinject8733b <iface> <knob> <idx> [count] [size]")?;
+    let iface = a
+        .next()
+        .ok_or("usage: refinject8733b <iface> <knob> <idx> [count] [size]")?;
     let knob: u8 = a.next().and_then(|s| s.parse().ok()).unwrap_or(5);
     let idx: u8 = a.next().and_then(|s| s.parse().ok()).unwrap_or(0);
     let count: usize = a.next().and_then(|s| s.parse().ok()).unwrap_or(1200);
@@ -32,7 +34,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // turns a MAC experiment into an interference experiment.
     let pace_us: u64 = a.next().and_then(|s| s.parse().ok()).unwrap_or(0);
 
-    let fmt = FrameFormat::RawNdn { ethertype: ndn_radio_drivers::NDN_ETHERTYPE };
+    let fmt = FrameFormat::RawNdn {
+        ethertype: ndn_radio_drivers::NDN_ETHERTYPE,
+    };
     let backend = AfPacketBackend::new(&iface, fmt)?;
     let mut p = vec![0xC3u8; size];
     p[0] = idx;
@@ -47,6 +51,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         dst: BROADCAST,
         src: [0x02, 0x50, 0x33, 0x02, knob, idx],
         addr3: None,
+        addr4: None,
+        htc: None,
     };
     // Explicit legacy RATE header: `frame::build` would emit the HT TX header and the reference
     // would secretly transmit at a different rate than the DUT, which is the one thing this
@@ -62,7 +68,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Rebuild per frame so the sequence advances; the radiotap+dot11 prefix is unchanged.
         let mut pl = p.clone();
         pl[4..8].copy_from_slice(&(seq as u32).to_le_bytes());
-        let fseq = InjectFrame { payload: Bytes::from(pl), ..f.clone() };
+        let fseq = InjectFrame {
+            payload: Bytes::from(pl),
+            ..f.clone()
+        };
         let mut dot11 = frame::build_dot11(fmt, &fseq)?;
         // NDN_NAV_US sets the 802.11 Duration field (header bytes 2..4) so this can act as a NAV
         // interferer: a receiver that honours a decoded NAV must defer for that long.
@@ -88,7 +97,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     if let Some(e) = first_err {
-        eprintln!("  ref: {} of {count} injects failed, first error: {e}", count - sent);
+        eprintln!(
+            "  ref: {} of {count} injects failed, first error: {e}",
+            count - sent
+        );
     }
     println!("  ref knob={knob} idx={idx} rate={rate}(x500kbps): sent={sent}/{count}");
     Ok(())

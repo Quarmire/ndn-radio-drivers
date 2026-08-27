@@ -54,11 +54,11 @@ use std::time::Duration;
 
 use rusb::{Context, Device, DeviceHandle, Direction, TransferType, UsbContext};
 
+use crate::{CapturedFrame, FrameFormat, FrameIo, InjectFrame, McsDescriptor};
 use async_trait::async_trait;
 use bytes::Bytes;
-use ndn_transport::FaceError;
-use crate::{CapturedFrame, FrameFormat, FrameIo, InjectFrame, McsDescriptor};
 use ndn_radio_hal::{Band, RadioCapability, RadioProfile, RateCapability};
+use ndn_transport::FaceError;
 
 /// Async USB TX ring (libusb URBs) — the TX-pipelining path. Linux-only.
 #[cfg(target_os = "linux")]
@@ -179,7 +179,10 @@ fn usb_err(e: rusb::Error) -> FaceError {
 /// VHT splits index[3:0]=MCS, index[5:4]=NSS-1. BW left 0 (20 MHz) for now.
 fn mt76_rate_val(m: &McsDescriptor) -> u16 {
     let (phy, idx): (u16, u16) = if m.vht {
-        (4, (m.index as u16 & 0x0f) | (((m.nss.max(1) - 1) as u16 & 0x03) << 4))
+        (
+            4,
+            (m.index as u16 & 0x0f) | (((m.nss.max(1) - 1) as u16 & 0x03) << 4),
+        )
     } else {
         (2, m.index as u16 & 0x3f)
     };
@@ -306,18 +309,19 @@ impl Mt7612uBackend {
             }
         }
         let ep_in = ins.first().copied();
-        let iface = iface_n.ok_or_else(|| {
-            init_err("MT7612U: no interface with bulk endpoints".into())
-        })?;
+        let iface =
+            iface_n.ok_or_else(|| init_err("MT7612U: no interface with bulk endpoints".into()))?;
         if outs.is_empty() || ep_in.is_none() {
             return Err(init_err("MT7612U: missing bulk OUT/IN endpoints".into()));
         }
         // The mt76 inband-command endpoint is ep 0x08 on this dongle (verified in
         // the golden trace); data rides the lower OUT pipes. Fall back to the
         // highest/lowest OUT address if 0x08 isn't present.
-        let ep_cmd = outs.iter().copied().find(|&e| e == 0x08).unwrap_or_else(|| {
-            *outs.iter().max().unwrap()
-        });
+        let ep_cmd = outs
+            .iter()
+            .copied()
+            .find(|&e| e == 0x08)
+            .unwrap_or_else(|| *outs.iter().max().unwrap());
         let ep_data = *outs.iter().min().unwrap();
 
         let _ = handle.set_auto_detach_kernel_driver(true);
@@ -418,7 +422,14 @@ impl Mt7612uBackend {
     }
     fn wr_cfg(&self, addr: u16, val: u32) -> Result<(), FaceError> {
         self.handle
-            .write_control(REQ_OUT, MT_VEND_WRITE_CFG, 0, addr, &val.to_le_bytes(), CTRL_TIMEOUT)
+            .write_control(
+                REQ_OUT,
+                MT_VEND_WRITE_CFG,
+                0,
+                addr,
+                &val.to_le_bytes(),
+                CTRL_TIMEOUT,
+            )
             .map_err(usb_err)?;
         Ok(())
     }
@@ -466,7 +477,10 @@ impl Mt7612uBackend {
         let dbg = std::env::var("NDN_RADIO_EP_DEBUG").is_ok();
         let nchunks = data.len().div_ceil(chunk);
         if dbg {
-            eprintln!("    send_data off={offset:#x} len={} chunks={nchunks}", data.len());
+            eprintln!(
+                "    send_data off={offset:#x} len={} chunks={nchunks}",
+                data.len()
+            );
         }
         let mut pos = 0usize;
         let mut idx = 0usize;
@@ -494,7 +508,9 @@ impl Mt7612uBackend {
             }
             self.handle
                 .write_bulk(self.ep_cmd, &buf, BULK_TIMEOUT)
-                .map_err(|e| init_err(format!("mt7612u fw chunk {idx} (dst {dst:#x}) bulk: {e}")))?;
+                .map_err(|e| {
+                    init_err(format!("mt7612u fw chunk {idx} (dst {dst:#x}) bulk: {e}"))
+                })?;
             // Inter-chunk handshake (from golden_init): wait for the FCE to drain
             // (MT_FCE_PSE_CTRL_GO reads 0), then write 1 to advance it to the next
             // chunk. The advance-write is essential — without it the next chunk's
@@ -551,10 +567,14 @@ impl Mt7612uBackend {
     /// USB U3DMA bulk-enable, MCU dev-mode, FCE base-ptr + max-count + conf.
     fn fce_setup(&self) -> Result<(), FaceError> {
         let d = std::env::var("NDN_RADIO_EP_DEBUG").is_ok();
-        if d { eprintln!("    fce: u3dma"); }
+        if d {
+            eprintln!("    fce: u3dma");
+        }
         self.wr_cfg(MT_USB_U3DMA_CFG, 0x00c0_0020)?; // bulk TX/RX DMA enable
         // DEV_MODE (bReq 0x01) wValue=1: MCU run/dev mode.
-        if d { eprintln!("    fce: devmode"); }
+        if d {
+            eprintln!("    fce: devmode");
+        }
         self.handle
             .write_control(REQ_OUT, MT_VEND_DEV_MODE, 0x0001, 0, &[], CTRL_TIMEOUT)
             .map_err(usb_err)?;
@@ -563,17 +583,29 @@ impl Mt7612uBackend {
         // trace shows an 8.67ms gap here vs 0.14ms between all other transfers —
         // firing the next write immediately times out and wedges the device.
         std::thread::sleep(Duration::from_millis(12));
-        if d { eprintln!("    fce: pse_ctrl"); }
+        if d {
+            eprintln!("    fce: pse_ctrl");
+        }
         self.wr(MT_FCE_PSE_CTRL, 0x1)?; // 0x0800
-        if d { eprintln!("    fce: base_ptr"); }
+        if d {
+            eprintln!("    fce: base_ptr");
+        }
         self.wr(0x09a0, 0x0040_0230)?; // MT_TX_CPU_FROM_FCE_BASE_PTR
-        if d { eprintln!("    fce: max_count"); }
+        if d {
+            eprintln!("    fce: max_count");
+        }
         self.wr(0x09a4, 0x1)?; // MT_TX_CPU_FROM_FCE_MAX_COUNT
-        if d { eprintln!("    fce: global_conf"); }
+        if d {
+            eprintln!("    fce: global_conf");
+        }
         self.wr(MT_FCE_PDMA_GLOBAL_CONF, 0x44)?; // 0x09c4
-        if d { eprintln!("    fce: skip_fs"); }
+        if d {
+            eprintln!("    fce: skip_fs");
+        }
         self.wr(MT_FCE_SKIP_FS, 0x3)?; // 0x0a6c
-        if d { eprintln!("    fce: done"); }
+        if d {
+            eprintln!("    fce: done");
+        }
         Ok(())
     }
 
@@ -585,15 +617,23 @@ impl Mt7612uBackend {
         }
         let d = std::env::var("NDN_RADIO_EP_DEBUG").is_ok();
         self.fce_setup()?;
-        self.mcu_fw_send_data(&ROM_PATCH[PATCH_HEADER_LEN..], MCU_ROM_PATCH_OFFSET, PATCH_CHUNK_MAX)?;
-        if d { eprintln!("  rom: data sent, WMT enable ..."); }
+        self.mcu_fw_send_data(
+            &ROM_PATCH[PATCH_HEADER_LEN..],
+            MCU_ROM_PATCH_OFFSET,
+            PATCH_CHUNK_MAX,
+        )?;
+        if d {
+            eprintln!("  rom: data sent, WMT enable ...");
+        }
         // Activate the patch (mt76x2u_mcu_enable_patch + reset_wmt). WMT class
         // requests (bmRequestType=0x20, bRequest=0x01, wValue=0x12) carrying the
         // MediaTek WMT command bytes. WITHOUT THIS the patched firmware never runs
         // and the MCU never consumes ep-0x08 commands — the root cause of the
         // ~1.1s command-write timeouts. Bytes decoded from golden_init.
         const WMT_REQ: u8 = 0x20; // host->device | class | device
-        let enable_patch = [0x6fu8, 0xfc, 0x08, 0x01, 0x20, 0x04, 0x00, 0x00, 0x00, 0x09, 0x00];
+        let enable_patch = [
+            0x6fu8, 0xfc, 0x08, 0x01, 0x20, 0x04, 0x00, 0x00, 0x00, 0x09, 0x00,
+        ];
         let reset_wmt = [0x6fu8, 0xfc, 0x05, 0x01, 0x07, 0x01, 0x00, 0x04];
         self.handle
             .write_control(WMT_REQ, 0x01, 0x0012, 0x0000, &enable_patch, CTRL_TIMEOUT)
@@ -633,8 +673,10 @@ impl Mt7612uBackend {
             let mut v = ilm_slice.to_vec();
             for pair in spec.split(';').filter(|s| !s.is_empty()) {
                 let mut it = pair.split(':');
-                let off = usize::from_str_radix(it.next().unwrap().trim_start_matches("0x"), 16).unwrap_or(0);
-                let val = u32::from_str_radix(it.next().unwrap().trim_start_matches("0x"), 16).unwrap_or(0);
+                let off = usize::from_str_radix(it.next().unwrap().trim_start_matches("0x"), 16)
+                    .unwrap_or(0);
+                let val = u32::from_str_radix(it.next().unwrap().trim_start_matches("0x"), 16)
+                    .unwrap_or(0);
                 if off + 4 <= v.len() {
                     v[off..off + 4].copy_from_slice(&val.to_le_bytes());
                     eprintln!("  [fw ILM patched: 0x{off:05x} -> 0x{val:08x}]");
@@ -642,15 +684,20 @@ impl Mt7612uBackend {
             }
             v
         });
-        self.mcu_fw_send_data(ilm_patched.as_deref().unwrap_or(ilm_slice), MCU_ILM_OFFSET, FW_CHUNK_MAX)?;
+        self.mcu_fw_send_data(
+            ilm_patched.as_deref().unwrap_or(ilm_slice),
+            MCU_ILM_OFFSET,
+            FW_CHUNK_MAX,
+        )?;
         let dlm_slice = &RAM_FIRMWARE[dlm_start..dlm_start + dlm_len];
         // Experimental DLM patch: the firmware's per-bandwidth TX page-count table
         // (marker 0x3f1f1f10 then two max-page u32s = 22/23 pages = the ~5888B
         // single-MPDU cap) lives at these DLM offsets. NDN_FW_PGCNT=<n> rewrites all
         // eight fields so the firmware allows larger MPDUs (the cap is enforced in
         // firmware, not a host register — see the register hunt). Off by default.
-        const DLM_PGCNT_OFFS: [usize; 8] =
-            [0x33c8, 0x33cc, 0x33fc, 0x3400, 0x3430, 0x3434, 0x3464, 0x3468];
+        const DLM_PGCNT_OFFS: [usize; 8] = [
+            0x33c8, 0x33cc, 0x33fc, 0x3400, 0x3430, 0x3434, 0x3464, 0x3468,
+        ];
         let patched: Option<Vec<u8>> = std::env::var("NDN_FW_PGCNT")
             .ok()
             .and_then(|s| s.parse::<u32>().ok())
@@ -684,14 +731,22 @@ impl Mt7612uBackend {
     pub fn load_firmware(&self) -> Result<(), FaceError> {
         let d = std::env::var("NDN_RADIO_EP_DEBUG").is_ok();
         if self.firmware_running() && std::env::var("NDN_RADIO_FORCE_FW").is_err() {
-            if d { eprintln!("  load_firmware: already running, skip"); }
+            if d {
+                eprintln!("  load_firmware: already running, skip");
+            }
             return Ok(());
         }
-        if d { eprintln!("  load_firmware: rom patch ..."); }
+        if d {
+            eprintln!("  load_firmware: rom patch ...");
+        }
         self.load_rom_patch()?;
-        if d { eprintln!("  load_firmware: ram firmware ..."); }
+        if d {
+            eprintln!("  load_firmware: ram firmware ...");
+        }
         self.load_ram_firmware()?;
-        if d { eprintln!("  load_firmware: done"); }
+        if d {
+            eprintln!("  load_firmware: done");
+        }
         Ok(())
     }
 
@@ -701,7 +756,9 @@ impl Mt7612uBackend {
     /// COM_REG0 value and whether bit0 (ready) is set.
     pub fn start_mcu(&self) -> Result<(u32, bool), FaceError> {
         let d = std::env::var("NDN_RADIO_EP_DEBUG").is_ok();
-        if d { eprintln!("  start_mcu: running={}", self.firmware_running()); }
+        if d {
+            eprintln!("  start_mcu: running={}", self.firmware_running());
+        }
         if !self.firmware_running() {
             let _ = self.wr(MT_FCE_PSE_CTRL_GO, 0x14); // ack last FCE completion
             self.handle
@@ -710,14 +767,21 @@ impl Mt7612uBackend {
             // load-IVB (DEV_MODE wValue=0x12) hands control to the freshly loaded
             // firmware; the golden trace waits ~20ms before reading COM_REG0.
             std::thread::sleep(Duration::from_millis(20));
-            if d { eprintln!("  start_mcu: ivb sent, polling COM_REG0 ..."); }
+            if d {
+                eprintln!("  start_mcu: ivb sent, polling COM_REG0 ...");
+            }
             for _ in 0..200 {
                 if self.rr(MT_MCU_COM_REG0)? & 1 != 0 {
                     break;
                 }
                 std::thread::sleep(Duration::from_millis(1));
             }
-            if d { eprintln!("  start_mcu: COM_REG0={:#x}", self.rr(MT_MCU_COM_REG0).unwrap_or(0)); }
+            if d {
+                eprintln!(
+                    "  start_mcu: COM_REG0={:#x}",
+                    self.rr(MT_MCU_COM_REG0).unwrap_or(0)
+                );
+            }
         }
         // Firmware-ready handshake: write COM_REG0 back (golden writes 0x1140fb
         // after polling) to signal the MCU into runtime command mode. Without it
@@ -783,13 +847,24 @@ impl Mt7612uBackend {
             // without needing us to read each ACK for flow control, so a brief
             // read just clears any response without stalling (returns immediately
             // when data is present). NDN_RADIO_MCU_RESP_MS overrides the timeout.
-            let ms = std::env::var("NDN_RADIO_MCU_RESP_MS").ok().and_then(|s| s.parse().ok()).unwrap_or(200);
+            let ms = std::env::var("NDN_RADIO_MCU_RESP_MS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(200);
             let tr = std::time::Instant::now();
-            let r = self.handle.read_bulk(ep_resp, &mut rx, Duration::from_millis(ms));
+            let r = self
+                .handle
+                .read_bulk(ep_resp, &mut rx, Duration::from_millis(ms));
             if dbg {
                 match &r {
-                    Ok(n) => eprintln!("  mcu 0x{cmd:02x} resp {n}B in {}ms", tr.elapsed().as_millis()),
-                    Err(rusb::Error::Timeout) => eprintln!("  mcu 0x{cmd:02x} resp TIMEOUT {}ms", tr.elapsed().as_millis()),
+                    Ok(n) => eprintln!(
+                        "  mcu 0x{cmd:02x} resp {n}B in {}ms",
+                        tr.elapsed().as_millis()
+                    ),
+                    Err(rusb::Error::Timeout) => eprintln!(
+                        "  mcu 0x{cmd:02x} resp TIMEOUT {}ms",
+                        tr.elapsed().as_millis()
+                    ),
                     Err(_) => {}
                 }
             }
@@ -831,14 +906,25 @@ impl Mt7612uBackend {
         }
         let ep_resp = *self.ep_ins.last().unwrap_or(&self.ep_in);
         let mut rx = [0u8; 512];
-        let ms = std::env::var("NDN_RADIO_MCU_RESP_MS").ok().and_then(|s| s.parse().ok()).unwrap_or(200);
+        let ms = std::env::var("NDN_RADIO_MCU_RESP_MS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(200);
         let tr = std::time::Instant::now();
-        let r = self.handle.read_bulk(ep_resp, &mut rx, Duration::from_millis(ms));
+        let r = self
+            .handle
+            .read_bulk(ep_resp, &mut rx, Duration::from_millis(ms));
         if dbg {
             match &r {
-                Ok(n) => eprintln!("  mcu 0x{cmd:02x} seq{seq} resp {n}B in {}ms", tr.elapsed().as_millis()),
+                Ok(n) => eprintln!(
+                    "  mcu 0x{cmd:02x} seq{seq} resp {n}B in {}ms",
+                    tr.elapsed().as_millis()
+                ),
                 Err(rusb::Error::Timeout) => {
-                    eprintln!("  mcu 0x{cmd:02x} seq{seq} resp TIMEOUT {}ms", tr.elapsed().as_millis())
+                    eprintln!(
+                        "  mcu 0x{cmd:02x} seq{seq} resp TIMEOUT {}ms",
+                        tr.elapsed().as_millis()
+                    )
                 }
                 Err(_) => {}
             }
@@ -915,7 +1001,10 @@ impl Mt7612uBackend {
         let mut loaded_fw = false;
         while i < b.len() {
             if dbg && (nw + nm) % 500 == 0 && (nw + nm) > 0 {
-                eprintln!("  ... {nw} writes + {nm} mcu, {ne} errs (op @ {i}/{})", b.len());
+                eprintln!(
+                    "  ... {nw} writes + {nm} mcu, {ne} errs (op @ {i}/{})",
+                    b.len()
+                );
             }
             let tag = b[i];
             i += 1;
@@ -953,11 +1042,12 @@ impl Mt7612uBackend {
                     // device back out of runtime mode, so register writes still land
                     // but every MCU command write times out. Suppress them post-load.
                     if !loaded_fw {
-                        exec!(self
-                            .handle
-                            .write_control(REQ_OUT, MT_VEND_DEV_MODE, wv, 0, &[], CTRL_TIMEOUT)
-                            .map_err(usb_err)
-                            .map(|_| ()));
+                        exec!(
+                            self.handle
+                                .write_control(REQ_OUT, MT_VEND_DEV_MODE, wv, 0, &[], CTRL_TIMEOUT)
+                                .map_err(usb_err)
+                                .map(|_| ())
+                        );
                     }
                 }
                 0x4d => {
@@ -990,7 +1080,9 @@ impl Mt7612uBackend {
                     }
                 }
                 other => {
-                    return Err(init_err(format!("mt7612u replay bad tag {other:#04x} @ {i}")));
+                    return Err(init_err(format!(
+                        "mt7612u replay bad tag {other:#04x} @ {i}"
+                    )));
                 }
             }
         }
@@ -1068,11 +1160,12 @@ impl Mt7612uBackend {
                 0x01 => {
                     let wv = u16::from_le_bytes(b[i..i + 2].try_into().unwrap());
                     i += 2;
-                    exec!(self
-                        .handle
-                        .write_control(REQ_OUT, MT_VEND_DEV_MODE, wv, 0, &[], CTRL_TIMEOUT)
-                        .map_err(usb_err)
-                        .map(|_| ()));
+                    exec!(
+                        self.handle
+                            .write_control(REQ_OUT, MT_VEND_DEV_MODE, wv, 0, &[], CTRL_TIMEOUT)
+                            .map_err(usb_err)
+                            .map(|_| ())
+                    );
                 }
                 0x4d => {
                     let info = u32::from_le_bytes(b[i..i + 4].try_into().unwrap());
@@ -1084,7 +1177,9 @@ impl Mt7612uBackend {
                     nm += 1;
                 }
                 other => {
-                    return Err(init_err(format!("mt7612u chanset bad tag {other:#04x} @ {i}")));
+                    return Err(init_err(format!(
+                        "mt7612u chanset bad tag {other:#04x} @ {i}"
+                    )));
                 }
             }
         }
@@ -1282,7 +1377,10 @@ impl Mt7612uBackend {
     /// Read one raw bulk-IN transfer (an mt76 RX burst: RXD descriptor + 802.11).
     /// Returns the byte count (0 on timeout). For the first RX-alive check.
     pub fn read_rx(&self, buf: &mut [u8]) -> Result<usize, FaceError> {
-        match self.handle.read_bulk(self.ep_in, buf, Duration::from_millis(200)) {
+        match self
+            .handle
+            .read_bulk(self.ep_in, buf, Duration::from_millis(200))
+        {
             Ok(n) => Ok(n),
             Err(rusb::Error::Timeout) => Ok(0),
             Err(e) => Err(usb_err(e)),
@@ -1320,11 +1418,20 @@ impl Mt7612uBackend {
     /// subframes (4-byte padded). Standard 802.11 A-MSDU — chip-independent, same
     /// as the RTL backend. This is the broadcast throughput lever (A-MPDU needs a
     /// Block-Ack that broadcast never gets; A-MSDU amortizes per-MPDU overhead).
-    fn build_amsdu_body(&self, payloads: &[Bytes], dst: [u8; 6], src: [u8; 6]) -> Result<Vec<u8>, FaceError> {
+    fn build_amsdu_body(
+        &self,
+        payloads: &[Bytes],
+        dst: [u8; 6],
+        src: [u8; 6],
+    ) -> Result<Vec<u8>, FaceError> {
         use std::sync::atomic::Ordering;
         let ethertype = match self.format {
             FrameFormat::RawNdn { ethertype } => ethertype,
-            other => return Err(init_err(format!("mt7612u A-MSDU: format {other:?} unsupported"))),
+            other => {
+                return Err(init_err(format!(
+                    "mt7612u A-MSDU: format {other:?} unsupported"
+                )));
+            }
         };
         let seq = self.seq.fetch_add(1, Ordering::Relaxed) & 0x0fff;
         let mut out = Vec::new();
@@ -1373,7 +1480,10 @@ impl Mt7612uBackend {
     /// pipelines them, hiding the ~0.37ms per-transfer round-trip that bounds a
     /// single writer. Call after `bring_up`. (Frame order across threads is not
     /// preserved — fine for connectionless NDN broadcast.)
-    pub fn spawn_tx_pump(self: &std::sync::Arc<Self>, depth: usize) -> Vec<std::thread::JoinHandle<()>> {
+    pub fn spawn_tx_pump(
+        self: &std::sync::Arc<Self>,
+        depth: usize,
+    ) -> Vec<std::thread::JoinHandle<()>> {
         use std::sync::atomic::Ordering;
         let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
         *self.tx_sender.lock().unwrap() = Some(tx);
@@ -1382,21 +1492,24 @@ impl Mt7612uBackend {
             .map(|_| {
                 let me = self.clone();
                 let rx = rx.clone();
-                std::thread::spawn(move || loop {
-                    let got = rx.lock().unwrap().try_recv();
-                    match got {
-                        Ok(buf) => {
-                            if let Ok(n) =
-                                me.handle.write_bulk(me.ep_data, &buf, Duration::from_secs(1))
-                            {
-                                me.tx_bytes.fetch_add(n as u64, Ordering::Relaxed);
-                                me.tx_count.fetch_add(1, Ordering::Relaxed);
+                std::thread::spawn(move || {
+                    loop {
+                        let got = rx.lock().unwrap().try_recv();
+                        match got {
+                            Ok(buf) => {
+                                if let Ok(n) =
+                                    me.handle
+                                        .write_bulk(me.ep_data, &buf, Duration::from_secs(1))
+                                {
+                                    me.tx_bytes.fetch_add(n as u64, Ordering::Relaxed);
+                                    me.tx_count.fetch_add(1, Ordering::Relaxed);
+                                }
                             }
+                            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                                std::thread::sleep(Duration::from_micros(50));
+                            }
+                            Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
                         }
-                        Err(std::sync::mpsc::TryRecvError::Empty) => {
-                            std::thread::sleep(Duration::from_micros(50));
-                        }
-                        Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
                     }
                 })
             })
@@ -1417,7 +1530,11 @@ impl Mt7612uBackend {
     /// event thread owns all libusb completions on this context.
     #[cfg(target_os = "linux")]
     pub fn new_tx_ring(&self, max_outstanding: usize) -> std::sync::Arc<TxRing> {
-        std::sync::Arc::new(TxRing::new(self.handle.clone(), self.ep_data, max_outstanding))
+        std::sync::Arc::new(TxRing::new(
+            self.handle.clone(),
+            self.ep_data,
+            max_outstanding,
+        ))
     }
 
     /// Send a pre-built USB TX bulk: fast path hands it to the TX pump thread
@@ -1437,9 +1554,9 @@ impl Mt7612uBackend {
                 .write_bulk(ep, &buf, Duration::from_secs(1))
                 .map_err(usb_err)
                 .and_then(|n| {
-                    (n == buf.len())
-                        .then_some(())
-                        .ok_or_else(|| init_err(format!("mt7612u TX: short write {n}/{}", buf.len())))
+                    (n == buf.len()).then_some(()).ok_or_else(|| {
+                        init_err(format!("mt7612u TX: short write {n}/{}", buf.len()))
+                    })
                 })
         })
         .await
@@ -1461,7 +1578,10 @@ impl Mt7612uBackend {
     ///
     /// It also brings `NDN_RX_AGG_DBG`, which reports average bytes per transfer — the instrument
     /// for the still-open question below.
-    pub fn spawn_rx_pump(self: &std::sync::Arc<Self>, depth: usize) -> Vec<std::thread::JoinHandle<()>> {
+    pub fn spawn_rx_pump(
+        self: &std::sync::Arc<Self>,
+        depth: usize,
+    ) -> Vec<std::thread::JoinHandle<()>> {
         self.pause_drain(true);
         crate::rx_pump::spawn_rx_pump(self, depth)
     }
@@ -1647,9 +1767,8 @@ impl Mt7612uBackend {
     /// The rate to transmit `frame` at: the control-plane-set MCS (state) if present,
     /// else the frame's intent resolved to this 11ac radio.
     fn resolved_mcs(&self, frame: &InjectFrame) -> crate::McsDescriptor {
-        self.cur_mcs
-            .lock()
-            .unwrap()
-            .unwrap_or_else(|| crate::McsDescriptor::for_intent(&frame.tx, crate::MAX_RELIABLE_MCS, true, false))
+        self.cur_mcs.lock().unwrap().unwrap_or_else(|| {
+            crate::McsDescriptor::for_intent(&frame.tx, crate::MAX_RELIABLE_MCS, true, false)
+        })
     }
 }

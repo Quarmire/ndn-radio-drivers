@@ -33,23 +33,41 @@ fn main() -> ExitCode {
     println!("firmware {} B, channel {chan_mhz} MHz", fw.len());
 
     let mut dev = Ath9kHtcBackend::open().expect("open");
-    dev.download_firmware(&fw).and_then(|_| dev.htc_init()).expect("transport");
+    dev.download_firmware(&fw)
+        .and_then(|_| dev.htc_init())
+        .expect("transport");
     dev.hw_reset(chan_mhz)
         .and_then(|_| dev.connect_data_services())
         .and_then(|_| dev.wmi_start())
         .expect("bring-up");
     // Command DISTINCT knob values so the descriptor read proves they reach the hardware:
     // rate = HT MCS5 ⇒ XmitRate0 should read 0x85; power = idx 24 ⇒ XmitPower should read 24.
-    dev.set_rate(McsDescriptor { index: 5, short_gi: false, vht: false, nss: 1, stbc: false, ldpc: false }).ok();
+    dev.set_rate(McsDescriptor {
+        index: 5,
+        short_gi: false,
+        vht: false,
+        nss: 1,
+        stbc: false,
+        ldpc: false,
+    })
+    .ok();
     dev.set_tx_power(24).ok();
-    println!("commanded: MCS5 (rate code 0x85), tx_power idx 24 — expect XmitRate0=0x85, XmitPower=24");
+    println!(
+        "commanded: MCS5 (rate code 0x85), tx_power idx 24 — expect XmitRate0=0x85, XmitPower=24"
+    );
 
     let t0 = r(&mut dev, AR_TFCNT);
-    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
     rt.block_on(async {
         for i in 0..4 {
             let payload = format!("\x05\x08ath9k-{i:03}");
-            let f = InjectFrame::broadcast(Bytes::copy_from_slice(payload.as_bytes()), TxIntent::CONSERVATIVE);
+            let f = InjectFrame::broadcast(
+                Bytes::copy_from_slice(payload.as_bytes()),
+                TxIntent::CONSERVATIVE,
+            );
             if let Err(e) = dev.inject(f).await {
                 eprintln!("[tx {i}] FAILED: {e}");
                 break;
@@ -58,7 +76,15 @@ fn main() -> ExitCode {
         }
     });
     let t1 = r(&mut dev, AR_TFCNT);
-    println!("ΔTFCNT={} (radiation {})", t1.wrapping_sub(t0), if t1.wrapping_sub(t0) > 1000 { "YES" } else { "no" });
+    println!(
+        "ΔTFCNT={} (radiation {})",
+        t1.wrapping_sub(t0),
+        if t1.wrapping_sub(t0) > 1000 {
+            "YES"
+        } else {
+            "no"
+        }
+    );
 
     let qtxdp = r(&mut dev, AR_QTXDP1);
     println!("\nAR_QTXDP(1) = {qtxdp:#010x}  (last-queued descriptor address in target RAM)");
@@ -94,12 +120,24 @@ fn main() -> ExitCode {
     println!("\n── decoded ──");
     println!("FrameLen   = {frame_len} B   (incl. FCS; my ~40-byte frame ⇒ expect ~44)");
     println!("BufLen     = {buf_len} B");
-    println!("XmitPower  = {xmit_power} (0.5dB units ⇒ {} dBm)  {}", xmit_power as f32 * 0.5, if xmit_power == 0 { "← ZERO POWER" } else { "" });
+    println!(
+        "XmitPower  = {xmit_power} (0.5dB units ⇒ {} dBm)  {}",
+        xmit_power as f32 * 0.5,
+        if xmit_power == 0 {
+            "← ZERO POWER"
+        } else {
+            ""
+        }
+    );
     println!("FrameType  = {frame_type} (0=Normal 1=ATIM 2=PSPOLL 3=Beacon 4=Probe_Resp)");
-    println!("XmitRate0  = {rate0:#04x}  (1Mb=0x1b 2Mb=0x1a 5.5=0x19 11=0x18 6Mb=0x0b OFDM; HT MCS have bit7=0x80)");
+    println!(
+        "XmitRate0  = {rate0:#04x}  (1Mb=0x1b 2Mb=0x1a 5.5=0x19 11=0x18 6Mb=0x0b OFDM; HT MCS have bit7=0x80)"
+    );
     println!("XmitRate1  = {rate1:#04x}");
     if rate0 & 0x80 != 0 {
-        println!("  ⚠ rate0 has bit7 set ⇒ HT-MCS format — a witness in legacy-only monitor won't decode it");
+        println!(
+            "  ⚠ rate0 has bit7 set ⇒ HT-MCS format — a witness in legacy-only monitor won't decode it"
+        );
     }
 
     // Follow ds_data to the frame buffer and dump the queued 802.11 bytes.
@@ -115,7 +153,9 @@ fn main() -> ExitCode {
                     let hex: Vec<String> = chunk.iter().map(|b| format!("{b:02x}")).collect();
                     println!("  +{:02x}: {}", i * 16, hex.join(" "));
                 }
-                println!("  (expect FC=08 00, A1=ff ff ff ff ff ff, A2=02 4e 44 4e 00 01, … LLC aa aa 03 00 00 00 86 24)");
+                println!(
+                    "  (expect FC=08 00, A1=ff ff ff ff ff ff, A2=02 4e 44 4e 00 01, … LLC aa aa 03 00 00 00 86 24)"
+                );
             }
             Err(e) => eprintln!("  read frame buffer FAILED: {e}"),
         }

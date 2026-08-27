@@ -26,7 +26,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for _ in 0..200 {
         let _ = dev.rr(0x1004)?;
     }
-    println!("rr() latency: {:.1} us/read (200 reads) — the per-frame register-read jitter floor", t.elapsed().as_micros() as f64 / 200.0);
+    println!(
+        "rr() latency: {:.1} us/read (200 reads) — the per-frame register-read jitter floor",
+        t.elapsed().as_micros() as f64 / 200.0
+    );
 
     // (0b) Start the TSF timer if it's disabled in monitor mode. MT_BEACON_TIME_CFG (0x1100):
     // bit4 = TIMER_EN; sync-mode (bits 8-9) = 0 → free-run. Clear DW0/DW1 first.
@@ -35,7 +38,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     dev.wr(0x1104, 0)?;
     dev.wr(0x1108, 0)?;
     dev.wr(0x1100, (bc & !0x0000_0300) | 0x0000_0010)?; // TIMER_EN, free-run
-    println!("MT_BEACON_TIME_CFG(0x1100) after  = {:#010x}", dev.rr(0x1100)?);
+    println!(
+        "MT_BEACON_TIME_CFG(0x1100) after  = {:#010x}",
+        dev.rr(0x1100)?
+    );
 
     // (1) Is 0x1104 a µs TSF? Read the candidate DW0/DW1 (+ 0x110c MT_TIME_STAMP) at 10 ms steps.
     println!("=== TSF register advance (10 ms steps; a µs TSF adds ~10000/step to 0x1104) ===");
@@ -49,7 +55,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let ts = dev.rr(0x110c)?;
         let d = dw0.wrapping_sub(last);
         last = dw0;
-        println!("  host={el:>9}us  0x1104={dw0:#010x} (+{d:<8})  0x1108={dw1:#010x}  0x110c={ts:#010x}");
+        println!(
+            "  host={el:>9}us  0x1104={dw0:#010x} (+{d:<8})  0x1108={dw1:#010x}  0x110c={ts:#010x}"
+        );
     }
 
     // (2) Does the RX descriptor carry a receive-latched timestamp? Dump the 36-byte prefix beside a

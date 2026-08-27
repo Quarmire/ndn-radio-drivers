@@ -269,7 +269,12 @@ impl McsDescriptor {
     /// out as **HE ER-SU + DCM** (~2–4 dB more reach than HT+STBC+LDPC). Since only an HE receiver can
     /// decode ER-SU (as only 11ac decodes VHT), pass `he_cap` `true` only for a known-HE reach; the
     /// worst-overheard-receiver legacy gate still forces legacy when a legacy-only RX is advertised.
-    pub fn for_intent(intent: &TxIntent, max_index: u8, vht_cap: bool, he_cap: bool) -> McsDescriptor {
+    pub fn for_intent(
+        intent: &TxIntent,
+        max_index: u8,
+        vht_cap: bool,
+        he_cap: bool,
+    ) -> McsDescriptor {
         match intent.reliability {
             Reliability::MostRobust if he_cap => McsDescriptor::he(0).with_er_su().with_dcm(),
             Reliability::MostRobust => McsDescriptor::ht(0).with_stbc().with_ldpc(),
@@ -407,6 +412,15 @@ pub struct InjectFrame {
     /// filter (which consumes the source field), preserving per-transmitter RSSI keying
     /// (mac-addressing-doctrine §2). Never a host MAC.
     pub addr3: Option<[u8; 6]>,
+    /// **Wide-profile `addr4`** (802.11 4-address layout): the additive *extra* Blur
+    /// projection (48 bits) that layers on top of the base 126-bit filter in `dst‖src‖addr3[0:4]`.
+    /// `None` ⇒ the base 3-address frame every bearer shares. Only the `RawNdn` arm of
+    /// `build_dot11` consumes it; setting it flips the frame to ToDS=FromDS=1 QoS-Data+HTC.
+    pub addr4: Option<[u8; 6]>,
+    /// **Wide-profile HT Control** (4 bytes): the exact-match fingerprint (24 bits, little-endian)
+    /// plus the wide-profile marker byte. Rides the +HTC/Order bit. `None` ⇒ base layout. Set
+    /// together with [`addr4`](Self::addr4) — the two are the wide profile's pushed-header fields.
+    pub htc: Option<[u8; 4]>,
 }
 
 impl InjectFrame {
@@ -419,6 +433,8 @@ impl InjectFrame {
             dst: BROADCAST,
             src: DEFAULT_SRC,
             addr3: None,
+            addr4: None,
+            htc: None,
         }
     }
 }
@@ -441,6 +457,14 @@ pub struct CapturedFrame {
     /// source nonce (`addr1 ‖ addr2` being the prefix-set filter); `None` if the backend
     /// did not surface it (the legacy layout duplicates `dst` here, carrying no new info).
     pub addr3: Option<[u8; 6]>,
+    /// **Wide-profile `addr4`** as received (802.11 4-address QoS-Data+HTC frame): the extra
+    /// Blur projection layered on the base filter. `None` on a base 3-address frame or a backend
+    /// that does not surface it — a base receiver simply never reads the extra bits (over-accept,
+    /// never a false negative), which is what lets wide and base senders share one airspace.
+    pub addr4: Option<[u8; 6]>,
+    /// **Wide-profile HT Control** as received: the exact-match fingerprint + profile marker.
+    /// `None` unless the frame carried the +HTC/Order bit with the wide-profile marker.
+    pub htc: Option<[u8; 4]>,
     /// Per-frame RSSI in dBm from radiotap, if measured.
     pub rssi_dbm: Option<i8>,
     /// MCS index the frame was received at, if radiotap reported it.
@@ -1029,7 +1053,11 @@ pub enum RateCapability {
     /// No transmit-rate ceiling — an RX-only sensor, or a single-fixed-rate bearer.
     None,
     /// Wi-Fi 802.11: max MCS index, spatial streams, and channel-bandwidth code (0=20…4=5).
-    Wifi { max_mcs: u8, max_nss: u8, max_bw: u8 },
+    Wifi {
+        max_mcs: u8,
+        max_nss: u8,
+        max_bw: u8,
+    },
     /// LoRa sub-GHz: the spreading-factor span (the reach↔rate range; lower SF = faster).
     Lora { min_sf: u8, max_sf: u8 },
 }
@@ -1231,7 +1259,12 @@ impl RadioCapability {
     /// neighbour's advertised RX capability. The cognition policy already reads these ceilings, so
     /// the cap takes effect with no further plumbing.
     pub fn with_wifi_caps(mut self, max_mcs: Option<u8>, max_nss: Option<u8>) -> Self {
-        if let RateCapability::Wifi { max_mcs: m, max_nss: n, .. } = &mut self.rate {
+        if let RateCapability::Wifi {
+            max_mcs: m,
+            max_nss: n,
+            ..
+        } = &mut self.rate
+        {
             if let Some(cap) = max_mcs {
                 *m = (*m).min(cap);
             }
@@ -1316,7 +1349,8 @@ impl RadioCapability {
     pub fn wifi_monitor_5ghz(channels: Vec<u8>) -> Self {
         Self {
             kind: RadioKind::WifiMonitor,
-            he_cap: false,            bands: vec![Band::Band5GHz],
+            he_cap: false,
+            bands: vec![Band::Band5GHz],
             rate: RateCapability::Wifi {
                 max_mcs: 9,
                 max_nss: 2,
@@ -1341,7 +1375,8 @@ impl RadioCapability {
     pub fn wifi_monitor_2ghz(channels: Vec<u8>) -> Self {
         Self {
             kind: RadioKind::WifiMonitor,
-            he_cap: false,            bands: vec![Band::Band2_4GHz],
+            he_cap: false,
+            bands: vec![Band::Band2_4GHz],
             rate: RateCapability::Wifi {
                 max_mcs: 7,
                 max_nss: 2,
@@ -1414,7 +1449,8 @@ impl RadioCapability {
     pub fn wifi_halow_s1g(channels: Vec<u8>) -> Self {
         Self {
             kind: RadioKind::WifiMonitor,
-            he_cap: false,            bands: vec![Band::Sub1GHz],
+            he_cap: false,
+            bands: vec![Band::Sub1GHz],
             rate: RateCapability::Wifi {
                 max_mcs: 10, // S1G MCS0–10 (MCS10 = 1 MHz-only rep-coded BPSK)
                 max_nss: 1,
@@ -1438,7 +1474,8 @@ impl RadioCapability {
     pub fn lora(channels: Vec<u8>) -> Self {
         Self {
             kind: RadioKind::Lora,
-            he_cap: false,            bands: vec![Band::Sub1GHz],
+            he_cap: false,
+            bands: vec![Band::Sub1GHz],
             // SX126x spreading-factor span 7–12 (the reach↔rate range).
             rate: RateCapability::Lora {
                 min_sf: 7,
@@ -1464,7 +1501,8 @@ impl RadioCapability {
     pub fn sdr_sensor(channels: Vec<u8>) -> Self {
         Self {
             kind: RadioKind::Sdr,
-            he_cap: false,            bands: vec![Band::Band5GHz],
+            he_cap: false,
+            bands: vec![Band::Band5GHz],
             rate: RateCapability::None, // RX-only instrument — no transmit rate
             channels,
             max_tx_power: 0,
@@ -1534,15 +1572,20 @@ mod ceiling_tests {
 
     #[test]
     fn a_radios_own_ceiling_governs_its_rate_not_another_chips_calibration() {
-        let throughput =
-            TxIntent { reliability: Reliability::Throughput, reach: Reach::Broadcast };
+        let throughput = TxIntent {
+            reliability: Reliability::Throughput,
+            reach: Reach::Broadcast,
+        };
 
         // The mt7612 declares MCS9 and is VHT-capable. It was being handed 7 — two rates below what
         // it advertises — because of a constant calibrated on a Realtek part.
         let mt = RadioCapability::wifi_monitor_5ghz(vec![36]);
         assert_eq!(mt.max_mcs(), 9, "fixture: this constructor declares 9");
         let d = McsDescriptor::for_intent(&throughput, mt.max_mcs(), true, false);
-        assert_eq!(d.index, 8, "VHT 1SS tops at MCS8 (9 needs >=40 MHz), NOT at the 8812EU's 7");
+        assert_eq!(
+            d.index, 8,
+            "VHT 1SS tops at MCS8 (9 needs >=40 MHz), NOT at the 8812EU's 7"
+        );
         assert!(d.vht);
 
         // Without VHT the structural HT limit still binds — this is the part of the old clamp that
@@ -1554,10 +1597,16 @@ mod ceiling_tests {
         // A part that genuinely validates lower keeps its lower ceiling: the capability is
         // authoritative in both directions, which is the whole point of de-globalising it.
         let d = McsDescriptor::for_intent(&throughput, 4, true, false);
-        assert_eq!(d.index, 4, "a conservative radio must not be pushed up to the mode ceiling");
+        assert_eq!(
+            d.index, 4,
+            "a conservative radio must not be pushed up to the mode ceiling"
+        );
 
         // Robust/Balanced are rate-class decisions, not ceiling decisions, and are unaffected.
-        let robust = TxIntent { reliability: Reliability::MostRobust, reach: Reach::Broadcast };
+        let robust = TxIntent {
+            reliability: Reliability::MostRobust,
+            reach: Reach::Broadcast,
+        };
         assert_eq!(McsDescriptor::for_intent(&robust, 9, true, false).index, 0);
     }
 
@@ -1565,9 +1614,21 @@ mod ceiling_tests {
     fn adaptive_rate_is_capped_per_radio() {
         // A strong signal asks for MCS7; a radio that declares 4 must still get 4.
         let mut cap = RadioCapability::wifi_monitor_5ghz(vec![36]);
-        cap.rate = RateCapability::Wifi { max_mcs: 4, max_nss: 1, max_bw: 0 };
-        assert_eq!(cap.mcs_for_rssi(-40), Some(4), "clamped to this radio's ceiling");
-        assert_eq!(cap.mcs_for_rssi(-90), Some(0), "and a weak link still drops to the floor");
+        cap.rate = RateCapability::Wifi {
+            max_mcs: 4,
+            max_nss: 1,
+            max_bw: 0,
+        };
+        assert_eq!(
+            cap.mcs_for_rssi(-40),
+            Some(4),
+            "clamped to this radio's ceiling"
+        );
+        assert_eq!(
+            cap.mcs_for_rssi(-90),
+            Some(0),
+            "and a weak link still drops to the floor"
+        );
 
         // Asking a LoRa radio for an MCS is a category error, not a number to guess at.
         assert_eq!(RadioCapability::lora(vec![0]).mcs_for_rssi(-40), None);

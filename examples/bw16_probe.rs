@@ -18,7 +18,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     use std::time::Duration;
 
     let mut args = std::env::args().skip(1);
-    let path = args.next().unwrap_or_else(|| "/dev/cu.usbserial-1110".into());
+    let path = args
+        .next()
+        .unwrap_or_else(|| "/dev/cu.usbserial-1110".into());
     let ch: u8 = args.next().and_then(|s| s.parse().ok()).unwrap_or(6);
 
     let dev = Arc::new(Bw16SerialBackend::open(&path)?);

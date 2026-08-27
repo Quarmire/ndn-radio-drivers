@@ -29,7 +29,10 @@ const RANGES: &[(u16, u16)] = &[
 ];
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let ch: u8 = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(36);
+    let ch: u8 = std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(36);
     let dev = Rtl8733buBackend::open()?;
     // Full TX bring-up: the point is to capture the state the transmitter actually runs in, which
     // includes everything calibration and `enable_tx` leave behind — not a freshly-initialised BB.

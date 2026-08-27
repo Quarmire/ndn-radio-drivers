@@ -90,7 +90,7 @@ const T_RX_TS: u8 = 0x82; // [rssi_i8][noise_i8][rate_code][phy_flags][rx_ts_us_
 const T_BLE_ADV: u8 = 0x30; // host->device: advertise this payload (BLE 5 ext-adv)
 const T_COEX: u8 = 0x31; // host->device: [scan_window_le16][scan_itvl_le16] — the BLE<->Wi-Fi radio-time split
 const T_BLE_RX: u8 = 0x88; // device->host: [rssi_i8][addr6][payload] — a scanned advertisement
-                          // µs stamp + the ESP's per-frame PHY metadata (radiotap-equiv): RX rate/MCS + SNR
+// µs stamp + the ESP's per-frame PHY metadata (radiotap-equiv): RX rate/MCS + SNR
 
 /// BW16 fixed TX-rate codes for [`SerialRadioBackend::set_tx_rate`]
 /// (`wifi_set_tx_data_rate`). CCK 0x00–0x03, OFDM 0x04–0x0b, HT MCS0–7 0x0c–0x13,
@@ -162,7 +162,11 @@ impl SerialRadioBackend {
         Self::open_inner(path, false, Some(domain))
     }
 
-    fn open_inner(path: &str, reset_pulse: bool, dev_clock: Option<ClockDomainId>) -> Result<Self, FaceError> {
+    fn open_inner(
+        path: &str,
+        reset_pulse: bool,
+        dev_clock: Option<ClockDomainId>,
+    ) -> Result<Self, FaceError> {
         let mut port = serialport::new(path, SERIAL_RADIO_BAUD)
             .timeout(Duration::from_millis(50))
             .open()
@@ -196,7 +200,15 @@ impl SerialRadioBackend {
         let wifi_fr_reader = wifi_frames.clone();
         std::thread::spawn(move || {
             reader_loop(
-                reader, format, txch, clkch, ttch, blech, act_reader, ble_act_reader, wifi_fr_reader,
+                reader,
+                format,
+                txch,
+                clkch,
+                ttch,
+                blech,
+                act_reader,
+                ble_act_reader,
+                wifi_fr_reader,
                 dev_clock,
             )
         });
@@ -330,7 +342,11 @@ impl SerialRadioBackend {
                 prev_b = b;
                 let total = dw + db;
                 // Idle on both bearers → hold the midpoint so each stays reachable; else split by demand.
-                let share = if total < 1.0 { (floor + ceil) * 0.5 } else { (db / total).clamp(floor, ceil) };
+                let share = if total < 1.0 {
+                    (floor + ceil) * 0.5
+                } else {
+                    (db / total).clamp(floor, ceil)
+                };
                 let _ = self.set_ble_share(share, itvl);
             }
         })
@@ -347,7 +363,11 @@ impl SerialRadioBackend {
     /// is present, a received 0x8624 frame whose in-address prefix-set matches no mask is dropped ON THE
     /// DEVICE — it never crosses the serial link, the §8.2 pre-USB drop. `enabled=false` (or no masks)
     /// forwards everything (stock behaviour). Masks beyond the 8th are ignored (the firmware cap).
-    pub fn configure_name_filter(&self, enabled: bool, masks: &[[u8; 16]]) -> Result<(), FaceError> {
+    pub fn configure_name_filter(
+        &self,
+        enabled: bool,
+        masks: &[[u8; 16]],
+    ) -> Result<(), FaceError> {
         let n = masks.len().min(8);
         let mut payload = Vec::with_capacity(2 + n * 16);
         payload.push(enabled as u8);
@@ -391,14 +411,20 @@ impl SerialRadioBackend {
         let mut rx = self.clock_rx.lock().await;
         while rx.try_recv().is_ok() {} // drop any stale reply before requesting a fresh one
         self.send_framed(T_READCLOCK, &[]).ok()?;
-        tokio::time::timeout(Duration::from_millis(300), rx.recv()).await.ok().flatten()
+        tokio::time::timeout(Duration::from_millis(300), rx.recv())
+            .await
+            .ok()
+            .flatten()
     }
 
     /// Await the next scheduled-TX confirmation `(target, actual)` esp_timer µs — the actual on-air
     /// instant of an [`inject_at_abs`](Self::inject_at_abs), for verifying slot placement. `None` on timeout.
     pub async fn recv_tx_confirm(&self) -> Option<(u64, u64)> {
         let mut rx = self.txtime_rx.lock().await;
-        tokio::time::timeout(Duration::from_millis(500), rx.recv()).await.ok().flatten()
+        tokio::time::timeout(Duration::from_millis(500), rx.recv())
+            .await
+            .ok()
+            .flatten()
     }
 
     /// Inject a complete 802.11 frame after poking `(offset, value)` bytes into the
@@ -452,7 +478,8 @@ fn reader_loop(
                         continue;
                     }
                     if ty == T_OCC && payload.len() >= 4 {
-                        let c = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
+                        let c =
+                            u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
                         activity.store(c, std::sync::atomic::Ordering::Relaxed);
                         acc.drain(..consumed);
                         continue;
@@ -474,23 +501,38 @@ fn reader_loop(
                     // RX stamp + the ESP's per-frame PHY metadata — its "radiotap": RX rate/MCS + SNR).
                     let parsed = if ty == T_RX && !payload.is_empty() {
                         let rssi = payload[0] as i8;
-                        frame::parse_dot11(format, &payload[1..], Some(rssi), None, Some(host_stamp()))
+                        frame::parse_dot11(
+                            format,
+                            &payload[1..],
+                            Some(rssi),
+                            None,
+                            Some(host_stamp()),
+                        )
                     } else if ty == T_RX_TS && payload.len() >= 8 {
                         let rssi = payload[0] as i8;
                         let noise = payload[1] as i8;
                         let rate_code = payload[2]; // MCS (bb_format ≥ HT) or the L-SIG rate (legacy)
                         let bb_format = payload[3] & 0x0f; // RX_BB_FORMAT_*: 0=11B 1=11G/A 2=HT 3=VHT 4+=HE
-                        let ts_us = u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]);
+                        let ts_us =
+                            u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]);
                         // MCS index is meaningful only for HT/VHT/HE; a legacy (11b/g/a) rate is not an MCS.
                         let mcs = (bb_format >= 2).then_some(rate_code);
                         // A device stamp only if this backend was opened with a device clock domain (the
                         // C5); else fall back to HostRecv so an un-clocked open still yields frames.
-                        let stamp = dev_clock.map(|d| dev_rx_stamp(ts_us, d)).unwrap_or_else(host_stamp);
-                        frame::parse_dot11(format, &payload[8..], Some(rssi), mcs, Some(stamp)).map(|mut c| {
-                            // rssi says how loud; SNR (rssi − noise floor) says how clean — the decode predictor.
-                            c.phy = Some(PhyMetrics { snr_db: Some(rssi.saturating_sub(noise)), evm_db: None, cfo_hz: None });
-                            c
-                        })
+                        let stamp = dev_clock
+                            .map(|d| dev_rx_stamp(ts_us, d))
+                            .unwrap_or_else(host_stamp);
+                        frame::parse_dot11(format, &payload[8..], Some(rssi), mcs, Some(stamp)).map(
+                            |mut c| {
+                                // rssi says how loud; SNR (rssi − noise floor) says how clean — the decode predictor.
+                                c.phy = Some(PhyMetrics {
+                                    snr_db: Some(rssi.saturating_sub(noise)),
+                                    evm_db: None,
+                                    cfo_hz: None,
+                                });
+                                c
+                            },
+                        )
                     } else {
                         None
                     };
@@ -560,7 +602,12 @@ impl RadioKnobs for SerialRadioBackend {
         // into a byte for the wext command.
         self.set_txpower(idx.min(u8::MAX as u32) as u8)
     }
-    fn configure_name_filter(&self, enabled: bool, _key: &[u8; 16], masks: &[[u8; 16]]) -> Result<(), FaceError> {
+    fn configure_name_filter(
+        &self,
+        enabled: bool,
+        _key: &[u8; 16],
+        masks: &[[u8; 16]],
+    ) -> Result<(), FaceError> {
         // The C5/BW16 firmware compares masks against the frame's pre-encoded address octets (the
         // transmitter baked the prefix-set in), so no on-device re-hash → the `key` is unused here.
         SerialRadioBackend::configure_name_filter(self, enabled, masks)
@@ -616,10 +663,14 @@ impl Esp32SerialBackend {
     pub fn open_c5(path: &str) -> Result<Self, FaceError> {
         let clock_domain = c5_clock_domain(path);
         Ok(Self {
-            inner: Arc::new(SerialRadioBackend::open_no_reset_clocked(path, clock_domain)?),
+            inner: Arc::new(SerialRadioBackend::open_no_reset_clocked(
+                path,
+                clock_domain,
+            )?),
             // .with_he(): the C5 is Wi-Fi 6 — it transmits real HE (verified on air, RX cur_bb_format=HE_SU),
             // so it advertises the HE reach levers (ER-SU + DCM) that for_intent(MostRobust) and set_rate use.
-            capability: RadioCapability::wifi_monitor_dual_1ss(vec![1, 6, 11, 36, 40, 44, 48]).with_he(),
+            capability: RadioCapability::wifi_monitor_dual_1ss(vec![1, 6, 11, 36, 40, 44, 48])
+                .with_he(),
             clock_domain,
         })
     }
@@ -636,7 +687,12 @@ impl Esp32SerialBackend {
         let knobs: Arc<dyn RadioKnobs> = dev.clone();
         let time: Arc<dyn RadioTime> = dev.clone();
         let profile: Arc<dyn RadioProfile> = dev;
-        Ok(OpenRadio { io, knobs: Some(knobs), time: Some(time), profile: Some(profile) })
+        Ok(OpenRadio {
+            io,
+            knobs: Some(knobs),
+            time: Some(time),
+            profile: Some(profile),
+        })
     }
 
     /// The shared-mux handle: the `Arc<SerialRadioBackend>` behind this Wi-Fi view, whose BLE methods
@@ -649,7 +705,11 @@ impl Esp32SerialBackend {
 
     /// Load the on-device Tier-0 name filter — see [`SerialRadioBackend::configure_name_filter`]. On the
     /// C5 this is a real pre-serial drop (the firmware is ours), unlike a commodity monitor NIC.
-    pub fn configure_name_filter(&self, enabled: bool, masks: &[[u8; 16]]) -> Result<(), FaceError> {
+    pub fn configure_name_filter(
+        &self,
+        enabled: bool,
+        masks: &[[u8; 16]],
+    ) -> Result<(), FaceError> {
         self.inner.configure_name_filter(enabled, masks)
     }
 
@@ -680,7 +740,12 @@ impl FrameIo for Esp32SerialBackend {
     /// Hardware scheduled placement: the C5 fires T_INJECT_ABS when its esp_timer reaches `target_tick`,
     /// so a scheduler places the frame in its slot without host sleep+inject jitter. `target_tick` is a
     /// value in the C5's schedule clock (esp_timer µs). See [`SerialRadioBackend::inject_at_abs`].
-    async fn inject_at_clock(&self, frame: InjectFrame, target_tick: u64, _domain: ClockDomainId) -> Result<(), FaceError> {
+    async fn inject_at_clock(
+        &self,
+        frame: InjectFrame,
+        target_tick: u64,
+        _domain: ClockDomainId,
+    ) -> Result<(), FaceError> {
         self.inner.inject_at_abs(frame, target_tick)
     }
     /// Relative hardware scheduling (T_INJECT_AT): the C5 fires the frame `delay_us` after it receives the
@@ -689,7 +754,8 @@ impl FrameIo for Esp32SerialBackend {
         if delay_us == 0 {
             self.inner.inject(frame).await
         } else {
-            self.inner.inject_at(frame, delay_us.min(u32::MAX as u64) as u32)
+            self.inner
+                .inject_at(frame, delay_us.min(u32::MAX as u64) as u32)
         }
     }
     /// Actuate cognition's rate lever. The C5 firmware decodes T_RATE as a `wifi_phy_rate_t` and calls the
@@ -703,7 +769,11 @@ impl FrameIo for Esp32SerialBackend {
             // 802.11ax reach path: phymode HE20 (6) + the DCM / ER-SU flags. Verified on air (RX HE_SU / HE_ERSU).
             // ★ HE ER-SU is only valid at MCS 0–2 (802.11ax) — the PHY silently drops the frame otherwise
             // (measured: MCS4+ER-SU → nothing on air), so clamp the index when ER-SU is requested.
-            let idx = if mcs.er_su { mcs.index.min(2) } else { mcs.index.min(7) };
+            let idx = if mcs.er_su {
+                mcs.index.min(2)
+            } else {
+                mcs.index.min(7)
+            };
             let flags = (mcs.dcm as u8) | ((mcs.er_su as u8) << 1);
             self.inner.set_tx_rate_ex(0x10 + idx, 6, flags)
         } else {
@@ -724,9 +794,16 @@ impl RadioKnobs for Esp32SerialBackend {
         // The C5 firmware places T_INJECT_AT frames at a scheduled instant via its monotonic timer.
         // Measured error ≤ ~190 µs (dominated by the esp_wifi_80211_tx submission latency), so declare
         // a conservative 200 µs granularity — the scheduler learns the C5 can name an airtime slot.
-        TxDiscipline::ScheduledAt { granularity_ns: 200_000 }
+        TxDiscipline::ScheduledAt {
+            granularity_ns: 200_000,
+        }
     }
-    fn configure_name_filter(&self, enabled: bool, key: &[u8; 16], masks: &[[u8; 16]]) -> Result<(), FaceError> {
+    fn configure_name_filter(
+        &self,
+        enabled: bool,
+        key: &[u8; 16],
+        masks: &[[u8; 16]],
+    ) -> Result<(), FaceError> {
         RadioKnobs::configure_name_filter(self.inner.as_ref(), enabled, key, masks)
     }
     fn read_channel_activity(&self) -> Result<Option<u16>, FaceError> {

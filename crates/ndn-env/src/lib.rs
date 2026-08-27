@@ -44,10 +44,18 @@ pub struct Var {
 }
 
 const fn cfg(name: &'static str, what: &'static str) -> Var {
-    Var { name, class: Class::Config, what }
+    Var {
+        name,
+        class: Class::Config,
+        what,
+    }
 }
 const fn dbg_(name: &'static str, what: &'static str) -> Var {
-    Var { name, class: Class::DebugBisect, what }
+    Var {
+        name,
+        class: Class::DebugBisect,
+        what,
+    }
 }
 
 /// **The classification table.** Every `NDN_*` read from library source across ndn-rs, ndn-ext,
@@ -60,20 +68,44 @@ const fn dbg_(name: &'static str, what: &'static str) -> Var {
 /// They are legitimately debug, and legitimately *not* things a deployment should ever set.
 pub const KNOWN: &[Var] = &[
     // ---- scheduler / MAC (the surface every on-air measurement is configured through) ----
-    cfg("NDN_SCHED_SLOT", "slot schedule: <slots> (derive width) or <slots>:<slot_us>"),
+    cfg(
+        "NDN_SCHED_SLOT",
+        "slot schedule: <slots> (derive width) or <slots>:<slot_us>",
+    ),
     cfg("NDN_SCHED_HOP", "FHSS schedule: ch,ch,...:dwell_us"),
-    cfg("NDN_SCHED_CLOCK", "clock source: wall | cv | hw — also sets the slot guard band"),
+    cfg(
+        "NDN_SCHED_CLOCK",
+        "clock source: wall | cv | hw — also sets the slot guard band",
+    ),
     cfg("NDN_SCHED_MASTER", "this node broadcasts the time beacon"),
-    cfg("NDN_SCHED_NODE_ID", "id for the network-reference election (lowest wins)"),
+    cfg(
+        "NDN_SCHED_NODE_ID",
+        "id for the network-reference election (lowest wins)",
+    ),
     // NDN_SCHED_GROUP_DEPTH was DELETED (P1, 2026-08-12): a per-node env var deciding a shared
     // slot map was the same hazard as a hand-edited slot width. Grouping now comes from the
     // registered-prefix table. Deliberately NOT listed here — a node still setting it gets the
     // Unrecognised warning, which is exactly the migration signal it needs.
-    cfg("NDN_SCHED_CLAIM", "enable claiming an idle slot (CCLF election)"),
-    cfg("NDN_SCHED_LEASE", "max base slots one lease may hold (#93); 1 = the measured single-slot hold"),
-    cfg("NDN_SCHED_RESERVE", "reserve every Nth slot as a latency lane (#93); 0 = none, the measured default"),
-    dbg_("NDN_SCHED_CLAIM_UNKNOWN", "claim slots whose owner was never heard — DEFEATS #94's hidden-terminal guard"),
-    dbg_("NDN_SCHED_DEAF_SRC", "claim-C topology instrument: hex nonce prefix this node is artificially deaf to (software hearing matrix — hiddenness is not achievable electronically at bench range)"),
+    cfg(
+        "NDN_SCHED_CLAIM",
+        "enable claiming an idle slot (CCLF election)",
+    ),
+    cfg(
+        "NDN_SCHED_LEASE",
+        "max base slots one lease may hold (#93); 1 = the measured single-slot hold",
+    ),
+    cfg(
+        "NDN_SCHED_RESERVE",
+        "reserve every Nth slot as a latency lane (#93); 0 = none, the measured default",
+    ),
+    dbg_(
+        "NDN_SCHED_CLAIM_UNKNOWN",
+        "claim slots whose owner was never heard — DEFEATS #94's hidden-terminal guard",
+    ),
+    dbg_(
+        "NDN_SCHED_DEAF_SRC",
+        "claim-C topology instrument: hex nonce prefix this node is artificially deaf to (software hearing matrix — hiddenness is not achievable electronically at bench range)",
+    ),
     // ---- face / link ----
     cfg("NDN_NAME", "face name prefix"),
     cfg("NDN_PORT", "unicast port"),
@@ -87,17 +119,32 @@ pub const KNOWN: &[Var] = &[
     cfg("NDN_BCST", "broadcast mode"),
     cfg("NDN_FLOG", "log file"),
     // ---- radio selection / rate / power (operational) ----
-    cfg("NDN_USB_INDEX", "which USB radio to open when several share a host"),
-    cfg("NDN_RADIO_TX_RATE", "TX rate code (4 = legacy 6M, the broadcast-safe choice)"),
-    cfg("NDN_RADIO_TXPWR", "TXAGC index 0..63 — read natively ONLY by the 8821c bring-up; campaign tools apply it via RadioKnobs::set_tx_power (a81a/8812au honor the knob, not the var)"),
+    cfg(
+        "NDN_USB_INDEX",
+        "which USB radio to open when several share a host",
+    ),
+    cfg(
+        "NDN_RADIO_TX_RATE",
+        "TX rate code (4 = legacy 6M, the broadcast-safe choice)",
+    ),
+    cfg(
+        "NDN_RADIO_TXPWR",
+        "TXAGC index 0..63 — read natively ONLY by the 8821c bring-up; campaign tools apply it via RadioKnobs::set_tx_power (a81a/8812au honor the knob, not the var)",
+    ),
     cfg("NDN_TX_PWR", "TX power (LoRa)"),
     cfg("NDN_RADIO_LDPC", "enable LDPC FEC"),
     cfg("NDN_RADIO_STBC", "enable space-time block coding"),
     cfg("NDN_RADIO_FIXEDRATE", "pin the rate rather than adapt"),
     cfg("NDN_RADIO_IBSS", "IBSS mode"),
     cfg("NDN_RADIO_STA", "station mode"),
-    cfg("NDN_NAVUSEHDR", "honour the Duration/NAV field from the injected header (#96: not honoured by stock 802.11)"),
-    cfg("NDN_LORA_CHANNEL", "LoRa channel — 78 (928 MHz) avoids the HaLow co-band collapse"),
+    cfg(
+        "NDN_NAVUSEHDR",
+        "honour the Duration/NAV field from the injected header (#96: not honoured by stock 802.11)",
+    ),
+    cfg(
+        "NDN_LORA_CHANNEL",
+        "LoRa channel — 78 (928 MHz) avoids the HaLow co-band collapse",
+    ),
     cfg("NDN_LORA_SF", "LoRa spreading factor"),
     cfg("NDN_LORA_BW", "LoRa bandwidth"),
     cfg("NDN_LORA_POWER", "LoRa TX power"),
@@ -106,26 +153,56 @@ pub const KNOWN: &[Var] = &[
     cfg("NDN_HALOW_BW", "HaLow bandwidth (1/2/4/8 MHz)"),
     cfg("NDN_HALOW_MCS", "HaLow MCS"),
     cfg("NDN_HALOW_POWER", "HaLow TX power"),
-    cfg("NDN_CAD_ON", "LoRa carrier-activity-detect LBT (measured: hurts at N=2)"),
+    cfg(
+        "NDN_CAD_ON",
+        "LoRa carrier-activity-detect LBT (measured: hurts at N=2)",
+    ),
     cfg("NDN_NODE_ID", "node identity for reports"),
     // ---- ndn-fwd radio daemon (cooperative sensing + TX opt-ins; read in radio_face.rs) ----
-    cfg("NDN_RADIO_TX_2T", "opt in to driving both antenna paths on TX, beyond the regulatory-calibrated default (#38)"),
-    cfg("NDN_RADIO_TX_RAW", "raw TXAGC index 0..63 written as-is — CAN EXCEED LICENSED EIRP; explicit operator opt-in only"),
-    cfg("NDN_RADIO_NODE_ID", "stable per-node id for cooperative sensing (the neighbour key others record); default FNV-1a of /etc/hostname"),
-    cfg("NDN_RADIO_REPORT_MS", "reception-report interval, ms (default 1000; 0 = reports off)"),
-    cfg("NDN_RADIO_FEC_MIN", "parity floor for known-lossy links: pins FEC redundancy R >= this (default 0 = fully loss-driven)"),
-    dbg_("NDN_RADIO_REPORT_DATA", "send reception reports via the data path instead of the basic legacy rate — exercises the HT->VHT rate mapping, but legacy-only-RX neighbours stop hearing reports"),
+    cfg(
+        "NDN_RADIO_TX_2T",
+        "opt in to driving both antenna paths on TX, beyond the regulatory-calibrated default (#38)",
+    ),
+    cfg(
+        "NDN_RADIO_TX_RAW",
+        "raw TXAGC index 0..63 written as-is — CAN EXCEED LICENSED EIRP; explicit operator opt-in only",
+    ),
+    cfg(
+        "NDN_RADIO_NODE_ID",
+        "stable per-node id for cooperative sensing (the neighbour key others record); default FNV-1a of /etc/hostname",
+    ),
+    cfg(
+        "NDN_RADIO_REPORT_MS",
+        "reception-report interval, ms (default 1000; 0 = reports off)",
+    ),
+    cfg(
+        "NDN_RADIO_FEC_MIN",
+        "parity floor for known-lossy links: pins FEC redundancy R >= this (default 0 = fully loss-driven)",
+    ),
+    dbg_(
+        "NDN_RADIO_REPORT_DATA",
+        "send reception reports via the data path instead of the basic legacy rate — exercises the HT->VHT rate mapping, but legacy-only-RX neighbours stop hearing reports",
+    ),
     // ---- debug-bisect: driver bring-up ----
-    dbg_("NDN_NO_PUMP", "disable the shared RX pump — starves RX to free USB bandwidth for TX"),
+    dbg_(
+        "NDN_NO_PUMP",
+        "disable the shared RX pump — starves RX to free USB bandwidth for TX",
+    ),
     dbg_("NDN_ASYNC_PUMP", "switch the RX pump to async transfers"),
     dbg_("NDN_RX_PUMP_DEPTH", "in-flight RX transfer depth"),
     dbg_("NDN_RX_AGG_OFF", "disable RX aggregation"),
     dbg_("NDN_RX_AGG_DBG", "log RX aggregation"),
     dbg_("NDN_RX_META_DBG", "log RX metadata parsing"),
     dbg_("NDN_RXDMA_AGG", "RX DMA aggregation tuning"),
-    dbg_("NDN_CCA_OFF", "disable clear-channel assessment — makes the radio a blaster"),
+    dbg_(
+        "NDN_CCA_OFF",
+        "disable clear-channel assessment — makes the radio a blaster",
+    ),
     dbg_("NDN_RADIO_PROBE", "probe and report chip identity only"),
-    dbg_("NDN_RADIO_MINIMAL", "minimal bring-up — skip most init blocks"),
+    dbg_(
+        "NDN_RADIO_MINIMAL",
+        "minimal bring-up — skip most init blocks",
+    ),
     dbg_("NDN_RADIO_SKIP_CAL", "skip IQ/RF calibration"),
     dbg_("NDN_RADIO_NO_RESET", "do not reset the MAC on open"),
     dbg_("NDN_RADIO_NO_EFEM", "skip external front-end module setup"),
@@ -134,7 +211,10 @@ pub const KNOWN: &[Var] = &[
     dbg_("NDN_RADIO_NO_STAREGS", "skip the station register block"),
     dbg_("NDN_RADIO_NO_TXEN", "do not enable TX"),
     dbg_("NDN_RADIO_STAREGS", "force the station register block"),
-    dbg_("NDN_RADIO_FORCE_FW", "force a firmware download over a running MCU (wedges the chip)"),
+    dbg_(
+        "NDN_RADIO_FORCE_FW",
+        "force a firmware download over a running MCU (wedges the chip)",
+    ),
     dbg_("NDN_RADIO_FORCE_8822E", "treat the part as an 8822E"),
     dbg_("NDN_RADIO_CLEAR_HALT", "clear USB endpoint halt"),
     dbg_("NDN_RADIO_EP", "override the USB endpoint"),
@@ -178,9 +258,12 @@ pub fn snapshot() -> Vec<Active> {
     let mut out: Vec<Active> = std::env::vars()
         .filter(|(k, _)| k.starts_with("NDN_"))
         .map(|(k, v)| match table.get(k.as_str()) {
-            Some(known) => {
-                Active { name: k, value: v, class: known.class, what: known.what }
-            }
+            Some(known) => Active {
+                name: k,
+                value: v,
+                class: known.class,
+                what: known.what,
+            },
             None => Active {
                 name: k,
                 value: v,
@@ -242,14 +325,30 @@ mod tests {
             std::env::set_var("NDN_SCHED_SLOT", "8");
         }
         let snap = snapshot();
-        let typo = snap.iter().find(|a| a.name == "NDN_SCHED_CLAM").expect("the typo is reported");
-        assert_eq!(typo.class, Class::Unrecognised, "a name matching nothing must not pass as config");
-        let real = snap.iter().find(|a| a.name == "NDN_SCHED_SLOT").expect("the real one too");
+        let typo = snap
+            .iter()
+            .find(|a| a.name == "NDN_SCHED_CLAM")
+            .expect("the typo is reported");
+        assert_eq!(
+            typo.class,
+            Class::Unrecognised,
+            "a name matching nothing must not pass as config"
+        );
+        let real = snap
+            .iter()
+            .find(|a| a.name == "NDN_SCHED_SLOT")
+            .expect("the real one too");
         assert_eq!(real.class, Class::Config);
 
         let text = describe();
-        assert!(text.contains("UNRECOGNISED"), "and it must be visible in the run header:\n{text}");
-        assert!(text.contains("!!"), "with the warning that the run is not what it claims");
+        assert!(
+            text.contains("UNRECOGNISED"),
+            "and it must be visible in the run header:\n{text}"
+        );
+        assert!(
+            text.contains("!!"),
+            "with the warning that the run is not what it claims"
+        );
         unsafe {
             std::env::remove_var("NDN_SCHED_CLAM");
             std::env::remove_var("NDN_SCHED_SLOT");
@@ -265,7 +364,10 @@ mod tests {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         unsafe { std::env::set_var("NDN_SCHED_CLAIM_UNKNOWN", "1") };
         let text = describe();
-        assert!(text.contains("[DEBUG]"), "debug switches must be labelled:\n{text}");
+        assert!(
+            text.contains("[DEBUG]"),
+            "debug switches must be labelled:\n{text}"
+        );
         assert!(text.contains("!!"), "and warned about:\n{text}");
         unsafe { std::env::remove_var("NDN_SCHED_CLAIM_UNKNOWN") };
     }
@@ -274,12 +376,19 @@ mod tests {
     /// duplicate entry making one classification shadow another.
     #[test]
     fn the_table_is_populated_and_free_of_duplicates() {
-        assert!(KNOWN.len() > 60, "the swept surface was ~70 library-read vars");
+        assert!(
+            KNOWN.len() > 60,
+            "the swept surface was ~70 library-read vars"
+        );
         let mut names: Vec<&str> = KNOWN.iter().map(|v| v.name).collect();
         names.sort_unstable();
         let before = names.len();
         names.dedup();
-        assert_eq!(before, names.len(), "a duplicated name would shadow one classification");
+        assert_eq!(
+            before,
+            names.len(),
+            "a duplicated name would shadow one classification"
+        );
         assert!(
             KNOWN.iter().any(|v| v.class == Class::Config)
                 && KNOWN.iter().any(|v| v.class == Class::DebugBisect),

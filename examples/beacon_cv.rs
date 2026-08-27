@@ -18,8 +18,14 @@ use std::time::{Duration, Instant};
 use ndn_radio_drivers::LibUsbRtl88xxBackend;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let ch: u8 = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(40);
-    let secs: u64 = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(20);
+    let ch: u8 = std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(40);
+    let secs: u64 = std::env::args()
+        .nth(2)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(20);
     let pid: u16 = std::env::var("NDN_PID")
         .ok()
         .and_then(|s| u16::from_str_radix(s.trim_start_matches("0x"), 16).ok())
@@ -27,7 +33,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let d = Arc::new(LibUsbRtl88xxBackend::open_monitor_pid(pid, ch)?);
     let _pump = d.spawn_rx_pump(8);
-    println!("beacon_cv: pid={pid:04x} ch{ch} secs={secs} — measuring hardware common-view jitter…");
+    println!(
+        "beacon_cv: pid={pid:04x} ch{ch} secs={secs} — measuring hardware common-view jitter…"
+    );
 
     // Per-BSSID series of (beacon_tsf, our_rxtsfl), collected by polling the side channel.
     let mut series: HashMap<[u8; 6], Vec<(u64, u64)>> = HashMap::new();
@@ -56,7 +64,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             continue;
         }
         // offset_k = beacon_tsf − rxtsfl (µs, wrapping); first difference removes constant + drift.
-        let offs: Vec<i64> = v.iter().map(|&(b, r)| (b as i64).wrapping_sub(r as i64)).collect();
+        let offs: Vec<i64> = v
+            .iter()
+            .map(|&(b, r)| (b as i64).wrapping_sub(r as i64))
+            .collect();
         let mut diffs: Vec<i64> = offs.windows(2).map(|w| w[1] - w[0]).collect();
         // Drop a lone 2^32 step if the 32-bit RXTSFL wrapped mid-run (a real hardware artifact, not
         // clock jitter): keep only |d| < 100 ms.
@@ -65,9 +76,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             continue;
         }
         let mean = diffs.iter().sum::<i64>() as f64 / diffs.len() as f64;
-        let var = diffs.iter().map(|&x| (x as f64 - mean).powi(2)).sum::<f64>() / diffs.len() as f64;
+        let var = diffs
+            .iter()
+            .map(|&x| (x as f64 - mean).powi(2))
+            .sum::<f64>()
+            / diffs.len() as f64;
         let (min, max) = (*diffs.iter().min().unwrap(), *diffs.iter().max().unwrap());
-        let mac = bssid.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(":");
+        let mac = bssid
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<Vec<_>>()
+            .join(":");
         println!(
             "{mac}  {:>7}  {:>10.2} µs  {:>6} µs",
             v.len(),

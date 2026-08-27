@@ -16,7 +16,10 @@ use ndn_radio_drivers::open_ath9k;
 use ndn_radio_hal::{InjectFrame, McsDescriptor, TxIntent};
 
 fn main() -> ExitCode {
-    let ch: u8 = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(1);
+    let ch: u8 = std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1);
     let radio = match open_ath9k(ch) {
         Ok(r) => r,
         Err(e) => {
@@ -27,7 +30,10 @@ fn main() -> ExitCode {
     let io = radio.io.clone();
     let knobs = radio.knobs.clone().expect("knobs");
 
-    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
     rt.block_on(async {
         let burst = |io: std::sync::Arc<dyn ndn_radio_hal::FrameIo>, tag: u8, n: usize| async move {
             for i in 0..n {
@@ -57,14 +63,24 @@ fn main() -> ExitCode {
         }
 
         // ── power test at MCS0: high then low (witness RSSI should drop) ──
-        io.set_rate(McsDescriptor { index: 0, short_gi: false, vht: false, nss: 1, stbc: false, ldpc: false }).ok();
+        io.set_rate(McsDescriptor {
+            index: 0,
+            short_gi: false,
+            vht: false,
+            nss: 1,
+            stbc: false,
+            ldpc: false,
+        })
+        .ok();
         for (tag, dbm) in [(0x20u8, 30i8), (0x21u8, 6i8)] {
             let applied = knobs.set_tx_power_dbm(dbm).unwrap_or(-1);
             println!("power {dbm} dBm (applied {applied}) tag {tag:#04x} — 40 frames");
             burst(io.clone(), tag, 40).await;
             tokio::time::sleep(Duration::from_millis(300)).await;
         }
-        println!("done — check the witness for MCS0-7 rates and the RSSI drop on the low-power burst.");
+        println!(
+            "done — check the witness for MCS0-7 rates and the RSSI drop on the low-power burst."
+        );
     });
     let _ = radio;
     ExitCode::SUCCESS

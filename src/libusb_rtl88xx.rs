@@ -58,7 +58,7 @@ use ndn_transport::FaceError;
 
 use crate::McsDescriptor;
 use crate::frame::LLC_SNAP_PREFIX;
-use crate::{CapturedFrame, FrameFormat, InjectFrame, FrameIo};
+use crate::{CapturedFrame, FrameFormat, FrameIo, InjectFrame};
 use ndn_frame_io::ClockDomainId;
 use ndn_radio_hal::{RadioCapability, RadioProfile, RadioTime, RadioTimeSource, RateCapability};
 
@@ -1046,15 +1046,19 @@ impl LibUsbRtl88xxBackend {
             )));
         }
         if info.chip_id != CHIP_ID_8822E {
-            tracing::warn!(chip_id = format!("{:#04x}", info.chip_id),
-                "NDN_RADIO_FORCE_8822E: running the 8822E power sequence on a non-0x17 chip id");
+            tracing::warn!(
+                chip_id = format!("{:#04x}", info.chip_id),
+                "NDN_RADIO_FORCE_8822E: running the 8822E power sequence on a non-0x17 chip id"
+            );
         }
 
         self.pre_init_system_cfg()?;
         if force {
             let post = self.chip_info()?;
-            tracing::warn!(chip_id_after_precfg = format!("{:#04x}", post.chip_id),
-                "chip id re-read after pre_init_system_cfg");
+            tracing::warn!(
+                chip_id_after_precfg = format!("{:#04x}", post.chip_id),
+                "chip id re-read after pre_init_system_cfg"
+            );
         }
 
         self.leave_32k()?;
@@ -1563,7 +1567,10 @@ impl LibUsbRtl88xxBackend {
         // (priority_queue_cfg set REG_BCNQ_BDNY_V1 0x0424 / 0x0204 = RSVD_BOUNDARY), NOT page 0.
         // rtw_fw_write_data_rsvd_page: head→rsvd_boundary + clear BCN_VALID; ENSWBCN; beacon function
         // OFF during the write; send; poll BCN_VALID; restore head, ENSWBCN, and the beacon role.
-        self.write16(REG_FIFOPAGE_CTRL_2, (Self::RSVD_BOUNDARY & 0x0fff) | (1 << 15))?;
+        self.write16(
+            REG_FIFOPAGE_CTRL_2,
+            (Self::RSVD_BOUNDARY & 0x0fff) | (1 << 15),
+        )?;
         let cr1 = self.read8(REG_CR + 1)?;
         self.set8(REG_CR + 1, ENSWBCN)?;
         self.write8(REG_BCN_CTRL, (bcn_backup & !EN_BCN_FUNCTION) | DIS_TSF_UDT)?;
@@ -1575,11 +1582,16 @@ impl LibUsbRtl88xxBackend {
                 break;
             }
         }
-        self.write16(REG_FIFOPAGE_CTRL_2, (Self::RSVD_BOUNDARY & 0x0fff) | (1 << 15))?;
+        self.write16(
+            REG_FIFOPAGE_CTRL_2,
+            (Self::RSVD_BOUNDARY & 0x0fff) | (1 << 15),
+        )?;
         self.write8(REG_CR + 1, cr1)?;
         self.write8(REG_BCN_CTRL, bcn_backup | EN_BCN_FUNCTION | DIS_TSF_UDT)?;
         if !valid {
-            return Err(init_err("rtl88xx timing beacon: BCN_VALID poll timeout".into()));
+            return Err(init_err(
+                "rtl88xx timing beacon: BCN_VALID poll timeout".into(),
+            ));
         }
 
         // THE step that was missing: arm periodic TBTT transmission. EN_BCNQ_DL (0x0422 bit6) SET arms
@@ -2726,7 +2738,9 @@ impl LibUsbRtl88xxBackend {
     /// [`set_channel`]: Self::set_channel
     pub fn set_channel_fast(&self, central_ch: u8) -> Result<(), FaceError> {
         if central_ch <= 14 {
-            return Err(init_err("rtl88xx phy: 2.4 GHz not ported (5 GHz only)".into()));
+            return Err(init_err(
+                "rtl88xx phy: 2.4 GHz not ported (5 GHz only)".into(),
+            ));
         }
         let band = |ch: u8| -> u8 {
             if ch < 80 {
@@ -3481,7 +3495,8 @@ impl LibUsbRtl88xxBackend {
         // measured: five indices commanded, Ok returned every time, zero RF effect. Storing the
         // base here makes the watchdog PRESERVE the request (thermally compensated around it,
         // which is the correct semantics for a user-set index) instead of fighting it.
-        self.tx_ref_base.store(idx.min(0x3f) as u8, Ordering::Relaxed);
+        self.tx_ref_base
+            .store(idx.min(0x3f) as u8, Ordering::Relaxed);
         Ok(())
     }
 
@@ -4128,7 +4143,11 @@ impl LibUsbRtl88xxBackend {
                 & 0x1f;
             let one_tx = std::env::var("NDN_TONE_1T").is_ok();
             self.bb_write(0x1d58, 0xff8, 0x1ff)?; // disable OFDM CCA
-            let paths: &[RfPath] = if one_tx { &[RfPath::A] } else { &[RfPath::A, RfPath::B] };
+            let paths: &[RfPath] = if one_tx {
+                &[RfPath::A]
+            } else {
+                &[RfPath::A, RfPath::B]
+            };
             for &path in paths {
                 self.rf_write(path, 0x00, 0xf0000, 0x2)?; // TX mode
                 self.rf_write(path, 0x00, 0x1f, gain)?; // gain idx (0=max pwr)
@@ -4795,11 +4814,7 @@ impl LibUsbRtl88xxBackend {
         // a 1-stream rate (HT MCS0–7, or VHT `nss == 1`): there is no 802.11 STBC
         // mode for 2 spatial streams, so suppress the bit for 2-stream rates
         // rather than emit an illegal HT-SIG/VHT-SIG. `NDN_RADIO_STBC=1` forces it.
-        let one_stream = if mcs.vht {
-            mcs.nss < 2
-        } else {
-            mcs.index < 8
-        };
+        let one_stream = if mcs.vht { mcs.nss < 2 } else { mcs.index < 8 };
         let stbc =
             !legacy_robust && (mcs.stbc || std::env::var("NDN_RADIO_STBC").is_ok()) && one_stream;
         if stbc {
@@ -4877,7 +4892,10 @@ impl LibUsbRtl88xxBackend {
                 .map_err(usb_err)
                 .and_then(|w| {
                     (w == buf.len()).then_some(()).ok_or_else(|| {
-                        init_err(format!("rtl88xx inject_ampdu: short write {w}/{}", buf.len()))
+                        init_err(format!(
+                            "rtl88xx inject_ampdu: short write {w}/{}",
+                            buf.len()
+                        ))
                     })
                 })
         })
@@ -4912,6 +4930,8 @@ impl LibUsbRtl88xxBackend {
             dst,
             src,
             addr3: None,
+            addr4: None,
+            htc: None,
         };
         let buf = self.build_tx_body(&frame, mcs, None, Some(body))?;
         let handle = self.handle.clone();
@@ -4922,7 +4942,10 @@ impl LibUsbRtl88xxBackend {
                 .map_err(usb_err)
                 .and_then(|w| {
                     (w == buf.len()).then_some(()).ok_or_else(|| {
-                        init_err(format!("rtl88xx inject_amsdu: short write {w}/{}", buf.len()))
+                        init_err(format!(
+                            "rtl88xx inject_amsdu: short write {w}/{}",
+                            buf.len()
+                        ))
                     })
                 })
         })
@@ -4953,6 +4976,8 @@ impl LibUsbRtl88xxBackend {
             dst,
             src,
             addr3: None,
+            addr4: None,
+            htc: None,
         };
         let mut buf = Vec::new();
         for (i, msdus) in mpdus.iter().enumerate() {
@@ -5114,7 +5139,10 @@ impl LibUsbRtl88xxBackend {
         // is Copy, so it rides all decode paths below.
         let stamp = Some(crate::realtek_rx::rx_stamp(dw(0x14), self.tsf_domain));
         if std::env::var("NDN_RX_META_DBG").is_ok() {
-            eprintln!("RX88 rate=0x{data_rate:02x} rssi={rssi_dbm:?} tsfl={}", dw(0x14));
+            eprintln!(
+                "RX88 rate=0x{data_rate:02x} rssi={rssi_dbm:?} tsfl={}",
+                dw(0x14)
+            );
         }
         // Decode the 802.11 data frame into one CapturedFrame, or — for a QoS
         // A-MSDU — several (the link-layer bundle de-aggregated back into the
@@ -5174,13 +5202,20 @@ impl LibUsbRtl88xxBackend {
                         .collect();
                 }
             };
-            // Type must be Data (FC byte0 bits\[3:2\]); the QoS subtype (bit 7) adds
-            // a 2-byte QoS Control field, so the MAC header is 26 not 24 bytes.
+            // Type must be Data (FC byte0 bits\[3:2\]). The header grows by whichever optional
+            // fields the frame control announces, in fixed order after SeqCtrl: addr4 (ToDS=FromDS=1),
+            // QoS Control (QoS-Data subtype, byte0 bit 7), HT Control (Order bit, byte1 bit 7). The
+            // wide profile sets all three (36 B); an A-MSDU sets only QoS (26 B); a plain frame none.
             if frame.len() < 24 || frame[0] & 0x0c != 0x08 {
                 return vec![];
             }
             let qos = frame[0] & 0x80 != 0;
-            let hdr = if qos { 26 } else { 24 };
+            let four_addr = frame[1] & 0x03 == 0x03; // ToDS && FromDS
+            let htc_present = frame[1] & 0x80 != 0; // Order bit ⇒ HT Control
+            let hdr = 24
+                + if four_addr { 6 } else { 0 }
+                + if qos { 2 } else { 0 }
+                + if htc_present { 4 } else { 0 };
             if frame.len() < hdr {
                 return vec![];
             }
@@ -5195,11 +5230,34 @@ impl LibUsbRtl88xxBackend {
                 a.copy_from_slice(s);
                 a
             });
+            // Wide profile: addr4 (extra Blur) @24 when four_addr; HT Control (fingerprint + marker)
+            // immediately after the QoS Control that precedes it.
+            let addr4 = if four_addr {
+                frame.get(24..30).map(|s| {
+                    let mut a = [0u8; 6];
+                    a.copy_from_slice(s);
+                    a
+                })
+            } else {
+                None
+            };
+            let htc = if htc_present {
+                let off = 24 + if four_addr { 6 } else { 0 } + if qos { 2 } else { 0 };
+                frame.get(off..off + 4).map(|s| {
+                    let mut h = [0u8; 4];
+                    h.copy_from_slice(s);
+                    h
+                })
+            } else {
+                None
+            };
 
             // A-MSDU: QoS data with A-MSDU-Present (QoS Ctrl byte 0 bit 7) →
             // de-aggregate `[DA(6) SA(6) Len(2 BE) | LLC/SNAP+payload]` subframes,
-            // each 4-byte-padded; each becomes its own CapturedFrame.
-            if qos && frame[24] & 0x80 != 0 {
+            // each 4-byte-padded; each becomes its own CapturedFrame. Guarded on `!four_addr`:
+            // in a 4-address wide frame byte 24 is addr4, not the QoS Control byte — without the
+            // guard a wide frame would be mis-detected as an aggregate.
+            if qos && !four_addr && frame[24] & 0x80 != 0 {
                 let mut out = Vec::new();
                 let mut p = hdr;
                 while p + 14 <= frame.len() {
@@ -5222,6 +5280,8 @@ impl LibUsbRtl88xxBackend {
                             addr: Some(sa),
                             group: Some(da),
                             addr3, // outer-header nonce, shared by all A-MSDU subframes
+                            addr4: None, // A-MSDU is a 3-address QoS frame, never the wide profile
+                            htc: None,
                             rssi_dbm,
                             mcs_index,
                             stamp,
@@ -5246,6 +5306,8 @@ impl LibUsbRtl88xxBackend {
                 addr: Some(addr2),
                 group: Some(addr1),
                 addr3,
+                addr4,
+                htc,
                 rssi_dbm,
                 mcs_index,
                 stamp,
@@ -5398,7 +5460,11 @@ impl RadioProfile for LibUsbRtl88xxBackend {
         // same margin. An optimistic inherited value is worse than a pessimistic one, and neither
         // ever looks wrong on inspection.
         RadioCapability {
-            rate: RateCapability::Wifi { max_mcs: 7, max_nss: 1, max_bw: 1 },
+            rate: RateCapability::Wifi {
+                max_mcs: 7,
+                max_nss: 1,
+                max_bw: 1,
+            },
             retune_us: Some(26_000),
             ..RadioCapability::wifi_monitor_5ghz(vec![36, 40, 44, 48, 149, 153, 157, 161])
         }
@@ -5413,10 +5479,9 @@ impl LibUsbRtl88xxBackend {
     /// The rate to transmit `frame` at: the control-plane-set MCS (state) if present,
     /// else the frame's `TxIntent` resolved to this 2×2 5 GHz radio.
     fn resolved_mcs(&self, frame: &InjectFrame) -> crate::McsDescriptor {
-        self.cur_mcs
-            .lock()
-            .unwrap()
-            .unwrap_or_else(|| crate::McsDescriptor::for_intent(&frame.tx, crate::MAX_RELIABLE_MCS, true, false))
+        self.cur_mcs.lock().unwrap().unwrap_or_else(|| {
+            crate::McsDescriptor::for_intent(&frame.tx, crate::MAX_RELIABLE_MCS, true, false)
+        })
     }
 
     /// A-MSDU-bundle maximal runs sharing dst/src/**rate** into one MPDU, bounded by
@@ -5446,8 +5511,10 @@ impl LibUsbRtl88xxBackend {
                 let buf = self.build_tx(&frames[i].0, mcs0, None)?;
                 self.send_buf(buf, "inject").await?;
             } else {
-                let payloads: Vec<Bytes> =
-                    frames[i..j].iter().map(|(f, _)| f.payload.clone()).collect();
+                let payloads: Vec<Bytes> = frames[i..j]
+                    .iter()
+                    .map(|(f, _)| f.payload.clone())
+                    .collect();
                 self.inject_amsdu(&payloads, mcs0, f0.dst, f0.src).await?;
             }
             i = j;

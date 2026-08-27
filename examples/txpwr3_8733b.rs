@@ -34,13 +34,21 @@ const DP_DEFAULT: u8 = 0x24; // mid-point of the stock 0x1c..0x38 ramp
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let ch: u8 = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(36);
-    let n: usize = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(900);
+    let ch: u8 = std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(36);
+    let n: usize = std::env::args()
+        .nth(2)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(900);
 
     let dev = Arc::new(Rtl8733buBackend::open()?);
     let _tracker = dev.bring_up_tx_tracked(ch)?; // keep tracking alive: thermal droop would otherwise
-                                                 // look like a gain effect on the later arms
-    println!("txpwr3 ch{ch} {n} frames/index — payload[0]=index payload[1]=knob(0 ref,1 table,2 datapath)");
+    // look like a gain effect on the later arms
+    println!(
+        "txpwr3 ch{ch} {n} frames/index — payload[0]=index payload[1]=knob(0 ref,1 table,2 datapath)"
+    );
 
     for knob in 0u8..3 {
         // Exactly one control varies per arm.
@@ -63,6 +71,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 dst: BROADCAST,
                 src: [0x02, 0x50, 0x33, 0x00, knob, idx],
                 addr3: None,
+                addr4: None,
+                htc: None,
             };
             for _ in 0..n {
                 dev.inject(f.clone()).await?;

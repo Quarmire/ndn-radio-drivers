@@ -500,8 +500,7 @@ impl Ath9kHtcBackend {
 
         // Per-device RX-stamp clock domain (bus<<8 | address), for the FreeRunRxStamp M2 clock.
         let d = handle.device();
-        let tsf_domain =
-            ClockDomainId((u32::from(d.bus_number()) << 8) | u32::from(d.address()));
+        let tsf_domain = ClockDomainId((u32::from(d.bus_number()) << 8) | u32::from(d.address()));
 
         // ⛔ DO NOT port-reset this device. It was tried and it is destructive: `handle.reset()`
         // on an AR9271 that is already running firmware makes it re-enumerate, and on the o5p-1
@@ -566,7 +565,8 @@ impl Ath9kHtcBackend {
     /// Record the channel number the PHY was brought up on (see [`Ath9kHtcBackend::channel`]).
     /// Called by `open_ath9k` after `hw_reset`, so `RadioKnobs::set_channel` can validate applies.
     pub fn note_channel(&self, channel: u8) {
-        self.channel.store(channel, std::sync::atomic::Ordering::Relaxed);
+        self.channel
+            .store(channel, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// The clock domain the AR9271's per-frame `rs_tstamp` lives on — build a `LinkStamp` from an
@@ -1038,7 +1038,8 @@ impl Ath9kHtcBackend {
             let base = addr + (chunk_idx * NDR_MEM_MAX_TUPLES * 4) as u32;
 
             let mut payload = Vec::with_capacity(4 + chunk.len() * 8);
-            payload.extend_from_slice(&(if write { NDR_MEM_FLAG_WRITE } else { 0u16 }).to_be_bytes());
+            payload
+                .extend_from_slice(&(if write { NDR_MEM_FLAG_WRITE } else { 0u16 }).to_be_bytes());
             payload.extend_from_slice(&(chunk.len() as u16).to_be_bytes());
             for (i, v) in chunk.iter().enumerate() {
                 payload.extend_from_slice(&(base + (i * 4) as u32).to_be_bytes());
@@ -1072,7 +1073,12 @@ impl Ath9kHtcBackend {
 
             for i in 0..count {
                 let v = 4 + i * 8 + 4;
-                out.push(u32::from_be_bytes([resp[v], resp[v + 1], resp[v + 2], resp[v + 3]]));
+                out.push(u32::from_be_bytes([
+                    resp[v],
+                    resp[v + 1],
+                    resp[v + 2],
+                    resp[v + 3],
+                ]));
             }
         }
 
@@ -1461,20 +1467,24 @@ impl Ath9kHtcBackend {
         // TX-gain. Expected = last value written to each addr (overlaps resolve to the
         // last writer automatically).
         let sentinels: [u32; 8] = [
-            0x9840,  // MODES digital PHY
-            0x9848,  // MODES digital PHY (2G-HT20 col: 0x1053)
-            0x9910,  // MODES digital PHY
-            0x99c0,  // MODES ∩ ANI (same col-4 value)
-            0x7804,  // COMMON analog (0x78xx)
-            0x7808,  // COMMON analog (0x78xx)
-            0xa208,  // COMMON ∩ ANI
-            0xa30c,  // TX-gain (normal power)
+            0x9840, // MODES digital PHY
+            0x9848, // MODES digital PHY (2G-HT20 col: 0x1053)
+            0x9910, // MODES digital PHY
+            0x99c0, // MODES ∩ ANI (same col-4 value)
+            0x7804, // COMMON analog (0x78xx)
+            0x7808, // COMMON analog (0x78xx)
+            0xa208, // COMMON ∩ ANI
+            0xa30c, // TX-gain (normal power)
         ];
         let mut mismatches = Vec::new();
         let mut matched = 0usize;
         let mut checked = 0usize;
         for addr in sentinels {
-            let Some(expected) = written.iter().rev().find(|(a, _)| *a == addr).map(|(_, v)| *v)
+            let Some(expected) = written
+                .iter()
+                .rev()
+                .find(|(a, _)| *a == addr)
+                .map(|(_, v)| *v)
             else {
                 continue; // addr not in any streamed table — skip
             };
@@ -1632,7 +1642,14 @@ impl Ath9kHtcBackend {
     /// 0 if the EEPROM can't be validated (falls back to the normal table).
     pub fn eeprom_tx_gain_type(&self) -> u8 {
         for _ in 0..5 {
-            let s: Vec<u16> = (0..32).map(|w| (self.reg_read(0x2000 + (((w as u32) + 64) << 2)).unwrap_or(0) & 0xffff) as u16).collect();
+            let s: Vec<u16> = (0..32)
+                .map(|w| {
+                    (self
+                        .reg_read(0x2000 + (((w as u32) + 64) << 2))
+                        .unwrap_or(0)
+                        & 0xffff) as u16
+                })
+                .collect();
             // byte 31 = high byte of word 15.
             if s[0] as usize >= 32 {
                 return (s[15] >> 8) as u8;
@@ -1643,14 +1660,20 @@ impl Ath9kHtcBackend {
 
     /// Mark this as a high-power module so [`apply_initvals`] streams the HIGH_POWER gain table.
     pub fn set_high_power(&self, on: bool) {
-        self.high_power.store(on, std::sync::atomic::Ordering::Relaxed);
+        self.high_power
+            .store(on, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn set_board_values(&self) -> Result<BoardValues, FaceError> {
         // M1: read + XOR-validate the 4k EEPROM (word w = reg 0x2000 + ((w+64)<<2)). Retry the whole
         // read — a single glitched reg_read among 376 words fails the strict XOR, and the WMI reg path
         // can glitch one word under concurrent TX; a clean re-read fixes it.
-        let rd = |w: usize| (self.reg_read(0x2000 + (((w as u32) + 64) << 2)).unwrap_or(0xffff_ffff) & 0xffff) as u16;
+        let rd = |w: usize| {
+            (self
+                .reg_read(0x2000 + (((w as u32) + 64) << 2))
+                .unwrap_or(0xffff_ffff)
+                & 0xffff) as u16
+        };
         let mut s: Vec<u16> = Vec::new();
         let mut checksum_ok = false;
         for _ in 0..5 {
@@ -1669,7 +1692,11 @@ impl Ath9kHtcBackend {
         }
         let byte = |off: usize| -> u8 {
             let w = s[off / 2];
-            if off & 1 == 0 { (w & 0xff) as u8 } else { (w >> 8) as u8 }
+            if off & 1 == 0 {
+                (w & 0xff) as u8
+            } else {
+                (w >> 8) as u8
+            }
         };
 
         // base_eep_header_4k = 32 B (txGainType@31); custData[20]; modalHeader @byte 52.
@@ -1735,7 +1762,10 @@ impl Ath9kHtcBackend {
             self.reg_rmw(0x9844, sw_settling << 7, 0x0000_3F80)?; // AR_PHY_SETTLING SWITCH
             self.reg_rmw(0x9850, adc_desired, 0x0000_00FF)?; //      AR_PHY_DESIRED_SZ ADC
             // AR_PHY_RF_CTL4: XPAA_OFF(16) | XPAB_OFF(24) | XPAA_ON(0) | XPAB_ON(8) — write all 4 fields.
-            let rf_ctl4 = (tx_end_xpa_off << 16) | (tx_end_xpa_off << 24) | tx_frame_xpa_on | (tx_frame_xpa_on << 8);
+            let rf_ctl4 = (tx_end_xpa_off << 16)
+                | (tx_end_xpa_off << 24)
+                | tx_frame_xpa_on
+                | (tx_frame_xpa_on << 8);
             self.reg_write(0x9834, rf_ctl4)?;
             self.reg_rmw(0x9828, tx_end_rx_on << 16, 0x00FF_0000)?; // AR_PHY_RF_CTL3 TX_END_TO_A2_RX_ON
             self.reg_rmw(0x9824, tx_frame_data_start, 0x0000_00FF)?; // AR_PHY_RF_CTL2 TX_END_DATA_START
@@ -1765,7 +1795,12 @@ impl Ath9kHtcBackend {
     pub fn set_txpower_4k(&self, chan_mhz: u16) -> Result<i16, FaceError> {
         use crate::ath9k_reg::AR_PHY_BASE;
         // M1 read + validate (retry).
-        let rd = |w: usize| (self.reg_read(0x2000 + (((w as u32) + 64) << 2)).unwrap_or(0xffff_ffff) & 0xffff) as u16;
+        let rd = |w: usize| {
+            (self
+                .reg_read(0x2000 + (((w as u32) + 64) << 2))
+                .unwrap_or(0xffff_ffff)
+                & 0xffff) as u16
+        };
         let mut s: Vec<u16> = Vec::new();
         for _ in 0..5 {
             s = (0..400).map(rd).collect();
@@ -1780,7 +1815,11 @@ impl Ath9kHtcBackend {
         }
         let byte = |off: usize| -> u8 {
             let w = s[off / 2];
-            if off & 1 == 0 { (w & 0xff) as u8 } else { (w >> 8) as u8 }
+            if off & 1 == 0 {
+                (w & 0xff) as u8
+            } else {
+                (w >> 8) as u8
+            }
         };
 
         const NUM_PD: usize = 2; // AR5416_EEP4K_NUM_PD_GAINS
@@ -1804,7 +1843,9 @@ impl Ath9kHtcBackend {
             }
         }
         if num_xpd == 0 {
-            return Err(err(format!("set_txpower_4k: xpdGain mask {xpd_gain:#04x} has no gains")));
+            return Err(err(format!(
+                "set_txpower_4k: xpdGain mask {xpd_gain:#04x} has no gains"
+            )));
         }
 
         // ch1 (2412) == cal pier 0 (calFreqPier2G @120 = 0x70/0x8e/0xac). Use pier 0 directly (match).
@@ -1856,10 +1897,13 @@ impl Ath9kHtcBackend {
                 k += 1;
                 ss += 1;
             }
-            let vpd_step2 = ((vpd_i[g][size_curr as usize - 1] as i16) - (vpd_i[g][size_curr as usize - 2] as i16)).max(1);
+            let vpd_step2 = ((vpd_i[g][size_curr as usize - 1] as i16)
+                - (vpd_i[g][size_curr as usize - 2] as i16))
+                .max(1);
             if tgt_index >= max_index {
                 while ss <= tgt_index && k < NUM_PDADC - 1 {
-                    let t = vpd_i[g][size_curr as usize - 1] as i16 + (ss - max_index + 1) * vpd_step2;
+                    let t =
+                        vpd_i[g][size_curr as usize - 1] as i16 + (ss - max_index + 1) * vpd_step2;
                     pdadc[k] = t.min(255) as u8;
                     k += 1;
                     ss += 1;
@@ -1877,9 +1921,21 @@ impl Ath9kHtcBackend {
 
         // ── Program AR_PHY_TPCRG1 (num PD gains + gain values) ──
         const AR_PHY_TPCRG1: u32 = 0xA258;
-        self.reg_rmw(AR_PHY_TPCRG1, ((num_xpd as u32 - 1) & 0x3) << 14, 0x0000_c000)?;
-        self.reg_rmw(AR_PHY_TPCRG1, (xpd_gain_values[0] as u32) << 16, 0x0003_0000)?;
-        self.reg_rmw(AR_PHY_TPCRG1, (xpd_gain_values[1] as u32) << 18, 0x000C_0000)?;
+        self.reg_rmw(
+            AR_PHY_TPCRG1,
+            ((num_xpd as u32 - 1) & 0x3) << 14,
+            0x0000_c000,
+        )?;
+        self.reg_rmw(
+            AR_PHY_TPCRG1,
+            (xpd_gain_values[0] as u32) << 16,
+            0x0003_0000,
+        )?;
+        self.reg_rmw(
+            AR_PHY_TPCRG1,
+            (xpd_gain_values[1] as u32) << 18,
+            0x000C_0000,
+        )?;
         self.reg_rmw(AR_PHY_TPCRG1, 0, 0x0030_0000)?; // PD_GAIN_3 = 0
 
         // ── AR_PHY_TPCRG5: PD gain overlap + boundaries ──
@@ -1910,13 +1966,22 @@ impl Ath9kHtcBackend {
         // ar5416 rate→target-group mapping (legacy). ratesArray indexed by the Ar5416_Rates enum.
         let mut rates = [0i16; 24];
         // OFDM: 6/9=[0] 12/18/24=[1] 36=[2] 48/54=[3]
-        rates[0] = ofdm(0); rates[1] = ofdm(0); // 6,9
-        rates[2] = ofdm(1); rates[3] = ofdm(1); // 12,18
-        rates[4] = ofdm(1); rates[5] = ofdm(2); // 24,36
-        rates[6] = ofdm(3); rates[7] = ofdm(3); // 48,54
+        rates[0] = ofdm(0);
+        rates[1] = ofdm(0); // 6,9
+        rates[2] = ofdm(1);
+        rates[3] = ofdm(1); // 12,18
+        rates[4] = ofdm(1);
+        rates[5] = ofdm(2); // 24,36
+        rates[6] = ofdm(3);
+        rates[7] = ofdm(3); // 48,54
         // CCK: 1l=[0] 2l/2s=[1] 5.5=[2] 11=[3]  (indices rate1l=8..rate11s=14)
-        rates[8] = cck(0); rates[9] = cck(1); rates[10] = cck(1); // 1l,2l,2s
-        rates[11] = cck(2); rates[12] = cck(2); rates[13] = cck(3); rates[14] = cck(3); // 5.5l/s,11l/s
+        rates[8] = cck(0);
+        rates[9] = cck(1);
+        rates[10] = cck(1); // 1l,2l,2s
+        rates[11] = cck(2);
+        rates[12] = cck(2);
+        rates[13] = cck(3);
+        rates[14] = cck(3); // 5.5l/s,11l/s
         // HT20 MCS0-7 (indices rateHt20_0=16..23)
         for m in 0..8 {
             rates[16 + m] = ht20(m);
@@ -1931,14 +1996,41 @@ impl Ath9kHtcBackend {
         }
         let pow_sm = |r: i16, sh: u32| ((r as u32) & 0x3f) << sh;
         // OFDM
-        self.reg_write(0x9934, pow_sm(rates[3], 24) | pow_sm(rates[2], 16) | pow_sm(rates[1], 8) | pow_sm(rates[0], 0))?; // RATE1
-        self.reg_write(0x9938, pow_sm(rates[7], 24) | pow_sm(rates[6], 16) | pow_sm(rates[5], 8) | pow_sm(rates[4], 0))?; // RATE2
+        self.reg_write(
+            0x9934,
+            pow_sm(rates[3], 24) | pow_sm(rates[2], 16) | pow_sm(rates[1], 8) | pow_sm(rates[0], 0),
+        )?; // RATE1
+        self.reg_write(
+            0x9938,
+            pow_sm(rates[7], 24) | pow_sm(rates[6], 16) | pow_sm(rates[5], 8) | pow_sm(rates[4], 0),
+        )?; // RATE2
         // CCK (RATE3: 2s,2l,xr,1l ; RATE4: 11s,11l,5.5s,5.5l)
-        self.reg_write(0xA234, pow_sm(rates[10], 24) | pow_sm(rates[9], 16) | pow_sm(0, 8) | pow_sm(rates[8], 0))?; // RATE3
-        self.reg_write(0xA238, pow_sm(rates[14], 24) | pow_sm(rates[13], 16) | pow_sm(rates[12], 8) | pow_sm(rates[11], 0))?; // RATE4
+        self.reg_write(
+            0xA234,
+            pow_sm(rates[10], 24) | pow_sm(rates[9], 16) | pow_sm(0, 8) | pow_sm(rates[8], 0),
+        )?; // RATE3
+        self.reg_write(
+            0xA238,
+            pow_sm(rates[14], 24)
+                | pow_sm(rates[13], 16)
+                | pow_sm(rates[12], 8)
+                | pow_sm(rates[11], 0),
+        )?; // RATE4
         // HT20
-        self.reg_write(0xA38C, pow_sm(rates[19], 24) | pow_sm(rates[18], 16) | pow_sm(rates[17], 8) | pow_sm(rates[16], 0))?; // RATE5
-        self.reg_write(0xA390, pow_sm(rates[23], 24) | pow_sm(rates[22], 16) | pow_sm(rates[21], 8) | pow_sm(rates[20], 0))?; // RATE6
+        self.reg_write(
+            0xA38C,
+            pow_sm(rates[19], 24)
+                | pow_sm(rates[18], 16)
+                | pow_sm(rates[17], 8)
+                | pow_sm(rates[16], 0),
+        )?; // RATE5
+        self.reg_write(
+            0xA390,
+            pow_sm(rates[23], 24)
+                | pow_sm(rates[22], 16)
+                | pow_sm(rates[21], 8)
+                | pow_sm(rates[20], 0),
+        )?; // RATE6
         // TPC off → the per-rate table is the cap; PA drives to it via the PDADC map.
         self.reg_write(0x993c, MAX_RATE_POWER as u32)?; // AR_PHY_POWER_TX_RATE_MAX (no TPC_ENABLE)
 
@@ -1979,10 +2071,8 @@ impl Ath9kHtcBackend {
         };
         let channel_sel = ((synth_mhz as u64 * 0x1_0000) / CHANSEL_2G_DIV) as u32;
         let prev = self.reg_read(AR_PHY_SYNTH_CONTROL)? & 0xc000_0000;
-        let synth = prev
-            | AR_PHY_SYNTH_CONTROL_2G_BMODE
-            | AR_PHY_SYNTH_CONTROL_2G_FRACMODE
-            | channel_sel; // aModeRefSel = 0
+        let synth =
+            prev | AR_PHY_SYNTH_CONTROL_2G_BMODE | AR_PHY_SYNTH_CONTROL_2G_FRACMODE | channel_sel; // aModeRefSel = 0
         self.reg_write(AR_PHY_SYNTH_CONTROL, synth)?;
         Self::settle(2);
         Ok(())
@@ -2117,7 +2207,11 @@ impl Ath9kHtcBackend {
     /// the ISR, seeds the RSSI threshold, then applies the operating mode (monitor ⇒
     /// KSRCH_MODE only, both AP/ADHOC opmode bits cleared). `mac_sta_id1` is the
     /// `AR_STA_ID1 & BASE_RATE_11B` saved before the chip reset.
-    pub fn reset_opmode(&mut self, mac_sta_id1: u32, save_def_antenna: u32) -> Result<(), FaceError> {
+    pub fn reset_opmode(
+        &mut self,
+        mac_sta_id1: u32,
+        save_def_antenna: u32,
+    ) -> Result<(), FaceError> {
         use crate::ath9k_reg::*;
         // REG_RMW(AR_STA_ID1, macStaId1 | RTS_USE_DEF | sta_id1_defaults, ~SADH_MASK).
         // sta_id1_defaults is 0 for our config.
@@ -2824,7 +2918,11 @@ impl RadioTime for Ath9kHtcBackend {
         let lo = self.reg_read(AR_TSF_L32)?;
         let hi2 = self.reg_read(AR_TSF_U32)?;
         // If the low word wrapped between the two high reads, take the second high with lo=0-ish edge.
-        let (hi, lo) = if hi1 == hi2 { (hi1, lo) } else { (hi2, self.reg_read(AR_TSF_L32)?) };
+        let (hi, lo) = if hi1 == hi2 {
+            (hi1, lo)
+        } else {
+            (hi2, self.reg_read(AR_TSF_L32)?)
+        };
         Ok(Some(((hi as u64) << 32) | lo as u64))
     }
 }
@@ -2992,7 +3090,13 @@ fn parse_rx_unit(
             1_000,
             LatchPoint::MacDone,
         ));
-        crate::frame::parse_dot11(format, &raw[mpdu_start..mpdu_end], rssi_dbm, mcs_index, stamp)
+        crate::frame::parse_dot11(
+            format,
+            &raw[mpdu_start..mpdu_end],
+            rssi_dbm,
+            mcs_index,
+            stamp,
+        )
     })();
 
     Some((captured, advance))
@@ -3033,7 +3137,8 @@ impl Ath9kHtcBackend {
 
     /// Clear the legacy-rate override — subsequent frames use `cur_mcs` (HT) or the target min rate.
     pub fn clear_legacy_rate(&self) {
-        self.cur_legacy.store(0, std::sync::atomic::Ordering::Relaxed);
+        self.cur_legacy
+            .store(0, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Build the HTC data-endpoint TX buffer for `frame` (the [`build_tx_frame_bytes`] wire layout,
@@ -3050,7 +3155,10 @@ impl Ath9kHtcBackend {
             (legacy, 0)
         } else {
             match *self.cur_mcs.lock().unwrap() {
-                Some(mcs) => (0x80 | mcs.index.min(7), if mcs.short_gi { 0x01 } else { 0x00 }),
+                Some(mcs) => (
+                    0x80 | mcs.index.min(7),
+                    if mcs.short_gi { 0x01 } else { 0x00 },
+                ),
                 None => (0, 0),
             }
         };
@@ -3059,7 +3167,14 @@ impl Ath9kHtcBackend {
             rate_flags |= 0x02; // HAL_RATESERIES_2040 — transmit the MCS at 40 MHz
         }
         let tx_power = self.cur_power.load(Relaxed);
-        build_tx_frame_bytes(self.mgmt_ep, self.format, frame, rate_code, tx_power, rate_flags)
+        build_tx_frame_bytes(
+            self.mgmt_ep,
+            self.format,
+            frame,
+            rate_code,
+            tx_power,
+            rate_flags,
+        )
     }
 }
 
@@ -3081,13 +3196,15 @@ impl FrameIo for Ath9kHtcBackend {
                 match handle.write_bulk(EP_WLAN_TX, &buf, TX_WRITE_TIMEOUT) {
                     Ok(n) if n == buf.len() => return Ok(()),
                     Ok(n) => {
-                        return Err(err(format!("ath9k_htc: short TX write {n}/{}", buf.len())))
+                        return Err(err(format!("ath9k_htc: short TX write {n}/{}", buf.len())));
                     }
                     Err(rusb::Error::Timeout) if attempt < TX_RETRY_MAX => continue,
                     Err(e) => return Err(usb_err("wlan tx", e)),
                 }
             }
-            Err(err("ath9k_htc: wlan tx backpressure did not clear".to_string()))
+            Err(err(
+                "ath9k_htc: wlan tx backpressure did not clear".to_string()
+            ))
         })
         .await
         .map_err(|e| err(format!("ath9k_htc tx: join {e}")))?
@@ -3100,7 +3217,8 @@ impl FrameIo for Ath9kHtcBackend {
     /// "inert" note); on ours it steers the on-air rate. See [`build_tx_frame`](Self::build_tx_frame).
     fn set_rate(&self, mcs: McsDescriptor) -> Result<(), FaceError> {
         // Choosing an HT MCS supersedes any legacy override (#6) — exactly one rate mode is active.
-        self.cur_legacy.store(0, std::sync::atomic::Ordering::Relaxed);
+        self.cur_legacy
+            .store(0, std::sync::atomic::Ordering::Relaxed);
         *self.cur_mcs.lock().unwrap() = Some(mcs);
         Ok(())
     }
@@ -3261,8 +3379,17 @@ impl RadioProfile for Ath9kHtcBackend {
 /// on air at the bench: 0x19608≈−74, 0x2d6d0≈−71, 0x3e9df≈−69 dBm (~5 dB usable range); 0x9200 crashes
 /// below the noise floor. Not dBm-calibrated (that needs the OLPC/PDADC port), so it's a relative knob.
 const TX_GAIN_LADDER: [u32; 11] = [
-    0x0000_9200, 0x0001_0208, 0x0001_9608, 0x0001_e610, 0x0002_4650, 0x0002_d6d0, 0x0003_16d2,
-    0x0003_9758, 0x0003_b759, 0x0003_d75a, 0x0003_e9df,
+    0x0000_9200,
+    0x0001_0208,
+    0x0001_9608,
+    0x0001_e610,
+    0x0002_4650,
+    0x0002_d6d0,
+    0x0003_16d2,
+    0x0003_9758,
+    0x0003_b759,
+    0x0003_d75a,
+    0x0003_e9df,
 ];
 /// The high-index gain LUT registers the OLPC latches (`AR9271MODES_NORMAL_POWER_TX_GAIN` tail).
 const TX_GAIN_LUT_TOP: [u32; 9] = [
@@ -3351,7 +3478,11 @@ impl RadioKnobs for Ath9kHtcBackend {
         if width_changed {
             self.set_bandwidth(want_ht40)?; // reprograms the PHY for the new width at self.channel
         } else {
-            let chan_mhz = if channel == 14 { 2484 } else { 2407 + 5 * channel as u16 };
+            let chan_mhz = if channel == 14 {
+                2484
+            } else {
+                2407 + 5 * channel as u16
+            };
             self.set_channel_and_cal(chan_mhz)?;
         }
         Ok(())
@@ -3382,7 +3513,8 @@ impl RadioKnobs for Ath9kHtcBackend {
     /// frame goes out OFDM ([`set_legacy_rate`] ≥ Ofdm6, or an HT MCS) — see [`MEASURED_DBM_BY_LEVEL`].
     fn set_tx_power(&self, idx: u32) -> Result<(), FaceError> {
         let level = (idx.min(63) as usize * (TX_GAIN_LADDER.len() - 1)) / 63;
-        self.cur_power.store(idx.min(63) as u8, std::sync::atomic::Ordering::Relaxed);
+        self.cur_power
+            .store(idx.min(63) as u8, std::sync::atomic::Ordering::Relaxed);
         self.set_tx_gain_level(level)
     }
 
@@ -3403,7 +3535,10 @@ impl RadioKnobs for Ath9kHtcBackend {
                     .total_cmp(&(MEASURED_DBM_BY_LEVEL[b] - req).abs())
             })
             .unwrap_or(TX_GAIN_LADDER.len() - 1);
-        self.cur_power.store(((level * 63) / (TX_GAIN_LADDER.len() - 1)) as u8, std::sync::atomic::Ordering::Relaxed);
+        self.cur_power.store(
+            ((level * 63) / (TX_GAIN_LADDER.len() - 1)) as u8,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         self.set_tx_gain_level(level)?;
         Ok(MEASURED_DBM_BY_LEVEL[level].round() as i8)
     }
@@ -3425,9 +3560,16 @@ impl RadioKnobs for Ath9kHtcBackend {
     /// (M3b). This is the named-time Cut-2 capability the beacon-slot / URLLC lane / TSCH-by-name read,
     /// and it is *unique to this part* among the Wi-Fi we own — every other backend is `BestEffort`.
     fn tx_discipline(&self) -> ndn_radio_hal::TxDiscipline {
-        ndn_radio_hal::TxDiscipline::ScheduledAt { granularity_ns: 1_000 }
+        ndn_radio_hal::TxDiscipline::ScheduledAt {
+            granularity_ns: 1_000,
+        }
     }
-    fn configure_name_filter(&self, enabled: bool, key: &[u8; 16], masks: &[[u8; 16]]) -> Result<(), FaceError> {
+    fn configure_name_filter(
+        &self,
+        enabled: bool,
+        key: &[u8; 16],
+        masks: &[[u8; 16]],
+    ) -> Result<(), FaceError> {
         // The AR9271 firmware re-derives each frame's prefix filter from its NAME via ndr_name_hash(key,…),
         // so the key is load-bearing here (unlike the C5). Enable = load key+masks with drop-foreign;
         // disable = restore the stock pass-all filter.
@@ -3450,7 +3592,11 @@ impl RadioKnobs for Ath9kHtcBackend {
 /// `qCoff = powerMeasI / qCoffDenom - 64` is computed in u32 then reinterpreted as i32
 /// (the C assigns the unsigned result into an `int32_t`), so a quotient below 64 yields a
 /// negative `qCoff` — that is the path that produces the RX-correction the demod needs.
-fn iq_cal_correction(power_meas_i: u32, power_meas_q: u32, iq_corr_meas: u32) -> Option<(i32, i32)> {
+fn iq_cal_correction(
+    power_meas_i: u32,
+    power_meas_q: u32,
+    iq_corr_meas: u32,
+) -> Option<(i32, i32)> {
     let mut iq_corr_meas = iq_corr_meas;
     // C: `if (iqCorrMeas > 0x80000000)` — strictly greater; 0x80000000 stays positive.
     let iq_corr_neg = if iq_corr_meas > 0x8000_0000 {
@@ -3585,8 +3731,14 @@ mod tests {
         // Budget the 4-byte receive trailer: a reply may carry one and the host cannot refuse it.
         let hdr = HTC_HDR_LEN + WMI_HDR_LEN + 4 + 4;
         assert!(hdr + NDR_MEM_MAX_TUPLES * 8 <= REG_PIPE_MAX);
-        assert!(hdr + 6 * 8 > REG_PIPE_MAX, "6 tuples overflow once a trailer is attached");
-        assert!(hdr + 8 * 8 > REG_PIPE_MAX, "the vendor's 8 tuples overflow the pipe");
+        assert!(
+            hdr + 6 * 8 > REG_PIPE_MAX,
+            "6 tuples overflow once a trailer is attached"
+        );
+        assert!(
+            hdr + 8 * 8 > REG_PIPE_MAX,
+            "the vendor's 8 tuples overflow the pipe"
+        );
     }
 
     /// A batched `WMI_REG_WRITE` must fit the 64-byte register pipe: `HTC(8) + WMI(4) + n*8`.
@@ -3596,7 +3748,10 @@ mod tests {
     fn reg_write_batch_fits_the_register_pipe() {
         let hdr = HTC_HDR_LEN + WMI_HDR_LEN; // 12
         assert!(hdr + REG_WRITE_MAX_PAIRS * 8 <= REG_PIPE_MAX);
-        assert!(hdr + (REG_WRITE_MAX_PAIRS + 1) * 8 > REG_PIPE_MAX, "one more pair overflows");
+        assert!(
+            hdr + (REG_WRITE_MAX_PAIRS + 1) * 8 > REG_PIPE_MAX,
+            "one more pair overflows"
+        );
     }
 
     /// A maximal echo must fit one register-pipe packet — and the firmware's own
@@ -3606,7 +3761,10 @@ mod tests {
     fn max_echo_fits_the_register_pipe() {
         assert_eq!(MAX_ECHO_LEN, 51);
         assert!(HTC_HDR_LEN + WMI_HDR_LEN + 1 + MAX_ECHO_LEN <= REG_PIPE_MAX);
-        assert!(HTC_HDR_LEN + WMI_HDR_LEN + 1 + 53 > REG_PIPE_MAX, "the firmware constant overflows");
+        assert!(
+            HTC_HDR_LEN + WMI_HDR_LEN + 1 + 53 > REG_PIPE_MAX,
+            "the firmware constant overflows"
+        );
     }
 
     /// IQ-mismatch fixed-point correction (`ar9002_hw_iqcalibrate`). Hand-computed against
@@ -3618,12 +3776,18 @@ mod tests {
         //   iCoffDenom = (0x40000/2 + 0x40000/2)/128 = 2048; qCoffDenom = 0x40000/64 = 4096
         //   iCoff = 4096/2048 = 2; &0x3f = 2; not-neg => 0x40-2 = 62
         //   qCoff = 0x40000/4096 - 64 = 64-64 = 0
-        assert_eq!(iq_cal_correction(0x0004_0000, 0x0004_0000, 0x0000_1000), Some((62, 0)));
+        assert_eq!(
+            iq_cal_correction(0x0004_0000, 0x0004_0000, 0x0000_1000),
+            Some((62, 0))
+        );
 
         // Same magnitude, but iqCorrMeas > 0x80000000 => the negative branch.
         //   iqCorrMeas -> (0xffffffff - 0xfffff000)+1 = 0x1000 = 4096, neg=true
         //   iCoff = 2; &0x3f = 2; neg => NOT flipped => 2 ; qCoff = 0
-        assert_eq!(iq_cal_correction(0x0004_0000, 0x0004_0000, 0xffff_f000), Some((2, 0)));
+        assert_eq!(
+            iq_cal_correction(0x0004_0000, 0x0004_0000, 0xffff_f000),
+            Some((2, 0))
+        );
     }
 
     /// A quotient below 64 must make qCoff negative (the u32->int32_t wrap) and then clamp
@@ -3635,7 +3799,10 @@ mod tests {
         //   qCoffDenom = 0x40000/64 = 4096
         //   iCoff = 0x800/1536 = 1; &0x3f=1; not-neg => 0x40-1 = 63
         //   qCoff = 0x20000/4096 - 64 = 32-64 = -32 (wrap) => clamp to -16
-        assert_eq!(iq_cal_correction(0x0002_0000, 0x0004_0000, 0x0000_0800), Some((63, -16)));
+        assert_eq!(
+            iq_cal_correction(0x0002_0000, 0x0004_0000, 0x0000_0800),
+            Some((63, -16))
+        );
     }
 
     /// Degenerate measurements match the C guard (`powerMeasQ && iCoffDenom && qCoffDenom`)
@@ -3720,8 +3887,7 @@ mod tests {
     fn rf_set_freq_synth_matches_trace() {
         use crate::ath9k_reg::*;
         let channel_sel = ((2412u64 * 0x1_0000) / CHANSEL_2G_DIV) as u32;
-        let synth =
-            AR_PHY_SYNTH_CONTROL_2G_BMODE | AR_PHY_SYNTH_CONTROL_2G_FRACMODE | channel_sel;
+        let synth = AR_PHY_SYNTH_CONTROL_2G_BMODE | AR_PHY_SYNTH_CONTROL_2G_FRACMODE | channel_sel;
         assert_eq!(synth, 0x30a0_cccc);
     }
 
@@ -3735,7 +3901,9 @@ mod tests {
     const SRC: [u8; 6] = [0x02, 0x4e, 0x44, 0x4e, 0x00, 0x01];
 
     fn ndn_fmt() -> FrameFormat {
-        FrameFormat::RawNdn { ethertype: TEST_ETHERTYPE }
+        FrameFormat::RawNdn {
+            ethertype: TEST_ETHERTYPE,
+        }
     }
 
     /// The injected TX buffer must be `[hif_usb 4B][HTC 8B][tx_mgmt_hdr 8B][802.11 + LLC/SNAP +
@@ -3751,24 +3919,43 @@ mod tests {
             dst: DST,
             src: SRC,
             addr3: None,
+            addr4: None,
+            htc: None,
         };
         let mgmt_ep = 0x07;
         let (rate_code, tx_power, rate_flags) = (0x85u8, 0x28u8, 0x01u8); // HT MCS5, 20 dBm, short-GI
-        let buf = build_tx_frame_bytes(mgmt_ep, ndn_fmt(), &frame, rate_code, tx_power, rate_flags).unwrap();
+        let buf = build_tx_frame_bytes(mgmt_ep, ndn_fmt(), &frame, rate_code, tx_power, rate_flags)
+            .unwrap();
         let dot11 = crate::frame::build_dot11(ndn_fmt(), &frame).unwrap();
 
         // hif_usb TX stream header (4 B): le16 HTC-frame length + le16 tag 0x697e.
         const HIF: usize = 4;
         let htc_frame_len = HTC_HDR_LEN + TX_MGMT_HDR_SIZE + dot11.len();
-        assert_eq!(u16::from_le_bytes([buf[0], buf[1]]) as usize, htc_frame_len, "hif len = HTC frame");
-        assert_eq!(u16::from_le_bytes([buf[2], buf[3]]), 0x697e, "hif stream tag");
+        assert_eq!(
+            u16::from_le_bytes([buf[0], buf[1]]) as usize,
+            htc_frame_len,
+            "hif len = HTC frame"
+        );
+        assert_eq!(
+            u16::from_le_bytes([buf[2], buf[3]]),
+            0x697e,
+            "hif stream tag"
+        );
 
         // HTC_FRAME_HDR (8 B): endpoint, flags, be16 payload length, control[4].
         assert_eq!(buf[HIF], mgmt_ep, "HTC endpoint = Mgmt");
         assert_eq!(buf[HIF + 1], 0, "HTC flags = 0");
         let payload_len = u16::from_be_bytes([buf[HIF + 2], buf[HIF + 3]]) as usize;
-        assert_eq!(payload_len, TX_MGMT_HDR_SIZE + dot11.len(), "HTC payload len = tx_mgmt_hdr + MPDU");
-        assert_eq!(&buf[HIF + 4..HIF + 8], &[0, 0, 0, 0], "HTC control bytes zero");
+        assert_eq!(
+            payload_len,
+            TX_MGMT_HDR_SIZE + dot11.len(),
+            "HTC payload len = tx_mgmt_hdr + MPDU"
+        );
+        assert_eq!(
+            &buf[HIF + 4..HIF + 8],
+            &[0, 0, 0, 0],
+            "HTC control bytes zero"
+        );
 
         // tx_mgmt_hdr (8 B): node_idx, vif_idx, tidno(=tx_power), flags, key_type, keyix=0xff,
         // cookie, pad(=rate_code) — the last two repurposed as our firmware's per-frame TX knobs.
@@ -3776,7 +3963,10 @@ mod tests {
         assert_eq!(&h[0..2], &[0, 0], "node/vif zero");
         assert_eq!(h[2], tx_power, "tidno byte carries AR_XmitPower");
         assert_eq!(h[3], 0, "flags zero");
-        assert_eq!(h[4], rate_flags, "keytype byte carries HT rate flags (SGI/HT40)");
+        assert_eq!(
+            h[4], rate_flags,
+            "keytype byte carries HT rate flags (SGI/HT40)"
+        );
         assert_eq!(h[5], 0xff, "keyix = 0xff (no key)");
         assert_eq!(h[6], 0, "cookie zero");
         assert_eq!(h[7], rate_code, "pad byte carries the HW rate code");
@@ -3803,6 +3993,8 @@ mod tests {
             dst: DST,
             src: SRC,
             addr3: None,
+            addr4: None,
+            htc: None,
         };
         let mpdu = crate::frame::build_dot11(ndn_fmt(), &frame).unwrap();
 
@@ -3827,7 +4019,11 @@ mod tests {
         let domain = ClockDomainId(0x1234);
         let (decoded, advance) = parse_rx_unit(ndn_fmt(), domain, &raw, 0).expect("parses a unit");
         let cf = decoded.expect("a good RawNdn frame decodes");
-        assert_eq!(cf.payload.as_ref(), payload, "payload recovered after LLC/SNAP");
+        assert_eq!(
+            cf.payload.as_ref(),
+            payload,
+            "payload recovered after LLC/SNAP"
+        );
         assert_eq!(cf.addr, Some(SRC), "addr2 -> addr");
         assert_eq!(cf.group, Some(DST), "addr1 -> group");
         assert_eq!(cf.rssi_dbm, Some(-55), "NF-relative rs_rssi -> dBm");
@@ -3858,6 +4054,9 @@ mod tests {
 
         let (decoded, advance) = parse_rx_unit(ndn_fmt(), ClockDomainId(0), &raw, 0).unwrap();
         assert!(decoded.is_none(), "CRC error -> dropped");
-        assert!(advance >= RX_PREFIX_LEN + HTC_RX_STATUS_LEN, "still advances past the unit");
+        assert!(
+            advance >= RX_PREFIX_LEN + HTC_RX_STATUS_LEN,
+            "still advances past the unit"
+        );
     }
 }

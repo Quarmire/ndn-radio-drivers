@@ -21,14 +21,14 @@ pub use event_id::EventId;
 /// here so every existing `ndn_frame_io::X` path and internal `crate::X`
 /// reference still resolves unchanged.
 pub use ndn_radio_hal::{
-    BROADCAST, CapturedFrame, ClockDomainId, DEFAULT_SRC, FaceError, FaceId, FrameIo, InjectFrame, PhyMetrics,
-    CsiSupport, LatchPoint, LinkStamp, MAX_RELIABLE_MCS, McsDescriptor, McsPolicy, RadioCapability,
-    RadioClockKind, RadioProfile, RadioTime, RadioTimeSource, Reach, Reliability, TxDiscipline,
-    TxIntent, mcs_for_rssi, mcs_phy_rate_bps,
+    BROADCAST, CapturedFrame, ClockDomainId, CsiSupport, DEFAULT_SRC, FaceError, FaceId, FrameIo,
+    InjectFrame, LatchPoint, LinkStamp, MAX_RELIABLE_MCS, McsDescriptor, McsPolicy, PhyMetrics,
+    RadioCapability, RadioClockKind, RadioProfile, RadioTime, RadioTimeSource, Reach, Reliability,
+    TxDiscipline, TxIntent, mcs_for_rssi, mcs_phy_rate_bps,
 };
 
 pub use frame::{
-    EphemeralSource, ESPNOW_MAX_BODY, ESPNOW_OUI, GroupKey, OPEN_GROUP_KEY, siphash24,
+    ESPNOW_MAX_BODY, ESPNOW_OUI, EphemeralSource, GroupKey, OPEN_GROUP_KEY, siphash24,
 };
 
 mod loopback;
@@ -137,6 +137,8 @@ mod tests {
             dst,
             src,
             addr3: None,
+            addr4: None,
+            htc: None,
         }
     }
 

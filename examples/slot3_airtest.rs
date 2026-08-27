@@ -19,19 +19,43 @@ use ndn_frame_io::{BROADCAST, InjectFrame, TxIntent};
 const N: u64 = 3;
 const FRAME_BYTES: usize = 900;
 
-fn env(k: &str) -> Option<String> { std::env::var(k).ok() }
-fn now_us() -> u64 { SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_micros() as u64).unwrap_or(0) }
+fn env(k: &str) -> Option<String> {
+    std::env::var(k).ok()
+}
+fn now_us() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_micros() as u64)
+        .unwrap_or(0)
+}
 
 struct Rng(u64);
-impl Rng { fn coin(&mut self) -> bool { let mut x=self.0; x^=x<<13; x^=x>>7; x^=x<<17; self.0=x; x&1==0 } }
+impl Rng {
+    fn coin(&mut self) -> bool {
+        let mut x = self.0;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.0 = x;
+        x & 1 == 0
+    }
+}
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let ch: u8 = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(40);
-    let secs: u64 = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(22);
+    let ch: u8 = std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(40);
+    let secs: u64 = std::env::args()
+        .nth(2)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(22);
     let node: u8 = env("NDN_NODE").and_then(|s| s.parse().ok()).unwrap_or(0);
     let slotted = env("NDN_MODE").as_deref() != Some("contention");
-    let slot_us: u64 = env("NDN_SLOT_US").and_then(|s| s.parse().ok()).unwrap_or(20_000);
+    let slot_us: u64 = env("NDN_SLOT_US")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(20_000);
     let my_slot = node as u64 % N;
     let my_tag = 0xA0u8 | node;
 
@@ -47,11 +71,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // making the narrowing visible rather than having the opener silently do it for everyone.
     let d = ndn_radio_drivers::open_named_radio(pid, ch)?.io;
     let src = [0x02, b'M', b'D', b'R', node, 0x01];
-    println!("slot3 node={node} slot={my_slot}/{N} mode={} ch{ch} secs={secs}",
-        if slotted { "slotted" } else { "contention" });
+    println!(
+        "slot3 node={node} slot={my_slot}/{N} mode={} ch{ch} secs={secs}",
+        if slotted { "slotted" } else { "contention" }
+    );
 
     let sent = Arc::new(AtomicU64::new(0));
-    let recv = [Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0))];
+    let recv = [
+        Arc::new(AtomicU64::new(0)),
+        Arc::new(AtomicU64::new(0)),
+        Arc::new(AtomicU64::new(0)),
+    ];
     let deadline = Instant::now() + Duration::from_secs(secs);
     let count_start = Instant::now() + Duration::from_secs(3); // warmup
 
@@ -60,7 +90,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let (d, recv) = (d.clone(), recv.clone());
         tokio::spawn(async move {
             while Instant::now() < deadline {
-                if let Ok(Ok(f)) = tokio::time::timeout(Duration::from_millis(5), d.recv_frame()).await {
+                if let Ok(Ok(f)) =
+                    tokio::time::timeout(Duration::from_millis(5), d.recv_frame()).await
+                {
                     let p = &f.payload;
                     if p.len() >= 2 && (p[0] & 0xf0) == 0xA0 {
                         let n = (p[1] & 0x0f) as usize;
@@ -86,14 +118,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let epoch = now_us() / slot_us;
         if epoch != cur_epoch {
             cur_epoch = epoch;
-            tx_this = if slotted { epoch % N == my_slot } else { rng.coin() };
+            tx_this = if slotted {
+                epoch % N == my_slot
+            } else {
+                rng.coin()
+            };
         }
         if tx_this {
             let mut payload = Vec::with_capacity(FRAME_BYTES + 2);
             payload.push(my_tag);
             payload.push(node);
             payload.extend_from_slice(&pad);
-            let _ = d.inject(InjectFrame { payload: payload.into(), tx: TxIntent::CONSERVATIVE, dst: BROADCAST, src, addr3: None }).await;
+            let _ = d
+                .inject(InjectFrame {
+                    payload: payload.into(),
+                    tx: TxIntent::CONSERVATIVE,
+                    dst: BROADCAST,
+                    src,
+                    addr3: None,
+                    addr4: None,
+                    htc: None,
+                })
+                .await;
             sent.fetch_add(1, Ordering::Relaxed);
             tokio::task::yield_now().await;
         } else {
@@ -105,10 +151,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // with a saturating TX loop could stall at shutdown; the tally is already in the atomics.)
     rx.abort();
 
-    let (r0, r1, r2) = (recv[0].load(Ordering::Relaxed), recv[1].load(Ordering::Relaxed), recv[2].load(Ordering::Relaxed));
+    let (r0, r1, r2) = (
+        recv[0].load(Ordering::Relaxed),
+        recv[1].load(Ordering::Relaxed),
+        recv[2].load(Ordering::Relaxed),
+    );
     let peers: u64 = r0 + r1 + r2;
-    println!("=== node={node} mode={} === sent={} recv_from_peers={peers} (n0={r0} n1={r1} n2={r2})",
-        if slotted { "slotted" } else { "contention" }, sent.load(Ordering::Relaxed));
+    println!(
+        "=== node={node} mode={} === sent={} recv_from_peers={peers} (n0={r0} n1={r1} n2={r2})",
+        if slotted { "slotted" } else { "contention" },
+        sent.load(Ordering::Relaxed)
+    );
     use std::io::Write;
     let _ = std::io::stdout().flush();
     Ok(())

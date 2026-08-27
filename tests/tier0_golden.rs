@@ -50,7 +50,9 @@ fn vectors() -> (Vec<Row>, (u32, u32, usize, u32)) {
             ));
             continue;
         }
-        let Some(rest) = line.strip_prefix("row ") else { continue };
+        let Some(rest) = line.strip_prefix("row ") else {
+            continue;
+        };
         let f: Vec<&str> = rest.split_whitespace().collect();
         assert_eq!(f.len(), 5, "row shape: label key name wire popcount");
         let mut key = [0u8; 16];
@@ -121,17 +123,26 @@ fn firmware_honours_keying_and_the_fill_cap() {
 
     let mut right_f = PrefixFilter::default();
     right_f.insert_name(&right.key, right.name.as_bytes());
-    assert!(right_f.may_match(&mask), "the right key matches its own prefix mask");
+    assert!(
+        right_f.may_match(&mask),
+        "the right key matches its own prefix mask"
+    );
 
     let mut wrong_f = PrefixFilter::default();
     wrong_f.insert_name(&wrong.key, wrong.name.as_bytes());
-    assert!(!wrong_f.may_match(&mask), "the same name under another key must not match");
+    assert!(
+        !wrong_f.may_match(&mask),
+        "the same name under another key must not match"
+    );
 
     // F1: an over-full filter is inert here too. A copy that skips the cap is a hole even if every
     // other byte agrees, which is why the cap is a vector parameter and not an implementation choice.
     let all_ones = PrefixFilter([0xff; 16]);
     assert!(all_ones.popcount() > FILL_CAP);
-    assert!(!all_ones.may_match(&mask), "the amplified universal wake is dead in the firmware copy");
+    assert!(
+        !all_ones.may_match(&mask),
+        "the amplified universal wake is dead in the firmware copy"
+    );
 }
 
 /// **The ath9k C copy, compiled and run from here** — so one `cargo test` is the gate for all three
@@ -169,7 +180,10 @@ fn ath9k_c_copy_matches_the_vectors() {
     );
 
     let run = Command::new(&bin)
-        .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/golden/tier0/vectors.txt"))
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/golden/tier0/vectors.txt"
+        ))
         .output()
         .expect("run the C vector check");
     let out = String::from_utf8_lossy(&run.stdout);

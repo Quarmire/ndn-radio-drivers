@@ -29,8 +29,14 @@ const SWING_IDX: &[u8] = &[0x7f, 0x00, 0x60, 0x10, 0x50, 0x20, 0x40, 0x30];
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let ch: u8 = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(36);
-    let n: usize = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(900);
+    let ch: u8 = std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(36);
+    let n: usize = std::env::args()
+        .nth(2)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(900);
 
     let dev = Arc::new(Rtl8733buBackend::open()?);
     dev.bring_up_tx(ch)?; // NO power tracker — see above
@@ -63,6 +69,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 dst: BROADCAST,
                 src: [0x02, 0x50, 0x33, 0x01, knob, idx],
                 addr3: None,
+                addr4: None,
+                htc: None,
             };
             for _ in 0..n {
                 dev.inject(f.clone()).await?;

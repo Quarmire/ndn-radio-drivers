@@ -29,7 +29,10 @@ use ndn_radio_drivers::{Ath9kHtcBackend, FrameIo, InjectFrame, McsDescriptor, Tx
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        eprintln!("usage: {} <htc_9271.fw> [chan_mhz=2437] [count=20]", args[0]);
+        eprintln!(
+            "usage: {} <htc_9271.fw> [chan_mhz=2437] [count=20]",
+            args[0]
+        );
         return ExitCode::FAILURE;
     }
     let fw = match std::fs::read(&args[1]) {
@@ -83,7 +86,10 @@ fn main() -> ExitCode {
     // Store a robust rate as bearer state (documentation only — inert on this HTC part).
     let _ = dev.set_rate(McsDescriptor::ht(0));
 
-    let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+    let rt = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
         Ok(r) => r,
         Err(e) => {
             eprintln!("tokio runtime: {e}");

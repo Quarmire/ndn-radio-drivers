@@ -99,7 +99,7 @@ pub const ATH9K_KEY_TYPE_CLEAR: u8 = 0;
 /// VERIFIED: 40 bytes — equals htc.h HTC_RX_FRAME_HEADER_SIZE and the spec's 40 B.
 #[repr(C)]
 pub struct AthHtcRxStatus {
-    pub rs_tstamp: [u8; 8], // __be64
+    pub rs_tstamp: [u8; 8],  // __be64
     pub rs_datalen: [u8; 2], // __be16
     pub rs_status: u8,
     pub rs_phyerr: u8,

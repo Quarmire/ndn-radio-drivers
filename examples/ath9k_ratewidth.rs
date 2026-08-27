@@ -35,13 +35,22 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
     let fw = std::fs::read(args.get(1).expect("usage: <fw>")).expect("read fw");
     let mut dev = Ath9kHtcBackend::open().expect("open");
-    dev.download_firmware(&fw).and_then(|_| dev.htc_init()).expect("transport");
-    dev.hw_reset(2412).and_then(|_| dev.connect_data_services()).expect("bring-up");
+    dev.download_firmware(&fw)
+        .and_then(|_| dev.htc_init())
+        .expect("transport");
+    dev.hw_reset(2412)
+        .and_then(|_| dev.connect_data_services())
+        .expect("bring-up");
     let _ = dev.write_target_u32s(0x0050_cf44, &[0]);
     dev.note_channel(1);
-    dev.wmi_start().and_then(|_| dev.start_receive()).expect("rx-start");
+    dev.wmi_start()
+        .and_then(|_| dev.start_receive())
+        .expect("rx-start");
 
-    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
     let burst = |dev: &Ath9kHtcBackend, tag: &str| {
         rt.block_on(async {
             for _ in 0..6 {
@@ -75,16 +84,34 @@ fn main() -> ExitCode {
             Some(got) => {
                 let good = got == want && got & 0x80 == 0;
                 ok6 += good as u32;
-                println!("  {name:<7} commanded {want:#04x} → XmitRate0 {got:#04x}  {}", if good { "✓" } else { "✗ MISMATCH" });
+                println!(
+                    "  {name:<7} commanded {want:#04x} → XmitRate0 {got:#04x}  {}",
+                    if good { "✓" } else { "✗ MISMATCH" }
+                );
             }
             None => println!("  {name:<7} — no descriptor read"),
         }
     }
     // And prove HT still overrides legacy (set_rate clears the legacy override):
-    dev.set_rate(McsDescriptor { index: 3, short_gi: false, vht: false, nss: 1, stbc: false, ldpc: false }).ok();
+    dev.set_rate(McsDescriptor {
+        index: 3,
+        short_gi: false,
+        vht: false,
+        nss: 1,
+        stbc: false,
+        ldpc: false,
+    })
+    .ok();
     burst(&dev, "ht3");
     let ht = xmit_rate0(&dev).unwrap_or(0);
-    println!("  ht MCS3 after legacy → XmitRate0 {ht:#04x}  {}", if ht == 0x83 { "✓ (HT overrode legacy)" } else { "✗" });
+    println!(
+        "  ht MCS3 after legacy → XmitRate0 {ht:#04x}  {}",
+        if ht == 0x83 {
+            "✓ (HT overrode legacy)"
+        } else {
+            "✗"
+        }
+    );
     dev.clear_legacy_rate();
 
     // ── #7 live HT20↔HT40 switch: synth + DYN2040 must flip, AGC re-converge ──
@@ -92,13 +119,25 @@ fn main() -> ExitCode {
     let show = |tag: &str, st: &ndn_radio_drivers::CalStatus, turbo: u32| {
         println!(
             "  {tag:<6} synth={:#010x} phy_active={} agc_converged={} TURBO={:#06x} DYN2040={}",
-            st.synth_control, st.phy_active, st.agc_cal_converged, turbo, (turbo & AR_PHY_FC_DYN2040_EN != 0) as u8
+            st.synth_control,
+            st.phy_active,
+            st.agc_cal_converged,
+            turbo,
+            (turbo & AR_PHY_FC_DYN2040_EN != 0) as u8
         );
     };
     let st40 = dev.set_bandwidth(true).expect("→HT40");
     let turbo40 = dev.reg_read(AR_PHY_TURBO).unwrap_or(0);
     show("HT40", &st40, turbo40);
-    dev.set_rate(McsDescriptor { index: 0, short_gi: false, vht: false, nss: 1, stbc: false, ldpc: false }).ok();
+    dev.set_rate(McsDescriptor {
+        index: 0,
+        short_gi: false,
+        vht: false,
+        nss: 1,
+        stbc: false,
+        ldpc: false,
+    })
+    .ok();
     burst(&dev, "w40");
     let st20 = dev.set_bandwidth(false).expect("→HT20");
     let turbo20 = dev.reg_read(AR_PHY_TURBO).unwrap_or(0);
@@ -109,8 +148,13 @@ fn main() -> ExitCode {
         && (turbo20 & AR_PHY_FC_DYN2040_EN == 0);
     println!(
         "\n→ #6 {}/{} legacy codes reached the descriptor; #7 live width switch {}.",
-        ok6, cases.len(),
-        if width_ok { "FLIPPED synth+DYN2040 (HT40↔HT20)" } else { "did NOT flip — check apply_initvals/synth" }
+        ok6,
+        cases.len(),
+        if width_ok {
+            "FLIPPED synth+DYN2040 (HT40↔HT20)"
+        } else {
+            "did NOT flip — check apply_initvals/synth"
+        }
     );
 
     // ── #5 EDCCA / force-rx-clear effect on air (ch1 is management-heavy — a busy medium) ──
@@ -127,7 +171,10 @@ fn main() -> ExitCode {
             let end = std::time::Instant::now() + Duration::from_secs(secs);
             let mut n = 0u64;
             while std::time::Instant::now() < end {
-                let f = InjectFrame::broadcast(Bytes::copy_from_slice(b"\x05\x08edcca"), TxIntent::CONSERVATIVE);
+                let f = InjectFrame::broadcast(
+                    Bytes::copy_from_slice(b"\x05\x08edcca"),
+                    TxIntent::CONSERVATIVE,
+                );
                 if dev.inject(f).await.is_ok() {
                     n += 1;
                 }
@@ -150,9 +197,13 @@ fn main() -> ExitCode {
     println!(
         "  → force-rx-clear {:+}% vs deference: {}",
         delta,
-        if delta >= 5 { "EDCCA-ignore lifts TX on the busy channel (knob has effect)" }
-        else if delta <= -5 { "lower (unexpected — investigate)" }
-        else { "within noise — ambient ch1 load too low to defer; needs a controlled interferer" }
+        if delta >= 5 {
+            "EDCCA-ignore lifts TX on the busy channel (knob has effect)"
+        } else if delta <= -5 {
+            "lower (unexpected — investigate)"
+        } else {
+            "within noise — ambient ch1 load too low to defer; needs a controlled interferer"
+        }
     );
 
     let _ = dev.detach();

@@ -43,8 +43,14 @@ enum Knob {
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let ch: u8 = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(36);
-    let n: usize = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(1500);
+    let ch: u8 = std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(36);
+    let n: usize = std::env::args()
+        .nth(2)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1500);
 
     let dev = Arc::new(Rtl8733buBackend::open()?);
     // ONE bring-up for the whole sweep — see the per-boot variance note above. Keep the tracker
@@ -54,35 +60,42 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let payload = Bytes::from(vec![0x5Au8; 400]);
     for knob in [Knob::Reference, Knob::Table] {
-    // Restore the other register to its bring-up value first, so each arm varies ONE thing.
-    match knob {
-        Knob::Reference => dev.set_txagc_table(0x2d)?,
-        Knob::Table => dev.set_tx_power_idx(0x40)?,
-    }
-    for &idx in INDICES {
+        // Restore the other register to its bring-up value first, so each arm varies ONE thing.
         match knob {
-            Knob::Reference => dev.set_tx_power_idx(idx)?,
-            Knob::Table => dev.set_txagc_table(idx)?,
+            Knob::Reference => dev.set_txagc_table(0x2d)?,
+            Knob::Table => dev.set_tx_power_idx(0x40)?,
         }
-        // Let the tracker's ~400 ms tick pass so the two power paths settle before the burst.
-        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
-        let pfx = match knob {
-            Knob::Reference => [0x50, 0x57, 0x52], // "PWR" — 0x4308 reference
-            Knob::Table => [0x54, 0x41, 0x42],     // "TAB" — 0x3a00 per-rate table
-        };
-        let f = InjectFrame {
-            payload: payload.clone(),
-            tx: TxIntent::CONSERVATIVE,
-            dst: BROADCAST,
-            src: [0x02, pfx[0], pfx[1], pfx[2], idx, 0x01],
-            addr3: None,
-        };
-        for _ in 0..n {
-            dev.inject(f.clone()).await?;
+        for &idx in INDICES {
+            match knob {
+                Knob::Reference => dev.set_tx_power_idx(idx)?,
+                Knob::Table => dev.set_txagc_table(idx)?,
+            }
+            // Let the tracker's ~400 ms tick pass so the two power paths settle before the burst.
+            tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+            let pfx = match knob {
+                Knob::Reference => [0x50, 0x57, 0x52], // "PWR" — 0x4308 reference
+                Knob::Table => [0x54, 0x41, 0x42],     // "TAB" — 0x3a00 per-rate table
+            };
+            let f = InjectFrame {
+                payload: payload.clone(),
+                tx: TxIntent::CONSERVATIVE,
+                dst: BROADCAST,
+                src: [0x02, pfx[0], pfx[1], pfx[2], idx, 0x01],
+                addr3: None,
+                addr4: None,
+                htc: None,
+            };
+            for _ in 0..n {
+                dev.inject(f.clone()).await?;
+            }
+            println!(
+                "  {} idx 0x{idx:02x}: {n} frames sent",
+                match knob {
+                    Knob::Reference => "ref  ",
+                    Knob::Table => "table",
+                }
+            );
         }
-        println!("  {} idx 0x{idx:02x}: {n} frames sent",
-            match knob { Knob::Reference => "ref  ", Knob::Table => "table" });
-    }
     }
     println!("done — read mean RSSI per source MAC at the witness");
     Ok(())

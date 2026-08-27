@@ -25,29 +25,62 @@ fn main() -> ExitCode {
     let ch: u16 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(1);
     let chan_mhz = 2407 + 5 * ch;
     let mut dev = Ath9kHtcBackend::open().expect("open");
-    dev.download_firmware(&fw).and_then(|_| dev.htc_init()).expect("transport");
+    dev.download_firmware(&fw)
+        .and_then(|_| dev.htc_init())
+        .expect("transport");
 
-    println!("bringing up HT40 on primary ch{ch} ({chan_mhz} MHz), expect synth centre {} MHz", chan_mhz + 10);
+    println!(
+        "bringing up HT40 on primary ch{ch} ({chan_mhz} MHz), expect synth centre {} MHz",
+        chan_mhz + 10
+    );
     if let Err(e) = dev.hw_reset_ht40(chan_mhz) {
         eprintln!("hw_reset_ht40 FAILED: {e}  (cal may not converge at 40 MHz on this part)");
         return ExitCode::FAILURE;
     }
     dev.connect_data_services().expect("data svc");
     let _ = dev.write_target_u32s(0x0050_cf44, &[0]);
-    dev.wmi_start().and_then(|_| dev.start_receive()).expect("rx-start");
+    dev.wmi_start()
+        .and_then(|_| dev.start_receive())
+        .expect("rx-start");
 
     let synth = dev.reg_read(AR_PHY_SYNTH_CONTROL).unwrap_or(0);
     let turbo = dev.reg_read(AR_PHY_TURBO).unwrap_or(0);
     let active = dev.reg_read(AR_PHY_ACTIVE).unwrap_or(0);
-    println!("SYNTH_CONTROL = {synth:#010x} (HT20 ch1 was 0x30a0cccc — should differ = +10 MHz centre)");
-    println!("AR_PHY_TURBO  = {turbo:#010x} — DYN2040 {}", if turbo & AR_PHY_FC_DYN2040_EN != 0 { "SET ✔" } else { "clear ✗" });
-    println!("AR_PHY_ACTIVE = {active:#x} (PHY {})", if active & 1 == 1 { "up" } else { "down" });
+    println!(
+        "SYNTH_CONTROL = {synth:#010x} (HT20 ch1 was 0x30a0cccc — should differ = +10 MHz centre)"
+    );
+    println!(
+        "AR_PHY_TURBO  = {turbo:#010x} — DYN2040 {}",
+        if turbo & AR_PHY_FC_DYN2040_EN != 0 {
+            "SET ✔"
+        } else {
+            "clear ✗"
+        }
+    );
+    println!(
+        "AR_PHY_ACTIVE = {active:#x} (PHY {})",
+        if active & 1 == 1 { "up" } else { "down" }
+    );
 
-    dev.set_rate(McsDescriptor { index: 0, short_gi: false, vht: false, nss: 1, stbc: false, ldpc: false }).ok();
-    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    dev.set_rate(McsDescriptor {
+        index: 0,
+        short_gi: false,
+        vht: false,
+        nss: 1,
+        stbc: false,
+        ldpc: false,
+    })
+    .ok();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
     rt.block_on(async {
         for i in 0..4 {
-            let f = InjectFrame::broadcast(Bytes::copy_from_slice(&[0x05u8, 0x08, 0x40, i as u8]), TxIntent::CONSERVATIVE);
+            let f = InjectFrame::broadcast(
+                Bytes::copy_from_slice(&[0x05u8, 0x08, 0x40, i as u8]),
+                TxIntent::CONSERVATIVE,
+            );
             let _ = dev.inject(f).await;
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
@@ -55,7 +88,15 @@ fn main() -> ExitCode {
     let qtxdp = dev.reg_read(AR_QTXDP1).unwrap_or(0);
     if let Ok(desc) = dev.read_target_u32s(qtxdp, 12) {
         if desc.len() >= 10 {
-            println!("ds_ctl7 = {:#010x} — AR_2040_0 (40 MHz) {}", desc[9], if desc[9] & AR_2040_0 != 0 { "SET ✔" } else { "clear ✗" });
+            println!(
+                "ds_ctl7 = {:#010x} — AR_2040_0 (40 MHz) {}",
+                desc[9],
+                if desc[9] & AR_2040_0 != 0 {
+                    "SET ✔"
+                } else {
+                    "clear ✗"
+                }
+            );
         }
     }
     let _ = dev.detach();

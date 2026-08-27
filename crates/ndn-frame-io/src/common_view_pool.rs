@@ -162,7 +162,10 @@ mod tests {
         let mut pool = CommonViewPool::new(8);
         let ev = event(0xABCD);
         // First receiver: no partner yet.
-        assert!(pool.observe(ev, 1, obs(2_000_000, 500), 100, prov()).is_empty());
+        assert!(
+            pool.observe(ev, 1, obs(2_000_000, 500), 100, prov())
+                .is_empty()
+        );
         // Second receiver of the same event: one offset, 2 − 1.
         let out = pool.observe(ev, 2, obs(2_005_000, 500), 100, prov());
         assert_eq!(out.len(), 1);
@@ -170,7 +173,10 @@ mod tests {
         assert_eq!((o.a, o.b), (2, 1));
         // Equal prop → offset = stamp_2 − stamp_1 = +5 µs.
         assert_eq!(o.offset.value, 5_000);
-        assert!(!o.offset.prov.distance_bounded, "common-view can't bound T1");
+        assert!(
+            !o.offset.prov.distance_bounded,
+            "common-view can't bound T1"
+        );
     }
 
     #[test]
@@ -194,7 +200,10 @@ mod tests {
             digest: 1,
             channel: 149,
         };
-        assert!(pool.observe(other_channel, 2, obs(0, 0), 0, prov()).is_empty());
+        assert!(
+            pool.observe(other_channel, 2, obs(0, 0), 0, prov())
+                .is_empty()
+        );
     }
 
     #[test]

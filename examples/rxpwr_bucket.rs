@@ -13,8 +13,14 @@ use std::time::{Duration, Instant};
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let ch: u8 = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(36);
-    let secs: u64 = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(120);
+    let ch: u8 = std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(36);
+    let secs: u64 = std::env::args()
+        .nth(2)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(120);
     let pid: u16 = match std::env::var("NDN_PID").as_deref() {
         Ok("a81a") | Err(_) => 0xa81a,
         Ok(p) => u16::from_str_radix(p.trim_start_matches("0x"), 16)?,
@@ -30,7 +36,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // The sweep's frames are the ones padded with 0xC3; anything else on-channel is ambient.
             if p.len() >= 3 && p[2] == 0xC3 && p[1] < 10 {
                 if let Some(r) = f.rssi_dbm {
-                    let e = acc.entry((p[1], p[0])).or_insert((0, 0, i32::MAX, i32::MIN));
+                    let e = acc
+                        .entry((p[1], p[0]))
+                        .or_insert((0, 0, i32::MAX, i32::MIN));
                     e.0 += r as i64;
                     e.1 += 1;
                     e.2 = e.2.min(r as i32);
@@ -40,7 +48,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    println!("=== per-index RSSI (0=ref 0x4308, 1=table 0x3a00, 2=datapath 0x1e4x, 3=RF 0x01[4:0], 4=swing 0x18a0) ===");
+    println!(
+        "=== per-index RSSI (0=ref 0x4308, 1=table 0x3a00, 2=datapath 0x1e4x, 3=RF 0x01[4:0], 4=swing 0x18a0) ==="
+    );
     let mut last_knob = 255u8;
     for ((knob, idx), (sum, n, mn, mx)) in &acc {
         if *knob != last_knob {

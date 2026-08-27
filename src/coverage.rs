@@ -248,9 +248,12 @@ mod tests {
         let mut provided_cells = 0;
         let mut pids_seen = std::collections::HashSet::new();
         for r in COVERAGE {
-            for (seam, name) in
-                [(&r.frame_io, "frame_io"), (&r.knobs, "knobs"), (&r.time, "time"), (&r.profile, "profile")]
-            {
+            for (seam, name) in [
+                (&r.frame_io, "frame_io"),
+                (&r.knobs, "knobs"),
+                (&r.time, "time"),
+                (&r.profile, "profile"),
+            ] {
                 match seam {
                     Provided => provided_cells += 1,
                     Excluded(reason) => {

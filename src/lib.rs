@@ -7,9 +7,9 @@
 // Re-export the contract surface the backend modules reference as `crate::…`
 // (they were written as modules of ndn-face-monitor-wifi, which re-exported these).
 pub use ndn_frame_io::{
-    frame, radiotap, BROADCAST, CapturedFrame, DEFAULT_SRC, FaceError, FaceId, FrameFormat,
-    FrameIo, InjectFrame, MAX_RELIABLE_MCS, McsDescriptor, McsPolicy, Reach, Reliability,
-    TxIntent, mcs_for_rssi, mcs_phy_rate_bps,
+    BROADCAST, CapturedFrame, DEFAULT_SRC, FaceError, FaceId, FrameFormat, FrameIo, InjectFrame,
+    MAX_RELIABLE_MCS, McsDescriptor, McsPolicy, Reach, Reliability, TxIntent, frame, mcs_for_rssi,
+    mcs_phy_rate_bps, radiotap,
 };
 // #78: the capability traits `OpenRadio` hands out. Re-exported so a caller of `open_named_radio`
 // needs exactly one import to use everything the opener returns.
@@ -23,13 +23,13 @@ pub use ndn_radio_hal::{OpenRadio, RadioKnobs, RadioProfile, RadioTime};
 pub mod usb_select;
 pub use usb_select::{DeviceSelect, usb_addr};
 
+/// Closed-loop frequency discipline: spend the time layer's skew estimate on a radio's clock trim.
+pub mod freq_discipline;
 mod libusb_rtl88xx;
 /// Shared Realtek RX-descriptor field decode (RSSI/MCS/timestamp) used by the USB backends.
 mod realtek_rx;
 /// Shared async-URB RX pump (bulk-IN pipelining) used by the USB backends.
 pub mod rx_pump;
-/// Closed-loop frequency discipline: spend the time layer's skew estimate on a radio's clock trim.
-pub mod freq_discipline;
 pub use freq_discipline::{FreqAction, FreqDiscipline};
 pub use libusb_rtl88xx::{
     CHIP_ID_8822E, ChannelBw, FwVersion, LibUsbRtl88xxBackend, REALTEK_VID, REG_SYS_CFG,
@@ -38,8 +38,8 @@ pub use libusb_rtl88xx::{
 // AR9271 (ath9k_htc) — the one Wi-Fi part whose FIRMWARE is ours, so Tier-0 can reject a frame
 // before it crosses USB (design §8.2) and TX can be scheduled off the hardware TSF (§8.5).
 // L1: USB transport + firmware download + HTC handshake + WMI. Does not yet replace ath9k_htc.
-pub mod coverage;
 mod ath9k_htc;
+pub mod coverage;
 // PHY-init data for the M1 bring-up port, transcribed verbatim from mainline ath9k v6.12.33:
 // AR9271 initval tables (ar9002_initvals.h), the register offsets/bits the reset+cal path writes
 // (reg.h / ar9002_phy.h / mac.h), and the HTC wire structs (htc.h). Consumed by ath9k_htc.rs.
@@ -48,8 +48,7 @@ mod ath9k_initvals;
 mod ath9k_reg;
 pub use ath9k_htc::{
     AR9271_FIRMWARE, AR9271_FIRMWARE_TEXT, AR9271_IDS, ATHEROS_VID, Ath9kHtcBackend, BoardValues,
-    CalStatus,
-    FW_NAME, HTC_RX_STATUS_LEN, HtcService, IEEE80211_MODE_11NG, IniVerify, LegacyRate,
+    CalStatus, FW_NAME, HTC_RX_STATUS_LEN, HtcService, IEEE80211_MODE_11NG, IniVerify, LegacyRate,
     NDR_MEM_MAX_TUPLES, NdrStats, REG_WRITE_MAX_PAIRS, ResetStatus, RxFrame, WmiCmd,
 };
 mod rtl8821c;
@@ -75,7 +74,7 @@ pub use libusb_rtl8733b::{
 #[cfg(feature = "serial-radio")]
 mod serial_radio;
 #[cfg(feature = "serial-radio")]
-pub use serial_radio::{SERIAL_RADIO_BAUD, SerialRadioBackend, Esp32SerialBackend};
+pub use serial_radio::{Esp32SerialBackend, SERIAL_RADIO_BAUD, SerialRadioBackend};
 
 // Waveshare USB-TO-LoRa (SX1262) serial-bridged sub-GHz backend: a transparent-mode byte pipe with
 // host-supplied framing and AT-programmed radio params, implementing the same FrameIo/RadioTime/
@@ -121,7 +120,9 @@ pub fn rx_raw_frames() -> u64 {
 /// the 8812au/88xx arms honour `NDN_USB_ADDR`/`NDN_USB_INDEX`, the 8733bu arm does not yet.)
 pub fn open_named_radio(pid: u16, channel: u8) -> Result<OpenRadio, FaceError> {
     use std::sync::Arc;
-    let fmt = FrameFormat::RawNdn { ethertype: NDN_ETHERTYPE };
+    let fmt = FrameFormat::RawNdn {
+        ethertype: NDN_ETHERTYPE,
+    };
     // Which dongle to claim when several identical ones share the host — `NDN_USB_ADDR="<bus>-<port>"`
     // (stable) or `NDN_USB_INDEX=<n>` (enumeration order). Both branches honour it, so a node with two
     // `0bda:a81a` can pin the spare and leave the kernel mesh on the other (see the multi-radio note).
@@ -160,7 +161,10 @@ pub fn open_named_radio(pid: u16, channel: u8) -> Result<OpenRadio, FaceError> {
             std::mem::forget(d.bring_up_tx_tracked(channel)?);
         }
         // Same `NDN_TX_PWR` contract as the other Realtek arms — here it is the per-rate TXAGC index.
-        if let Some(p) = std::env::var("NDN_TX_PWR").ok().and_then(|s| s.parse::<u32>().ok()) {
+        if let Some(p) = std::env::var("NDN_TX_PWR")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+        {
             let _ = d.set_tx_power(p);
         }
         apply_bw_override(d.as_ref(), channel);
@@ -176,10 +180,15 @@ pub fn open_named_radio(pid: u16, channel: u8) -> Result<OpenRadio, FaceError> {
     let radio: Arc<dyn FrameIo> = if matches!(pid, 0xa81a | 0xa811 | 0x8814) {
         // RTL8822E: `open_monitor_pid_select` claims the selected device + BB/RF-inits + monitors +
         // channel in one call, and its default format is already the canonical RawNdn(0x8624).
-        let d = Arc::new(LibUsbRtl88xxBackend::open_monitor_pid_select(pid, &sel, channel)?);
+        let d = Arc::new(LibUsbRtl88xxBackend::open_monitor_pid_select(
+            pid, &sel, channel,
+        )?);
         // `NDN_TX_PWR=<idx>` lowers this radio's TX power (e.g. to dial an RX peer out of front-end
         // overload for a clean-RSSI measurement); the 88xx set_tx_power is a per-rate TXAGC index.
-        if let Some(p) = std::env::var("NDN_TX_PWR").ok().and_then(|s| s.parse::<u32>().ok()) {
+        if let Some(p) = std::env::var("NDN_TX_PWR")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+        {
             let _ = d.set_tx_power(p);
         }
         apply_bw_override(d.as_ref(), channel);
@@ -224,7 +233,10 @@ pub fn open_named_radio(pid: u16, channel: u8) -> Result<OpenRadio, FaceError> {
         }
         // `bring_up_monitor` sets TXAGC to full 0x3f; on a USB-power-limited host a full-power 2-chain
         // TX can brown the PA out so the FIFO never drains. `NDN_TX_PWR=<0..63>` overrides the index.
-        if let Some(p) = std::env::var("NDN_TX_PWR").ok().and_then(|s| s.parse::<u8>().ok()) {
+        if let Some(p) = std::env::var("NDN_TX_PWR")
+            .ok()
+            .and_then(|s| s.parse::<u8>().ok())
+        {
             let _ = d.set_tx_power(p.min(63));
         }
         // `NDN_CCA_OFF=1` forces full carrier-sense off (EDCCA + OFDM packet CCA) so this radio blasts
@@ -327,11 +339,17 @@ pub fn open_ath9k(channel: u8) -> Result<OpenRadio, FaceError> {
         && std::env::var_os("NDN_ATH9K_NO_CAL").is_none()
     {
         match dev.set_board_values() {
-            Ok(bv) => eprintln!("open_ath9k: board cal applied (txGainType={} ob={:?})", bv.tx_gain_type, bv.ob),
+            Ok(bv) => eprintln!(
+                "open_ath9k: board cal applied (txGainType={} ob={:?})",
+                bv.tx_gain_type, bv.ob
+            ),
             Err(e) => eprintln!("open_ath9k: board cal skipped: {e}"),
         }
         match dev.set_txpower_4k(chan_mhz) {
-            Ok(peak) => eprintln!("open_ath9k: power cal applied (peak target {} dBm)", peak / 2),
+            Ok(peak) => eprintln!(
+                "open_ath9k: power cal applied (peak target {} dBm)",
+                peak / 2
+            ),
             Err(e) => eprintln!("open_ath9k: power cal skipped: {e}"),
         }
     }
@@ -371,7 +389,9 @@ pub fn open_ath9k(channel: u8) -> Result<OpenRadio, FaceError> {
 /// backend's own error rather than being silently ignored.
 fn apply_bw_override(knobs: &dyn RadioKnobs, channel: u8) {
     use ndn_radio_hal::Bandwidth;
-    let Some(v) = std::env::var("NDN_RADIO_BW").ok() else { return };
+    let Some(v) = std::env::var("NDN_RADIO_BW").ok() else {
+        return;
+    };
     let bw = match v.trim() {
         "5" => Bandwidth::Nb5,
         "10" => Bandwidth::Nb10,
@@ -395,7 +415,11 @@ fn apply_bw_override(knobs: &dyn RadioKnobs, channel: u8) {
 
 /// RX-pump reader-thread / transfer-pool count. Default 8; `NDN_RX_PUMP_DEPTH` overrides.
 fn pump_depth() -> usize {
-    std::env::var("NDN_RX_PUMP_DEPTH").ok().and_then(|s| s.parse().ok()).filter(|&n| n > 0).unwrap_or(8)
+    std::env::var("NDN_RX_PUMP_DEPTH")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(8)
 }
 
 /// Start the RX pump for a backend. `NDN_ASYNC_PUMP=1` uses the libusb async submit-ahead pump (keeps
@@ -510,10 +534,15 @@ mod capability_declarations {
             "the MT7612U is dual-band, as its own module header says: {:?}",
             mt.bands
         );
-        assert!(!mt.channels.is_empty(), "a channel list nothing can tune is not a capability");
+        assert!(
+            !mt.channels.is_empty(),
+            "a channel list nothing can tune is not a capability"
+        );
         match mt.rate {
             // 2x2 11ac: the driver's captured tune streams include 5 GHz ch36 VHT80.
-            RateCapability::Wifi { max_nss, max_bw, .. } => {
+            RateCapability::Wifi {
+                max_nss, max_bw, ..
+            } => {
                 assert_eq!(max_nss, 2, "MT7612U is a 2x2 part");
                 assert_eq!(max_bw, 2, "and reaches VHT80 on the ch36 path");
             }

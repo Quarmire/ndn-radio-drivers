@@ -28,16 +28,28 @@ const IDX: &[u8] = &[0x3f, 0x08, 0x38, 0x10, 0x30, 0x18, 0x28, 0x20];
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let ch: u8 = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(36);
-    let n: usize = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(900);
+    let ch: u8 = std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(36);
+    let n: usize = std::env::args()
+        .nth(2)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(900);
 
     let dev = Arc::new(Rtl8733buBackend::open()?);
     dev.bring_up_tx(ch)?; // tracker off
 
     let r = dev.read32(0x4318)?;
     let tssi = (r >> 28) & 0x7;
-    println!("after bring_up_tx: 0x4318={r:08x}  TSSI[30:28]={tssi}  ({})",
-        if tssi == 7 { "ENABLED — a closed loop is regulating TX power" } else { "not 7" });
+    println!(
+        "after bring_up_tx: 0x4318={r:08x}  TSSI[30:28]={tssi}  ({})",
+        if tssi == 7 {
+            "ENABLED — a closed loop is regulating TX power"
+        } else {
+            "not 7"
+        }
+    );
 
     for knob in 5u8..7 {
         // knob 5 = TSSI left as bring-up leaves it (the control)
@@ -45,7 +57,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if knob == 6 {
             dev.set_tssi_enabled(false)?;
             let v = dev.read32(0x4318)?;
-            println!("  TSSI forced off -> 0x4318={v:08x} field={}", (v >> 28) & 0x7);
+            println!(
+                "  TSSI forced off -> 0x4318={v:08x} field={}",
+                (v >> 28) & 0x7
+            );
         }
         for &idx in IDX {
             dev.set_txagc_datapath(idx)?;
@@ -59,6 +74,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 dst: BROADCAST,
                 src: [0x02, 0x50, 0x33, 0x02, knob, idx],
                 addr3: None,
+                addr4: None,
+                htc: None,
             };
             for _ in 0..n {
                 dev.inject(f.clone()).await?;

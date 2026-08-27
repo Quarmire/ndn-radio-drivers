@@ -8,9 +8,9 @@
 //!   sudo ./af_wedge_probe mon0
 #[cfg(target_os = "linux")]
 fn main() {
-    use ndn_frame_io::{frame, FrameFormat};
+    use ndn_frame_io::{FrameFormat, frame};
     #[allow(unused_imports)]
-    use ndn_radio_hal::{InjectFrame, TxIntent, DEFAULT_SRC};
+    use ndn_radio_hal::{DEFAULT_SRC, InjectFrame, TxIntent};
 
     let iface = std::env::args().nth(1).unwrap_or_else(|| "mon0".into());
     let cname = std::ffi::CString::new(iface.clone()).unwrap();
@@ -26,15 +26,25 @@ fn main() {
     // Mirror the backend exactly: set SO_RCVBUF, DO NOT set SO_SNDBUF.
     let rcvbuf: libc::c_int = 4 * 1024 * 1024;
     unsafe {
-        libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_RCVBUF,
-            &rcvbuf as *const _ as *const libc::c_void, std::mem::size_of::<libc::c_int>() as u32);
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUF,
+            &rcvbuf as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as u32,
+        );
     }
     // Report the effective send buffer.
     let mut sndbuf: libc::c_int = 0;
     let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
     unsafe {
-        libc::getsockopt(fd, libc::SOL_SOCKET, libc::SO_SNDBUF,
-            &mut sndbuf as *mut _ as *mut libc::c_void, &mut len);
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_SNDBUF,
+            &mut sndbuf as *mut _ as *mut libc::c_void,
+            &mut len,
+        );
     }
     println!("effective SO_SNDBUF = {sndbuf} bytes");
 
@@ -43,8 +53,11 @@ fn main() {
     addr.sll_protocol = ETH_P_ALL.to_be();
     addr.sll_ifindex = ifindex as i32;
     let br = unsafe {
-        libc::bind(fd, &addr as *const _ as *const libc::sockaddr,
-            std::mem::size_of::<libc::sockaddr_ll>() as u32)
+        libc::bind(
+            fd,
+            &addr as *const _ as *const libc::sockaddr,
+            std::mem::size_of::<libc::sockaddr_ll>() as u32,
+        )
     };
     assert!(br == 0, "bind: {}", std::io::Error::last_os_error());
 
@@ -55,6 +68,8 @@ fn main() {
         dst: [0xff; 6],
         src: DEFAULT_SRC,
         addr3: None,
+        addr4: None,
+        htc: None,
     };
     let buf = frame::build(FrameFormat::RawNdnS1g { ethertype: 0x8624 }, &inj).expect("build");
     println!("frame = {} bytes on the wire", buf.len());
@@ -66,14 +81,21 @@ fn main() {
 
     let send_once = |flags: libc::c_int| -> isize {
         unsafe {
-            libc::sendto(fd, buf.as_ptr() as *const libc::c_void, buf.len(), flags,
+            libc::sendto(
+                fd,
+                buf.as_ptr() as *const libc::c_void,
+                buf.len(),
+                flags,
                 &dst as *const _ as *const libc::sockaddr,
-                std::mem::size_of::<libc::sockaddr_ll>() as u32)
+                std::mem::size_of::<libc::sockaddr_ll>() as u32,
+            )
         }
     };
     let outq = || -> libc::c_int {
         let mut v: libc::c_int = -1;
-        unsafe { libc::ioctl(fd, libc::TIOCOUTQ, &mut v); }
+        unsafe {
+            libc::ioctl(fd, libc::TIOCOUTQ, &mut v);
+        }
         v
     };
 
@@ -88,21 +110,33 @@ fn main() {
     let mut wedged_at = None;
     for _ in 0..2_000_000u64 {
         let r = send_once(0);
-        if r >= 0 { n += 1; continue; }
+        if r >= 0 {
+            n += 1;
+            continue;
+        }
         let e = std::io::Error::last_os_error();
         if e.raw_os_error() == Some(libc::EAGAIN) || e.kind() == std::io::ErrorKind::WouldBlock {
             wedged_at = Some(n);
             break;
         }
         // ENOBUFS or other: report and keep trying a few, then stop.
-        println!("send #{n} errored (not EAGAIN): {e} (errno {:?})", e.raw_os_error());
+        println!(
+            "send #{n} errored (not EAGAIN): {e} (errno {:?})",
+            e.raw_os_error()
+        );
         wedged_at = Some(n);
         break;
     }
     match wedged_at {
-        Some(k) => println!("PHASE1: send returned EAGAIN after {k} frames (~{} KiB queued), TIOCOUTQ={}",
-            (k * buf.len() as u64) / 1024, outq()),
-        None => { println!("PHASE1: never wedged in 2M frames — buffer drains fine, NOT the bug"); return; }
+        Some(k) => println!(
+            "PHASE1: send returned EAGAIN after {k} frames (~{} KiB queued), TIOCOUTQ={}",
+            (k * buf.len() as u64) / 1024,
+            outq()
+        ),
+        None => {
+            println!("PHASE1: never wedged in 2M frames — buffer drains fine, NOT the bug");
+            return;
+        }
     }
 
     // Phase 2: idle, no traffic, no tokio. Does the buffer drain on its own?
@@ -110,9 +144,19 @@ fn main() {
         std::thread::sleep(std::time::Duration::from_secs(secs));
         let r = send_once(0);
         let ok = r >= 0;
-        println!("PHASE2: after {secs}s idle -> send {} (TIOCOUTQ={})",
-            if ok { "SUCCEEDED (drained)" } else { "still EAGAIN (permanent)" }, outq());
-        if ok { println!("=> transient backpressure, drains when idle"); return; }
+        println!(
+            "PHASE2: after {secs}s idle -> send {} (TIOCOUTQ={})",
+            if ok {
+                "SUCCEEDED (drained)"
+            } else {
+                "still EAGAIN (permanent)"
+            },
+            outq()
+        );
+        if ok {
+            println!("=> transient backpressure, drains when idle");
+            return;
+        }
     }
 
     // Phase 3: no tokio in the picture at all — a BLOCKING send with a hard
@@ -125,8 +169,12 @@ fn main() {
     }
     println!("PHASE3: attempting a BLOCKING send (5s alarm)…");
     let r = send_once(0);
-    println!("PHASE3: blocking send returned {r} (if the process was killed by SIGALRM, it blocked forever = kernel send path stuck, tokio exonerated)");
+    println!(
+        "PHASE3: blocking send returned {r} (if the process was killed by SIGALRM, it blocked forever = kernel send path stuck, tokio exonerated)"
+    );
 }
 
 #[cfg(not(target_os = "linux"))]
-fn main() { eprintln!("linux only"); }
+fn main() {
+    eprintln!("linux only");
+}

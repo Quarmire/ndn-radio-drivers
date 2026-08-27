@@ -33,7 +33,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         let dev = bw.clone();
         let inj = tokio::spawn(async move {
             for _ in 0..150 {
-                let f = InjectFrame::broadcast(Bytes::from_static(b"PWR-SWEEP"), TxIntent::CONSERVATIVE);
+                let f = InjectFrame::broadcast(
+                    Bytes::from_static(b"PWR-SWEEP"),
+                    TxIntent::CONSERVATIVE,
+                );
                 let _ = dev.inject_at(f, McsDescriptor::ht(0)).await;
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
@@ -41,7 +44,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         let (mut sum, mut n) = (0i32, 0i32);
         let deadline = Instant::now() + Duration::from_millis(1800);
         while Instant::now() < deadline {
-            if let Ok(Ok(f)) = tokio::time::timeout(Duration::from_millis(250), eu.recv_frame()).await {
+            if let Ok(Ok(f)) =
+                tokio::time::timeout(Duration::from_millis(250), eu.recv_frame()).await
+            {
                 if f.payload.windows(9).any(|w| w == b"PWR-SWEEP") {
                     if let Some(r) = f.rssi_dbm {
                         sum += r as i32;

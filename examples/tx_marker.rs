@@ -12,7 +12,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     use ndn_radio_drivers::LibUsbRtl88xxBackend;
     use std::time::Duration;
 
-    let ch: u8 = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(149);
+    let ch: u8 = std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(149);
     let dev = LibUsbRtl88xxBackend::open_monitor(ch)?;
     let payload = Bytes::from_static(b"NDN-8812-CAFE-XMIT");
     println!("RTL8812EU injecting {payload:?} on ch{ch}, 600x…");

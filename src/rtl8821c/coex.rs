@@ -92,7 +92,13 @@ impl Rtl8821cuBackend {
     // ── LTE-coex indirect access (util.c:24-50) ──────────────────────────────
 
     fn ltecoex_wait_ready(&self) -> Result<(), FaceError> {
-        self.poll32(LTECOEX_CTRL, LTECOEX_READY, LTECOEX_READY, 1000, Duration::from_micros(10))
+        self.poll32(
+            LTECOEX_CTRL,
+            LTECOEX_READY,
+            LTECOEX_READY,
+            1000,
+            Duration::from_micros(10),
+        )
     }
 
     fn ltecoex_read(&self, off: u16) -> Result<u32, FaceError> {

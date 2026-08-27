@@ -63,7 +63,10 @@ fn scan(b: &Arc<Rtl8812auBackend>, window: u64) -> Result<(), Box<dyn std::error
     }
     let dt = t0.elapsed().as_secs_f64();
     let s1 = snap(b)?;
-    println!("decoded {frames} frames ({:.0}/s). registers that changed:", frames as f64 / dt);
+    println!(
+        "decoded {frames} frames ({:.0}/s). registers that changed:",
+        frames as f64 / dt
+    );
     for (i, &a) in addrs.iter().enumerate() {
         if s0[i] != s1[i] {
             let d = s1[i].wrapping_sub(s0[i]);
@@ -82,19 +85,34 @@ fn scan(b: &Arc<Rtl8812auBackend>, window: u64) -> Result<(), Box<dyn std::error
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let a1 = std::env::args().nth(1).unwrap_or_default();
     if a1 == "scan" {
-        let ch: u8 = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(6);
-        let window: u64 = std::env::args().nth(3).and_then(|s| s.parse().ok()).unwrap_or(3);
+        let ch: u8 = std::env::args()
+            .nth(2)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(6);
+        let window: u64 = std::env::args()
+            .nth(3)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(3);
         let b = bring_up(ch)?;
         println!("8812AU pid={:#06x} scanning ch{ch}", b.pid());
         scan(&b, window)?;
         return Ok(());
     }
     let ch: u8 = a1.parse().ok().unwrap_or(6);
-    let window: u64 = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(2);
-    let iters: u32 = std::env::args().nth(3).and_then(|s| s.parse().ok()).unwrap_or(4);
+    let window: u64 = std::env::args()
+        .nth(2)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(2);
+    let iters: u32 = std::env::args()
+        .nth(3)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(4);
     let b = bring_up(ch)?;
     b.set_rx_group_filter(None)?; // promiscuous — count all frames as ground truth
-    println!("8812AU pid={:#06x} sensing ch{ch}, {window}s windows × {iters}", b.pid());
+    println!(
+        "8812AU pid={:#06x} sensing ch{ch}, {window}s windows × {iters}",
+        b.pid()
+    );
     println!(
         "  {:>3} {:>4} {:>4} | {:>10} | {:>9}",
         "it", "igiA", "igiB", "activity/s", "decoded/s"

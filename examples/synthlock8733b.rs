@@ -23,8 +23,14 @@ use ndn_radio_drivers::{BROADCAST, FrameIo, InjectFrame, Rtl8733buBackend, TxInt
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let ch: u8 = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(36);
-    let secs: u64 = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(6);
+    let ch: u8 = std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(36);
+    let secs: u64 = std::env::args()
+        .nth(2)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(6);
 
     let dev = Arc::new(Rtl8733buBackend::open()?);
     let _t = dev.bring_up_tx_tracked(ch)?;
@@ -38,6 +44,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         dst: BROADCAST,
         src: [0x02, 0x53, 0x59, 0x4e, 0x01, 0x01],
         addr3: None,
+        addr4: None,
+        htc: None,
     };
     let end = std::time::Instant::now() + std::time::Duration::from_secs(secs);
     let mut sent = 0u64;
@@ -48,6 +56,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Re-read at the END too: if a run starts locked and finishes unlocked, losing lock is the
     // mechanism behind the chip going quiet partway through, which has voided several sweeps.
     let live_end = dev.synth_locked_now().unwrap_or(false);
-    println!("RESULT lock_latched={latched} lock_after={live} lock_end={live_end} rate={}/s", sent / secs.max(1));
+    println!(
+        "RESULT lock_latched={latched} lock_after={live} lock_end={live_end} rate={}/s",
+        sent / secs.max(1)
+    );
     Ok(())
 }

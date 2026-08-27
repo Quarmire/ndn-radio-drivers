@@ -18,7 +18,10 @@ fn stats(mut v: Vec<u128>) -> (u128, u128, u128) {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let n: usize = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(40);
+    let n: usize = std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(40);
     let dev = Rtl8733buBackend::open()?;
     dev.bring_up_monitor(36)?;
 

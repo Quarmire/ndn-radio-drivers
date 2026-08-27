@@ -8,7 +8,10 @@ use ndn_radio_hal::Bandwidth;
 use std::time::Instant;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let n: usize = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(40);
+    let n: usize = std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(40);
     let dev = LibUsbRtl88xxBackend::open_monitor(36)?;
     for (label, chans) in [
         ("5 GHz same-band (36<->40)", vec![36u8, 40]),
@@ -23,8 +26,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             t.push(t0.elapsed().as_micros());
         }
         t.sort_unstable();
-        println!("{label:<28} p50={:>7} p90={:>7} max={:>7} us",
-                 t[t.len() / 2], t[t.len() * 9 / 10], t[t.len() - 1]);
+        println!(
+            "{label:<28} p50={:>7} p90={:>7} max={:>7} us",
+            t[t.len() / 2],
+            t[t.len() * 9 / 10],
+            t[t.len() - 1]
+        );
     }
     RadioKnobs::set_channel(&dev, 36, Bandwidth::Bw20)?;
     Ok(())

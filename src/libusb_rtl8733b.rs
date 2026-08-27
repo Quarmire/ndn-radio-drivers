@@ -26,18 +26,19 @@
 //! `apply_efuse_trim`) is retained for that follow-on; it is not on the working RX/inject
 //! path and is not required for it.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use async_trait::async_trait;
-use ndn_frame_io::{PhyMetrics, 
-    frame, CapturedFrame, ClockDomainId, FrameFormat, FrameIo, InjectFrame,
-};
 use crate::realtek_rx;
-use ndn_radio_hal::{ClockSteering,
-    Band, Bandwidth, McsDescriptor, RadioCapability, RadioKnobs, RadioProfile, RadioTime,
-    RadioTimeSource, RateCapability, TxDiscipline, };
+use async_trait::async_trait;
+use ndn_frame_io::{
+    CapturedFrame, ClockDomainId, FrameFormat, FrameIo, InjectFrame, PhyMetrics, frame,
+};
+use ndn_radio_hal::{
+    Band, Bandwidth, ClockSteering, McsDescriptor, RadioCapability, RadioKnobs, RadioProfile,
+    RadioTime, RadioTimeSource, RateCapability, TxDiscipline,
+};
 use ndn_transport::FaceError;
 use rusb::{Context, Device, DeviceHandle, Direction, TransferType, UsbContext};
 
@@ -181,11 +182,42 @@ pub const FW_NIC_8733B: &[u8] = include_bytes!("../fw/rtl8733b_fw_nic.bin");
 /// flat `[addr, value, …]` pairs terminated by `0xFFFF`. All byte writes, no
 /// condition blocks. `0x002 = 0xC3` enables the BB block.
 const MAC_REG_8733B: &[u32] = &[
-    0x002, 0x0000_00C3, 0x55C, 0x0000_0050, 0x638, 0x0000_0050, 0x639, 0x0000_0019,
-    0x640, 0x0000_0019, 0x63C, 0x0000_000D, 0x63D, 0x0000_000D, 0x63E, 0x0000_000D,
-    0x63F, 0x0000_000D, 0x4CA, 0x0000_003F, 0x66C, 0x0000_0004, 0x520, 0x0000_006F,
-    0x5A7, 0x0000_00FF, 0x6A2, 0x0000_00FF, 0x6A3, 0x0000_00FF, 0x4E5, 0x0000_00E0,
-    0x4E6, 0x0000_0009, 0xFFFF, 0x0000_FFFF,
+    0x002,
+    0x0000_00C3,
+    0x55C,
+    0x0000_0050,
+    0x638,
+    0x0000_0050,
+    0x639,
+    0x0000_0019,
+    0x640,
+    0x0000_0019,
+    0x63C,
+    0x0000_000D,
+    0x63D,
+    0x0000_000D,
+    0x63E,
+    0x0000_000D,
+    0x63F,
+    0x0000_000D,
+    0x4CA,
+    0x0000_003F,
+    0x66C,
+    0x0000_0004,
+    0x520,
+    0x0000_006F,
+    0x5A7,
+    0x0000_00FF,
+    0x6A2,
+    0x0000_00FF,
+    0x6A3,
+    0x0000_00FF,
+    0x4E5,
+    0x0000_00E0,
+    0x4E6,
+    0x0000_0009,
+    0xFFFF,
+    0x0000_FFFF,
 ];
 
 /// 8733b baseband tables (`array_mp_8733b_phy_reg` / `_agc_tab`) and the RF/radioA
@@ -448,7 +480,10 @@ impl PowerTracker {
     /// A tracker that owns no thread — returned when a hardware loop (TSSI) is doing the thermal
     /// compensation instead, so callers keep the same RAII shape without a second controller.
     pub fn inert() -> Self {
-        PowerTracker { stop: Arc::new(AtomicBool::new(true)), handle: None }
+        PowerTracker {
+            stop: Arc::new(AtomicBool::new(true)),
+            handle: None,
+        }
     }
 }
 
@@ -516,10 +551,9 @@ impl Rtl8733buBackend {
                     }
                     match ep.direction() {
                         Direction::In if bulk_in.is_none() => bulk_in = Some(ep.address()),
-                        Direction::Out
-                            if !bulk_outs.contains(&ep.address()) => {
-                                bulk_outs.push(ep.address());
-                            }
+                        Direction::Out if !bulk_outs.contains(&ep.address()) => {
+                            bulk_outs.push(ep.address());
+                        }
                         _ => {}
                     }
                 }
@@ -581,7 +615,14 @@ impl Rtl8733buBackend {
     /// Write a 16-bit register (little-endian on the wire).
     pub fn write16(&self, addr: u16, val: u16) -> Result<(), FaceError> {
         self.handle
-            .write_control(VENQT_WRITE, VENQT_REQ, addr, 0, &val.to_le_bytes(), CTRL_TIMEOUT)
+            .write_control(
+                VENQT_WRITE,
+                VENQT_REQ,
+                addr,
+                0,
+                &val.to_le_bytes(),
+                CTRL_TIMEOUT,
+            )
             .map_err(usb_err)?;
         Ok(())
     }
@@ -597,7 +638,14 @@ impl Rtl8733buBackend {
     /// Write a 32-bit register (little-endian on the wire).
     pub fn write32(&self, addr: u16, val: u32) -> Result<(), FaceError> {
         self.handle
-            .write_control(VENQT_WRITE, VENQT_REQ, addr, 0, &val.to_le_bytes(), CTRL_TIMEOUT)
+            .write_control(
+                VENQT_WRITE,
+                VENQT_REQ,
+                addr,
+                0,
+                &val.to_le_bytes(),
+                CTRL_TIMEOUT,
+            )
             .map_err(usb_err)?;
         Ok(())
     }
@@ -646,7 +694,10 @@ impl Rtl8733buBackend {
                         if Instant::now() >= deadline {
                             return Err(io_err(format!(
                                 "8733b {what}: poll timeout at 0x{:04x} (msk 0x{:02x}, want 0x{:02x}, got 0x{:02x})",
-                                s.offset, s.msk, s.val & s.msk, got
+                                s.offset,
+                                s.msk,
+                                s.val & s.msk,
+                                got
                             )));
                         }
                     }
@@ -695,7 +746,10 @@ impl Rtl8733buBackend {
     /// HIQ to high priority, enable TXDMA, set the download queue page counts, and
     /// disable beacon functions. (The prologue of the vendor `download_firmware`.)
     pub fn fw_dl_setup(&self) -> Result<(), FaceError> {
-        self.write8(REG_EXT_SYS_CLK_CTRL, self.read8(REG_EXT_SYS_CLK_CTRL)? | 0x02)?;
+        self.write8(
+            REG_EXT_SYS_CLK_CTRL,
+            self.read8(REG_EXT_SYS_CLK_CTRL)? | 0x02,
+        )?;
         // BIT(17) = DDMA_FUNC_EN gates the IDDMA registers (0x1200): if it is clear the
         // DMA engine is inert and the firmware never reaches IMEM. The Linux capture had
         // it set (EXT_FUNC=0x0003300f) by power-on default; a fresh macOS-side chip has
@@ -858,7 +912,9 @@ impl Rtl8733buBackend {
         }
         // Checksum status (0 = OK) after the section.
         if self.read32(REG_DDMA_CH0CTRL)? & DDMA_CHKSUM_STS != 0 {
-            return Err(io_err(format!("fw section @0x{dest_base:08x}: DDMA checksum error")));
+            return Err(io_err(format!(
+                "fw section @0x{dest_base:08x}: DDMA checksum error"
+            )));
         }
         // Flag DW_OK|CHKSUM_OK: DMEM (base >= 0x14200000) = 0x60, IMEM = 0x18.
         let bits = if dest_base >= 0x1420_0000 { 0x60 } else { 0x18 };
@@ -908,7 +964,9 @@ impl Rtl8733buBackend {
         self.write32(REG_TXDMA_STATUS, 0x0004)?; // clear TXDMA
         let fw_ctrl = self.read16(REG_MCUFW_CTRL)?;
         if fw_ctrl & 0x50 != 0x50 {
-            return Err(io_err(format!("fw checksums not OK (MCUFW_CTRL=0x{fw_ctrl:04x})")));
+            return Err(io_err(format!(
+                "fw checksums not OK (MCUFW_CTRL=0x{fw_ctrl:04x})"
+            )));
         }
         // Set FW_DW_RDY (BIT14), clear FWDL_EN (BIT0).
         self.write16(REG_MCUFW_CTRL, (fw_ctrl | 0x4000) & !0x0001)?;
@@ -930,7 +988,10 @@ impl Rtl8733buBackend {
         while Instant::now() < deadline {
             let m = self.read16(REG_MCUFW_CTRL)?;
             if dbg && ticks < 6 {
-                eprintln!("  [poll {ticks}] MCUFW=0x{m:04x} FW_DBG7=0x{:08x}", self.read32(0x10AC)?);
+                eprintln!(
+                    "  [poll {ticks}] MCUFW=0x{m:04x} FW_DBG7=0x{:08x}",
+                    self.read32(0x10AC)?
+                );
             }
             ticks += 1;
             if m & 0xC078 == 0xC078 {
@@ -1246,7 +1307,10 @@ impl Rtl8733buBackend {
                 }
                 let h2 = phys[i];
                 i += 1;
-                ((((h2 & 0xf0) >> 1) | ((hdr & 0xe0) >> 5)) as usize, h2 & 0x0f)
+                (
+                    (((h2 & 0xf0) >> 1) | ((hdr & 0xe0) >> 5)) as usize,
+                    h2 & 0x0f,
+                )
             } else {
                 (((hdr & 0xf0) >> 4) as usize, hdr & 0x0f)
             };
@@ -1295,7 +1359,14 @@ impl Rtl8733buBackend {
     /// HwRate code (0x00 = 1M CCK, 0x04 = 6M OFDM). Run after [`init_trx`](Self::init_trx).
     pub fn inject_raw(&self, frame: &[u8], rate: u8, seq: u16) -> Result<(), FaceError> {
         let bcast = frame.len() > 4 && frame[4] & 0x01 != 0; // 802.11 addr1[0] group bit
-        let desc = build_data_txdesc(frame.len(), rate, seq, self.tx_pwr_ofs.load(Ordering::Relaxed), bcast, self.tx_flags.load(Ordering::Relaxed));
+        let desc = build_data_txdesc(
+            frame.len(),
+            rate,
+            seq,
+            self.tx_pwr_ofs.load(Ordering::Relaxed),
+            bcast,
+            self.tx_flags.load(Ordering::Relaxed),
+        );
         let mut pkt = Vec::with_capacity(desc.len() + frame.len() + 1);
         pkt.extend_from_slice(&desc);
         pkt.extend_from_slice(frame);
@@ -1308,7 +1379,10 @@ impl Rtl8733buBackend {
             .write_bulk(ep, &pkt, Duration::from_millis(500))
             .map_err(usb_err)?;
         if wrote != pkt.len() {
-            return Err(io_err(format!("inject: short bulk write {wrote}/{}", pkt.len())));
+            return Err(io_err(format!(
+                "inject: short bulk write {wrote}/{}",
+                pkt.len()
+            )));
         }
         Ok(())
     }
@@ -1392,7 +1466,9 @@ impl Rtl8733buBackend {
         // What remains true, and is why this stays: TSSI performs thermal compensation in hardware,
         // so a software tracker writing the same quantity is redundant and semantically wrong.
         if std::env::var_os("NDN_8733B_NO_TSSI").is_none() {
-            eprintln!("8733b: TSSI enabled — skipping the software power tracker (hardware loop owns thermal)");
+            eprintln!(
+                "8733b: TSSI enabled — skipping the software power tracker (hardware loop owns thermal)"
+            );
             return Ok(PowerTracker::inert());
         }
         Ok(self.spawn_power_tracking())
@@ -1423,19 +1499,28 @@ impl Rtl8733buBackend {
                 // enables the loop LAZILY, long after this thread starts — an env-var or spawn-time
                 // check silently misses that path, which is how the first end-to-end HAL sweep came
                 // to drift 7 dB and fail its own return-to-baseline arm.
-                if dev.read32(0x4318).map(|v| v & (1 << 30) != 0).unwrap_or(false) {
+                if dev
+                    .read32(0x4318)
+                    .map(|v| v & (1 << 30) != 0)
+                    .unwrap_or(false)
+                {
                     std::thread::sleep(Duration::from_millis(400));
                     continue;
                 }
                 let die = dev.read_thermal().unwrap_or(32);
-                let sw = u32::from(die.saturating_sub(31)).saturating_mul(16).min(0x28);
+                let sw = u32::from(die.saturating_sub(31))
+                    .saturating_mul(16)
+                    .min(0x28);
                 if let Ok(v) = dev.read32(0x18a0) {
                     let _ = dev.write32(0x18a0, (v & !0x7f) | sw);
                 }
                 std::thread::sleep(Duration::from_millis(400));
             }
         });
-        PowerTracker { stop, handle: Some(handle) }
+        PowerTracker {
+            stop,
+            handle: Some(handle),
+        }
     }
 
     /// Read the RF thermal meter (`RF_T_METER` = RF 0x42). Triggers a measurement (toggle
@@ -1490,13 +1575,19 @@ impl Rtl8733buBackend {
         if tssi {
             self.tssi_setup(ch)?;
             let v = self.read32(0x4318)?;
-            eprintln!("8733b: TSSI setup applied, 0x4318={v:08x} tssi_field={}", (v >> 28) & 0x7);
+            eprintln!(
+                "8733b: TSSI setup applied, 0x4318={v:08x} tssi_field={}",
+                (v >> 28) & 0x7
+            );
         }
         self.enable_tx(ch)?;
         if tssi {
             // `enable_tx` re-tunes and re-applies the datapath; report whether the loop survived it.
             let v = self.read32(0x4318)?;
-            eprintln!("8733b: after enable_tx, 0x4318={v:08x} tssi_field={}", (v >> 28) & 0x7);
+            eprintln!(
+                "8733b: after enable_tx, 0x4318={v:08x} tssi_field={}",
+                (v >> 28) & 0x7
+            );
         }
         Ok(())
     }
@@ -1514,7 +1605,12 @@ impl Rtl8733buBackend {
     /// response (an ACK, an NDN Data for an Interest, a peer echo). No on-chip signal reports
     /// radiated power on this part, which is a real and separate finding: the entire TXAGC page
     /// is inert here, so registers cannot tell you how much RF left the antenna.
-    pub fn bring_up_tx_until<F>(&self, ch: u8, max_attempts: u32, mut verify: F) -> Result<bool, FaceError>
+    pub fn bring_up_tx_until<F>(
+        &self,
+        ch: u8,
+        max_attempts: u32,
+        mut verify: F,
+    ) -> Result<bool, FaceError>
     where
         F: FnMut(&Self) -> bool,
     {
@@ -1542,14 +1638,35 @@ impl Rtl8733buBackend {
         // Vendor final values for the TXAGC/datapath regs the cal leaves zeroed/un-restored
         // (from a post-cal-vs-vendor BB diff). 0x1e40-0x1e60 is the per-rate TX power table.
         const DP: &[(u16, u32)] = &[
-            (0x180c, 0x17f43863), (0x18ac, 0x00065a60), (0x1968, 0x36632640),
-            (0x1c38, 0xffb5005e), (0x1c3c, 0x01051f43), (0x1c80, 0x0f38e000), (0x1c84, 0x24512054),
-            (0x1ca4, 0xe0000000), (0x1d70, 0x2020201c), (0x1e1c, 0x8400b000),
-            (0x1e40, 0xfffeffff), (0x1e44, 0x2824201c), (0x1e48, 0x3834302c), (0x1e50, 0x2824201c),
-            (0x1e54, 0x3834302c), (0x1e58, 0xfe44403c), (0x1e5c, 0xc13c00ff), (0x1e60, 0x4440413f),
-            (0x1e88, 0x0000fc1c), (0x1e8c, 0x00007000), (0x1eb8, 0x00000b00),
-            (0x1ed4, 0x800c0040), (0x1ed8, 0x8005000c), (0x1edc, 0x80020005), (0x1ee0, 0x80000002),
-            (0x1ee4, 0xf0000000), (0x1ef0, 0x30000a80), (0x1ef4, 0x40001266), (0x1ef8, 0x3b000100),
+            (0x180c, 0x17f43863),
+            (0x18ac, 0x00065a60),
+            (0x1968, 0x36632640),
+            (0x1c38, 0xffb5005e),
+            (0x1c3c, 0x01051f43),
+            (0x1c80, 0x0f38e000),
+            (0x1c84, 0x24512054),
+            (0x1ca4, 0xe0000000),
+            (0x1d70, 0x2020201c),
+            (0x1e1c, 0x8400b000),
+            (0x1e40, 0xfffeffff),
+            (0x1e44, 0x2824201c),
+            (0x1e48, 0x3834302c),
+            (0x1e50, 0x2824201c),
+            (0x1e54, 0x3834302c),
+            (0x1e58, 0xfe44403c),
+            (0x1e5c, 0xc13c00ff),
+            (0x1e60, 0x4440413f),
+            (0x1e88, 0x0000fc1c),
+            (0x1e8c, 0x00007000),
+            (0x1eb8, 0x00000b00),
+            (0x1ed4, 0x800c0040),
+            (0x1ed8, 0x8005000c),
+            (0x1edc, 0x80020005),
+            (0x1ee0, 0x80000002),
+            (0x1ee4, 0xf0000000),
+            (0x1ef0, 0x30000a80),
+            (0x1ef4, 0x40001266),
+            (0x1ef8, 0x3b000100),
         ];
         self.apply_efuse_trim()?;
         self.rfk_init()?; // KIP microcode (prereq for IQK/DPK)
@@ -1558,9 +1675,13 @@ impl Rtl8733buBackend {
         let _ = self.phy_dpk()?; // digital pre-distortion
         // The cal zeroes the per-rate TXAGC + leaves datapath regs un-restored; apply the
         // vendor final values, re-tune (needed to re-lock RF/BB), then re-assert.
-        for &(a, v) in DP { self.write32(a, v)?; }
+        for &(a, v) in DP {
+            self.write32(a, v)?;
+        }
         self.tune_channel(ch)?;
-        for &(a, v) in DP { self.write32(a, v)?; }
+        for &(a, v) in DP {
+            self.write32(a, v)?;
+        }
         // Grant the shared RF front-end to WiFi (phy_set_rf_path_switch: GNT_WL=1, GNT_BT=0).
         let g = self.read32(0x70)?;
         self.write32(0x70, (g & !0xF000_0000) | (1 << 26) | (0x9 << 28))?;
@@ -1573,11 +1694,15 @@ impl Rtl8733buBackend {
     /// and successive frames are 8-byte aligned; `DMA_AGG_NUM` counts them.
     pub fn capture(&self, timeout_ms: u64) -> Result<Vec<Vec<u8>>, FaceError> {
         let mut buf = vec![0u8; 16384];
-        let n = match self.handle.read_bulk(self.bulk_in, &mut buf, Duration::from_millis(timeout_ms)) {
-            Ok(n) => n,
-            Err(rusb::Error::Timeout) => return Ok(Vec::new()),
-            Err(e) => return Err(usb_err(e)),
-        };
+        let n =
+            match self
+                .handle
+                .read_bulk(self.bulk_in, &mut buf, Duration::from_millis(timeout_ms))
+            {
+                Ok(n) => n,
+                Err(rusb::Error::Timeout) => return Ok(Vec::new()),
+                Err(e) => return Err(usb_err(e)),
+            };
         let data = &buf[..n];
         let mut frames = Vec::new();
         let mut off = 0usize;
@@ -1589,7 +1714,8 @@ impl Rtl8733buBackend {
             }
             let drvinfo = ((dw0 >> 16) & 0xF) as usize * 8;
             let shift = ((dw0 >> 24) & 0x3) as usize;
-            let dw2 = u32::from_le_bytes([data[off + 8], data[off + 9], data[off + 10], data[off + 11]]);
+            let dw2 =
+                u32::from_le_bytes([data[off + 8], data[off + 9], data[off + 10], data[off + 11]]);
             let is_c2h = dw2 & (1 << 28) != 0;
             let fstart = off + 24 + drvinfo + shift;
             if !is_c2h && fstart + pkt_len <= data.len() {
@@ -1604,7 +1730,9 @@ impl Rtl8733buBackend {
     /// short list of byte writes, including `0x002 = 0xC3` which brings up the BB
     /// block. Run after the firmware is booted.
     pub fn mac_config(&self) -> Result<(), FaceError> {
-        self.config_table(MAC_REG_8733B, |s, addr, val| s.write8(addr as u16, val as u8))
+        self.config_table(MAC_REG_8733B, |s, addr, val| {
+            s.write8(addr as u16, val as u8)
+        })
     }
 
     /// The discovered bulk endpoints (for the later TX/RX milestones).
@@ -1649,12 +1777,14 @@ const RFREG_MASK: u32 = 0x000F_FFFF; // RF registers are 20-bit
 
 /// DPK register backup lists (do_dpk_8733b).
 const DPK_BB_REGS: [u16; 15] = [
-    0x0522, 0x1884, 0x09f0, 0x2a24, 0x1830, 0x1d40, 0x1b38, 0x1b3c, 0x1bf8, 0x1e70, 0x1c38,
-    0x1c68, 0x1864, 0x180c, 0x1880,
+    0x0522, 0x1884, 0x09f0, 0x2a24, 0x1830, 0x1d40, 0x1b38, 0x1b3c, 0x1bf8, 0x1e70, 0x1c38, 0x1c68,
+    0x1864, 0x180c, 0x1880,
 ];
 const DPK_RF_REGS: [u32; 9] = [0x0, 0x5, 0x83, 0x8c, 0x8f, 0x9e, 0xde, 0xdf, 0xef];
 /// TXGAPK (TX Gain-K) register backup lists (halrf_txgapk_8733b).
-const GAPK_BB_REGS: [u16; 8] = [0x1b00, 0x1b14, 0x1b24, 0x1b38, 0x1b3c, 0x1bcc, 0x1d40, 0x09f0];
+const GAPK_BB_REGS: [u16; 8] = [
+    0x1b00, 0x1b14, 0x1b24, 0x1b38, 0x1b3c, 0x1bcc, 0x1d40, 0x09f0,
+];
 const GAPK_RF_REGS: [u32; 8] = [0x00, 0x01, 0x83, 0x8c, 0x8f, 0x9e, 0xdf, 0x05];
 // enablek one-shot actions: index → 0x1bf0 bit.
 const GAPK_D_CLR: u8 = 0; // BIT21
@@ -1704,8 +1834,6 @@ pub struct TxPowerInfo {
     pub ofdm_diff_5g: Option<i8>,
     pub bw20_diff_5g: Option<i8>,
 }
-
-
 
 /// IQK measurement results — the per-path TX/RX correction coefficients.
 #[derive(Default, Debug, Clone, Copy)]
@@ -1910,72 +2038,188 @@ impl Rtl8733buBackend {
         // ── efuse-DE prep: per-channel TSSI power offsets + thermal reference ──
         // (halrf_tssi_get_efuse: tssi_efuse[A] = logical 0x10-0x1a ++ 0x22-0x2f; thermal 0xBA).
         let logi = Self::decode_efuse(&self.read_efuse(512)?);
-        let thermal = if logi[0xBA] == 0xff { 0x20u32 } else { logi[0xBA] as u32 };
+        let thermal = if logi[0xBA] == 0xff {
+            0x20u32
+        } else {
+            logi[0xBA] as u32
+        };
         // OFDM offset index (_halrf_get_efuse_tssi_offset) → logical efuse byte.
         let ofdm_idx: usize = match ch {
-            1..=2 => 6, 3..=5 => 7, 6..=8 => 8, 9..=11 => 9, 12..=14 => 10,
-            16..=40 => 11, 42..=48 => 12, 50..=58 => 13, 60..=64 => 14,
-            100..=104 => 15, 106..=112 => 16, 114..=120 => 17, 122..=128 => 18,
-            130..=136 => 19, 138..=144 => 20, 149..=153 => 21, 155..=161 => 22,
-            163..=169 => 23, _ => 24,
+            1..=2 => 6,
+            3..=5 => 7,
+            6..=8 => 8,
+            9..=11 => 9,
+            12..=14 => 10,
+            16..=40 => 11,
+            42..=48 => 12,
+            50..=58 => 13,
+            60..=64 => 14,
+            100..=104 => 15,
+            106..=112 => 16,
+            114..=120 => 17,
+            122..=128 => 18,
+            130..=136 => 19,
+            138..=144 => 20,
+            149..=153 => 21,
+            155..=161 => 22,
+            163..=169 => 23,
+            _ => 24,
         };
-        let ofdm_byte = if ofdm_idx < 11 { 0x10 + ofdm_idx } else { 0x22 + (ofdm_idx - 11) };
-        let cck_idx: usize = match ch { 3..=5 => 1, 6..=8 => 2, 9..=11 => 3, 12..=13 => 4, 14 => 5, _ => 0 };
+        let ofdm_byte = if ofdm_idx < 11 {
+            0x10 + ofdm_idx
+        } else {
+            0x22 + (ofdm_idx - 11)
+        };
+        let cck_idx: usize = match ch {
+            3..=5 => 1,
+            6..=8 => 2,
+            9..=11 => 3,
+            12..=13 => 4,
+            14 => 5,
+            _ => 0,
+        };
         let ofdm_off = logi[ofdm_byte] as i8 as i32;
         let cck_off = logi[0x10 + cck_idx] as i8 as i32;
         let clamp8 = |v: i32| (v.clamp(-128, 127) & 0xff) as u32;
-        if upto < 2 { return Ok(()); }
+        if upto < 2 {
+            return Ok(());
+        }
         self.bb_set(0x4318, 0x7000_0000, 0x0)?; // disable tssi first
         // ── anapar (00_set_tssi_sys) ──
         self.bb_set(0x1860, 1 << 30, 0)?;
-        let ana_5g: [u32; 16] = [0x700b8041,0x701f0048,0x702f0048,0x703f0048,0x704f0048,0x705f0041,0x70644041,0x707b8041,0x708b8041,0x709b8041,0x70ab8041,0x70bb8041,0x70cb8041,0x70db8041,0x70eb8041,0x70fb8041];
-        let ana_2g: [u32; 16] = [0x700b8041,0x701f0044,0x702f0044,0x703f0044,0x704f0044,0x705f0041,0x70644041,0x707b8041,0x708b8041,0x709b8041,0x70ab8041,0x70bb8041,0x70cb8041,0x70db8041,0x70eb8041,0x70fb8041];
-        for &v in if band_5g { &ana_5g } else { &ana_2g } { self.write32(0x1830, v)?; }
+        let ana_5g: [u32; 16] = [
+            0x700b8041, 0x701f0048, 0x702f0048, 0x703f0048, 0x704f0048, 0x705f0041, 0x70644041,
+            0x707b8041, 0x708b8041, 0x709b8041, 0x70ab8041, 0x70bb8041, 0x70cb8041, 0x70db8041,
+            0x70eb8041, 0x70fb8041,
+        ];
+        let ana_2g: [u32; 16] = [
+            0x700b8041, 0x701f0044, 0x702f0044, 0x703f0044, 0x704f0044, 0x705f0041, 0x70644041,
+            0x707b8041, 0x708b8041, 0x709b8041, 0x70ab8041, 0x70bb8041, 0x70cb8041, 0x70db8041,
+            0x70eb8041, 0x70fb8041,
+        ];
+        for &v in if band_5g { &ana_5g } else { &ana_2g } {
+            self.write32(0x1830, v)?;
+        }
         self.write32(0x1c38, 0xffb5_005e)?;
         self.bb_set(0x1d40, 1 << 3, 0)?;
         self.bb_set(0x1e1c, 1 << 31, 1)?;
         self.bb_set(0x1e1c, 1 << 26, 1)?;
         self.bb_set(0x1ca4, 1 << 31, 1)?;
         self.bb_set(0x1e1c, 0x0000_F000, 0xB)?;
-        if upto < 3 { return Ok(()); }
+        if upto < 3 {
+            return Ok(());
+        }
         // ── rf-setting (path A; 1×1 part) ──
         self.rf_set(0, 0x7f, 1 << 8, 1)?;
         self.rf_set(0, 0x55, 1 << 7, 1)?; // enable RF power tracking at RFC
-        if upto < 4 { return Ok(()); }
+        if upto < 4 {
+            return Ok(());
+        }
         // ── txpwr-bb-common (02_ini_txpwr_ctrl_bb) ──
         for (a, m, v) in [
-            (0x4300u16, 0x1Fu32, 0x00u32), (0x4300, 0x00FFFF00, 0x00ff), (0x4300, 0x07000000, 0x4), (0x4300, 0xF0000000, 0x4),
-            (0x4304, 0x0000FFFF, 0x0000), (0x4304, 0xFFFF0000, 0x0000),
-            (0x4314, 0x000001FF, 0x000), (0x4314, 0x00007000, 0x7), (0x4314, 0x00038000, 0x7), (0x4314, 0x007C0000, 0x1f), (0x4314, 0x0F800000, 0x00),
-            (0x4318, 0x0000FFFF, 0x807f), (0x4318, 0x7FFF0000, 0x0),
-            (0x4320, 0x0000007F, 0x00), (0x4320, 0x00000100, 0x1), (0x4320, 0x0000FE00, 0x00), (0x4320, 0x00FF0000, 0x88), (0x4320, 0x0F000000, 0x2),
-            (0x4328, 0x00FFFFFF, 0x280200), (0x4328, 0x7F000000, 0x43),
-            (0x432c, 0x000000FF, 0x50), (0x432c, 0x0001FF00, 0x0ff), (0x432c, 0x1FF00000, 0x100),
-            (0x4330, 0x00000FFF, 0x800), (0x4330, 0x03FF0000, 0x000), (0x4338, 0x00000FFF, 0x800), (0x4338, 0x03FF0000, 0x000),
-            (0x4340, 0x00000FFF, 0x800), (0x4340, 0x03FF0000, 0x000), (0x4348, 0x00000FFF, 0x800),
-            (0x4360, 0x00000003, 0x0), (0x4360, 0x01FFFFF0, 0x1f1f1f), (0x4370, 0x001FFFFF, 0x1f1f1f),
-            (0x438c, 0x00007FFF, 0x4040), (0x438c, 0xFFFF0000, 0xA0A0), (0x4390, 0x0000FFFF, 0x4040), (0x4390, 0xFFFF0000, 0x8080),
-            (0x4394, 0x00007FFF, 0x4040), (0x4394, 0xFFFF0000, 0xA4A4), (0x4398, 0x0000FFFF, 0x8080), (0x4398, 0xFFFF0000, 0x8080),
-            (0x439c, 0x00000007, 0x1), (0x439c, 0x0FFFFFF0, 0x080080), (0x439c, 0x30000000, 0x0),
-            (0x43a4, 0x00001FFF, 0x0000), (0x43a4, 0x0001_0000, 0x1),
-            (0x43a8, 0x0000001F, 0x00), (0x43a8, 0x00000F00, 0xd), (0x43a8, 0x0000F000, 0x0), (0x43a8, 0x00070000, 0x7), (0x43a8, 0x00380000, 0x0), (0x43a8, 0x03C00000, 0xd), (0x43a8, 0x7C000000, 0x1d),
-            (0x43ac, 0x0000FFFF, 0x4040), (0x1ca4, 1 << 30, 0x1), (0x1c84, 0x0000FC00, 0x8), (0x1c84, 0x000003c0, 0x1),
-        ] { self.bb_set(a, m, v)?; }
-        if upto < 5 { return Ok(()); }
+            (0x4300u16, 0x1Fu32, 0x00u32),
+            (0x4300, 0x00FFFF00, 0x00ff),
+            (0x4300, 0x07000000, 0x4),
+            (0x4300, 0xF0000000, 0x4),
+            (0x4304, 0x0000FFFF, 0x0000),
+            (0x4304, 0xFFFF0000, 0x0000),
+            (0x4314, 0x000001FF, 0x000),
+            (0x4314, 0x00007000, 0x7),
+            (0x4314, 0x00038000, 0x7),
+            (0x4314, 0x007C0000, 0x1f),
+            (0x4314, 0x0F800000, 0x00),
+            (0x4318, 0x0000FFFF, 0x807f),
+            (0x4318, 0x7FFF0000, 0x0),
+            (0x4320, 0x0000007F, 0x00),
+            (0x4320, 0x00000100, 0x1),
+            (0x4320, 0x0000FE00, 0x00),
+            (0x4320, 0x00FF0000, 0x88),
+            (0x4320, 0x0F000000, 0x2),
+            (0x4328, 0x00FFFFFF, 0x280200),
+            (0x4328, 0x7F000000, 0x43),
+            (0x432c, 0x000000FF, 0x50),
+            (0x432c, 0x0001FF00, 0x0ff),
+            (0x432c, 0x1FF00000, 0x100),
+            (0x4330, 0x00000FFF, 0x800),
+            (0x4330, 0x03FF0000, 0x000),
+            (0x4338, 0x00000FFF, 0x800),
+            (0x4338, 0x03FF0000, 0x000),
+            (0x4340, 0x00000FFF, 0x800),
+            (0x4340, 0x03FF0000, 0x000),
+            (0x4348, 0x00000FFF, 0x800),
+            (0x4360, 0x00000003, 0x0),
+            (0x4360, 0x01FFFFF0, 0x1f1f1f),
+            (0x4370, 0x001FFFFF, 0x1f1f1f),
+            (0x438c, 0x00007FFF, 0x4040),
+            (0x438c, 0xFFFF0000, 0xA0A0),
+            (0x4390, 0x0000FFFF, 0x4040),
+            (0x4390, 0xFFFF0000, 0x8080),
+            (0x4394, 0x00007FFF, 0x4040),
+            (0x4394, 0xFFFF0000, 0xA4A4),
+            (0x4398, 0x0000FFFF, 0x8080),
+            (0x4398, 0xFFFF0000, 0x8080),
+            (0x439c, 0x00000007, 0x1),
+            (0x439c, 0x0FFFFFF0, 0x080080),
+            (0x439c, 0x30000000, 0x0),
+            (0x43a4, 0x00001FFF, 0x0000),
+            (0x43a4, 0x0001_0000, 0x1),
+            (0x43a8, 0x0000001F, 0x00),
+            (0x43a8, 0x00000F00, 0xd),
+            (0x43a8, 0x0000F000, 0x0),
+            (0x43a8, 0x00070000, 0x7),
+            (0x43a8, 0x00380000, 0x0),
+            (0x43a8, 0x03C00000, 0xd),
+            (0x43a8, 0x7C000000, 0x1d),
+            (0x43ac, 0x0000FFFF, 0x4040),
+            (0x1ca4, 1 << 30, 0x1),
+            (0x1c84, 0x0000FC00, 0x8),
+            (0x1c84, 0x000003c0, 0x1),
+        ] {
+            self.bb_set(a, m, v)?;
+        }
+        if upto < 5 {
+            return Ok(());
+        }
         for (a, v) in [
-            (0x4308u16, 0x5c545c50u32), (0x430c, 0x3f3f3f3f), (0x4310, 0x003f3f3f), (0x431c, 0x0076280a),
-            (0x4324, 0x807f807f), (0x433c, 0), (0x4344, 0), (0x434c, 0), (0x4350, 0), (0x4354, 0), (0x4358, 0), (0x435c, 0),
-            (0x4364, 0), (0x4368, 0), (0x436c, 0), (0x4374, 0), (0x4378, 0), (0x437c, 0), (0x4380, 0x00000002),
-            (0x4384, 0x100000ff), (0x4388, 0), (0x43a0, 0),
-        ] { self.write32(a, v)?; }
-        if upto < 6 { return Ok(()); }
+            (0x4308u16, 0x5c545c50u32),
+            (0x430c, 0x3f3f3f3f),
+            (0x4310, 0x003f3f3f),
+            (0x431c, 0x0076280a),
+            (0x4324, 0x807f807f),
+            (0x433c, 0),
+            (0x4344, 0),
+            (0x434c, 0),
+            (0x4350, 0),
+            (0x4354, 0),
+            (0x4358, 0),
+            (0x435c, 0),
+            (0x4364, 0),
+            (0x4368, 0),
+            (0x436c, 0),
+            (0x4374, 0),
+            (0x4378, 0),
+            (0x437c, 0),
+            (0x4380, 0x00000002),
+            (0x4384, 0x100000ff),
+            (0x4388, 0),
+            (0x43a0, 0),
+        ] {
+            self.write32(a, v)?;
+        }
+        if upto < 6 {
+            return Ok(());
+        }
         // ── tmeter table (03): thermal reference + zeroed compensation LUT (cal temp) ──
         self.bb_set(0x4380, 0x0000_0007, 0x3)?;
         self.bb_set(0x4380, 0x0000_0FF0, thermal)?;
         self.bb_set(0x4380, 0x000F_F000, 0x0)?;
         self.bb_set(0x4380, 0xFFF0_0000, 0x0)?;
-        for i in (0..64u16).step_by(4) { self.write32(0x4200 + i, 0)?; }
-        if upto < 7 { return Ok(()); }
+        for i in (0..64u16).step_by(4) {
+            self.write32(0x4200 + i, 0)?;
+        }
+        if upto < 7 {
+            return Ok(());
+        }
         // ── DCK (05, auto) ──
         self.bb_set(0x4328, 1 << 24, 0x1)?;
         self.bb_set(0x4328, 1 << 25, 0x1)?;
@@ -1985,20 +2229,34 @@ impl Rtl8733buBackend {
         self.write32(0x4368, 0x0000_0002)?;
         self.write32(0x4378, 0x0000_0002)?;
         self.write32(0x436c, 0)?;
-        if upto < 8 { return Ok(()); }
+        if upto < 8 {
+            return Ok(());
+        }
         // ── slope (06) + slope-cal (07) ──
         for (a, m, v) in [
-            (0x4318u16, 0x70000000u32, 0x0u32), (0x4320, 0x0100_0000, 0x1), (0x4328, 0x00FFFFFF, 0x280200), (0x4320, 0x0000F000, 0x3),
-            (0x4330, 0x00000FFF, 0x800), (0x4330, 0x03FF0000, 0x000), (0x4338, 0x00000FFF, 0x800), (0x4338, 0x03FF0000, 0x000),
-            (0x4340, 0x00000FFF, 0x800), (0x4340, 0x03FF0000, 0x000), (0x4348, 0x00000FFF, 0x800),
-        ] { self.bb_set(a, m, v)?; }
+            (0x4318u16, 0x70000000u32, 0x0u32),
+            (0x4320, 0x0100_0000, 0x1),
+            (0x4328, 0x00FFFFFF, 0x280200),
+            (0x4320, 0x0000F000, 0x3),
+            (0x4330, 0x00000FFF, 0x800),
+            (0x4330, 0x03FF0000, 0x000),
+            (0x4338, 0x00000FFF, 0x800),
+            (0x4338, 0x03FF0000, 0x000),
+            (0x4340, 0x00000FFF, 0x800),
+            (0x4340, 0x03FF0000, 0x000),
+            (0x4348, 0x00000FFF, 0x800),
+        ] {
+            self.bb_set(a, m, v)?;
+        }
         self.write32(0x433c, 0)?;
         self.write32(0x4344, 0)?;
         self.write32(0x434c, 0)?;
         self.write32(0x4390, 0x8080_8080)?;
         self.write32(0x4398, 0x8080_8080)?;
         self.bb_set(0x439c, 1 << 0, 0x1)?;
-        if upto < 9 { return Ok(()); }
+        if upto < 9 {
+            return Ok(());
+        }
         // ── efuse-DE (halrf_tssi_set_efuse_de, path A): the calibrated TX-power offset ──
         let diff = 2i32;
         let tmp_ofdm = clamp8(ofdm_off);
@@ -2010,7 +2268,9 @@ impl Rtl8733buBackend {
         self.bb_set(0x43b0, 0x0000_FF00, tmp_ofdm)?; // RF40M OFDM 6M
         self.bb_set(0x43b0, 0x00FF_0000, tmp_ofdm)?; // RF40M OFDM 6M
         self.bb_set(0x433c, 0x0FF0_0000, tmp_cck)?; // CCK
-        if upto < 10 { return Ok(()); }
+        if upto < 10 {
+            return Ok(());
+        }
         // ── track (08) + ENABLE (0x4318[30:28]=7) + un-pause TSSI ──
         self.bb_set(0x4320, 1 << 24, 0x0)?;
         self.bb_set(0x439c, 0x0FFF_FFF0, 0x080080)?;
@@ -2099,7 +2359,10 @@ impl Rtl8733buBackend {
             }
         }
         if std::env::var("IQKDBG").is_ok() {
-            eprintln!("  [nctl] not converged (0x2d9c=0x{:02x})", self.bb_get(0x2d9c, 0xFF)?);
+            eprintln!(
+                "  [nctl] not converged (0x2d9c=0x{:02x})",
+                self.bb_get(0x2d9c, 0xFF)?
+            );
         }
         Ok(false)
     }
@@ -2218,7 +2481,9 @@ impl Rtl8733buBackend {
         let idac_if = ((r >> 26) & 0xF) + u32::from(r & (1 << 25) != 0);
         let idac_qf = ((r >> 6) & 0xF) + u32::from(r & (1 << 5) != 0);
         if std::env::var("IQKDBG").is_ok() {
-            eprintln!("  [lok] idac ic={idac_ic:#x} qc={idac_qc:#x} if={idac_if:#x} qf={idac_qf:#x}");
+            eprintln!(
+                "  [lok] idac ic={idac_ic:#x} qc={idac_qc:#x} if={idac_if:#x} qf={idac_qf:#x}"
+            );
         }
         self.rf_set(path, 0x09, 0xF0000, idac_if)?;
         self.rf_set(path, 0x09, 0x003C0, idac_qf)?;
@@ -2262,7 +2527,11 @@ impl Rtl8733buBackend {
         for lna in 0..2usize {
             // -- RF LNA gain (small=0 / large=1) --
             if band == 0 {
-                let (rf00, rf83) = if lna == 0 { (0x1cc, 0x79) } else { (0x342, 0x7e) };
+                let (rf00, rf83) = if lna == 0 {
+                    (0x1cc, 0x79)
+                } else {
+                    (0x342, 0x7e)
+                };
                 self.rf_set(0, 0x00, 0x03FF0, rf00)?;
                 self.rf_set(1, 0x00, 0x03FF0, rf00)?;
                 self.rf_set(path, 0x83, 0x00300, 0x2)?;
@@ -2584,7 +2853,11 @@ impl Rtl8733buBackend {
         self.write8(0x1bd8, 0x00)?;
         // TPG BW select (test-pattern generator) — the DPK measurement signal.
         let dpk_bw = (self.rf_get(path, 0x18, RFREG_MASK)? >> 10) & 1;
-        let tpg = if dpk_bw == 1 { 0xd200_0065 } else { 0xd200_0068 };
+        let tpg = if dpk_bw == 1 {
+            0xd200_0065
+        } else {
+            0xd200_0068
+        };
         self.bb_set(0x1bf8, 0xFFFF_FFFF, tpg)?;
         self.bb_set(0x1b3c, 0xFFFF_FF00, 0x200000)?; // RXIQC default
         self.bb_set(0x1b88, 0xFFFF_FFFF, 0x00b4_8000)?;
@@ -2783,7 +3056,11 @@ impl Rtl8733buBackend {
             self.rf_set(path, reg, mask, idx + if track { 2 } else { 1 })?;
             let g2 = self.rf_get(path, 0x56, gmask)?;
             if std::env::var("IQKDBG").is_ok() {
-                eprintln!("  [gapk {}] D{i}: g1=0x{g1:x} g2=0x{g2:x} RF56=0x{:x}", if track {"trk"} else {"pwr"}, self.rf_get(path, 0x56, RFREG_MASK)?);
+                eprintln!(
+                    "  [gapk {}] D{i}: g1=0x{g1:x} g2=0x{g2:x} RF56=0x{:x}",
+                    if track { "trk" } else { "pwr" },
+                    self.rf_get(path, 0x56, RFREG_MASK)?
+                );
             }
             if g1 != g2 {
                 self.rf_set(path, reg, mask, idx)?;
@@ -3037,7 +3314,14 @@ impl Rtl8733buBackend {
         let dot11 = frame::build_dot11(self.format, &frame_in)?;
         let seq = self.tx_seq.fetch_add(1, Ordering::Relaxed) & 0xFFF;
         let bcast = dot11.len() > 4 && dot11[4] & 0x01 != 0;
-        let desc = build_data_txdesc(dot11.len(), rate, seq, self.tx_pwr_ofs.load(Ordering::Relaxed), bcast, flags);
+        let desc = build_data_txdesc(
+            dot11.len(),
+            rate,
+            seq,
+            self.tx_pwr_ofs.load(Ordering::Relaxed),
+            bcast,
+            flags,
+        );
         let mut buf = Vec::with_capacity(desc.len() + dot11.len() + 1);
         buf.extend_from_slice(&desc);
         buf.extend_from_slice(&dot11);
@@ -3131,7 +3415,11 @@ impl Rtl8733buBackend {
     /// ch14 gets its own CCK group (5) because its CCK spectral mask differs.
     pub fn pg_group_2g(ch: u8) -> Option<(usize, usize)> {
         let gp = match ch {
-            1..=2 => 0, 3..=5 => 1, 6..=8 => 2, 9..=11 => 3, 12..=14 => 4,
+            1..=2 => 0,
+            3..=5 => 1,
+            6..=8 => 2,
+            9..=11 => 3,
+            12..=14 => 4,
             _ => return None,
         };
         Some((gp, if ch == 14 { 5 } else { gp }))
@@ -3140,9 +3428,20 @@ impl Rtl8733buBackend {
     /// 5 GHz PG group for a channel. Ports `rtw_get_ch_group`'s 5 GHz arm (14 groups).
     pub fn pg_group_5g(ch: u8) -> Option<usize> {
         Some(match ch {
-            16..=42 => 0, 44..=48 => 1, 50..=58 => 2, 60..=98 => 3, 100..=106 => 4,
-            108..=114 => 5, 116..=122 => 6, 124..=130 => 7, 132..=138 => 8, 140..=144 => 9,
-            149..=155 => 10, 157..=161 => 11, 165..=171 => 12, 173..=253 => 13,
+            16..=42 => 0,
+            44..=48 => 1,
+            50..=58 => 2,
+            60..=98 => 3,
+            100..=106 => 4,
+            108..=114 => 5,
+            116..=122 => 6,
+            124..=130 => 7,
+            132..=138 => 8,
+            140..=144 => 9,
+            149..=155 => 10,
+            157..=161 => 11,
+            165..=171 => 12,
+            173..=253 => 13,
             _ => return None,
         })
     }
@@ -3170,7 +3469,9 @@ impl Rtl8733buBackend {
         let nib = |v: u8, msb: bool| -> Option<i8> {
             let n = if msb { (v & 0xf0) >> 4 } else { v & 0x0f } as i8;
             let sx = if n & 0x8 != 0 { n | !0x0f } else { n };
-            (-8..=7).contains(&sx).then(|| sx.saturating_mul(DIFF_FACTOR))
+            (-8..=7)
+                .contains(&sx)
+                .then(|| sx.saturating_mul(DIFF_FACTOR))
         };
 
         let g2 = SADDR; // path-A 2.4 GHz block, 18 B
@@ -3207,10 +3508,14 @@ impl Rtl8733buBackend {
     pub fn calibrated_ofdm_index(&self, ch: u8) -> Result<Option<u8>, FaceError> {
         let info = self.read_tx_power_info()?;
         let (base, bw20, ofdm) = if ch <= 14 {
-            let Some((gp, _)) = Self::pg_group_2g(ch) else { return Ok(None) };
+            let Some((gp, _)) = Self::pg_group_2g(ch) else {
+                return Ok(None);
+            };
             (info.bw40_base_2g[gp], info.bw20_diff_2g, info.ofdm_diff_2g)
         } else {
-            let Some(gp) = Self::pg_group_5g(ch) else { return Ok(None) };
+            let Some(gp) = Self::pg_group_5g(ch) else {
+                return Ok(None);
+            };
             (info.bw40_base_5g[gp], info.bw20_diff_5g, info.ofdm_diff_5g)
         };
         Ok(base.map(|b| {
@@ -3570,8 +3875,13 @@ impl Rtl8733buBackend {
     /// from base" and was WRONG on hardware — the per-step gain rises 0.500 -> 0.738 ppm across the
     /// range, so eight steps down from cap 86 is -6.4 ppm while the same eight steps around cap 70
     /// is -5.1. The delta model claimed -5.076 and the radio actually moved -6.408.
-    const XTAL_KNOTS: [(f32, f32); 5] =
-        [(54.0, -9.073), (62.0, -5.076), (70.0, 0.0), (78.0, 5.366), (86.0, 11.270)];
+    const XTAL_KNOTS: [(f32, f32); 5] = [
+        (54.0, -9.073),
+        (62.0, -5.076),
+        (70.0, 0.0),
+        (78.0, 5.366),
+        (86.0, 11.270),
+    ];
 
     /// Rate offset (ppm, relative to cap 70) produced by an absolute crystal cap.
     pub fn xtal_ppm_at_cap(cap: f32) -> f32 {
@@ -3759,8 +4069,12 @@ impl Rtl8733buBackend {
             let shift = ((dw0 >> 24) & 0x3) as usize;
             let dw2 =
                 u32::from_le_bytes([data[off + 8], data[off + 9], data[off + 10], data[off + 11]]);
-            let dw3 =
-                u32::from_le_bytes([data[off + 12], data[off + 13], data[off + 14], data[off + 15]]);
+            let dw3 = u32::from_le_bytes([
+                data[off + 12],
+                data[off + 13],
+                data[off + 14],
+                data[off + 15],
+            ]);
             let rx_rate = (dw3 & 0x7f) as u8; // RX HwRate (DESC_RATE code)
             let is_c2h = dw2 & (1 << 28) != 0;
             let fstart = off + 24 + drvinfo + shift;
@@ -3815,17 +4129,18 @@ impl Rtl8733buBackend {
                 //
                 // `snr_db` and `evm_db` DO behave as advertised: 20.8 dB / -29.9 dB on a strong
                 // co-located link vs 7..13 dB / -7..-11 dB on weak ambient traffic.
-                let phy = (drvinfo >= 28 && rx_rate >= 0x04 && off + 24 + 28 <= data.len()).then(|| {
-                    let b = |i: usize| data[off + 24 + i] as i8;
-                    let evm = b(16);
-                    PhyMetrics {
-                        snr_db: Some(b(24) >> 1),
-                        // -128 is the hardware's "no measurement" sentinel (the vendor substitutes
-                        // -25 dB); report None rather than a number that reads like data.
-                        evm_db: (evm != -128).then(|| evm / 2),
-                        cfo_hz: Some(i32::from(b(20)) * 312_500 / 128),
-                    }
-                });
+                let phy =
+                    (drvinfo >= 28 && rx_rate >= 0x04 && off + 24 + 28 <= data.len()).then(|| {
+                        let b = |i: usize| data[off + 24 + i] as i8;
+                        let evm = b(16);
+                        PhyMetrics {
+                            snr_db: Some(b(24) >> 1),
+                            // -128 is the hardware's "no measurement" sentinel (the vendor substitutes
+                            // -25 dB); report None rather than a number that reads like data.
+                            evm_db: (evm != -128).then(|| evm / 2),
+                            cfo_hz: Some(i32::from(b(20)) * 312_500 / 128),
+                        }
+                    });
                 if std::env::var("NDN_RX_META_DBG").is_ok() {
                     eprintln!(
                         "RX len={pkt_len} drvinfo={drvinfo} rate=0x{rx_rate:02x} rssi={rssi:?} mcs={mcs:?} tsfl={rxtsfl} phy={phy:?}"
@@ -4036,7 +4351,9 @@ impl RadioKnobs for Rtl8733buBackend {
         // The measuring instrument is ready either way: per-frame hardware RX stamps on a second
         // f72b (`examples/rxgaps8733b.rs`, `rxseq8733b.rs`), which resolved the TXPAUSE gate to
         // ~252 us and the slot gate to 99% confinement.
-        TxDiscipline::PromptBounded { max_delay_ns: 1_000_000 }
+        TxDiscipline::PromptBounded {
+            max_delay_ns: 1_000_000,
+        }
     }
 
     fn read_channel_activity(&self) -> Result<Option<u16>, FaceError> {
@@ -4149,7 +4466,10 @@ impl RadioTime for Rtl8733buBackend {
             // reproducible to six decimals. Left uncorrected, every consumer converting this
             // domain's ticks to real time is off by 4x. The RX-stamp clock above is unaffected
             // (it declares its own 1_000 explicitly and is a different physical counter).
-            RadioTimeSource { tick_ns: 4_000, ..RadioTimeSource::port_tsf(self.port_tsf_domain()) },
+            RadioTimeSource {
+                tick_ns: 4_000,
+                ..RadioTimeSource::port_tsf(self.port_tsf_domain())
+            },
         ]
     }
 
@@ -4161,7 +4481,10 @@ impl RadioTime for Rtl8733buBackend {
         //    steer nobody has verified.
         //  * resolution: 0.64 ppm/step is the fitted centre; the true step runs 0.500..0.738 across
         //    the span, so a caller must believe the RETURNED ppm, not its request.
-        Some(ClockSteering { range_ppm: 9.0, resolution_ppm: 0.64 })
+        Some(ClockSteering {
+            range_ppm: 9.0,
+            resolution_ppm: 0.64,
+        })
     }
 
     fn steer_clock_ppm(&self, ppm: f32) -> Result<f32, FaceError> {
@@ -4249,7 +4572,11 @@ impl RadioProfile for Rtl8733buBackend {
         // only readbacks of the DE it just wrote.
         RadioCapability {
             bands: vec![Band::Band2_4GHz, Band::Band5GHz],
-            rate: RateCapability::Wifi { max_mcs: 7, max_nss: 1, max_bw: 1 },
+            rate: RateCapability::Wifi {
+                max_mcs: 7,
+                max_nss: 1,
+                max_bw: 1,
+            },
             max_tx_power: 127,
             // MEASURED on this part (`examples/retune8733b.rs`, 40 retunes per case) rather than
             // inherited. `wifi_monitor_5ghz` supplies 16_000 us from a DIFFERENT radio (#97), and
@@ -4266,9 +4593,7 @@ impl RadioProfile for Rtl8733buBackend {
             // (The inherited 16_000 was, by coincidence, close to this radio's max — conservative
             // rather than wrong. The provenance was the problem, not the magnitude.)
             retune_us: Some(15_500),
-            ..RadioCapability::wifi_monitor_5ghz(vec![
-                1, 6, 11, 36, 40, 44, 48, 149, 153, 157, 161,
-            ])
+            ..RadioCapability::wifi_monitor_5ghz(vec![1, 6, 11, 36, 40, 44, 48, 149, 153, 157, 161])
         }
     }
 }
@@ -4351,9 +4676,17 @@ mod golden {
     #[test]
     fn download_txdesc_golden() {
         let d = download_txdesc(64);
-        assert_eq!(&d[..8], &[0x40, 0x00, 0x28, 0x00, 0x00, 0x10, 0x00, 0x00], "dw0/dw1");
+        assert_eq!(
+            &d[..8],
+            &[0x40, 0x00, 0x28, 0x00, 0x00, 0x10, 0x00, 0x00],
+            "dw0/dw1"
+        );
         assert_eq!(&d[0x1C..0x1E], &[0x97, 0xEF], "TX-desc checksum (~XOR)");
-        assert_eq!(u16::from_le_bytes([d[0], d[1]]), 64, "TXPKTSIZE = payload len");
+        assert_eq!(
+            u16::from_le_bytes([d[0], d[1]]),
+            64,
+            "TXPKTSIZE = payload len"
+        );
         assert_eq!(d[2], TX_DESC_SIZE as u8, "OFFSET = descriptor size (40)");
         let qsel = (u32::from_le_bytes([d[4], d[5], d[6], d[7]]) >> 8) & 0x1F;
         assert_eq!(qsel, QSLT_BEACON & 0x1F, "QSEL = beacon queue");

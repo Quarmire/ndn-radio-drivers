@@ -23,25 +23,44 @@ fn main() -> ExitCode {
     let chan_mhz = if ch == 14 { 2484 } else { 2407 + 5 * ch as u16 };
 
     let mut dev = Ath9kHtcBackend::open().expect("open");
-    dev.download_firmware(&fw).and_then(|_| dev.htc_init()).expect("transport");
-    dev.hw_reset(chan_mhz).and_then(|_| dev.connect_data_services()).expect("bring-up");
+    dev.download_firmware(&fw)
+        .and_then(|_| dev.htc_init())
+        .expect("transport");
+    dev.hw_reset(chan_mhz)
+        .and_then(|_| dev.connect_data_services())
+        .expect("bring-up");
     let _ = dev.write_target_u32s(0x0050_cf44, &[0]);
-    dev.wmi_start().and_then(|_| dev.start_receive()).expect("rx-start");
+    dev.wmi_start()
+        .and_then(|_| dev.start_receive())
+        .expect("rx-start");
 
-    let big = { let mut v = Vec::with_capacity(900); v.extend_from_slice(b"\x05\x08"); v.resize(900, b'p'); Bytes::from(v) };
-    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let big = {
+        let mut v = Vec::with_capacity(900);
+        v.extend_from_slice(b"\x05\x08");
+        v.resize(900, b'p');
+        Bytes::from(v)
+    };
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
     let t0 = Instant::now();
     let flood = |dev: &Ath9kHtcBackend, secs: u64| {
         rt.block_on(async {
             let end = Instant::now() + Duration::from_secs(secs);
             while Instant::now() < end {
-                let _ = dev.inject(InjectFrame::broadcast(big.clone(), TxIntent::CONSERVATIVE)).await;
+                let _ = dev
+                    .inject(InjectFrame::broadcast(big.clone(), TxIntent::CONSERVATIVE))
+                    .await;
             }
         })
     };
 
     // PHASE 1: baseline (uncalibrated PA, no set_board_values).
-    println!("PHASE1 baseline t={:.1}s (no board-values) — flooding 6s", t0.elapsed().as_secs_f64());
+    println!(
+        "PHASE1 baseline t={:.1}s (no board-values) — flooding 6s",
+        t0.elapsed().as_secs_f64()
+    );
     flood(&dev, 6);
     println!("  gap t={:.1}s", t0.elapsed().as_secs_f64());
     std::thread::sleep(Duration::from_secs(1));
@@ -49,18 +68,28 @@ fn main() -> ExitCode {
     // Apply the EEPROM analog cal (M2) unless skipped.
     if std::env::var_os("NDN_SKIP_BOARD").is_none() {
         match dev.set_board_values() {
-            Ok(bv) => println!("set_board_values ✓ txGainType={} ob={:?} db1={} db2={}", bv.tx_gain_type, bv.ob, bv.db1_0, bv.db2_0),
+            Ok(bv) => println!(
+                "set_board_values ✓ txGainType={} ob={:?} db1={} db2={}",
+                bv.tx_gain_type, bv.ob, bv.db1_0, bv.db2_0
+            ),
             Err(e) => println!("set_board_values FAILED: {e}"),
         }
     }
     // ★ M3: the OLPC power cal (PDADC target→gain map + per-rate target power) — the actual lever.
     match dev.set_txpower_4k(chan_mhz) {
-        Ok(peak) => println!("set_txpower_4k ✓ peak target = {} (0.5dB) = {} dBm", peak, peak / 2),
+        Ok(peak) => println!(
+            "set_txpower_4k ✓ peak target = {} (0.5dB) = {} dBm",
+            peak,
+            peak / 2
+        ),
         Err(e) => println!("set_txpower_4k FAILED: {e}"),
     }
 
     // PHASE 2: after board-values (PA biased from the OTP cal).
-    println!("PHASE2 boarded t={:.1}s — flooding 6s", t0.elapsed().as_secs_f64());
+    println!(
+        "PHASE2 boarded t={:.1}s — flooding 6s",
+        t0.elapsed().as_secs_f64()
+    );
     flood(&dev, 6);
     println!("SWEEP DONE t={:.1}s", t0.elapsed().as_secs_f64());
     println!("# B210: compare the phase-1 vs phase-2 power plateaus; a rise = the PA cal took.");

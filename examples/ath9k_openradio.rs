@@ -20,7 +20,10 @@ use ndn_radio_drivers::open_ath9k;
 use ndn_radio_hal::{Bandwidth, InjectFrame, TxIntent};
 
 fn main() -> ExitCode {
-    let ch: u8 = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(1);
+    let ch: u8 = std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1);
     println!("opening AR9271 via open_ath9k(ch={ch}) — the production OpenRadio path");
 
     let radio = match open_ath9k(ch) {
@@ -57,12 +60,17 @@ fn main() -> ExitCode {
         }
         let other = if ch == 6 { 1 } else { 6 };
         match k.set_channel(other, Bandwidth::Bw20) {
-            Err(_) => println!("knobs.set_channel({other}) = Unsupported (honest — retune not wired)"),
+            Err(_) => {
+                println!("knobs.set_channel({other}) = Unsupported (honest — retune not wired)")
+            }
             Ok(()) => eprintln!("WARN: set_channel({other}) unexpectedly Ok"),
         }
     }
 
-    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
     rt.block_on(async {
         let io = radio.io.clone();
         let poll_rx = |secs: u64| {

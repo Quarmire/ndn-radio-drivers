@@ -25,10 +25,16 @@ fn main() -> ExitCode {
     let chan_mhz = if ch == 14 { 2484 } else { 2407 + 5 * ch as u16 };
 
     let mut dev = Ath9kHtcBackend::open().expect("open");
-    dev.download_firmware(&fw).and_then(|_| dev.htc_init()).expect("transport");
-    dev.hw_reset(chan_mhz).and_then(|_| dev.connect_data_services()).expect("bring-up");
+    dev.download_firmware(&fw)
+        .and_then(|_| dev.htc_init())
+        .expect("transport");
+    dev.hw_reset(chan_mhz)
+        .and_then(|_| dev.connect_data_services())
+        .expect("bring-up");
     let _ = dev.write_target_u32s(0x0050_cf44, &[0]);
-    dev.wmi_start().and_then(|_| dev.start_receive()).expect("rx-start");
+    dev.wmi_start()
+        .and_then(|_| dev.start_receive())
+        .expect("rx-start");
 
     // The gain LUT (0xa334-0xa354) is the OFDM NORMAL_POWER_TX_GAIN table — CCK (1 Mbps, the target
     // min) uses a SEPARATE power path, so a CCK flood would be flat regardless. Flood OFDM 6M so the
@@ -42,8 +48,19 @@ fn main() -> ExitCode {
     }
 
     // idx values that map to gain levels 10..0 (level = idx*10/63). Top = idx 63 = reset-default max.
-    let steps: [(u32, u32); 11] =
-        [(10, 63), (9, 57), (8, 51), (7, 45), (6, 38), (5, 32), (4, 26), (3, 19), (2, 13), (1, 7), (0, 0)];
+    let steps: [(u32, u32); 11] = [
+        (10, 63),
+        (9, 57),
+        (8, 51),
+        (7, 45),
+        (6, 38),
+        (5, 32),
+        (4, 26),
+        (3, 19),
+        (2, 13),
+        (1, 7),
+        (0, 0),
+    ];
     const FLOOD_S: u64 = 4;
     const GAP_S: u64 = 1;
 
@@ -55,13 +72,19 @@ fn main() -> ExitCode {
         v.resize(900, b'p');
         Bytes::from(v)
     };
-    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
     let t0 = Instant::now();
     println!("SWEEP START chan={chan_mhz}MHz  (flood {FLOOD_S}s + {GAP_S}s silent gap per level)");
     println!("# order is DESCENDING power: level 10 (max) → 0. Segment the capture the same way.");
     for (level, idx) in steps {
         dev.set_tx_power(idx).ok();
-        println!("LEVEL {level:>2} idx={idx:>2}  t={:.1}s  (flooding 1Mbps CCK, 900B)", t0.elapsed().as_secs_f64());
+        println!(
+            "LEVEL {level:>2} idx={idx:>2}  t={:.1}s  (flooding 1Mbps CCK, 900B)",
+            t0.elapsed().as_secs_f64()
+        );
         let end = Instant::now() + Duration::from_secs(FLOOD_S);
         rt.block_on(async {
             while Instant::now() < end {

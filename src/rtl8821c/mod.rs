@@ -44,8 +44,8 @@ use ndn_transport::FaceError;
 use crate::frame::{self, LLC_SNAP_PREFIX};
 use crate::realtek_rx;
 use crate::{CapturedFrame, FrameFormat, FrameIo, InjectFrame};
-use ndn_radio_hal::{Band, RadioCapability, RadioProfile};
 use ndn_frame_io::ClockDomainId;
+use ndn_radio_hal::{Band, RadioCapability, RadioProfile};
 
 mod coex;
 mod efuse;
@@ -212,7 +212,8 @@ impl Rtl8821cuBackend {
             let context = Context::new().map_err(usb_err)?;
             for device in context.devices().map_err(usb_err)?.iter() {
                 let desc = device.device_descriptor().map_err(usb_err)?;
-                if desc.vendor_id() == REALTEK_VID && RTL8821CU_PIDS.contains(&desc.product_id())
+                if desc.vendor_id() == REALTEK_VID
+                    && RTL8821CU_PIDS.contains(&desc.product_id())
                     && let Ok(h) = device.open()
                 {
                     let _ = h.reset();
@@ -278,7 +279,11 @@ impl Rtl8821cuBackend {
         if std::env::var("NDN_RADIO_EP_DEBUG").is_ok() {
             eprintln!(
                 "8821cu WLAN bulk OUT endpoints: {}  (IN {:#04x})",
-                bulk_outs.iter().map(|e| format!("{e:#04x}")).collect::<Vec<_>>().join(" "),
+                bulk_outs
+                    .iter()
+                    .map(|e| format!("{e:#04x}"))
+                    .collect::<Vec<_>>()
+                    .join(" "),
                 bulk_in.unwrap_or(0)
             );
         }
@@ -334,7 +339,9 @@ impl Rtl8821cuBackend {
                 let mut buf = vec![0u8; 32768];
                 loop {
                     let Some(dev) = weak.upgrade() else { break };
-                    let r = dev.handle.read_bulk(dev.bulk_in, &mut buf, Duration::from_millis(200));
+                    let r = dev
+                        .handle
+                        .read_bulk(dev.bulk_in, &mut buf, Duration::from_millis(200));
                     if std::env::var("NDN_RADIO_RX_DEBUG").is_ok() {
                         match &r {
                             Ok(n) => eprintln!("read_bulk(ep {:#04x}) -> Ok({n})", dev.bulk_in),
@@ -347,7 +354,8 @@ impl Rtl8821cuBackend {
                             let mut off = 0;
                             {
                                 let mut q = dev.rx_pending.lock().unwrap();
-                                while let Some((decoded, advance)) = dev.parse_rx_at(&buf[..n], off) {
+                                while let Some((decoded, advance)) = dev.parse_rx_at(&buf[..n], off)
+                                {
                                     for f in decoded {
                                         q.push_back(f);
                                     }
@@ -491,14 +499,23 @@ impl Rtl8821cuBackend {
     }
 
     /// Poll `(read32(addr) & mask) == target`, up to `tries` × `delay`.
-    fn poll32(&self, addr: u16, mask: u32, target: u32, tries: u32, delay: Duration) -> Result<(), FaceError> {
+    fn poll32(
+        &self,
+        addr: u16,
+        mask: u32,
+        target: u32,
+        tries: u32,
+        delay: Duration,
+    ) -> Result<(), FaceError> {
         for _ in 0..tries {
             if (self.read32(addr)? & mask) == target {
                 return Ok(());
             }
             std::thread::sleep(delay);
         }
-        Err(init_err(format!("8821cu poll timeout @{addr:#06x} mask={mask:#x}")))
+        Err(init_err(format!(
+            "8821cu poll timeout @{addr:#06x} mask={mask:#x}"
+        )))
     }
 
     /// Synchronous bulk-OUT write to the single WLAN endpoint.
@@ -508,7 +525,10 @@ impl Rtl8821cuBackend {
             .write_bulk(self.bulk_out, buf, Duration::from_secs(1))
             .map_err(usb_err)?;
         if n != buf.len() {
-            return Err(init_err(format!("8821cu bulk_write short {n}/{}", buf.len())));
+            return Err(init_err(format!(
+                "8821cu bulk_write short {n}/{}",
+                buf.len()
+            )));
         }
         Ok(())
     }
@@ -775,9 +795,15 @@ impl Rtl8821cuBackend {
         //     prior assumptions on a read failure.
         match self.read_chip_info() {
             Ok(info) => {
-                tracing::info!("8821cu efuse: rfe_option={:#04x} (full={:#04x}) pkg={} btg={}",
-                    info.rfe_option, info.rfe_option_full, info.pkg_type, info.rfe_btg);
-                self.rfe_option.store(info.rfe_option_full, Ordering::Relaxed);
+                tracing::info!(
+                    "8821cu efuse: rfe_option={:#04x} (full={:#04x}) pkg={} btg={}",
+                    info.rfe_option,
+                    info.rfe_option_full,
+                    info.pkg_type,
+                    info.rfe_btg
+                );
+                self.rfe_option
+                    .store(info.rfe_option_full, Ordering::Relaxed);
                 self.rfe_btg.store(info.rfe_btg, Ordering::Relaxed);
                 let mut c = self.cond.lock().unwrap();
                 c.rfe = info.rfe_option_full >> 3;
@@ -878,9 +904,10 @@ impl Rtl8821cuBackend {
         //     network-type to ADHOC + EDCA + BSSID so the firmware keys injected
         //     TX (monitor's NO_LINK opmode gates it). `NDN_RADIO_IBSS=1`.
         if std::env::var("NDN_RADIO_IBSS").is_ok()
-            && let Err(e) = self.setup_ibss() {
-                eprintln!("8821cu setup_ibss failed: {e}");
-            }
+            && let Err(e) = self.setup_ibss()
+        {
+            eprintln!("8821cu setup_ibss failed: {e}");
+        }
 
         // 9) USB RX burst + aggregation config — LAST (rtw_hci_start ordering),
         //    so the BB table load / channel set can't clobber REG_RXDMA_MODE.
@@ -960,10 +987,7 @@ impl Rtl8821cuBackend {
     /// BW=[25:24], LDPC=BIT26, VHT=[29:28]; ext word = 32-bit rate bitmap
     /// (DESC_RATE index per bit: 0-3 CCK, 4-11 OFDM 6-54, 12-19 MCS0-7).
     fn ra_info(&self, macid: u8, rate_id: u8, ra_mask: u32) -> Result<(), FaceError> {
-        let w0 = 0x40u32
-            | ((macid as u32) << 8)
-            | ((rate_id as u32 & 0x1f) << 16)
-            | (1u32 << 22); // INIT_RA_LVL = highest, so it tries real rates immediately
+        let w0 = 0x40u32 | ((macid as u32) << 8) | ((rate_id as u32 & 0x1f) << 16) | (1u32 << 22); // INIT_RA_LVL = highest, so it tries real rates immediately
         self.send_h2c_mailbox(w0, ra_mask)
     }
 
@@ -1018,7 +1042,11 @@ impl Rtl8821cuBackend {
 
     /// Build `[48-byte rtw88 TX descriptor][802.11 frame]` for `frame`, fixing
     /// the rate (USE_RATE + DISDATAFB + DATARATE) and routing to the MGMT queue.
-    fn build_tx(&self, frame: &InjectFrame, mcs: crate::McsDescriptor) -> Result<Vec<u8>, FaceError> {
+    fn build_tx(
+        &self,
+        frame: &InjectFrame,
+        mcs: crate::McsDescriptor,
+    ) -> Result<Vec<u8>, FaceError> {
         let body = self.build_80211(frame)?;
         let mut buf = vec![0u8; TX_DESC_SIZE + body.len()];
 
@@ -1038,7 +1066,10 @@ impl Rtl8821cuBackend {
         // QSEL: golden scan probe-reqs (which radiate, unassociated) use MGMT(18),
         // not HIGH(17). MGMT is not firmware-gated (probe/auth must work pre-assoc).
         // NDN_RADIO_QSEL overrides for sweeping; default 18 = MGMT.
-        let qsel: u32 = std::env::var("NDN_RADIO_QSEL").ok().and_then(|s| s.parse().ok()).unwrap_or(17);
+        let qsel: u32 = std::env::var("NDN_RADIO_QSEL")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(17);
         txdesc_set(&mut buf, 1, 8, 5, qsel); // W1 QSEL
         txdesc_set(&mut buf, 1, 16, 5, 6); // W1 RATE_ID = 6
         txdesc_set(&mut buf, 2, 19, 1, 1); // W2 SPE_RPT
@@ -1182,7 +1213,11 @@ impl Rtl8821cuBackend {
 
         let body = &buf[off + hdr_off..off + hdr_off + pkt_len];
         // Strip the trailing FCS (4 bytes) that monitor RX appends.
-        let body = if body.len() >= 4 { &body[..body.len() - 4] } else { body };
+        let body = if body.len() >= 4 {
+            &body[..body.len() - 4]
+        } else {
+            body
+        };
         // #41: per-frame hardware RX timestamp — RX descriptor dword5 (bytes 20-23) is the free-run
         // RX TSF-low latched at MAC-done (RXTSFL, µs). Same 88xx layout as the 8733b/8812au backends.
         let rxtsfl = u32::from_le_bytes([d[20], d[21], d[22], d[23]]);
@@ -1223,7 +1258,11 @@ fn rate_code(mcs: &crate::McsDescriptor) -> u8 {
 fn txdesc_set(desc: &mut [u8], word: usize, bit: u32, len: u32, value: u32) {
     let off = word * 4;
     let mut v = u32::from_le_bytes([desc[off], desc[off + 1], desc[off + 2], desc[off + 3]]);
-    let mask = if len >= 32 { u32::MAX } else { ((1u32 << len) - 1) << bit };
+    let mask = if len >= 32 {
+        u32::MAX
+    } else {
+        ((1u32 << len) - 1) << bit
+    };
     v = (v & !mask) | ((value << bit) & mask);
     desc[off..off + 4].copy_from_slice(&v.to_le_bytes());
 }
@@ -1248,7 +1287,13 @@ fn log_write(addr: u16, data: &[u8]) {
         for (i, b) in data.iter().enumerate().take(4) {
             v |= (*b as u32) << (i * 8);
         }
-        eprintln!("W{}\t0x{:04x}\t0x{:0w$x}", data.len(), addr, v, w = data.len() * 2);
+        eprintln!(
+            "W{}\t0x{:04x}\t0x{:0w$x}",
+            data.len(),
+            addr,
+            v,
+            w = data.len() * 2
+        );
     }
 }
 
@@ -1421,14 +1466,12 @@ impl RadioProfile for Rtl8821cuBackend {
     }
 }
 
-
 impl Rtl8821cuBackend {
     /// The rate to transmit `frame` at: the control-plane-set MCS (state) if present,
     /// else the frame's intent resolved to this radio.
     fn resolved_mcs(&self, frame: &InjectFrame) -> crate::McsDescriptor {
-        self.cur_mcs
-            .lock()
-            .unwrap()
-            .unwrap_or_else(|| crate::McsDescriptor::for_intent(&frame.tx, crate::MAX_RELIABLE_MCS, true, false))
+        self.cur_mcs.lock().unwrap().unwrap_or_else(|| {
+            crate::McsDescriptor::for_intent(&frame.tx, crate::MAX_RELIABLE_MCS, true, false)
+        })
     }
 }

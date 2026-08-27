@@ -25,10 +25,16 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
     let fw = std::fs::read(args.get(1).expect("usage: <fw>")).expect("read fw");
     let mut dev = Ath9kHtcBackend::open().expect("open");
-    dev.download_firmware(&fw).and_then(|_| dev.htc_init()).expect("transport");
-    dev.hw_reset(2412).and_then(|_| dev.connect_data_services()).expect("bring-up");
+    dev.download_firmware(&fw)
+        .and_then(|_| dev.htc_init())
+        .expect("transport");
+    dev.hw_reset(2412)
+        .and_then(|_| dev.connect_data_services())
+        .expect("bring-up");
     let _ = dev.write_target_u32s(0x0050_cf44, &[0]);
-    dev.wmi_start().and_then(|_| dev.start_receive()).expect("rx-start");
+    dev.wmi_start()
+        .and_then(|_| dev.start_receive())
+        .expect("rx-start");
 
     let synth_ch1 = dev.reg_read(AR_PHY_SYNTH_CONTROL).unwrap_or(0);
     println!("SYNTH_CONTROL @ ch1 = {synth_ch1:#010x}");
@@ -38,13 +44,27 @@ fn main() -> ExitCode {
     let diag = dev.reg_read(AR_DIAG_SW).unwrap_or(0);
     println!(
         "EDCCA: AR_DIAG_SW = {diag:#010x} — FORCE_RX_CLEAR {}",
-        if diag & AR_DIAG_FORCE_RX_CLEAR != 0 { "SET ✔" } else { "clear" }
+        if diag & AR_DIAG_FORCE_RX_CLEAR != 0 {
+            "SET ✔"
+        } else {
+            "clear"
+        }
     );
 
     // ── SGI: command MCS0 + short-GI, inject, read the descriptor's GI bit ──
-    dev.set_rate(McsDescriptor { index: 0, short_gi: true, vht: false, nss: 1, stbc: false, ldpc: false })
-        .ok();
-    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    dev.set_rate(McsDescriptor {
+        index: 0,
+        short_gi: true,
+        vht: false,
+        nss: 1,
+        stbc: false,
+        ldpc: false,
+    })
+    .ok();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
     rt.block_on(async {
         for i in 0..4 {
             let p = vec![0x05u8, 0x08, 0x53, i as u8];
@@ -59,7 +79,11 @@ fn main() -> ExitCode {
             let ctl7 = desc[9];
             println!(
                 "SGI: ds_ctl7 = {ctl7:#010x} — AR_GI0 (short-GI) {}",
-                if ctl7 & AR_GI0 != 0 { "SET ✔" } else { "clear ✗" }
+                if ctl7 & AR_GI0 != 0 {
+                    "SET ✔"
+                } else {
+                    "clear ✗"
+                }
             );
         }
         _ => println!("SGI: could not read descriptor at {qtxdp:#010x}"),
@@ -70,7 +94,11 @@ fn main() -> ExitCode {
     let synth_ch6 = dev.reg_read(AR_PHY_SYNTH_CONTROL).unwrap_or(0);
     println!(
         "retune: SYNTH_CONTROL @ ch6 = {synth_ch6:#010x} — {}",
-        if synth_ch6 != synth_ch1 { "CHANGED ✔ (synth retuned)" } else { "unchanged ✗" }
+        if synth_ch6 != synth_ch1 {
+            "CHANGED ✔ (synth retuned)"
+        } else {
+            "unchanged ✗"
+        }
     );
 
     let _ = dev.detach();

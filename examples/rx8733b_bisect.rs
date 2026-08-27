@@ -26,7 +26,10 @@ fn cap(dev: &Rtl8733buBackend, label: &str) -> usize {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let ch: u8 = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(6);
+    let ch: u8 = std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(6);
 
     println!("stage A: bring_up_monitor({ch}) + direct capture (pump bypassed)");
     let dev = Rtl8733buBackend::open()?;
@@ -39,7 +42,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    println!("\nstage B: probe8733b's prefix, then bring_up_monitor's four extra steps one at a time");
+    println!(
+        "\nstage B: probe8733b's prefix, then bring_up_monitor's four extra steps one at a time"
+    );
     let dev = Rtl8733buBackend::open()?;
     dev.power_on()?;
     dev.fw_dl_setup()?;
@@ -62,8 +67,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     cap(&dev, "+ configure_trsw(true)");
 
     if base == 0 {
-        println!("\n=> even the baseline prefix saw nothing this run — the chip state carried over \
-                  from the previous process. Power-cycle/replug and re-run before concluding.");
+        println!(
+            "\n=> even the baseline prefix saw nothing this run — the chip state carried over \
+                  from the previous process. Power-cycle/replug and re-run before concluding."
+        );
     }
     Ok(())
 }

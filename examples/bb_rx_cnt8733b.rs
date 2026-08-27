@@ -37,13 +37,22 @@ fn snap(dev: &Rtl8733buBackend) -> Vec<(u16, u16)> {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let ch: u8 = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(36);
-    let secs: u64 = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(20);
+    let ch: u8 = std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(36);
+    let secs: u64 = std::env::args()
+        .nth(2)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(20);
 
     let dev = Rtl8733buBackend::open()?;
     dev.bring_up_monitor(ch)?;
     println!("8733b BB RX counters on ch{ch}, {secs}s — deltas per second");
-    println!("BB state machine 0x2db4 = 0x{:08x}", dev.read32(0x2db4).unwrap_or(0));
+    println!(
+        "BB state machine 0x2db4 = 0x{:08x}",
+        dev.read32(0x2db4).unwrap_or(0)
+    );
 
     // The counters are free-running 16-bit and wrap; take deltas with wrapping_sub so a wrap shows
     // as a plausible small delta rather than a 65k spike.

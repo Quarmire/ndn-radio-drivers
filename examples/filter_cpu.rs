@@ -52,7 +52,10 @@ fn cpu_secs() -> f64 {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mode = std::env::args().nth(1).unwrap_or_else(|| "rx".into());
-    let ch: u8 = std::env::var("FC_CH").ok().and_then(|s| s.parse().ok()).unwrap_or(14);
+    let ch: u8 = std::env::var("FC_CH")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(14);
 
     let b = Arc::new(Rtl8812auBackend::open()?);
     b.power_on()?;
@@ -71,9 +74,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("8812AU pid={:#06x} up on ch{ch}", b.pid());
 
     if mode == "tx" {
-        let rate: u64 = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(800);
-        let match_pct: u64 = std::env::args().nth(3).and_then(|s| s.parse().ok()).unwrap_or(10);
-        let secs: u64 = std::env::args().nth(4).and_then(|s| s.parse().ok()).unwrap_or(18);
+        let rate: u64 = std::env::args()
+            .nth(2)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(800);
+        let match_pct: u64 = std::env::args()
+            .nth(3)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(10);
+        let secs: u64 = std::env::args()
+            .nth(4)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(18);
         let period = Duration::from_secs_f64(1.0 / rate as f64);
         println!("tx: {rate}/s total, {match_pct}% to the name-group, {secs}s");
         let t0 = Instant::now();
@@ -100,13 +112,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 std::thread::sleep(d);
             }
         }
-        println!("tx: sent {i} frames in {:.1}s ({:.0}/s)", t0.elapsed().as_secs_f64(), i as f64 / t0.elapsed().as_secs_f64());
+        println!(
+            "tx: sent {i} frames in {:.1}s ({:.0}/s)",
+            t0.elapsed().as_secs_f64(),
+            i as f64 / t0.elapsed().as_secs_f64()
+        );
         return Ok(());
     }
 
     // rx: "all" = promiscuous (process everything); "filter" = chip filters on GROUP.
     let sub = std::env::args().nth(2).unwrap_or_else(|| "all".into());
-    let secs: u64 = std::env::args().nth(3).and_then(|s| s.parse().ok()).unwrap_or(20);
+    let secs: u64 = std::env::args()
+        .nth(3)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(20);
     match sub.as_str() {
         "all" => b.set_rx_group_filter(None)?,
         "filter" => b.set_rx_group_filter(Some(GROUP))?,
@@ -115,7 +134,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::process::exit(2);
         }
     }
-    println!("rx [{sub}]: measuring {secs}s (chip filter {})…", if sub == "filter" { "ON" } else { "off" });
+    println!(
+        "rx [{sub}]: measuring {secs}s (chip filter {})…",
+        if sub == "filter" { "ON" } else { "off" }
+    );
 
     // ONE reader via blocking rx_raw (NOT the pump — two readers on one bulk-IN
     // steal transfers and read as 50% loss). rx_raw blocks in the kernel up to
@@ -150,7 +172,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         total as f64 / wall,
         matching as f64 / wall,
         cpu / wall * 100.0,
-        if total > 0 { cpu / total as f64 * 1e6 } else { 0.0 },
+        if total > 0 {
+            cpu / total as f64 * 1e6
+        } else {
+            0.0
+        },
     );
     Ok(())
 }

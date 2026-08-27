@@ -20,9 +20,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     // Full monitor bring-up (including calibration + watchdog) — the probe must see the same
     // runtime the campaign sees, or it proves nothing about the campaign's failure.
-    let dev = std::sync::Arc::new(
-        ndn_radio_drivers::LibUsbRtl88xxBackend::open_monitor_pid(pid, 149)?,
-    );
+    let dev = std::sync::Arc::new(ndn_radio_drivers::LibUsbRtl88xxBackend::open_monitor_pid(
+        pid, 149,
+    )?);
     let _wd = dev.spawn_watchdog();
 
     let ofdm_ref = |d: &ndn_radio_drivers::LibUsbRtl88xxBackend| -> Result<u32, _> {

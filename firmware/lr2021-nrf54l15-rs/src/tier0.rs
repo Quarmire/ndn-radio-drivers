@@ -114,7 +114,6 @@ pub const MAX_DEPTH: usize = 8;
 /// every implementation must use the same value or they disagree about which frames are admissible.
 pub const FILL_CAP: u32 = 64;
 
-
 /// The two bits of octet 0 that must not be used by the filter (I/G and U/L).
 const RESERVED_MASK0: u8 = 0b0000_0011;
 
@@ -135,8 +134,14 @@ impl Default for PrefixFilter {
 /// exact; [`tests::siphash24_reference_vector`] pins it to the published Aumasson & Bernstein vector
 /// so the two copies cannot drift silently.
 pub fn siphash24(key: &[u8; 16], data: &[u8]) -> u64 {
-    let k0 = u64::from_le_bytes(match key[0..8].try_into() { Ok(v) => v, Err(_) => [0; 8] });
-    let k1 = u64::from_le_bytes(match key[8..16].try_into() { Ok(v) => v, Err(_) => [0; 8] });
+    let k0 = u64::from_le_bytes(match key[0..8].try_into() {
+        Ok(v) => v,
+        Err(_) => [0; 8],
+    });
+    let k1 = u64::from_le_bytes(match key[8..16].try_into() {
+        Ok(v) => v,
+        Err(_) => [0; 8],
+    });
     let mut v0 = 0x736f_6d65_7073_6575 ^ k0;
     let mut v1 = 0x646f_7261_6e64_6f6d ^ k1;
     let mut v2 = 0x6c79_6765_6e65_7261 ^ k0;
@@ -161,7 +166,10 @@ pub fn siphash24(key: &[u8; 16], data: &[u8]) -> u64 {
     }
     let mut chunks = data.chunks_exact(8);
     for c in &mut chunks {
-        let m = u64::from_le_bytes(match c.try_into() { Ok(v) => v, Err(_) => [0; 8] });
+        let m = u64::from_le_bytes(match c.try_into() {
+            Ok(v) => v,
+            Err(_) => [0; 8],
+        });
         v3 ^= m;
         round!();
         round!();

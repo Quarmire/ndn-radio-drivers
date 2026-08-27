@@ -12,18 +12,20 @@
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     use ndn_frame_io::{AfPacketBackend, FrameFormat, FrameIo};
-    use ndn_radio_hal::{InjectFrame, TxIntent, DEFAULT_SRC};
+    use ndn_radio_hal::{DEFAULT_SRC, InjectFrame, TxIntent};
     use std::time::Duration;
 
     let iface = std::env::args().nth(1).unwrap_or_else(|| "mon0".into());
-    let backend = AfPacketBackend::new(&iface, FrameFormat::RawNdnS1g { ethertype: 0x8624 })
-        .expect("open");
+    let backend =
+        AfPacketBackend::new(&iface, FrameFormat::RawNdnS1g { ethertype: 0x8624 }).expect("open");
     let mk = || InjectFrame {
         payload: bytes::Bytes::from_static(&[0x5a; 900]),
         tx: TxIntent::CONSERVATIVE,
         dst: [0xff; 6],
         src: DEFAULT_SRC,
         addr3: None,
+        addr4: None,
+        htc: None,
     };
 
     let mut total_ok = 0u64;
@@ -47,8 +49,12 @@ async fn main() {
                 Ok(r) => {
                     let ms = t.elapsed().as_millis();
                     max_ms = max_ms.max(ms);
-                    if r.is_ok() { ok += 1; }
-                    if ms > 50 { total_slow += 1; }
+                    if r.is_ok() {
+                        ok += 1;
+                    }
+                    if ms > 50 {
+                        total_slow += 1;
+                    }
                 }
             }
         }
@@ -59,13 +65,23 @@ async fn main() {
         // noticed) — the exact thing the old code failed.
         let t = tokio::time::Instant::now();
         match tokio::time::timeout(Duration::from_secs(8), backend.inject(mk())).await {
-            Ok(Ok(())) => println!("  post-idle inject OK in {}ms (recovered)", t.elapsed().as_millis()),
+            Ok(Ok(())) => println!(
+                "  post-idle inject OK in {}ms (recovered)",
+                t.elapsed().as_millis()
+            ),
             Ok(Err(e)) => println!("  post-idle inject Err {e:?}"),
-            Err(_) => { println!("FAIL: post-idle inject HUNG — not fixed"); std::process::exit(1); }
+            Err(_) => {
+                println!("FAIL: post-idle inject HUNG — not fixed");
+                std::process::exit(1);
+            }
         }
     }
-    println!("PASS: {total_ok} injects Ok across 6 bursts, {total_slow} needed retry, no hang (max {max_ms}ms). Fix holds.");
+    println!(
+        "PASS: {total_ok} injects Ok across 6 bursts, {total_slow} needed retry, no hang (max {max_ms}ms). Fix holds."
+    );
 }
 
 #[cfg(not(target_os = "linux"))]
-fn main() { eprintln!("linux only"); }
+fn main() {
+    eprintln!("linux only");
+}

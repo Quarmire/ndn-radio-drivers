@@ -32,7 +32,10 @@ fn dump(dev: &Rtl8733buBackend, tag: &str) {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let ch: u8 = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(36);
+    let ch: u8 = std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(36);
     let dev = Rtl8733buBackend::open()?;
     dev.bring_up_monitor(ch)?;
     println!("after bring_up_monitor(ch{ch}) — set_txagc_table(0x2d) has run:");

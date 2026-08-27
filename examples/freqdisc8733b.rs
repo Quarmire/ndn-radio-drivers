@@ -31,6 +31,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     let action = d.update(skew)?;
     println!("measured skew {skew:+.3} ppm -> {action:?}");
-    println!("now commanded {:+.3} ppm (cap {})", d.applied_ppm(), dev.crystal_cap()?);
+    println!(
+        "now commanded {:+.3} ppm (cap {})",
+        d.applied_ppm(),
+        dev.crystal_cap()?
+    );
     Ok(())
 }

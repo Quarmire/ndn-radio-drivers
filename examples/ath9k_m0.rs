@@ -69,7 +69,10 @@ fn main() -> ExitCode {
             } else {
                 0
             };
-            println!("      post-setup event: ep={ep} id={id:#06x} len={}", payload.len());
+            println!(
+                "      post-setup event: ep={ep} id={id:#06x} len={}",
+                payload.len()
+            );
         }
     }
 

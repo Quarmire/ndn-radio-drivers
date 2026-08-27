@@ -9,7 +9,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let v = dev.chip_version()?;
     println!(
         "M1  chip_id=0x{:02x}  cut=0x{:x}  sys_cfg1=0x{:08x}  eps out=0x{:02x}/in=0x{:02x}  alive={}",
-        v.chip_id, v.chip_ver, v.sys_cfg1, dev.bulk_out(), dev.bulk_in(), v.looks_alive(),
+        v.chip_id,
+        v.chip_ver,
+        v.sys_cfg1,
+        dev.bulk_out(),
+        dev.bulk_in(),
+        v.looks_alive(),
     );
 
     // M2: power on.
@@ -32,8 +37,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let secure = dev.fw_secure()?;
             println!(
                 "M3  fw {} B  sig=0x{:04x} v{}.{}  dmem={}B@0x{:08x} imem={}B@0x{:08x} emem={}B  hdr_ok={}  secure_path={}",
-                fw.len(), h.signature, h.version, h.subversion,
-                h.dmem_size, h.dmem_addr, h.imem_size, h.imem_addr, h.emem_size,
+                fw.len(),
+                h.signature,
+                h.version,
+                h.subversion,
+                h.dmem_size,
+                h.dmem_addr,
+                h.imem_size,
+                h.imem_addr,
+                h.emem_size,
                 h.nonsecure_len() == fw.len() as u32,
                 secure,
             );
@@ -44,12 +56,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Diagnostic: did the setup registers actually stick?
             println!(
                 "\n    regs after setup: CR=0x{:02x} CR+1=0x{:02x} RQPN=0x{:08x} DWBCN0=0x{:08x} EXT_FUNC=0x{:08x} EXT_CLK=0x{:02x}",
-                dev.read8(0x0100)?, dev.read8(0x0101)?, dev.read32(0x0200)?,
-                dev.read32(0x0208)?, dev.read32(0x1000)?, dev.read8(0x1008)?,
+                dev.read8(0x0100)?,
+                dev.read8(0x0101)?,
+                dev.read32(0x0200)?,
+                dev.read32(0x0208)?,
+                dev.read32(0x1000)?,
+                dev.read8(0x1008)?,
             );
             let page = [0xA5u8; 128];
             match dev.dl_rsvd_page(0, &page) {
-                Ok(()) => println!("dl_rsvd_page(128B @ pg0): BCN_VALID ✓ (reserved-page path works)"),
+                Ok(()) => {
+                    println!("dl_rsvd_page(128B @ pg0): BCN_VALID ✓ (reserved-page path works)")
+                }
                 Err(e) => println!("dl_rsvd_page: {e}"),
             }
             // M5: full firmware download + boot the WLAN CPU.
@@ -112,9 +130,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     match dev.phy_iq_calibrate() {
                         Ok(info) => println!(
                             "✓ txxy=[{:03x},{:03x}] rxxy_s=[{:03x},{:03x}] rxxy_l=[{:03x},{:03x}] rxk_ok={}",
-                            info.txxy[0][0], info.txxy[0][1],
-                            info.rxxy[0][0][0], info.rxxy[0][1][0],
-                            info.rxxy[0][0][1], info.rxxy[0][1][1],
+                            info.txxy[0][0],
+                            info.txxy[0][1],
+                            info.rxxy[0][0][0],
+                            info.rxxy[0][1][0],
+                            info.rxxy[0][0][1],
+                            info.rxxy[0][1][1],
                             info.rxk_ok,
                         ),
                         Err(e) => println!("FAILED: {e}"),
@@ -122,7 +143,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // M7 DPK: gain-loss/auto-AGC + per-path DO_DPK.
                     print!("M7 phy_dpk … ");
                     match dev.phy_dpk() {
-                        Ok((agc, fail)) => println!("✓ agc_done={agc} dpk_fail={fail} (agc 1=ok, fail 0=ok)"),
+                        Ok((agc, fail)) => {
+                            println!("✓ agc_done={agc} dpk_fail={fail} (agc 1=ok, fail 0=ok)")
+                        }
                         Err(e) => println!("FAILED: {e}"),
                     }
                     // M8: monitor-mode RX capture (ambient frames) + TX inject.

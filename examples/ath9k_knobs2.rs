@@ -20,7 +20,14 @@ use ndn_radio_hal::{Bandwidth, InjectFrame, McsDescriptor, TxIntent};
 
 fn mcs0_sgi() -> McsDescriptor {
     // MCS0 (robust — decodable by the witness) + short-GI so "short GI" shows in the radiotap.
-    McsDescriptor { index: 0, short_gi: true, vht: false, nss: 1, stbc: false, ldpc: false }
+    McsDescriptor {
+        index: 0,
+        short_gi: true,
+        vht: false,
+        nss: 1,
+        stbc: false,
+        ldpc: false,
+    }
 }
 
 fn main() -> ExitCode {
@@ -41,7 +48,10 @@ fn main() -> ExitCode {
     }
     let _ = io.set_rate(mcs0_sgi());
 
-    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
     rt.block_on(async {
         let burst = |io: std::sync::Arc<dyn ndn_radio_hal::FrameIo>, tag: u8| async move {
             for i in 0..40 {

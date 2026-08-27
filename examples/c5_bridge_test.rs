@@ -15,15 +15,23 @@ use ndn_radio_hal::{Bandwidth, FrameIo, InjectFrame, RadioKnobs, RadioProfile, T
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let port = std::env::args().nth(1).unwrap_or_else(|| "/dev/cu.usbmodem1101".into());
+    let port = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "/dev/cu.usbmodem1101".into());
     let dev = Esp32SerialBackend::open_c5(&port)?; // dual-band C5 over native USB-Serial-JTAG (no RTS/DTR reset)
     dev.set_channel(1, Bandwidth::Bw20)?;
     let cap = dev.capability();
-    println!("C5 bridge open on {port}, ch1 — bands {:?}, channels {:?}", cap.bands, cap.channels);
+    println!(
+        "C5 bridge open on {port}, ch1 — bands {:?}, channels {:?}",
+        cap.bands, cap.channels
+    );
 
     // TX: inject 20 NDN 0x8624 frames through the C5 (witness with the mt76).
     for i in 0..20u32 {
-        let f = InjectFrame::broadcast(Bytes::copy_from_slice(format!("\x05\x08c5br-{i:02}").as_bytes()), TxIntent::CONSERVATIVE);
+        let f = InjectFrame::broadcast(
+            Bytes::copy_from_slice(format!("\x05\x08c5br-{i:02}").as_bytes()),
+            TxIntent::CONSERVATIVE,
+        );
         dev.inject(f).await?;
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -39,23 +47,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         match tokio::time::timeout(Duration::from_millis(500), dev.recv_frame()).await {
             Ok(Ok(cap)) => {
                 got += 1;
-                if let Some(r) = cap.rssi_dbm { rssi_sum += r as i32; }
-                if let Some(st) = &cap.stamp { raws.push(st.raw); }
+                if let Some(r) = cap.rssi_dbm {
+                    rssi_sum += r as i32;
+                }
+                if let Some(st) = &cap.stamp {
+                    raws.push(st.raw);
+                }
                 if got <= 3 {
-                    println!("  RX #{got}: {} B, rssi {:?}, stamp {:?}", cap.payload.len(), cap.rssi_dbm, cap.stamp);
+                    println!(
+                        "  RX #{got}: {} B, rssi {:?}, stamp {:?}",
+                        cap.payload.len(),
+                        cap.rssi_dbm,
+                        cap.stamp
+                    );
                 }
             }
             _ => {}
         }
     }
-    println!("→ received {got} NDN frames via the C5 bridge (avg rssi {})",
-        if got > 0 { rssi_sum / got as i32 } else { 0 });
+    println!(
+        "→ received {got} NDN frames via the C5 bridge (avg rssi {})",
+        if got > 0 { rssi_sum / got as i32 } else { 0 }
+    );
     if raws.len() >= 3 {
         let mono = raws.windows(2).all(|w| w[1] >= w[0]);
-        let mut gaps: Vec<i64> = raws.windows(2).map(|w| w[1] as i64 - w[0] as i64).filter(|&g| g > 0 && g < 1_000_000).collect();
+        let mut gaps: Vec<i64> = raws
+            .windows(2)
+            .map(|w| w[1] as i64 - w[0] as i64)
+            .filter(|&g| g > 0 && g < 1_000_000)
+            .collect();
         gaps.sort();
         let med = gaps.get(gaps.len() / 2).copied().unwrap_or(0);
-        println!("→ hardware RX stamp: monotonic={mono}, median inter-frame gap {med} µs (device clock, not host-recv)");
+        println!(
+            "→ hardware RX stamp: monotonic={mono}, median inter-frame gap {med} µs (device clock, not host-recv)"
+        );
     }
     Ok(())
 }

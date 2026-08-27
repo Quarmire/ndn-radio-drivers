@@ -12,12 +12,20 @@ use std::time::{Duration, Instant};
 
 use ndn_frame_io::{BROADCAST, InjectFrame, TxIntent};
 
-fn env(k: &str) -> Option<String> { std::env::var(k).ok() }
+fn env(k: &str) -> Option<String> {
+    std::env::var(k).ok()
+}
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let ch: u8 = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(40);
-    let secs: u64 = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(20);
+    let ch: u8 = std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(40);
+    let secs: u64 = std::env::args()
+        .nth(2)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(20);
     let role = env("NDN_ROLE").unwrap_or_else(|| "rx".into());
     let tag: u8 = env("NDN_TAG").and_then(|s| s.parse().ok()).unwrap_or(2);
     let pid: u16 = match env("NDN_PID").as_deref() {
@@ -41,19 +49,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mode = env("NDN_MODE").unwrap_or_default();
         let flood = mode == "flood"; // continuous TX every iteration — for the RX-ceiling / link probe
         let slotted = mode != "contention" && !flood;
-        let slot_us: u64 = env("NDN_SLOT_US").and_then(|s| s.parse().ok()).unwrap_or(20_000);
+        let slot_us: u64 = env("NDN_SLOT_US")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(20_000);
         let my_slot = (tag as u64) % 3;
         let mut rng: u64 = (std::process::id() as u64).wrapping_mul(0x9E37_79B9) ^ (tag as u64 + 1);
-        let mut coin = || { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; rng % 3 == my_slot };
+        let mut coin = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng % 3 == my_slot
+        };
         let src = [0x02, b'M', b'D', b'R', tag, 0x01];
         // NDN_PAYLOAD_LEN: total payload bytes (default 900). SMALL frames flood far faster (the
         // inject rate is per-frame, not per-byte) — use ~20 to offer >1000 f/s for an RX-ceiling probe.
-        let plen: usize = env("NDN_PAYLOAD_LEN").and_then(|s| s.parse().ok()).unwrap_or(902);
+        let plen: usize = env("NDN_PAYLOAD_LEN")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(902);
         let pad = vec![0u8; plen.saturating_sub(2)];
         let mut sent = 0u64;
         let mut last = Instant::now();
         let (mut cur_epoch, mut tx_this) = (u64::MAX, false);
-        let now_us = || std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_micros() as u64).unwrap_or(0);
+        let now_us = || {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_micros() as u64)
+                .unwrap_or(0)
+        };
         while Instant::now() < deadline {
             if flood {
                 tx_this = true;
@@ -61,7 +83,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let epoch = now_us() / slot_us;
                 if epoch != cur_epoch {
                     cur_epoch = epoch;
-                    tx_this = if slotted { epoch % 3 == my_slot } else { coin() };
+                    tx_this = if slotted {
+                        epoch % 3 == my_slot
+                    } else {
+                        coin()
+                    };
                 }
             }
             if !tx_this {
@@ -71,22 +97,57 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 payload.push(0xA0 | tag);
                 payload.push(tag);
                 payload.extend_from_slice(&pad);
-                match tokio::time::timeout(Duration::from_millis(200),
-                    d.inject(InjectFrame { payload: payload.into(), tx: TxIntent::CONSERVATIVE, dst: BROADCAST, src, addr3: None })).await {
+                match tokio::time::timeout(
+                    Duration::from_millis(200),
+                    d.inject(InjectFrame {
+                        payload: payload.into(),
+                        tx: TxIntent::CONSERVATIVE,
+                        dst: BROADCAST,
+                        src,
+                        addr3: None,
+                        addr4: None,
+                        htc: None,
+                    }),
+                )
+                .await
+                {
                     Ok(_) => sent += 1,
                     Err(_) => {}
                 }
                 tokio::task::yield_now().await;
             }
             if last.elapsed() >= Duration::from_secs(1) {
-                println!("  TX sent={sent} mode={}", if flood { "flood" } else if slotted { "slotted" } else { "contention" });
+                println!(
+                    "  TX sent={sent} mode={}",
+                    if flood {
+                        "flood"
+                    } else if slotted {
+                        "slotted"
+                    } else {
+                        "contention"
+                    }
+                );
                 last = Instant::now();
             }
         }
-        println!("=== TX DONE sent={sent} mode={} ===", if flood { "flood" } else if slotted { "slotted" } else { "contention" });
+        println!(
+            "=== TX DONE sent={sent} mode={} ===",
+            if flood {
+                "flood"
+            } else if slotted {
+                "slotted"
+            } else {
+                "contention"
+            }
+        );
     } else {
         let raw0 = ndn_radio_drivers::rx_raw_frames(); // pump's raw pull count (pre-CRC filter)
-        let counts = [Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0))];
+        let counts = [
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+        ];
         // RSSI accumulator (sum, min, max, n) — distinguishes a weak/attenuated LINK (low RSSI, RF loss)
         // from an RX-side drop (strong RSSI but frames still missing = pump/USB/FIFO ceiling).
         let rssi = Arc::new(std::sync::Mutex::new((0i64, i32::MAX, i32::MIN, 0u64)));
@@ -95,14 +156,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let (d, counts, rssi) = (d.clone(), counts.clone(), rssi.clone());
             tokio::spawn(async move {
                 while Instant::now() < deadline {
-                    if let Ok(Ok(f)) = tokio::time::timeout(Duration::from_millis(20), d.recv_frame()).await {
+                    if let Ok(Ok(f)) =
+                        tokio::time::timeout(Duration::from_millis(20), d.recv_frame()).await
+                    {
                         let p = &f.payload;
                         if p.len() >= 2 && (p[0] & 0xf0) == 0xA0 {
                             let t = (p[1] & 0x03) as usize;
                             counts[t].fetch_add(1, Ordering::Relaxed);
                             if let Some(r) = f.rssi_dbm {
                                 let mut g = rssi.lock().unwrap();
-                                g.0 += r as i64; g.1 = g.1.min(r as i32); g.2 = g.2.max(r as i32); g.3 += 1;
+                                g.0 += r as i64;
+                                g.1 = g.1.min(r as i32);
+                                g.2 = g.2.max(r as i32);
+                                g.3 += 1;
                             }
                         }
                     }
@@ -113,18 +179,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tokio::time::sleep(Duration::from_secs(1)).await;
             let c: Vec<u64> = counts.iter().map(|a| a.load(Ordering::Relaxed)).collect();
             let total: u64 = c.iter().sum();
-            println!("  RX heard tag0={} tag1={} tag2={} tag3={} ({:.0}/s)", c[0], c[1], c[2], c[3],
-                total as f64 / start.elapsed().as_secs_f64().max(0.001));
+            println!(
+                "  RX heard tag0={} tag1={} tag2={} tag3={} ({:.0}/s)",
+                c[0],
+                c[1],
+                c[2],
+                c[3],
+                total as f64 / start.elapsed().as_secs_f64().max(0.001)
+            );
         }
         let _ = rx.await;
         let c: Vec<u64> = counts.iter().map(|a| a.load(Ordering::Relaxed)).collect();
         let total: u64 = c.iter().sum();
         let (sum, mn, mx, n) = *rssi.lock().unwrap();
         let avg = if n > 0 { sum as f64 / n as f64 } else { 0.0 };
-        let raw_rate = (ndn_radio_drivers::rx_raw_frames() - raw0) as f64 / start.elapsed().as_secs_f64().max(0.001);
-        println!("=== RX DONE tag0={} tag1={} tag2={} tag3={} | tag_rate={:.0}/s RAW_PULL={:.0}/s rssi avg={:.1} min={} max={} dBm (n={}) ===",
-            c[0], c[1], c[2], c[3], total as f64 / start.elapsed().as_secs_f64().max(0.001), raw_rate,
-            avg, if n > 0 { mn } else { 0 }, if n > 0 { mx } else { 0 }, n);
+        let raw_rate = (ndn_radio_drivers::rx_raw_frames() - raw0) as f64
+            / start.elapsed().as_secs_f64().max(0.001);
+        println!(
+            "=== RX DONE tag0={} tag1={} tag2={} tag3={} | tag_rate={:.0}/s RAW_PULL={:.0}/s rssi avg={:.1} min={} max={} dBm (n={}) ===",
+            c[0],
+            c[1],
+            c[2],
+            c[3],
+            total as f64 / start.elapsed().as_secs_f64().max(0.001),
+            raw_rate,
+            avg,
+            if n > 0 { mn } else { 0 },
+            if n > 0 { mx } else { 0 },
+            n
+        );
     }
     Ok(())
 }

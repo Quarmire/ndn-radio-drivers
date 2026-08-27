@@ -15,11 +15,20 @@ use std::time::Instant;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pid = u16::from_str_radix(
-        std::env::args().nth(1).unwrap_or_else(|| "f72b".into()).trim_start_matches("0x"),
+        std::env::args()
+            .nth(1)
+            .unwrap_or_else(|| "f72b".into())
+            .trim_start_matches("0x"),
         16,
     )?;
-    let ch: u8 = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(36);
-    let secs: u64 = std::env::args().nth(3).and_then(|s| s.parse().ok()).unwrap_or(20);
+    let ch: u8 = std::env::args()
+        .nth(2)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(36);
+    let secs: u64 = std::env::args()
+        .nth(3)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(20);
     let r = ndn_radio_drivers::open_named_radio(pid, ch)?;
     let declared = r
         .time
@@ -46,7 +55,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let ticks = last.wrapping_sub(f0) as f64;
             let host_us = (last_host - h0) as f64;
             let measured = host_us * 1000.0 / ticks;
-            println!("frames={n} host_span={:.2}s ticks={ticks:.0}", host_us / 1e6);
+            println!(
+                "frames={n} host_span={:.2}s ticks={ticks:.0}",
+                host_us / 1e6
+            );
             println!(
                 "=> MEASURED {measured:.1} ns/tick  ({:.2}x the declared {declared})",
                 measured / f64::from(declared.max(1))

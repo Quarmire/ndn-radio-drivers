@@ -24,7 +24,10 @@
 use ndn_radio_drivers::Rtl8733buBackend;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let ch: u8 = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(36);
+    let ch: u8 = std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(36);
     let dev = Rtl8733buBackend::open()?;
     let log = Rtl8733buBackend::decode_efuse_pub(&dev.read_efuse(512)?);
 
@@ -34,25 +37,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let thermal = *log.get(0xba).unwrap_or(&0xff);
     println!("efuse logical 0xc8 = 0x{pg:02x}  -> power_track_type = {track}");
     println!("efuse logical 0xba = 0x{thermal:02x}  (thermal ref)");
-    println!("REGIME: {}", match track {
-        4..=7 => "TSSI closed loop  => vendor SUPPRESSES all TXAGC writes; power is set by the TSSI DE",
-        0     => "thermal tracking  => TXAGC table/ref IS the knob",
-        _     => "other/unknown     => cross-check against the vendor tables",
-    });
+    println!(
+        "REGIME: {}",
+        match track {
+            4..=7 =>
+                "TSSI closed loop  => vendor SUPPRESSES all TXAGC writes; power is set by the TSSI DE",
+            0 => "thermal tracking  => TXAGC table/ref IS the knob",
+            _ => "other/unknown     => cross-check against the vendor tables",
+        }
+    );
 
     // Bring the BB up but do NOT run enable_tx / tssi_setup: we want the COLD register state, so
     // that "is the TSSI loop already running before we touch anything?" is answerable.
     dev.bring_up_monitor(ch)?;
-    for (name, addr) in [("0x4318 TSSI ctrl", 0x4318u16), ("0x4308 txagc ref", 0x4308),
-                         ("0x4334 DE path-A", 0x4334), ("0x4344 DE path-B", 0x4344),
-                         ("0x3a00 rate tbl", 0x3a00), ("0x3a04 ofdm tbl", 0x3a04)] {
+    for (name, addr) in [
+        ("0x4318 TSSI ctrl", 0x4318u16),
+        ("0x4308 txagc ref", 0x4308),
+        ("0x4334 DE path-A", 0x4334),
+        ("0x4344 DE path-B", 0x4344),
+        ("0x3a00 rate tbl", 0x3a00),
+        ("0x3a04 ofdm tbl", 0x3a04),
+    ] {
         let v = dev.read32(addr)?;
         println!("  {name} = 0x{v:08x}");
     }
     let t = dev.read32(0x4318)?;
-    println!("\nTSSI enable field 0x4318[30:28] = {} (7 = loop enabled)", (t >> 28) & 0x7);
+    println!(
+        "\nTSSI enable field 0x4318[30:28] = {} (7 = loop enabled)",
+        (t >> 28) & 0x7
+    );
     let de = (dev.read32(0x4334)? >> 20) & 0xff;
-    println!("TSSI DE 0x4334[27:20] = 0x{de:02x} ({} as s8) — signed, this is the offset the loop applies",
-             de as u8 as i8);
+    println!(
+        "TSSI DE 0x4334[27:20] = 0x{de:02x} ({} as s8) — signed, this is the offset the loop applies",
+        de as u8 as i8
+    );
     Ok(())
 }

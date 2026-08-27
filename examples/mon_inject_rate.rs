@@ -25,9 +25,14 @@ fn radiotap(rate_500kbps: u8) -> Vec<u8> {
         return vec![0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00];
     }
     vec![
-        0x00, 0x00, // version, pad
-        0x09, 0x00, // length = 9
-        0x04, 0x00, 0x00, 0x00, // present = bit 2 (RATE)
+        0x00,
+        0x00, // version, pad
+        0x09,
+        0x00, // length = 9
+        0x04,
+        0x00,
+        0x00,
+        0x00, // present = bit 2 (RATE)
         rate_500kbps,
     ]
 }
@@ -84,8 +89,15 @@ fn main() {
     let addr1: [u8; 6] = args
         .get(4)
         .and_then(|s| {
-            let v: Vec<u8> = s.split(':').filter_map(|b| u8::from_str_radix(b, 16).ok()).collect();
-            if v.len() == 6 { Some([v[0], v[1], v[2], v[3], v[4], v[5]]) } else { None }
+            let v: Vec<u8> = s
+                .split(':')
+                .filter_map(|b| u8::from_str_radix(b, 16).ok())
+                .collect();
+            if v.len() == 6 {
+                Some([v[0], v[1], v[2], v[3], v[4], v[5]])
+            } else {
+                None
+            }
         })
         .unwrap_or([0x03, 0x11, 0x22, 0x33, 0x44, 0x55]);
     // Fifth arg: Duration/ID in microseconds (NAV announcement). Default 0.
@@ -99,7 +111,11 @@ fn main() {
 
     unsafe {
         // AF_PACKET/SOCK_RAW so the radiotap header is passed straight through to the driver.
-        let fd = libc::socket(libc::AF_PACKET, libc::SOCK_RAW, (libc::ETH_P_ALL as u16).to_be() as i32);
+        let fd = libc::socket(
+            libc::AF_PACKET,
+            libc::SOCK_RAW,
+            (libc::ETH_P_ALL as u16).to_be() as i32,
+        );
         if fd < 0 {
             eprintln!("socket: {} (need root)", std::io::Error::last_os_error());
             std::process::exit(1);
@@ -108,7 +124,10 @@ fn main() {
         let cname = CString::new(ifname.as_str()).unwrap();
         let idx = libc::if_nametoindex(cname.as_ptr());
         if idx == 0 {
-            eprintln!("if_nametoindex({ifname}): {}", std::io::Error::last_os_error());
+            eprintln!(
+                "if_nametoindex({ifname}): {}",
+                std::io::Error::last_os_error()
+            );
             std::process::exit(1);
         }
 

@@ -55,13 +55,12 @@ use std::io;
 use std::sync::Arc;
 use std::time::Duration;
 
-
 use async_trait::async_trait;
 use bytes::Bytes;
 use rusb::{Context, Device, DeviceHandle, Direction, TransferType};
 
 use crate::realtek_rx;
-use ndn_frame_io::{frame, CapturedFrame, ClockDomainId, FrameFormat, FrameIo, InjectFrame};
+use ndn_frame_io::{CapturedFrame, ClockDomainId, FrameFormat, FrameIo, InjectFrame, frame};
 use ndn_radio_hal::{Band, RadioCapability, RadioProfile, RadioTime, RadioTimeSource};
 use ndn_transport::FaceError;
 
@@ -161,18 +160,53 @@ const PWR_POLLING: u8 = 2;
 /// `Hal8812PwrSeq.h` (USB path; all entries apply to USB).
 const CARDEMU_TO_ACT: &[PwrCfg] = &[
     // 0x04[10]=0: disable SW LPS.
-    PwrCfg { offset: 0x0005, cmd: PWR_WRITE, msk: 0x04, value: 0x00 },
+    PwrCfg {
+        offset: 0x0005,
+        cmd: PWR_WRITE,
+        msk: 0x04,
+        value: 0x00,
+    },
     // 0x04[17]=1: poll until power ready.
-    PwrCfg { offset: 0x0006, cmd: PWR_POLLING, msk: 0x02, value: 0x02 },
+    PwrCfg {
+        offset: 0x0006,
+        cmd: PWR_POLLING,
+        msk: 0x02,
+        value: 0x02,
+    },
     // 0x04[11]=0: disable WL suspend.
-    PwrCfg { offset: 0x0005, cmd: PWR_WRITE, msk: 0x08, value: 0x00 },
+    PwrCfg {
+        offset: 0x0005,
+        cmd: PWR_WRITE,
+        msk: 0x08,
+        value: 0x00,
+    },
     // 0x04[8]=1: APFM_ONMAC — turn on MAC via HW state machine.
-    PwrCfg { offset: 0x0005, cmd: PWR_WRITE, msk: 0x01, value: 0x01 },
+    PwrCfg {
+        offset: 0x0005,
+        cmd: PWR_WRITE,
+        msk: 0x01,
+        value: 0x01,
+    },
     // poll until 0x04[8]=0 (state machine done).
-    PwrCfg { offset: 0x0005, cmd: PWR_POLLING, msk: 0x01, value: 0x00 },
+    PwrCfg {
+        offset: 0x0005,
+        cmd: PWR_POLLING,
+        msk: 0x01,
+        value: 0x00,
+    },
     // 0x24[1]=0 / 0x28[3]=0: xosc buffer type.
-    PwrCfg { offset: 0x0024, cmd: PWR_WRITE, msk: 0x02, value: 0x00 },
-    PwrCfg { offset: 0x0028, cmd: PWR_WRITE, msk: 0x08, value: 0x00 },
+    PwrCfg {
+        offset: 0x0024,
+        cmd: PWR_WRITE,
+        msk: 0x02,
+        value: 0x00,
+    },
+    PwrCfg {
+        offset: 0x0028,
+        cmd: PWR_WRITE,
+        msk: 0x08,
+        value: 0x00,
+    },
 ];
 
 /// 8812A **card-disable** (`RTL8812_TRANS_ACT_TO_CARDEMU`, USB entries) — bring
@@ -181,17 +215,52 @@ const CARDEMU_TO_ACT: &[PwrCfg] = &[
 /// transition that never completes if the MAC is already active).
 const ACT_TO_CARDEMU: &[PwrCfg] = &[
     // 0xc00/0xe00 = 4: turn off the BB 3-wire (path A/B).
-    PwrCfg { offset: 0x0c00, cmd: PWR_WRITE, msk: 0xFF, value: 0x04 },
-    PwrCfg { offset: 0x0e00, cmd: PWR_WRITE, msk: 0xFF, value: 0x04 },
+    PwrCfg {
+        offset: 0x0c00,
+        cmd: PWR_WRITE,
+        msk: 0xFF,
+        value: 0x04,
+    },
+    PwrCfg {
+        offset: 0x0e00,
+        cmd: PWR_WRITE,
+        msk: 0xFF,
+        value: 0x04,
+    },
     // 0x02[0] = 0: reset BB, close RF.
-    PwrCfg { offset: 0x0002, cmd: PWR_WRITE, msk: 0x01, value: 0x00 },
+    PwrCfg {
+        offset: 0x0002,
+        cmd: PWR_WRITE,
+        msk: 0x01,
+        value: 0x00,
+    },
     // 0x07 = 0x2A: SPS PWM mode.
-    PwrCfg { offset: 0x0007, cmd: PWR_WRITE, msk: 0xFF, value: 0x2A },
+    PwrCfg {
+        offset: 0x0007,
+        cmd: PWR_WRITE,
+        msk: 0xFF,
+        value: 0x2A,
+    },
     // 0x08[1] = 0: ANA clock 500 kHz.
-    PwrCfg { offset: 0x0008, cmd: PWR_WRITE, msk: 0x02, value: 0x00 },
+    PwrCfg {
+        offset: 0x0008,
+        cmd: PWR_WRITE,
+        msk: 0x02,
+        value: 0x00,
+    },
     // 0x04[9] = 1: turn off MAC via HW state machine, then poll until it clears.
-    PwrCfg { offset: 0x0005, cmd: PWR_WRITE, msk: 0x02, value: 0x02 },
-    PwrCfg { offset: 0x0005, cmd: PWR_POLLING, msk: 0x02, value: 0x00 },
+    PwrCfg {
+        offset: 0x0005,
+        cmd: PWR_WRITE,
+        msk: 0x02,
+        value: 0x02,
+    },
+    PwrCfg {
+        offset: 0x0005,
+        cmd: PWR_POLLING,
+        msk: 0x02,
+        value: 0x00,
+    },
 ];
 
 /// The vendored 8812A **NIC** firmware (`array_mp_8812a_fw_nic`, v52.14,
@@ -324,8 +393,17 @@ const NETTYPE_AP: u32 = 0x2 << 16;
 /// **Monitor** receive config: accept all unicast/phys-match/multicast/broadcast,
 /// data + management frames, no BSSID filter, append PHY status (for RSSI), force
 /// ACK off-path. `AAP|APM|AM|AB|ADF|AMF|HTC_LOC_CTRL|APP_PHYST_RXFF|FORCEACK`.
-const MONITOR_RCR: u32 =
-    0x1 | 0x2 | 0x4 | 0x8 | (1 << 8) | (1 << 9) | (1 << 11) | (1 << 13) | (1 << 14) | (1 << 28) | (1 << 26);
+const MONITOR_RCR: u32 = 0x1
+    | 0x2
+    | 0x4
+    | 0x8
+    | (1 << 8)
+    | (1 << 9)
+    | (1 << 11)
+    | (1 << 13)
+    | (1 << 14)
+    | (1 << 28)
+    | (1 << 26);
 // bit8 ACRC32 + bit9 AICV: keep CRC/ICV-error frames too — a true monitor sees
 // marginal/corrupt frames (e.g. an uncalibrated peer's TX), not just clean ones.
 
@@ -950,7 +1028,6 @@ static CH157_5G_PROGRAM: RegProgram = &[
     (0x0c1c, 4, 0x39000003),
     (0x0e1c, 4, 0x32e00003),
 ];
-
 
 /// The RTL8812AU **5 GHz ch40** channel program (UNII-1) — golden trace
 /// (golden/rtw88-8812au-ch40-5g), same capture/decode as ch36.
@@ -2228,7 +2305,6 @@ static CH165_5G_PROGRAM: RegProgram = &[
     (0x08b0, 4, 0x00000642),
     (0x0c90, 4, 0x04238d10),
 ];
-
 
 /// The RTL8812AU **5 GHz ch52** channel program (UNII-2A DFS) — golden trace
 /// (golden/rtw88-8812au-ch52-5g), same capture/decode as ch36.
@@ -3928,8 +4004,6 @@ static PROGS_5G: &[(u8, RegProgram)] = &[
     (165, CH165_5G_PROGRAM),
 ];
 
-
-
 /// Management-queue select (`QSLT_MGNT`) + its rate-adaptation group
 /// (`RATEID_IDX_G`, the OFDM/11g table).
 const QSLT_MGNT: u32 = 0x12;
@@ -4095,12 +4169,20 @@ fn classify_channel(ch: u8) -> Option<(u8, u8, u8)> {
 /// Sign-extend the high nibble of a PG diff byte (`pg_msb_diff`).
 fn pg_msb_diff(v: u8) -> i8 {
     let n = (v >> 4) & 0x0f;
-    if n & 0x08 != 0 { (n | 0xf0) as i8 } else { n as i8 }
+    if n & 0x08 != 0 {
+        (n | 0xf0) as i8
+    } else {
+        n as i8
+    }
 }
 /// Sign-extend the low nibble of a PG diff byte (`pg_lsb_diff`).
 fn pg_lsb_diff(v: u8) -> i8 {
     let n = v & 0x0f;
-    if n & 0x08 != 0 { (n | 0xf0) as i8 } else { n as i8 }
+    if n & 0x08 != 0 {
+        (n | 0xf0) as i8
+    } else {
+        n as i8
+    }
 }
 
 /// MGN_* rate classifiers (from Realtek `phydm_types.h`).
@@ -4321,7 +4403,6 @@ impl Drop for Rtl8812auBackend {
     }
 }
 
-
 impl Rtl8812auBackend {
     /// Find and claim the RTL8812AU (a product id in [`RTL8812AU_PIDS`]), taking
     /// it from any kernel driver. Never matches the 8812EU (`0xa81a`), so a
@@ -4343,7 +4424,8 @@ impl Rtl8812auBackend {
     /// Warns (or, with `NDN_GUARD_LIVE_LINK=1`, refuses) if the chosen device currently carries an UP
     /// kernel netdev, so a named-radio face never silently grabs the host's live Wi-Fi link.
     pub fn open_select(sel: &crate::DeviceSelect) -> Result<Self, FaceError> {
-        let device = crate::usb_select::select_device(&RTL8812AU_PIDS, REALTEK_VID, sel, "RTL8812AU")?;
+        let device =
+            crate::usb_select::select_device(&RTL8812AU_PIDS, REALTEK_VID, sel, "RTL8812AU")?;
         let pid = device.device_descriptor().map_err(usb_err)?.product_id();
         Self::claim(device, pid)
     }
@@ -4414,7 +4496,9 @@ impl Rtl8812auBackend {
     // ── Realtek register I/O (the `usbctrl_vendorreq` path) ──────────────────
 
     fn read_reg(&self, addr: u16, buf: &mut [u8]) -> Result<(), FaceError> {
-        let seq = self.ctrl_ops.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let seq = self
+            .ctrl_ops
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let n = self
             .handle
             .read_control(REQ_READ, VENDOR_REQ, addr, 0, buf, CTRL_TIMEOUT)
@@ -4429,7 +4513,9 @@ impl Rtl8812auBackend {
     }
 
     fn write_reg(&self, addr: u16, data: &[u8]) -> Result<(), FaceError> {
-        let seq = self.ctrl_ops.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let seq = self
+            .ctrl_ops
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let n = self
             .handle
             .write_control(REQ_WRITE, VENDOR_REQ, addr, 0, data, CTRL_TIMEOUT)
@@ -5417,10 +5503,26 @@ impl Rtl8812auBackend {
         }
 
         // ── fill the correction matrices (default = identity-ish 0x200/0x0) ──
-        self.iqk_tx_fill_iqc(RfPath::A, if tx0_fin { tx_iqc[0] } else { 0x200 }, if tx0_fin { tx_iqc[1] } else { 0x0 })?;
-        self.iqk_rx_fill_iqc(RfPath::A, if rx0_fin { rx_iqc[0] as u32 } else { 0x200 }, if rx0_fin { rx_iqc[1] as u32 } else { 0x0 })?;
-        self.iqk_tx_fill_iqc(RfPath::B, if tx1_fin { tx_iqc[2] } else { 0x200 }, if tx1_fin { tx_iqc[3] } else { 0x0 })?;
-        self.iqk_rx_fill_iqc(RfPath::B, if rx1_fin { rx_iqc[2] as u32 } else { 0x200 }, if rx1_fin { rx_iqc[3] as u32 } else { 0x0 })?;
+        self.iqk_tx_fill_iqc(
+            RfPath::A,
+            if tx0_fin { tx_iqc[0] } else { 0x200 },
+            if tx0_fin { tx_iqc[1] } else { 0x0 },
+        )?;
+        self.iqk_rx_fill_iqc(
+            RfPath::A,
+            if rx0_fin { rx_iqc[0] as u32 } else { 0x200 },
+            if rx0_fin { rx_iqc[1] as u32 } else { 0x0 },
+        )?;
+        self.iqk_tx_fill_iqc(
+            RfPath::B,
+            if tx1_fin { tx_iqc[2] } else { 0x200 },
+            if tx1_fin { tx_iqc[3] } else { 0x0 },
+        )?;
+        self.iqk_rx_fill_iqc(
+            RfPath::B,
+            if rx1_fin { rx_iqc[2] as u32 } else { 0x200 },
+            if rx1_fin { rx_iqc[3] as u32 } else { 0x0 },
+        )?;
         Ok(IqkResult {
             tx_a: tx0_fin,
             rx_a: rx0_fin,
@@ -5437,9 +5539,12 @@ impl Rtl8812auBackend {
     /// [`lc_calibrate`](Self::lc_calibrate)). Corrects TX/RX IQ imbalance —
     /// improves EVM and image rejection.
     pub fn iq_calibrate(&self) -> Result<IqkResult, FaceError> {
-        const MACBB: [u16; 9] = [0x520, 0x550, 0x808, 0xa04, 0x90c, 0xc00, 0xe00, 0x838, 0x82c];
-        const AFE: [u16; 12] =
-            [0xc5c, 0xc60, 0xc64, 0xc68, 0xcb0, 0xcb4, 0xe5c, 0xe60, 0xe64, 0xe68, 0xeb0, 0xeb4];
+        const MACBB: [u16; 9] = [
+            0x520, 0x550, 0x808, 0xa04, 0x90c, 0xc00, 0xe00, 0x838, 0x82c,
+        ];
+        const AFE: [u16; 12] = [
+            0xc5c, 0xc60, 0xc64, 0xc68, 0xcb0, 0xcb4, 0xe5c, 0xe60, 0xe64, 0xe68, 0xeb0, 0xeb4,
+        ];
         const RFREG: [u32; 3] = [0x65, 0x8f, 0x0];
 
         // back up MAC/BB (page C), the C1 one-shot regs, AFE (page C), RF A/B
@@ -5492,8 +5597,12 @@ impl Rtl8812auBackend {
     /// and radio-B register tables via the BB LSSI. Run after
     /// [`bb_config`](Self::bb_config) (which powers on the RF analog).
     pub fn rf_config(&self) -> Result<(), FaceError> {
-        self.config_table(RADIO_A, |s, addr, data| s.rf_write_entry(RfPath::A, addr, data))?;
-        self.config_table(RADIO_B, |s, addr, data| s.rf_write_entry(RfPath::B, addr, data))?;
+        self.config_table(RADIO_A, |s, addr, data| {
+            s.rf_write_entry(RfPath::A, addr, data)
+        })?;
+        self.config_table(RADIO_B, |s, addr, data| {
+            s.rf_write_entry(RfPath::B, addr, data)
+        })?;
         Ok(())
     }
 
@@ -5600,7 +5709,11 @@ impl Rtl8812auBackend {
     /// Set a `len`-bit field at bit `shift` within the little-endian 32-bit word
     /// at byte `off` of a descriptor (the `SET_BITS_TO_LE_4BYTE` macro).
     fn set_desc_bits(desc: &mut [u8], off: usize, shift: u32, len: u32, val: u32) {
-        let mask = if len >= 32 { u32::MAX } else { ((1u32 << len) - 1) << shift };
+        let mask = if len >= 32 {
+            u32::MAX
+        } else {
+            ((1u32 << len) - 1) << shift
+        };
         let mut w = u32::from_le_bytes(desc[off..off + 4].try_into().unwrap());
         w = (w & !mask) | ((val << shift) & mask);
         desc[off..off + 4].copy_from_slice(&w.to_le_bytes());
@@ -5715,7 +5828,10 @@ impl Rtl8812auBackend {
         self.write16(REG_EFUSE_TEST, 0x0000)?;
         self.write8(REG_EFUSE_CTRL + 1, (offset & 0xff) as u8)?;
         let hi = self.read8(REG_EFUSE_CTRL + 2)?;
-        self.write8(REG_EFUSE_CTRL + 2, (((offset >> 8) & 0x03) as u8) | (hi & 0xfc))?;
+        self.write8(
+            REG_EFUSE_CTRL + 2,
+            (((offset >> 8) & 0x03) as u8) | (hi & 0xfc),
+        )?;
         let b3 = self.read8(REG_EFUSE_CTRL + 3)?;
         self.write8(REG_EFUSE_CTRL + 3, b3 & 0x7f)?; // bit31=0 => request READ
         let mut v = self.read32(REG_EFUSE_CTRL)?;
@@ -6087,9 +6203,16 @@ impl Rtl8812auBackend {
         if ignore {
             // Save the bring-up CCA nibble + EDCA-BE once, then force CCA off + zero-backoff EDCA.
             let cur = (self.bb_query(0x838, 0xf)? & 0xf) as u16;
-            let _ = self.cca_saved.compare_exchange(0xffff, cur, Ordering::SeqCst, Ordering::SeqCst);
+            let _ =
+                self.cca_saved
+                    .compare_exchange(0xffff, cur, Ordering::SeqCst, Ordering::SeqCst);
             let edca = self.read32(REG_EDCA_BE_PARAM)?;
-            let _ = self.edca_saved.compare_exchange(0xffff_ffff, edca, Ordering::SeqCst, Ordering::SeqCst);
+            let _ = self.edca_saved.compare_exchange(
+                0xffff_ffff,
+                edca,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            );
             self.bb_set(0x838, 0xf, 0xc)?; // OFDM CCA off — the MAC now reads the medium idle
             self.write32(REG_EDCA_BE_PARAM, EDCA_BLAST)?; // no EDCA backoff on the BE (data) queue
             self.disable_edcca() // energy-detect path too (thresholds max + ignore-EDCCA bit)
@@ -6241,7 +6364,9 @@ impl Rtl8812auBackend {
     /// has three OUT endpoints `0x02/0x03/0x04` mapped to TX priority queues).
     pub fn send_frame_ep(&self, ep: u8, frame: &[u8], hw_rate: u32) -> Result<(), FaceError> {
         let buf = Self::tx_buffer(frame, hw_rate);
-        self.handle.write_bulk(ep, &buf, TX_TIMEOUT).map_err(usb_err)?;
+        self.handle
+            .write_bulk(ep, &buf, TX_TIMEOUT)
+            .map_err(usb_err)?;
         Ok(())
     }
 
@@ -6283,7 +6408,9 @@ impl Rtl8812auBackend {
                     .then(|| realtek_rx::rssi_dbm(d[RXDESC_SIZE + 1]));
                 let w3 = u32::from_le_bytes([d[12], d[13], d[14], d[15]]);
                 let w4 = u32::from_le_bytes([d[16], d[17], d[18], d[19]]);
-                eprintln!("RX8812AU_CRCERR len={pkt_len} rate=0x{rate:02x} rssi={rssi:?} w3={w3:08x} w4={w4:08x}");
+                eprintln!(
+                    "RX8812AU_CRCERR len={pkt_len} rate=0x{rate:02x} rssi={rssi:?} w3={w3:08x} w4={w4:08x}"
+                );
             }
             if !crc_err && !rpt_sel && pkt_len >= DOT11_HDR_LEN {
                 let body = &d[start..end];
@@ -6323,7 +6450,11 @@ impl Rtl8812auBackend {
                 // independent of whether parse_dot11 accepts it — isolates RX-capture vs RX-parse.
                 // First 2 header bytes (frame-control) + first payload byte after the 24-B hdr.
                 if std::env::var("NDN_RX_META_DBG").is_ok() {
-                    let fc = if body.len() >= 2 { (body[0], body[1]) } else { (0, 0) };
+                    let fc = if body.len() >= 2 {
+                        (body[0], body[1])
+                    } else {
+                        (0, 0)
+                    };
                     let w3 = u32::from_le_bytes([d[12], d[13], d[14], d[15]]);
                     let w4 = u32::from_le_bytes([d[16], d[17], d[18], d[19]]);
                     eprintln!(
@@ -6356,6 +6487,11 @@ impl Rtl8812auBackend {
                             addr: Some(ta),
                             group: Some(group),
                             addr3,
+                            // NAN/Raw80211 capture: the whole 802.11 frame is the payload; the
+                            // wide-profile extra fields are not surfaced here (RawNdn routes through
+                            // parse_dot11 above, which does surface them).
+                            addr4: None,
+                            htc: None,
                             rssi_dbm,
                             mcs_index,
                             stamp,

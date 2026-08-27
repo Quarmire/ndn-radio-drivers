@@ -24,7 +24,10 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 3 {
         eprintln!("usage: {} <htc_9271.fw> <ndr_stats_addr>", args[0]);
-        eprintln!("  e.g. {} ~/ath9k-fw/target_firmware/htc_9271.fw 0x0050d880", args[0]);
+        eprintln!(
+            "  e.g. {} ~/ath9k-fw/target_firmware/htc_9271.fw 0x0050d880",
+            args[0]
+        );
         return ExitCode::FAILURE;
     }
 
@@ -104,13 +107,19 @@ fn main() -> ExitCode {
     match dev.write_target_u32s(sentinel_addr, &[SENTINEL]) {
         Ok(_) => match dev.read_target_u32s(sentinel_addr, 1) {
             Ok(v) if v[0] == SENTINEL => {
-                println!("sentinel: wrote {SENTINEL:#010x} to {sentinel_addr:#010x}, read back {:#010x} OK", v[0]);
+                println!(
+                    "sentinel: wrote {SENTINEL:#010x} to {sentinel_addr:#010x}, read back {:#010x} OK",
+                    v[0]
+                );
                 if let Err(e) = dev.write_target_u32s(sentinel_addr, &[0]) {
                     eprintln!("WARNING: could not restore short_frame to 0: {e}");
                 }
             }
             Ok(v) => {
-                eprintln!("sentinel MISMATCH: wrote {SENTINEL:#010x}, read {:#010x}", v[0]);
+                eprintln!(
+                    "sentinel MISMATCH: wrote {SENTINEL:#010x}, read {:#010x}",
+                    v[0]
+                );
                 return ExitCode::FAILURE;
             }
             Err(e) => {

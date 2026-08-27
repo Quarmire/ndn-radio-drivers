@@ -8,8 +8,14 @@
 //!   args: [secs=10] [ch=149]
 use ndn_radio_drivers::LibUsbRtl88xxBackend;
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let secs: u64 = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(10);
-    let ch: u8 = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(149);
+    let secs: u64 = std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(10);
+    let ch: u8 = std::env::args()
+        .nth(2)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(149);
 
     // Stage 1: claim only (open_pid, no bring_up) — isolates a USB/claim fault from a
     // bring-up/cal fault. Print the raw error (with errno) at each stage.
@@ -46,7 +52,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if std::env::var("NDN_NO_TONE").is_ok() {
         eprintln!("[stage] NO_TONE: holding {secs}s with TX OFF (bus-stability check)");
         std::thread::sleep(std::time::Duration::from_secs(secs));
-        eprintln!("[stage] held {secs}s, still alive; chip_id re-read: {:?}", d.chip_info().map(|i| i.chip_id));
+        eprintln!(
+            "[stage] held {secs}s, still alive; chip_id re-read: {:?}",
+            d.chip_info().map(|i| i.chip_id)
+        );
         return Ok(());
     }
     eprintln!("[stage] single_tone(true) ...");

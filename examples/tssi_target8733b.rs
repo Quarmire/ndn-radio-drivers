@@ -22,8 +22,14 @@ const DE_ARMS: [i8; 10] = [0, 16, 32, 48, 64, 80, 96, 112, 127, 0];
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let ch: u8 = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(36);
-    let n: u32 = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(600);
+    let ch: u8 = std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(36);
+    let n: u32 = std::env::args()
+        .nth(2)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(600);
     let dev = Rtl8733buBackend::open()?;
     dev.bring_up_tx(ch)?;
     println!("=== TSSI target sweep, ch{ch}, {n} frames/arm ===");
@@ -34,31 +40,46 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if de_mode {
         dev.set_tssi_enabled(true)?;
         let t = dev.read32(0x4318)?;
-        println!("  TSSI loop enabled for DE sweep: 0x4318=0x{t:08x} field={}", (t >> 28) & 0x7);
+        println!(
+            "  TSSI loop enabled for DE sweep: 0x4318=0x{t:08x} field={}",
+            (t >> 28) & 0x7
+        );
         if (t >> 28) & 0x7 != 7 {
             return Err("TSSI loop did not enable — DE sweep would be meaningless".into());
         }
     }
     let arms: &[i8] = if de_mode { &DE_ARMS } else { &ARMS };
     for (i, &q) in arms.iter().enumerate() {
-        if de_mode { dev.set_tssi_de(q)?; } else { dev.set_tssi_target(q)?; }
+        if de_mode {
+            dev.set_tssi_de(q)?;
+        } else {
+            dev.set_tssi_target(q)?;
+        }
         let t = dev.read32(0x4318)?;
         if de_mode {
-            println!("  arm {i}: de={q:4} -> {:+6.2} dB offset   0x4334=0x{:08x}  0x4318=0x{t:08x}",
-                     q as f32 * 0.125, dev.read32(0x4334)?);
+            println!(
+                "  arm {i}: de={q:4} -> {:+6.2} dB offset   0x4334=0x{:08x}  0x4318=0x{t:08x}",
+                q as f32 * 0.125,
+                dev.read32(0x4334)?
+            );
         } else {
-            println!("  arm {i}: q={q:4} -> target {:6.2} dBm   0x4318=0x{t:08x} (tssi_field={})",
-                     Rtl8733buBackend::tssi_target_dbm(q), (t >> 28) & 0x7);
+            println!(
+                "  arm {i}: q={q:4} -> target {:6.2} dBm   0x4318=0x{t:08x} (tssi_field={})",
+                Rtl8733buBackend::tssi_target_dbm(q),
+                (t >> 28) & 0x7
+            );
         }
         let mut p = vec![0xC3u8; 300];
-        p[0] = i as u8;   // arm index
-        p[1] = if de_mode { 8 } else { 7 };   // 7 = TSSI target, 8 = TSSI DE
+        p[0] = i as u8; // arm index
+        p[1] = if de_mode { 8 } else { 7 }; // 7 = TSSI target, 8 = TSSI DE
         let f = InjectFrame {
             payload: Bytes::from(p),
             tx: TxIntent::CONSERVATIVE,
             dst: BROADCAST,
-            src: [0x02, 0x50, 0x33, 0x02, if de_mode {8} else {7}, i as u8],
+            src: [0x02, 0x50, 0x33, 0x02, if de_mode { 8 } else { 7 }, i as u8],
             addr3: None,
+            addr4: None,
+            htc: None,
         };
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         for _ in 0..n {

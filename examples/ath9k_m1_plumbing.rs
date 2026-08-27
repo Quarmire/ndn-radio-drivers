@@ -51,41 +51,57 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
     let (credits, credit_size) = dev.credits();
-    println!("[transport] HTC up: {credits} credits of {credit_size} B, FW {:?}", dev.fw_version());
+    println!(
+        "[transport] HTC up: {credits} credits of {credit_size} B, FW {:?}",
+        dev.fw_version()
+    );
     let _ = dev.drain_events(800);
 
     // M1.0 — connect the data services.
     let rc = match dev.connect_data_services() {
         Ok(()) => {
             let (mgmt, be, beacon) = dev.data_endpoints();
-            println!("[M1.0] data services connected: mgmt_ep={mgmt} data_be_ep={be} beacon_ep={beacon}");
+            println!(
+                "[M1.0] data services connected: mgmt_ep={mgmt} data_be_ep={be} beacon_ep={beacon}"
+            );
             if mgmt == 0 || be == 0 || beacon == 0 {
                 eprintln!("[M1.0] WARNING: a data endpoint id came back 0 (unexpected)");
             }
 
             // Claim + poll the bulk RX pipe. No PHY => expect clean timeouts. If anything DOES
             // arrive, dump the first 48 bytes ([HTC 8B][ath_htc_rx_status 40B]) as a bonus.
-            println!("[M1.0] polling bulk RX (EP 0x82) for 3 s — timeouts are the expected result...");
+            println!(
+                "[M1.0] polling bulk RX (EP 0x82) for 3 s — timeouts are the expected result..."
+            );
             let mut got = 0u32;
             let deadline = std::time::Instant::now() + Duration::from_secs(3);
             while std::time::Instant::now() < deadline {
                 match dev.recv_raw_frame(Duration::from_millis(400)) {
                     Ok(b) if !b.is_empty() => {
                         let head = &b[..b.len().min(48)];
-                        println!("[M1.0] ★ RX {} B (unexpected without PHY): {head:02x?}", b.len());
+                        println!(
+                            "[M1.0] ★ RX {} B (unexpected without PHY): {head:02x?}",
+                            b.len()
+                        );
                         got += 1;
                     }
                     Ok(_) => {}
                     Err(_) => {} // timeout — the expected, healthy case
                 }
             }
-            println!("[M1.0] RX poll done: {got} frames (0 = healthy; pipe is claimable). PLUMBING OK ✓");
+            println!(
+                "[M1.0] RX poll done: {got} frames (0 = healthy; pipe is claimable). PLUMBING OK ✓"
+            );
             ExitCode::SUCCESS
         }
         Err(e) => {
             eprintln!("[M1.0] data-service connect FAILED: {e}");
-            eprintln!("        if this is a CONNECT_SERVICE_RESPONSE timeout/refusal, the likely cause");
-            eprintln!("        is ordering — connect the data services BEFORE SETUP_COMPLETE (split htc_init).");
+            eprintln!(
+                "        if this is a CONNECT_SERVICE_RESPONSE timeout/refusal, the likely cause"
+            );
+            eprintln!(
+                "        is ordering — connect the data services BEFORE SETUP_COMPLETE (split htc_init)."
+            );
             ExitCode::FAILURE
         }
     };

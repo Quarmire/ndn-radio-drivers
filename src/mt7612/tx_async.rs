@@ -7,8 +7,8 @@
 //! libusb backend `rusb` already uses — no new USB dependency). Linux-only.
 
 use std::os::raw::{c_int, c_void};
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -41,7 +41,9 @@ extern "system" fn on_complete(t: *mut ffi::libusb_transfer) {
         job.counters.outstanding.fetch_sub(1, Ordering::Relaxed);
         if (*t).status == LIBUSB_TRANSFER_COMPLETED {
             job.counters.completed.fetch_add(1, Ordering::Relaxed);
-            job.counters.bytes.fetch_add((*t).actual_length as u64, Ordering::Relaxed);
+            job.counters
+                .bytes
+                .fetch_add((*t).actual_length as u64, Ordering::Relaxed);
         } else {
             job.counters.errors.fetch_add(1, Ordering::Relaxed);
         }
@@ -79,7 +81,10 @@ impl TxRing {
         let r2 = running.clone();
         let event_thread = std::thread::spawn(move || {
             let ctx = ctx; // move the raw ctx in
-            let tv = libc::timeval { tv_sec: 0, tv_usec: 100_000 };
+            let tv = libc::timeval {
+                tv_sec: 0,
+                tv_usec: 100_000,
+            };
             while r2.load(Ordering::Relaxed) {
                 unsafe {
                     ffi::libusb_handle_events_timeout(ctx.0, &tv);

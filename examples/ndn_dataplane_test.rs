@@ -33,7 +33,9 @@ const SF: u8 = 9;
 const BW_KHZ: u32 = 125;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
     rt.block_on(run())
 }
 
@@ -72,7 +74,11 @@ async fn send(dev: &LoraSerialBackend, wire: &str) {
     }
 }
 
-async fn tx(dev: Arc<LoraSerialBackend>, scenario: &str, secs: u64) -> Result<(), Box<dyn std::error::Error>> {
+async fn tx(
+    dev: Arc<LoraSerialBackend>,
+    scenario: &str,
+    secs: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
     let deadline = Instant::now() + Duration::from_secs(secs);
     // The firmware's dedup ring persists across runs (the dongle never reboots), so a fixed dedup name
     // would already be "seen" from a prior sweep and the very first frame would be dropped. Mint a
@@ -111,7 +117,11 @@ async fn tx(dev: Arc<LoraSerialBackend>, scenario: &str, secs: u64) -> Result<()
     Ok(())
 }
 
-async fn rx(dev: Arc<LoraSerialBackend>, scenario: &str, secs: u64) -> Result<(), Box<dyn std::error::Error>> {
+async fn rx(
+    dev: Arc<LoraSerialBackend>,
+    scenario: &str,
+    secs: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
     // The firmware DataPlane persists across host restarts (the dongle never reboots between runs), so
     // establish the COMPLETE state each time — clear the knobs this scenario doesn't use, or the prior
     // scenario's filter/dedup would leak in and contaminate the result.
@@ -146,7 +156,10 @@ async fn rx(dev: Arc<LoraSerialBackend>, scenario: &str, secs: u64) -> Result<()
     let s = dev.ndn_stats()?;
     let d = delivered.load(Ordering::Relaxed);
     println!("\n[rx/{scenario}] === RESULT ===");
-    println!("  counters: rx={} filtered={} deduped={} served={} relayed={}", s.rx, s.filtered, s.deduped, s.served, s.relayed);
+    println!(
+        "  counters: rx={} filtered={} deduped={} served={} relayed={}",
+        s.rx, s.filtered, s.deduped, s.served, s.relayed
+    );
     println!("  host delivered (Deliver wakes): {d}");
 
     // Judge against the model for this scenario.
@@ -160,7 +173,10 @@ async fn rx(dev: Arc<LoraSerialBackend>, scenario: &str, secs: u64) -> Result<()
             "deduped>0 (repeats dropped) AND host saw ~1 (first only)",
         ),
         "relay" => (s.relayed > 0, "relayed>0 (frames re-broadcast + delivered)"),
-        "cs" => (s.served > 0, "served>0 (Interests answered from on-device cache)"),
+        "cs" => (
+            s.served > 0,
+            "served>0 (Interests answered from on-device cache)",
+        ),
         _ => (false, ""),
     };
     println!("  model: {why}");

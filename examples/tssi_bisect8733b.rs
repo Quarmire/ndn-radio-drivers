@@ -19,8 +19,14 @@ use ndn_radio_drivers::{BROADCAST, FrameIo, InjectFrame, Rtl8733buBackend, TxInt
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let ch: u8 = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(36);
-    let phase: u8 = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(0);
+    let ch: u8 = std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(36);
+    let phase: u8 = std::env::args()
+        .nth(2)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
 
     let dev = Arc::new(Rtl8733buBackend::open()?);
     dev.bring_up_monitor(ch)?;
@@ -44,6 +50,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         dst: BROADCAST,
         src: [0x02, 0x42, 0x49, 0x53, phase, 0x01],
         addr3: None,
+        addr4: None,
+        htc: None,
     };
     let mut sent = 0u64;
     let end = std::time::Instant::now() + std::time::Duration::from_secs(3);

@@ -76,7 +76,11 @@ fn main() -> ExitCode {
         }
     };
     let chan_mhz: u16 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(2437);
-    println!("firmware: {} ({} bytes), channel {chan_mhz} MHz", args[1], fw.len());
+    println!(
+        "firmware: {} ({} bytes), channel {chan_mhz} MHz",
+        args[1],
+        fw.len()
+    );
 
     let mut dev = match Ath9kHtcBackend::open() {
         Ok(d) => d,
@@ -125,7 +129,9 @@ fn main() -> ExitCode {
                 match dev.inject(frame).await {
                     Ok(()) => {}
                     Err(e) => {
-                        eprintln!("[tx {n:03}] inject FAILED: {e}  (pool likely drained — the block)");
+                        eprintln!(
+                            "[tx {n:03}] inject FAILED: {e}  (pool likely drained — the block)"
+                        );
                         dump(&mut dev, "at-block");
                         return;
                     }

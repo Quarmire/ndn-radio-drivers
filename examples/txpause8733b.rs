@@ -24,15 +24,24 @@ use std::time::Instant;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let ch: u8 = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(36);
-    let n: u32 = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(1500);
+    let ch: u8 = std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(36);
+    let n: u32 = std::env::args()
+        .nth(2)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1500);
     let dev = Rtl8733buBackend::open()?;
     dev.bring_up_tx(ch)?;
     // NDN_NAV_UPPER_US caps how long a DECODED NAV from someone else may hold our transmitter.
     if let Ok(v) = std::env::var("NDN_NAV_UPPER_US") {
         let us: u32 = v.parse().unwrap_or(0);
         dev.set_nav_upper_us(us)?;
-        println!("NAV_UPPER set to {us} us -> reads {} us", dev.nav_upper_us()?);
+        println!(
+            "NAV_UPPER set to {us} us -> reads {} us",
+            dev.nav_upper_us()?
+        );
     } else {
         println!("NAV_UPPER left at {} us (default)", dev.nav_upper_us()?);
     }
@@ -44,15 +53,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let per = t0.elapsed().as_secs_f64() * 1e6 / 200.0;
     dev.set_tx_pause(0x00)?;
-    println!("gate toggle cost: {per:.1} us/write  (readback now 0x{:02x})", dev.tx_pause()?);
-    println!("=> a 50% duty cycle cannot be shaped faster than ~{:.0} us half-period", per * 2.0);
+    println!(
+        "gate toggle cost: {per:.1} us/write  (readback now 0x{:02x})",
+        dev.tx_pause()?
+    );
+    println!(
+        "=> a 50% duty cycle cannot be shaped faster than ~{:.0} us half-period",
+        per * 2.0
+    );
 
     // NDN_PAUSE_HALF_MS=<n> runs ONE arm at that half-period (0 = ungated control) for
     // NDN_PAUSE_SECS seconds, so a time-resolved receiver measures one condition at a time
     // instead of a blended histogram across six.
     if let Ok(half) = std::env::var("NDN_PAUSE_HALF_MS") {
         let half: u64 = half.parse().unwrap_or(0);
-        let secs: u64 = std::env::var("NDN_PAUSE_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(15);
+        let secs: u64 = std::env::var("NDN_PAUSE_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(15);
         let mut p = vec![0xC3u8; 300];
         p[0] = 0;
         p[1] = 3;
@@ -62,6 +80,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             dst: BROADCAST,
             src: [0x02, 0x50, 0x33, 0x02, 3, 0],
             addr3: None,
+            addr4: None,
+            htc: None,
         };
         dev.set_tx_pause(0x00)?;
         let start = Instant::now();
@@ -74,7 +94,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     gated = want;
                 }
             }
-            match tokio::time::timeout(std::time::Duration::from_millis(50), dev.inject(f.clone())).await {
+            match tokio::time::timeout(std::time::Duration::from_millis(50), dev.inject(f.clone()))
+                .await
+            {
                 Ok(Ok(())) => sent += 1,
                 Ok(Err(_)) => {}
                 Err(_) => stalled += 1,
@@ -109,6 +131,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             dst: BROADCAST,
             src: [0x02, 0x50, 0x33, 0x02, 3, i as u8],
             addr3: None,
+            addr4: None,
+            htc: None,
         };
         let start = Instant::now();
         let mut sent = 0u32;
@@ -124,7 +148,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             // Bounded: a held queue blocks the injector, so never wait unbounded on a gated arm.
-            match tokio::time::timeout(std::time::Duration::from_millis(50), dev.inject(f.clone())).await {
+            match tokio::time::timeout(std::time::Duration::from_millis(50), dev.inject(f.clone()))
+                .await
+            {
                 Ok(Ok(())) => sent += 1,
                 Ok(Err(_)) => {}
                 Err(_) => stalled += 1,
@@ -134,11 +160,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if *half_ms > 0 {
             dev.set_tx_pause(0x00)?;
         }
-        println!("  arm {i} {name:<28} injected={sent} stalled={stalled} in {:.2}s",
-                 start.elapsed().as_secs_f64());
+        println!(
+            "  arm {i} {name:<28} injected={sent} stalled={stalled} in {:.2}s",
+            start.elapsed().as_secs_f64()
+        );
         tokio::time::sleep(std::time::Duration::from_millis(400)).await;
     }
     dev.set_tx_pause(0x00)?;
-    println!("=== TXPAUSE SWEEP DONE (gate released: 0x{:02x}) ===", dev.tx_pause()?);
+    println!(
+        "=== TXPAUSE SWEEP DONE (gate released: 0x{:02x}) ===",
+        dev.tx_pause()?
+    );
     Ok(())
 }

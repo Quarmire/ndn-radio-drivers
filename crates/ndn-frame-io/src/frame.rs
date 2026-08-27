@@ -131,14 +131,20 @@ impl EphemeralSource {
     /// or an RNG). `rotation_period_ms` is how long one nonce stays stable; `0` disables rotation
     /// (one fixed nonce for the whole boot — still per-boot random, just not rotating).
     pub const fn new(boot_seed: u64, rotation_period_ms: u64) -> Self {
-        Self { boot_seed, rotation_period_ms }
+        Self {
+            boot_seed,
+            rotation_period_ms,
+        }
     }
 
     /// The source address in effect at `now_ms`. Frames within one rotation period share it (so a
     /// receiver can attribute their RSSI to one neighbour); it changes across periods and boots.
     pub fn current(&self, now_ms: u64) -> [u8; 6] {
-        let epoch =
-            if self.rotation_period_ms == 0 { 0 } else { now_ms / self.rotation_period_ms };
+        let epoch = if self.rotation_period_ms == 0 {
+            0
+        } else {
+            now_ms / self.rotation_period_ms
+        };
         let mut key = [0u8; 16];
         key[..8].copy_from_slice(&self.boot_seed.to_le_bytes());
         let h = siphash24(&key, &epoch.to_le_bytes()).to_le_bytes();
@@ -272,21 +278,50 @@ pub fn build_dot11(format: FrameFormat, frame: &InjectFrame) -> Result<Vec<u8>, 
         // RawNdn and RawNdnS1g share the exact data-frame body; they differ only
         // in the radiotap TX rate header chosen in `build_at`.
         FrameFormat::RawNdn { ethertype } | FrameFormat::RawNdnS1g { ethertype } => {
-            // 802.11 non-QoS data frame. addr1/addr3 = destination group (or
-            // broadcast); addr2 = name-derived source. The NDN name is the
-            // addressing — these fields are a name-keyed index, not host ids.
-            out.extend_from_slice(&[0x08, 0x00]); // FC: type=Data, subtype=0
-            out.extend_from_slice(&[0x00, 0x00]); // Duration
-            out.extend_from_slice(&frame.dst); // addr1 (RA/DA) = group / Tier-0 filter hi
-            out.extend_from_slice(&frame.src); // addr2 (TA/SA) = name-derived / filter lo
-            // addr3: the ephemeral source nonce when addr1‖addr2 is a Tier-0 filter, else
-            // the legacy BSSID slot (a copy of dst). Nothing on the RX path reads addr3 for
-            // the legacy layout, so the fallback is byte-compatible with prior deployments.
-            out.extend_from_slice(&frame.addr3.unwrap_or(frame.dst)); // addr3 (BSSID / nonce)
-            out.extend_from_slice(&[0x00, 0x00]); // SeqCtrl
-            out.extend_from_slice(&LLC_SNAP_PREFIX);
-            out.extend_from_slice(&ethertype.to_be_bytes());
-            out.extend_from_slice(&frame.payload);
+            match (frame.addr4, frame.htc) {
+                // ── WIDE PROFILE: 4-address QoS-Data + HT Control ──────────────────────────────
+                // Set together (the wide-profile pushed header). addr4 carries the extra Blur
+                // projection; HT Control carries the exact-match fingerprint + profile marker.
+                // ToDS=FromDS=1 makes addr4 present; subtype QoS-Data makes QoS Control present;
+                // the Order/+HTC bit makes HT Control present — ~222 usable header bits total.
+                // The base 126-bit Blur still lives byte-identically in addr1‖addr2‖addr3[0:4],
+                // so a base-only receiver reads this frame with zero false negatives.
+                (Some(addr4), Some(htc)) => {
+                    // FC: type=Data, subtype=QoS Data (0x88); ToDS+FromDS+Order (0x83).
+                    out.extend_from_slice(&[0x88, 0x83]);
+                    out.extend_from_slice(&[0x00, 0x00]); // Duration
+                    out.extend_from_slice(&frame.dst); // addr1 = Tier-0 filter hi
+                    out.extend_from_slice(&frame.src); // addr2 = Tier-0 filter lo
+                    out.extend_from_slice(&frame.addr3.unwrap_or(frame.dst)); // addr3 = base[12:16]‖id‖flags
+                    out.extend_from_slice(&[0x00, 0x00]); // SeqCtrl
+                    out.extend_from_slice(&addr4); // addr4 = extra Blur (48 bits)
+                    // QoS Control: A-MSDU-present bit CLEAR (this is a single MSDU, not an
+                    // aggregate), TID 0. The extra Blur deliberately does NOT ride here — QoS
+                    // Control belongs to the A-MSDU/QoS layer (see `build_amsdu`).
+                    out.extend_from_slice(&[0x00, 0x00]);
+                    out.extend_from_slice(&htc); // HT Control = fingerprint(24b LE) ‖ marker
+                    out.extend_from_slice(&LLC_SNAP_PREFIX);
+                    out.extend_from_slice(&ethertype.to_be_bytes());
+                    out.extend_from_slice(&frame.payload);
+                }
+                // ── BASE PROFILE: 802.11 non-QoS 3-address data frame ─────────────────────────
+                // addr1/addr3 = destination group (or broadcast); addr2 = name-derived source.
+                // The NDN name is the addressing — these fields are a name-keyed index, not host ids.
+                _ => {
+                    out.extend_from_slice(&[0x08, 0x00]); // FC: type=Data, subtype=0
+                    out.extend_from_slice(&[0x00, 0x00]); // Duration
+                    out.extend_from_slice(&frame.dst); // addr1 (RA/DA) = group / Tier-0 filter hi
+                    out.extend_from_slice(&frame.src); // addr2 (TA/SA) = name-derived / filter lo
+                    // addr3: the ephemeral source nonce when addr1‖addr2 is a Tier-0 filter, else
+                    // the legacy BSSID slot (a copy of dst). Nothing on the RX path reads addr3 for
+                    // the legacy layout, so the fallback is byte-compatible with prior deployments.
+                    out.extend_from_slice(&frame.addr3.unwrap_or(frame.dst)); // addr3 (BSSID / nonce)
+                    out.extend_from_slice(&[0x00, 0x00]); // SeqCtrl
+                    out.extend_from_slice(&LLC_SNAP_PREFIX);
+                    out.extend_from_slice(&ethertype.to_be_bytes());
+                    out.extend_from_slice(&frame.payload);
+                }
+            }
         }
         FrameFormat::EspNow { oui } => {
             if frame.payload.len() > ESPNOW_MAX_BODY {
@@ -385,11 +420,19 @@ pub fn parse_dot11(
             if (fc0 >> 2) & 0x03 != 0x02 {
                 return None; // not a data frame
             }
-            let hdr_len = if (fc0 >> 4) & 0x08 != 0 {
-                DOT11_QOS_HDR_LEN
-            } else {
-                DOT11_HDR_LEN
-            };
+            let fc1 = body[1];
+            // The 802.11 header grows by whichever optional fields the frame control announces,
+            // in fixed order after SeqCtrl: addr4 (when ToDS=FromDS=1), QoS Control (subtype
+            // QoS-Data), HT Control (Order/+HTC bit). Compute the true header length from the bits
+            // rather than assuming — the wide profile sets all three (36 B), an A-MSDU sets only
+            // QoS (26 B), a plain data frame none (24 B).
+            let four_addr = (fc1 & 0x03) == 0x03; // ToDS && FromDS
+            let qos = (fc0 >> 4) & 0x08 != 0; // subtype QoS-Data
+            let htc = (fc1 & 0x80) != 0; // Order bit ⇒ HT Control present
+            let hdr_len = DOT11_HDR_LEN
+                + if four_addr { 6 } else { 0 }
+                + if qos { 2 } else { 0 }
+                + if htc { 4 } else { 0 };
             if body.len() < hdr_len + LLC_SNAP_LEN {
                 return None;
             }
@@ -408,11 +451,34 @@ pub fn parse_dot11(
                 a.copy_from_slice(s);
                 a
             });
+            // Wide profile: addr4 (extra Blur, at offset 24 when four_addr) and HT Control
+            // (fingerprint + marker, immediately after the QoS Control that precedes it).
+            let addr4 = if four_addr {
+                body.get(24..30).map(|s| {
+                    let mut a = [0u8; 6];
+                    a.copy_from_slice(s);
+                    a
+                })
+            } else {
+                None
+            };
+            let htc_bytes = if htc {
+                let off = DOT11_HDR_LEN + if four_addr { 6 } else { 0 } + if qos { 2 } else { 0 };
+                body.get(off..off + 4).map(|s| {
+                    let mut h = [0u8; 4];
+                    h.copy_from_slice(s);
+                    h
+                })
+            } else {
+                None
+            };
             Some(CapturedFrame {
                 payload: Bytes::copy_from_slice(&body[hdr_len + LLC_SNAP_LEN..]),
                 addr: Some(ta),
                 group: Some(group),
                 addr3,
+                addr4,
+                htc: htc_bytes,
                 rssi_dbm: rssi,
                 mcs_index: mcs,
                 stamp,
@@ -453,6 +519,8 @@ pub fn parse_dot11(
                 addr: Some(ta),
                 group: Some(group),
                 addr3: None, // ESP-NOW addr3 is broadcast, not a nonce
+                addr4: None,
+                htc: None,
                 rssi_dbm: rssi,
                 mcs_index: mcs,
                 stamp,
@@ -481,6 +549,8 @@ pub fn parse_dot11(
                 addr: Some(ta),
                 group: Some(group),
                 addr3,
+                addr4: None,
+                htc: None,
                 rssi_dbm: rssi,
                 mcs_index: mcs,
                 stamp,
@@ -505,6 +575,8 @@ mod tests {
             dst: BROADCAST,
             src: SRC,
             addr3: None,
+            addr4: None,
+            htc: None,
         }
     }
 
@@ -577,16 +649,32 @@ mod tests {
         let src = EphemeralSource::new(0xDEAD_BEEF, 1000); // 1 s rotation
         let a = src.current(0);
         // Locally administered (not a vendor MAC) + individual (a source, not multicast).
-        assert_eq!(a[0] & 0x02, 0x02, "U/L local bit set — not a globally-unique host MAC");
-        assert_eq!(a[0] & 0x01, 0x00, "I/G individual bit clear — a source address");
+        assert_eq!(
+            a[0] & 0x02,
+            0x02,
+            "U/L local bit set — not a globally-unique host MAC"
+        );
+        assert_eq!(
+            a[0] & 0x01,
+            0x00,
+            "I/G individual bit clear — a source address"
+        );
         // Stable within a period; rotates across periods.
         assert_eq!(a, src.current(999), "stable within one rotation period");
         assert_ne!(a, src.current(1000), "rotates into the next period");
         // Different boot seed → different nonce (per-boot randomness, no persistent identity).
-        assert_ne!(a, EphemeralSource::new(0x1234_5678, 1000).current(0), "differs across boots");
+        assert_ne!(
+            a,
+            EphemeralSource::new(0x1234_5678, 1000).current(0),
+            "differs across boots"
+        );
         // No rotation when the period is 0 (still per-boot random, just fixed for the boot).
         let fixed = EphemeralSource::new(7, 0);
-        assert_eq!(fixed.current(0), fixed.current(1_000_000), "period 0 → one nonce for the boot");
+        assert_eq!(
+            fixed.current(0),
+            fixed.current(1_000_000),
+            "period 0 → one nonce for the boot"
+        );
     }
 
     /// SipHash-2-4 correctness against the reference vector (Aumasson & Bernstein):
@@ -657,6 +745,8 @@ mod tests {
             dst: BROADCAST,
             src: SRC,
             addr3: None,
+            addr4: None,
+            htc: None,
         };
         // build_dot11 is the identity on the payload (no extra framing).
         assert_eq!(build_dot11(fmt, &inj).unwrap(), frame_bytes);
@@ -677,6 +767,55 @@ mod tests {
         assert_eq!(got.addr, Some(SRC), "addr2 surfaced");
         assert_eq!(got.group, Some(BROADCAST), "addr1 surfaced");
         assert_eq!(got.rssi_dbm, Some(-60));
+    }
+
+    /// The **wide profile** builds a 4-address QoS-Data+HT-Control frame that carries addr4 and
+    /// HT Control, round-trips them through `parse_dot11`, AND stays readable by a base receiver:
+    /// the base 126-bit Blur in addr1‖addr2‖addr3 is byte-identical whether or not the wide fields
+    /// are present, so both profiles share one airspace with zero false negatives.
+    #[test]
+    fn wide_profile_4addr_qos_htc_round_trips_and_stays_base_readable() {
+        let fmt = FrameFormat::RawNdn { ethertype: 0x8624 };
+        let addr4 = [0x54, 0x02, 0x88, 0x92, 0x6a, 0x10];
+        let htc = [0xd0, 0x38, 0x4e, 0x01]; // fp=0x4e38d0 LE ‖ marker 0x01
+        let addr3 = [0x00, 0xc0, 0x81, 0x00, 0x37, 0x00];
+        let wide = InjectFrame {
+            payload: Bytes::copy_from_slice(b"\x05\x03abc"),
+            tx: TxIntent::CONSERVATIVE,
+            dst: [0x03, 0x80, 0x84, 0x00, 0x01, 0x00],
+            src: [0x08, 0x00, 0x81, 0x00, 0x05, 0x01],
+            addr3: Some(addr3),
+            addr4: Some(addr4),
+            htc: Some(htc),
+        };
+        let dot11 = build_dot11(fmt, &wide).unwrap();
+        // Wire header pins: FC = QoS-Data + ToDS+FromDS+Order; then the 36-byte header.
+        assert_eq!(&dot11[0..2], &[0x88, 0x83], "FC: QoS-Data, ToDS=FromDS=Order=1");
+        assert_eq!(&dot11[4..10], &wide.dst, "addr1 = base Blur hi");
+        assert_eq!(&dot11[10..16], &wide.src, "addr2 = base Blur mid");
+        assert_eq!(&dot11[16..22], &addr3, "addr3 = base[12:16]‖id‖flags");
+        assert_eq!(&dot11[24..30], &addr4, "addr4 = extra Blur");
+        assert_eq!(&dot11[30..32], &[0x00, 0x00], "QoS Control: A-MSDU bit CLEAR (reserved for A-MSDU)");
+        assert_eq!(&dot11[32..36], &htc, "HT Control = fingerprint ‖ marker");
+        assert_eq!(&dot11[36..42], &LLC_SNAP_PREFIX, "LLC/SNAP at offset 36");
+
+        // Full-fidelity parse recovers the wide fields.
+        let got = parse_dot11(fmt, &dot11, Some(-42), Some(5), None).unwrap();
+        assert_eq!(got.payload.as_ref(), b"\x05\x03abc");
+        assert_eq!(got.group, Some(wide.dst));
+        assert_eq!(got.addr, Some(wide.src));
+        assert_eq!(got.addr3, Some(addr3));
+        assert_eq!(got.addr4, Some(addr4), "extra Blur surfaced");
+        assert_eq!(got.htc, Some(htc), "fingerprint surfaced");
+
+        // Base coexistence: a base 3-address frame with the SAME addr1/2/3 yields identical
+        // addr1‖addr2‖addr3 bytes — the Blur a base receiver ANDs its masks against is unchanged.
+        let base = InjectFrame { addr4: None, htc: None, ..wide.clone() };
+        let base11 = build_dot11(fmt, &base).unwrap();
+        assert_eq!(&base11[4..22], &dot11[4..22], "base Blur bytes identical across profiles");
+        let base_got = parse_dot11(fmt, &base11, None, None, None).unwrap();
+        assert_eq!(base_got.addr4, None, "base frame carries no extra Blur");
+        assert_eq!(base_got.htc, None, "base frame carries no fingerprint");
     }
 
     #[test]

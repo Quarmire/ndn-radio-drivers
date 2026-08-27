@@ -16,7 +16,10 @@
 use ndn_radio_drivers::Rtl8733buBackend;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let ch: u8 = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(36);
+    let ch: u8 = std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(36);
     let dev = Rtl8733buBackend::open()?;
     dev.power_on()?; // efuse reads need the MAC powered; no PHY bring-up required
 
@@ -41,11 +44,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     match dev.calibrated_ofdm_index(ch)? {
         Some(idx) => {
-            println!("\nch{ch}: CALIBRATED OFDM index = {idx} (0x{idx:02x})  = {:.2} dB of gain index", f64::from(idx) / 4.0);
-            println!("  driver currently writes: table 0x2d ({}), datapath ramp 0x1c-0x38 ({}-{})", 0x2d, 0x1c, 0x38);
+            println!(
+                "\nch{ch}: CALIBRATED OFDM index = {idx} (0x{idx:02x})  = {:.2} dB of gain index",
+                f64::from(idx) / 4.0
+            );
+            println!(
+                "  driver currently writes: table 0x2d ({}), datapath ramp 0x1c-0x38 ({}-{})",
+                0x2d, 0x1c, 0x38
+            );
             let over = i32::from(0x2du8) - i32::from(idx);
-            println!("  flat table value is {} index steps = {:.1} dB {} the calibrated point",
-                over.abs(), f64::from(over.abs()) / 4.0, if over > 0 { "ABOVE" } else { "below" });
+            println!(
+                "  flat table value is {} index steps = {:.1} dB {} the calibrated point",
+                over.abs(),
+                f64::from(over.abs()) / 4.0,
+                if over > 0 { "ABOVE" } else { "below" }
+            );
         }
         None => println!("\nch{ch}: efuse cell unprogrammed — no calibrated index for this group"),
     }

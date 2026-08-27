@@ -84,7 +84,10 @@ impl DeviceSelect {
         if let Some(a) = std::env::var_os("NDN_USB_ADDR") {
             return DeviceSelect::Addr(a.to_string_lossy().into_owned());
         }
-        if let Some(i) = std::env::var("NDN_USB_INDEX").ok().and_then(|s| s.trim().parse().ok()) {
+        if let Some(i) = std::env::var("NDN_USB_INDEX")
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+        {
             return DeviceSelect::Index(i);
         }
         DeviceSelect::First
@@ -116,7 +119,11 @@ pub fn usb_addr(device: &Device<Context>) -> String {
     let bus = device.bus_number();
     match device.port_numbers() {
         Ok(ports) if !ports.is_empty() => {
-            let path = ports.iter().map(u8::to_string).collect::<Vec<_>>().join(".");
+            let path = ports
+                .iter()
+                .map(u8::to_string)
+                .collect::<Vec<_>>()
+                .join(".");
             format!("{bus}-{path}")
         }
         _ => format!("{bus}-0"),
@@ -231,7 +238,10 @@ mod tests {
         assert_eq!(DeviceSelect::parse("  "), DeviceSelect::First);
         assert_eq!(DeviceSelect::parse("#0"), DeviceSelect::Index(0));
         assert_eq!(DeviceSelect::parse("#3"), DeviceSelect::Index(3));
-        assert_eq!(DeviceSelect::parse("1-1.4"), DeviceSelect::Addr("1-1.4".into()));
+        assert_eq!(
+            DeviceSelect::parse("1-1.4"),
+            DeviceSelect::Addr("1-1.4".into())
+        );
         // A "#" with a non-numeric tail is not an index — treat the whole thing as an address
         // rather than silently selecting the first device.
         assert_eq!(DeviceSelect::parse("#x"), DeviceSelect::Addr("#x".into()));

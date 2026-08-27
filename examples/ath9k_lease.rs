@@ -19,18 +19,30 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
     let fw = std::fs::read(args.get(1).expect("usage: <fw>")).expect("read fw");
     let mut dev = Ath9kHtcBackend::open().expect("open");
-    dev.download_firmware(&fw).and_then(|_| dev.htc_init()).expect("transport");
-    dev.hw_reset(2412).and_then(|_| dev.connect_data_services()).expect("bring-up");
+    dev.download_firmware(&fw)
+        .and_then(|_| dev.htc_init())
+        .expect("transport");
+    dev.hw_reset(2412)
+        .and_then(|_| dev.connect_data_services())
+        .expect("bring-up");
     let _ = dev.write_target_u32s(0x0050_cf44, &[0]);
-    dev.wmi_start().and_then(|_| dev.start_receive()).expect("rx-start");
+    dev.wmi_start()
+        .and_then(|_| dev.start_receive())
+        .expect("rx-start");
 
-    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
     let flood = |dev: &Ath9kHtcBackend, secs: u64| -> u64 {
         rt.block_on(async {
             let deadline = Instant::now() + Duration::from_secs(secs);
             let mut n = 0u64;
             while Instant::now() < deadline {
-                let f = InjectFrame::broadcast(Bytes::copy_from_slice(b"\x05\x08lease"), TxIntent::CONSERVATIVE);
+                let f = InjectFrame::broadcast(
+                    Bytes::copy_from_slice(b"\x05\x08lease"),
+                    TxIntent::CONSERVATIVE,
+                );
                 if dev.inject(f).await.is_ok() {
                     n += 1;
                 }
@@ -63,16 +75,28 @@ fn main() -> ExitCode {
     mac_state(&dev, "armed");
     let leased = flood(&dev, 3);
     mac_state(&dev, "armed'");
-    println!("lease armed:{} frames / 3s = {}/s  (4 slots × 8 TU, own slot 0)", leased, leased / 3);
+    println!(
+        "lease armed:{} frames / 3s = {}/s  (4 slots × 8 TU, own slot 0)",
+        leased,
+        leased / 3
+    );
 
     // Phase 3 — disarmed again: rate recovers.
     dev.disarm_airtime_lease().ok();
     let free2 = flood(&dev, 3);
     println!("disarmed:   {} frames / 3s = {}/s", free2, free2 / 3);
 
-    let drop = if free > 0 { 100 - (leased * 100 / free.max(1)) } else { 0 };
-    println!("\n→ lease removed ~{drop}% of transmit opportunity (MAC-gated, no host involvement) — §8.5.");
-    println!("  (expected ~75% for 1-of-4 slots; arm_count>0 + quiet1_rb bit16 set = the PCU enforced it.)");
+    let drop = if free > 0 {
+        100 - (leased * 100 / free.max(1))
+    } else {
+        0
+    };
+    println!(
+        "\n→ lease removed ~{drop}% of transmit opportunity (MAC-gated, no host involvement) — §8.5."
+    );
+    println!(
+        "  (expected ~75% for 1-of-4 slots; arm_count>0 + quiet1_rb bit16 set = the PCU enforced it.)"
+    );
     let _ = dev.detach();
     ExitCode::SUCCESS
 }

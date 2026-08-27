@@ -218,7 +218,8 @@ impl SerialFd {
 
     fn read(&self, buf: &mut [u8]) -> std::io::Result<usize> {
         loop {
-            let n = unsafe { libc::read(self.fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+            let n =
+                unsafe { libc::read(self.fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
             if n < 0 {
                 let e = std::io::Error::last_os_error();
                 if e.kind() == std::io::ErrorKind::Interrupted {
@@ -317,8 +318,8 @@ impl LoraSerialBackend {
     /// Open the dongle at `path`, program `params` over the binary protocol, and spawn the reader
     /// that parses events and hands received NDN frames (with RSSI/SNR) up as [`CapturedFrame`]s.
     pub fn open_with(path: &str, params: LoraParams) -> Result<Self, FaceError> {
-        let port =
-            SerialFd::open(path, LORA_BAUD).map_err(|e| io_err(format!("lora open {path}: {e}")))?;
+        let port = SerialFd::open(path, LORA_BAUD)
+            .map_err(|e| io_err(format!("lora open {path}: {e}")))?;
         configure(&port, &params)?;
         let reader = port
             .try_clone()
@@ -342,7 +343,12 @@ impl LoraSerialBackend {
 
     /// #52: tune the LBT contention window (ms), max backoff exponent, and max attempts at runtime —
     /// no reflash (Tier 2). Bigger `cw_ms` = better fairness (nodes separate more) at higher latency.
-    pub fn set_lbt_cfg(&self, cw_ms: u16, max_backoff: u8, max_attempts: u8) -> Result<(), FaceError> {
+    pub fn set_lbt_cfg(
+        &self,
+        cw_ms: u16,
+        max_backoff: u8,
+        max_attempts: u8,
+    ) -> Result<(), FaceError> {
         let p = [(cw_ms >> 8) as u8, cw_ms as u8, max_backoff, max_attempts];
         self.exec_idempotent(CMD_SET_LBT_CFG, &p, EVT_INFO)?;
         Ok(())
@@ -397,7 +403,13 @@ impl LoraSerialBackend {
         hop_base_ch: u8,
         hop_span: u8,
     ) -> Result<(), FaceError> {
-        let p = [cs_serve as u8, dedup as u8, hop_on as u8, hop_base_ch, hop_span];
+        let p = [
+            cs_serve as u8,
+            dedup as u8,
+            hop_on as u8,
+            hop_base_ch,
+            hop_span,
+        ];
         self.exec_idempotent(CMD_DATAPLANE, &p, EVT_INFO)?;
         Ok(())
     }
@@ -498,13 +510,17 @@ impl LoraSerialBackend {
         loop {
             let left = deadline.saturating_duration_since(std::time::Instant::now());
             if left.is_zero() {
-                return Err(io_err(format!("lora cmd {typ:#04x}: no reply in {timeout:?}")));
+                return Err(io_err(format!(
+                    "lora cmd {typ:#04x}: no reply in {timeout:?}"
+                )));
             }
             match cmd.resp.recv_timeout(left) {
                 Ok((t, p)) if t == expect => return Ok(p),
                 Ok(_) => continue, // some other event slipped in; keep waiting for ours
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                    return Err(io_err(format!("lora cmd {typ:#04x}: no reply in {timeout:?}")));
+                    return Err(io_err(format!(
+                        "lora cmd {typ:#04x}: no reply in {timeout:?}"
+                    )));
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                     return Err(FaceError::Closed);
@@ -630,7 +646,11 @@ fn reader_loop(
                 acc.extend_from_slice(&tmp[..n]);
                 loop {
                     match next_event(&acc) {
-                        EvParse::Event { typ, payload, consumed } => {
+                        EvParse::Event {
+                            typ,
+                            payload,
+                            consumed,
+                        } => {
                             handle_event(typ, &payload, &tx, &resp, debug);
                             acc.drain(..consumed);
                             if tx.is_closed() {
@@ -691,7 +711,10 @@ fn handle_event(
             let ts_ms = u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]);
             let ndn = &payload[8..];
             if debug {
-                eprintln!("lora RX [{rssi} dBm, SNR {snr}, ts {ts_ms}ms] {} bytes", ndn.len());
+                eprintln!(
+                    "lora RX [{rssi} dBm, SNR {snr}, ts {ts_ms}ms] {} bytes",
+                    ndn.len()
+                );
             }
             let cap = CapturedFrame {
                 payload: ndn.to_vec().into(),
@@ -715,8 +738,14 @@ fn hex(b: &[u8]) -> String {
 
 /// Outcome of trying to parse one event from the front of the accumulator.
 enum EvParse {
-    Event { typ: u8, payload: Vec<u8>, consumed: usize },
-    Drop { consumed: usize },
+    Event {
+        typ: u8,
+        payload: Vec<u8>,
+        consumed: usize,
+    },
+    Drop {
+        consumed: usize,
+    },
     Need,
 }
 
@@ -726,7 +755,9 @@ fn next_event(buf: &[u8]) -> EvParse {
         // No sync word; keep only a possible trailing lone SYNC0 for the next read.
         let keep = if buf.last() == Some(&SYNC0) { 1 } else { 0 };
         return if buf.len() > keep {
-            EvParse::Drop { consumed: buf.len() - keep }
+            EvParse::Drop {
+                consumed: buf.len() - keep,
+            }
         } else {
             EvParse::Need
         };
@@ -751,7 +782,11 @@ fn next_event(buf: &[u8]) -> EvParse {
     if crc != buf[4 + len] {
         return EvParse::Drop { consumed: 2 }; // crc miss — skip past this sync word and resync
     }
-    EvParse::Event { typ, payload: payload.to_vec(), consumed: total }
+    EvParse::Event {
+        typ,
+        payload: payload.to_vec(),
+        consumed: total,
+    }
 }
 
 #[async_trait]
@@ -814,7 +849,11 @@ impl RadioProfile for LoraSerialBackend {
 impl RadioKnobs for LoraSerialBackend {
     fn set_channel(&self, channel: u8, _bw: Bandwidth) -> Result<(), FaceError> {
         // LoRa is half-duplex on a single carrier: point TX and RX at it together.
-        self.exec_idempotent(CMD_SET_FREQ, &channel_to_hz(channel).to_be_bytes(), EVT_INFO)?;
+        self.exec_idempotent(
+            CMD_SET_FREQ,
+            &channel_to_hz(channel).to_be_bytes(),
+            EVT_INFO,
+        )?;
         let mut p = self.params.lock().unwrap();
         p.tx_ch = channel;
         p.rx_ch = channel;
@@ -891,7 +930,11 @@ mod tests {
         p.extend_from_slice(b"hi");
         let buf = wire(EVT_RX, &p);
         match next_event(&buf) {
-            EvParse::Event { typ, payload, consumed } => {
+            EvParse::Event {
+                typ,
+                payload,
+                consumed,
+            } => {
                 assert_eq!(typ, EVT_RX);
                 assert_eq!(consumed, buf.len());
                 assert_eq!(i16::from_be_bytes([payload[0], payload[1]]), -31);
@@ -958,9 +1001,14 @@ mod tests {
         let payload = 915_000_000u32.to_be_bytes();
         let buf = wire(CMD_SET_FREQ, &payload);
         match next_event(&buf) {
-            EvParse::Event { typ, payload: got, .. } => {
+            EvParse::Event {
+                typ, payload: got, ..
+            } => {
                 assert_eq!(typ, CMD_SET_FREQ);
-                assert_eq!(u32::from_be_bytes([got[0], got[1], got[2], got[3]]), 915_000_000);
+                assert_eq!(
+                    u32::from_be_bytes([got[0], got[1], got[2], got[3]]),
+                    915_000_000
+                );
             }
             _ => panic!("expected event"),
         }

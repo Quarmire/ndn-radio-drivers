@@ -46,7 +46,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     use std::collections::BTreeMap;
     use std::time::{Duration, Instant};
 
-    let secs: u64 = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(20);
+    let secs: u64 = std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(20);
 
     println!("opening MT7612U ...");
     let dev = Mt7612uBackend::open()?;
@@ -128,7 +131,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         100.0 * mismatches as f64 / transfers as f64
     );
 
-    let multi: u64 = units_hist.iter().filter(|(u, _)| **u > 1).map(|(_, c)| *c).sum();
+    let multi: u64 = units_hist
+        .iter()
+        .filter(|(u, _)| **u > 1)
+        .map(|(_, c)| *c)
+        .sum();
     println!("\n--- verdict ---");
     if mismatches * 5 > transfers {
         println!(

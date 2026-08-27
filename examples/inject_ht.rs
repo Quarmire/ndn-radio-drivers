@@ -22,11 +22,11 @@
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     use bytes::Bytes;
+    use ndn_frame_io::AfPacketBackend;
     use ndn_radio_drivers::{
         BROADCAST, DEFAULT_SRC, FrameFormat, FrameIo, InjectFrame, McsDescriptor, TxIntent, frame,
         radiotap,
     };
-    use ndn_frame_io::AfPacketBackend;
 
     let mut args = std::env::args().skip(1);
     let iface = args.next().unwrap_or_else(|| {
@@ -37,7 +37,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let count: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(4000);
     let size: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(400);
 
-    let fmt = FrameFormat::RawNdn { ethertype: ndn_radio_drivers::NDN_ETHERTYPE };
+    let fmt = FrameFormat::RawNdn {
+        ethertype: ndn_radio_drivers::NDN_ETHERTYPE,
+    };
     let backend = AfPacketBackend::new(&iface, fmt)?;
     let payload = Bytes::from(vec![0xA5u8; size]);
     let f = InjectFrame::broadcast(payload, TxIntent::CONSERVATIVE);

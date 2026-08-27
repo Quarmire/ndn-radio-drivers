@@ -56,7 +56,10 @@ impl RxPumpState {
     /// `(non-timeout errors, stalls cleared)` — the pump-health counters. Poll during a run to
     /// see a dongle degrading before the host controller disconnects it.
     pub fn rx_health(&self) -> (u64, u64) {
-        (self.rx_errors.load(Ordering::Relaxed), self.rx_stalls_cleared.load(Ordering::Relaxed))
+        (
+            self.rx_errors.load(Ordering::Relaxed),
+            self.rx_stalls_cleared.load(Ordering::Relaxed),
+        )
     }
 
     /// Buffer decoded frames and wake one waiting [`recv`](Self::recv).
@@ -255,24 +258,29 @@ pub fn spawn_rx_pump_async<B: Pumpable>(backend: &Arc<B>, depth: usize) -> JoinH
     let ctx = SendCtx(handle.context().as_raw());
     let ep = backend.pump_bulk_in();
     let inflight = Arc::new(AtomicUsize::new(0));
-    let raw = Arc::new(RawQueue { q: Mutex::new(VecDeque::new()), cv: Condvar::new() });
+    let raw = Arc::new(RawQueue {
+        q: Mutex::new(VecDeque::new()),
+        cv: Condvar::new(),
+    });
 
     // Parse pool: de-aggregate each transfer into frames on its own thread, in parallel.
     let n_parse = 6.min(depth.max(1)).max(2);
     for _ in 0..n_parse {
         let raw = raw.clone();
         let wb = Arc::downgrade(backend);
-        std::thread::spawn(move || loop {
-            let buf = {
-                let mut q = raw.q.lock().unwrap();
-                while q.is_empty() {
-                    q = raw.cv.wait(q).unwrap();
+        std::thread::spawn(move || {
+            loop {
+                let buf = {
+                    let mut q = raw.q.lock().unwrap();
+                    while q.is_empty() {
+                        q = raw.cv.wait(q).unwrap();
+                    }
+                    q.pop_front()
+                };
+                match (buf, wb.upgrade()) {
+                    (Some(buf), Some(b)) => b.pump_state().push(b.parse_transfer(&buf)),
+                    _ => break, // backend dropped
                 }
-                q.pop_front()
-            };
-            match (buf, wb.upgrade()) {
-                (Some(buf), Some(b)) => b.pump_state().push(b.parse_transfer(&buf)),
-                _ => break, // backend dropped
             }
         });
     }

@@ -14,8 +14,14 @@ use std::sync::Arc;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let ch: u8 = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(36);
-    let secs: u64 = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(25);
+    let ch: u8 = std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(36);
+    let secs: u64 = std::env::args()
+        .nth(2)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(25);
     let cap: Option<u8> = std::env::args().nth(3).and_then(|s| s.parse().ok());
     let dev = Arc::new(Rtl8733buBackend::open()?);
     dev.bring_up_monitor(ch)?;
@@ -30,14 +36,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         use ndn_radio_drivers::RadioTime;
         let want: f32 = v.parse().unwrap_or(0.0);
         let got = dev.steer_clock_ppm(want)?;
-        eprintln!("steer_clock_ppm({want}) -> applied {got:+.3} ppm (cap now {})", dev.crystal_cap()?);
+        eprintln!(
+            "steer_clock_ppm({want}) -> applied {got:+.3} ppm (cap now {})",
+            dev.crystal_cap()?
+        );
     }
     eprintln!("cap={} collecting {secs}s on ch{ch}", dev.crystal_cap()?);
     let _pump = dev.spawn_rx_pump(4);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
     let mut n = 0usize;
     while std::time::Instant::now() < deadline {
-        if let Ok(Ok(f)) = tokio::time::timeout(std::time::Duration::from_millis(300), dev.recv_frame()).await {
+        if let Ok(Ok(f)) =
+            tokio::time::timeout(std::time::Duration::from_millis(300), dev.recv_frame()).await
+        {
             let p = &f.payload;
             if p.len() >= 8 && p[2] == 0xC3 {
                 if let Some(s) = f.stamp {

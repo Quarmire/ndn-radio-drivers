@@ -16,14 +16,25 @@ use bytes::Bytes;
 use ndn_radio_drivers::{BROADCAST, FrameFormat, InjectFrame, Rtl8733buBackend, TxIntent, frame};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let ch: u8 = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(36);
-    let tu: u16 = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(100);
-    let secs: u64 = std::env::args().nth(3).and_then(|s| s.parse().ok()).unwrap_or(20);
+    let ch: u8 = std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(36);
+    let tu: u16 = std::env::args()
+        .nth(2)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(100);
+    let secs: u64 = std::env::args()
+        .nth(3)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(20);
     let dev = Rtl8733buBackend::open()?;
     dev.bring_up_tx(ch)?;
 
     // Our own frame, tagged knob 7 so a witness can tell beacon-borne traffic from anything else.
-    let fmt = FrameFormat::RawNdn { ethertype: ndn_radio_drivers::NDN_ETHERTYPE };
+    let fmt = FrameFormat::RawNdn {
+        ethertype: ndn_radio_drivers::NDN_ETHERTYPE,
+    };
     let mut p = vec![0xC3u8; 200];
     p[0] = 0;
     p[1] = 7;
@@ -34,9 +45,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         dst: BROADCAST,
         src: [0x02, 0x50, 0x33, 0x02, 7, 0],
         addr3: None,
+        addr4: None,
+        htc: None,
     };
     let dot11 = frame::build_dot11(fmt, &f)?;
-    println!("beacon payload = {} bytes of our own 0x8624 frame", dot11.len());
+    println!(
+        "beacon payload = {} bytes of our own 0x8624 frame",
+        dot11.len()
+    );
     dev.dl_rsvd_page(0x80, &dot11)?;
     println!("reserved page loaded (BCN_VALID asserted)");
 
@@ -46,8 +62,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // what it was, then set it explicitly — a candidate for why the page loads but never transmits.
     let txq = dev.read8(0x0420 + 2)?;
     dev.write8(0x0420 + 2, txq | (1 << 6))?;
-    println!("FWHW_TXQ_CTRL+2 was {txq:#04x} (bcn-queue bit6 = {}), now {:#04x}",
-             (txq >> 6) & 1, dev.read8(0x0420 + 2)?);
+    println!(
+        "FWHW_TXQ_CTRL+2 was {txq:#04x} (bcn-queue bit6 = {}), now {:#04x}",
+        (txq >> 6) & 1,
+        dev.read8(0x0420 + 2)?
+    );
     // net_type = AP on port 0
     let cr2 = dev.read8(0x0100 + 2)?;
     dev.write8(0x0100 + 2, (cr2 & !0x03) | 0x03)?;
@@ -80,7 +99,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ticks as f64 / secs as f64,
         250_000.0
     );
-    println!("expected TBTTs in that window: {:.0}", secs as f64 * 1000.0 / (f32::from(tu) * 1.024) as f64);
+    println!(
+        "expected TBTTs in that window: {:.0}",
+        secs as f64 * 1000.0 / (f32::from(tu) * 1.024) as f64
+    );
     // Disarm so the radio does not keep beaconing into later experiments.
     let b = dev.read8(0x0550)?;
     dev.write8(0x0550, b & !(1 << 3))?;

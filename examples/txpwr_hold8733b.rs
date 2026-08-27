@@ -21,9 +21,15 @@ use ndn_radio_drivers::{BROADCAST, FrameIo, InjectFrame, Rtl8733buBackend, TxInt
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let ch: u8 = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(36);
+    let ch: u8 = std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(36);
     let knob = std::env::var("NDN_PWR_KNOB").unwrap_or_else(|_| "datapath".into());
-    let dwell: u64 = std::env::var("NDN_DWELL").ok().and_then(|s| s.parse().ok()).unwrap_or(3);
+    let dwell: u64 = std::env::var("NDN_DWELL")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(3);
     // Interleaved, so a monotone thermal drift over the ~96 s pass cannot fake a monotone curve.
     // Datapath TXAGC sweep, run WITH the full TSSI loop (now the default in bring_up_tx).
     // Every gain control measured inert with TSSI off; if the loop is what consults these tables,
@@ -37,8 +43,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Warm-up flood before announcing: the capture host must not start counting dwells until frames
     // are genuinely on the air, or every index is offset by the (variable) calibration time.
     let warm = InjectFrame {
-        payload: payload.clone(), tx: TxIntent::CONSERVATIVE, dst: BROADCAST,
-        src: [0x02, 0x50, 0x48, 0x4c, 0xff, 0x01], addr3: None,
+        payload: payload.clone(),
+        tx: TxIntent::CONSERVATIVE,
+        dst: BROADCAST,
+        src: [0x02, 0x50, 0x48, 0x4c, 0xff, 0x01],
+        addr3: None,
+        addr4: None,
+        htc: None,
     };
     let t0 = std::time::Instant::now();
     while t0.elapsed() < std::time::Duration::from_secs(2) {
@@ -63,10 +74,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // is the contract `rxpwr_bucket` reads. The source MAC keeps the index too, for tcpdump.
         let mut p = vec![0xC3u8; 300];
         p[0] = idx;
-        p[1] = match knob.as_str() { "ref" => 0, "table" => 1, "datapath" => 2, "tssi" => 6, _ => 5 };
+        p[1] = match knob.as_str() {
+            "ref" => 0,
+            "table" => 1,
+            "datapath" => 2,
+            "tssi" => 6,
+            _ => 5,
+        };
         let f = InjectFrame {
-            payload: Bytes::from(p), tx: TxIntent::CONSERVATIVE, dst: BROADCAST,
-            src: [0x02, 0x50, 0x48, 0x4c, idx, 0x01], addr3: None,
+            payload: Bytes::from(p),
+            tx: TxIntent::CONSERVATIVE,
+            dst: BROADCAST,
+            src: [0x02, 0x50, 0x48, 0x4c, idx, 0x01],
+            addr3: None,
+            addr4: None,
+            htc: None,
         };
         let end = std::time::Instant::now() + std::time::Duration::from_secs(dwell);
         let mut sent = 0u64;

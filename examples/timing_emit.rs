@@ -39,20 +39,38 @@ fn timing_beacon() -> Vec<u8> {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let ch: u8 = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(40);
-    let secs: u64 = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(20);
+    let ch: u8 = std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(40);
+    let secs: u64 = std::env::args()
+        .nth(2)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(20);
     let pid: u16 = std::env::var("NDN_PID")
         .ok()
         .and_then(|s| u16::from_str_radix(s.trim_start_matches("0x"), 16).ok())
         .unwrap_or(0xa81a);
-    let period_ms: u64 = std::env::var("NDN_EMIT_MS").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let period_ms: u64 = std::env::var("NDN_EMIT_MS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
 
     let d = Arc::new(LibUsbRtl88xxBackend::open_monitor_pid(pid, ch)?);
-    let bssid = BSSID.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(":");
-    println!("timing_emit: pid={pid:04x} ch{ch} bssid={bssid} — on-demand HW-stamped frames every {period_ms}ms for {secs}s");
+    let bssid = BSSID
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<Vec<_>>()
+        .join(":");
+    println!(
+        "timing_emit: pid={pid:04x} ch{ch} bssid={bssid} — on-demand HW-stamped frames every {period_ms}ms for {secs}s"
+    );
 
     let frame = timing_beacon();
-    let tu: u16 = std::env::var("NDN_BCN_SPACE").ok().and_then(|s| s.parse().ok()).unwrap_or(100);
+    let tu: u16 = std::env::var("NDN_BCN_SPACE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(100);
     // ON-DEMAND WINDOW control (the doctrine's demand-driven emission, NOT a blind free-running beacon):
     // the node ARMS a timing beacon only while it wants to be a reference, then DISARMS. Here we hold one
     // window for the run; a real node arms before a scheduled burst / while a neighbour syncs and disarms
@@ -64,12 +82,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (mut armed, mut err) = (0u64, 0u64);
     match d.emit_timing_frame(&frame, tu) {
         Ok(()) => armed = 1,
-        Err(e) => { eprintln!("emit_timing_frame error: {e:?}"); err = 1; }
+        Err(e) => {
+            eprintln!("emit_timing_frame error: {e:?}");
+            err = 1;
+        }
     }
     while Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(200));
     }
     let _ = d.stop_timing_beacon(); // close the window — the node stops being a reference
-    println!("on-demand window: armed={armed} errors={err} (HW-stamped, TBTT every {tu}TU; beacon_cv → {bssid})");
+    println!(
+        "on-demand window: armed={armed} errors={err} (HW-stamped, TBTT every {tu}TU; beacon_cv → {bssid})"
+    );
     Ok(())
 }

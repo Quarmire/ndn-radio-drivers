@@ -130,7 +130,9 @@ fn main() -> ExitCode {
     );
     let dt = t1.wrapping_sub(t0);
     if dt > 1000 {
-        println!("→ TFCNT jumped: the PHY IS keying the transmitter. On-air absence ⇒ power/witness.");
+        println!(
+            "→ TFCNT jumped: the PHY IS keying the transmitter. On-air absence ⇒ power/witness."
+        );
     } else {
         println!("→ TFCNT ~flat while descriptors complete: the PHY is NOT keying despite TXOK.");
     }

@@ -169,6 +169,7 @@ fn run(
         "probe" => probe(dev),
         "timer" => timer(dev, false),
         "tx" => timer(dev, true),
+        "qtx" => queued_tx(dev),
         other => Err(format!("unknown NDN_SCHED_PHASE={other}").into()),
     }
 }
@@ -277,11 +278,20 @@ fn timer(dev: &Rtl8733buBackend, do_tx: bool) -> Result<String, Box<dyn std::err
         println!("  0x04F4 <- {tri:08x} (readback {:08x})", dev.read32(REG_TRI_CTRL)?);
     }
 
-    dev.write32(REG_PARAM, (cw << 8) | aifs)?;
-    dev.write8(REG_EARLY, early)?;
-    // Unmask both timer interrupts so FTISR latches them.
-    let ftimr = dev.read32(REG_FTIMR)?;
-    dev.write32(REG_FTIMR, ftimr | FTISR_FIRE | FTISR_EARLY)?;
+    // ⚠ BISECT KNOBS. Arming this timer was measured to break the ORDINARY TX path inside the same
+    // process (control injects 200/200 -> 100/200, and 197 heard -> 0), so which write does it is
+    // the question that has to be answered before any of this can be trusted.
+    if env_u32("NDN_SCHED_NOPARAM", 0) == 0 {
+        dev.write32(REG_PARAM, (cw << 8) | aifs)?;
+        dev.write8(REG_EARLY, early)?;
+    }
+    // FTIMR is the *firmware* timer interrupt MASK: unmasking hands the on-chip WLAN CPU an
+    // interrupt for a queue nobody set up. The status bits normally latch regardless of the mask,
+    // so skipping this should still let us observe the fire.
+    if env_u32("NDN_SCHED_NOMASK", 0) == 0 {
+        let ftimr = dev.read32(REG_FTIMR)?;
+        dev.write32(REG_FTIMR, ftimr | FTISR_FIRE | FTISR_EARLY)?;
+    }
 
     let mut fired = 0u32;
     let mut deltas: Vec<i64> = Vec::new();
@@ -292,7 +302,9 @@ fn timer(dev: &Rtl8733buBackend, do_tx: bool) -> Result<String, Box<dyn std::err
         let target = (now as u32).wrapping_add(delay_ticks);
         dev.write32(REG_TX_TIMER, target)?;
         let ctrl = TIMER_EN | (tsfsel << 24) | if do_tx { TX_EN } else { 0 };
-        dev.write32(REG_CTRL, ctrl)?;
+        if env_u32("NDN_SCHED_NOARM", 0) == 0 {
+            dev.write32(REG_CTRL, ctrl)?;
+        }
         let armed_back = dev.read32(REG_CTRL)?;
 
         let host_start = Instant::now();
@@ -346,4 +358,79 @@ fn timer(dev: &Rtl8733buBackend, do_tx: bool) -> Result<String, Box<dyn std::err
         )
     };
     Ok(summary)
+}
+
+/// ★ The decisive test, and a different theory of the mechanism.
+///
+/// `build_data_txdesc` sends ordinary injects with **QSEL = MGT (0x12)** — and CPUMGQ is the *CPU
+/// Management Queue*. The bisect showed the arming write alone captures the TX path (injects are
+/// accepted but never air), which is exactly what queue capture looks like. If that is right, the
+/// frame the timer releases is not the reserved page at all: it is whatever we injected into MGT.
+/// That would be `inject_at_clock` directly.
+///
+/// The trap in measuring this is that the witness's clock is not ours, so "did it air at the
+/// target?" cannot be answered by comparing stamps across nodes. This avoids the question: loop at
+/// a FIXED period and alternate the delay between short and long. If frames air at the target, the
+/// witness's own inter-arrival gaps alternate long/short. If they air the moment we inject, the
+/// gaps are uniformly one period. Single clock, no common-view needed.
+fn queued_tx(dev: &Rtl8733buBackend) -> Result<String, Box<dyn std::error::Error>> {
+    let reps = env_u32("NDN_SCHED_REPS", 40);
+    let period_ms = env_u32("NDN_SCHED_PERIOD_MS", 400) as u64;
+    let d_short = env_u32("NDN_SCHED_D1", 50) as u64;
+    let d_long = env_u32("NDN_SCHED_D2", 350) as u64;
+    let tsfsel = env_u32("NDN_SCHED_TSFSEL", 0) & 0x7;
+    let rate = env_u32("NDN_SCHED_RATE", 4) as u8;
+    let knob = env_u32("NDN_SCHED_KNOB", 9) as u8;
+
+    let t0 = dev.read_tsf()?;
+    let w0 = Instant::now();
+    std::thread::sleep(Duration::from_millis(200));
+    let ns_per_tick = w0.elapsed().as_secs_f64() * 1e9 / (dev.read_tsf()?.wrapping_sub(t0) as f64);
+    let ticks_per_ms = 1e6 / ns_per_tick;
+    println!(
+        "  tick={:.2} us; period {period_ms} ms, delay alternates {d_short}/{d_long} ms, \
+         knob={knob} (even seq = short, odd = long)",
+        ns_per_tick / 1000.0
+    );
+
+    dev.write32(REG_PARAM, (env_u32("NDN_SCHED_CW", 0) << 8) | env_u32("NDN_SCHED_AIFS", 2))?;
+    let mut sent = 0u32;
+    let start = Instant::now();
+    for rep in 0..reps {
+        let d = if rep % 2 == 0 { d_short } else { d_long };
+        let now = dev.read_tsf()?;
+        let target = (now as u32).wrapping_add((d as f64 * ticks_per_ms) as u32);
+        dev.write32(REG_TX_TIMER, target)?;
+        dev.write32(REG_CTRL, TIMER_EN | TX_EN | (tsfsel << 24))?;
+
+        let mut pl = vec![0xC3u8; 96];
+        pl[0] = (rep % 2) as u8;
+        pl[1] = knob;
+        pl[2] = 0xC3;
+        pl[4..8].copy_from_slice(&rep.to_le_bytes());
+        let f = InjectFrame {
+            payload: Bytes::from(pl),
+            tx: TxIntent::CONSERVATIVE,
+            dst: BROADCAST,
+            src: [0x02, 0x50, 0x33, 0x09, knob, (rep % 2) as u8],
+            addr3: None,
+            addr4: None,
+            htc: None,
+        };
+        let dot11 = frame::build_dot11(
+            FrameFormat::RawNdn { ethertype: ndn_radio_drivers::NDN_ETHERTYPE },
+            &f,
+        )?;
+        if dev.inject_raw(&dot11, rate, rep as u16).is_ok() {
+            sent += 1;
+        }
+        // Hold the arm past the target so the MAC has its chance, then release before the next rep.
+        let next = start + Duration::from_millis(period_ms * (rep as u64 + 1));
+        while Instant::now() < next {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        dev.write32(REG_CTRL, 0)?;
+    }
+    Ok(format!("qtx: {sent}/{reps} injected while armed (knob={knob}); \
+         witness gaps alternate => scheduled, uniform {period_ms} ms => immediate"))
 }

@@ -721,6 +721,8 @@ fn handle_event(
                 addr: None,
                 group: None,
                 addr3: None,
+                addr4: None, // LoRa has no 802.11 wide-profile fields
+                htc: None,
                 rssi_dbm: Some(rssi.clamp(i8::MIN as i16, i8::MAX as i16) as i8),
                 mcs_index: None,
                 stamp: Some(host_stamp()),

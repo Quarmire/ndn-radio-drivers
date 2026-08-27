@@ -37,7 +37,7 @@
 //!   NDN_SCHED_PAGE=0   NDN_SCHED_HEAD=<abs page>   NDN_SCHED_CW=0   NDN_SCHED_AIFS=2
 //!   NDN_SCHED_TSFSEL=0   NDN_SCHED_LIFETIME=0   NDN_SCHED_KNOB=7  NDN_SCHED_IDX=0
 use bytes::Bytes;
-use ndn_radio_drivers::{FrameFormat, InjectFrame, Rtl8733buBackend, TxIntent, frame};
+use ndn_radio_drivers::{BROADCAST, FrameFormat, InjectFrame, Rtl8733buBackend, TxIntent, frame};
 use std::time::{Duration, Instant};
 
 const REG_FTIMR: u16 = 0x0138;
@@ -150,12 +150,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let dot11 = frame::build_dot11(FrameFormat::RawNdn { ethertype: ndn_radio_drivers::NDN_ETHERTYPE }, &f)?;
     let mut ok = 0;
-    for seq in 0..20u16 {
-        if dev.inject_raw(&dot11, 12, seq).is_ok() {
+    for seq in 0..200u16 {
+        if dev.inject_raw(&dot11, env_u32("NDN_SCHED_RATE", 4) as u8, seq).is_ok() {
             ok += 1;
         }
     }
-    println!("post-test sanity: ordinary inject {ok}/20 accepted, registers restored");
+    println!("post-test sanity: ordinary inject {ok}/200 accepted, registers restored");
     println!("{r}");
     Ok(())
 }

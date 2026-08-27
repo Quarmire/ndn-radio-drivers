@@ -485,13 +485,12 @@ fn queued_tx(dev: &Rtl8733buBackend) -> Result<String, Box<dyn std::error::Error
 /// This phase samples both across three moments: idle, after ordinary injects (the positive control
 /// — these DO air, so TX_EN must move), and after an armed comparator fires.
 fn diag(dev: &Rtl8733buBackend) -> Result<String, Box<dyn std::error::Error>> {
+    // Exercise the HAL seam rather than the raw registers, so the accessor is proven by the same
+    // measurement that justified adding it.
     let bb = |dev: &Rtl8733buBackend| -> Result<(u16, u16, u16, u16), FaceErr> {
-        Ok((
-            dev.read16(0x2de0)?,
-            dev.read16(0x2de2)?,
-            dev.read16(0x2de4)?,
-            dev.read16(0x2de6)?,
-        ))
+        use ndn_radio_drivers::RadioKnobs;
+        let (en, on) = dev.read_tx_counters()?.unwrap_or((0, 0));
+        Ok((en, on, dev.read16(0x2de4)?, dev.read16(0x2de6)?))
     };
     let fifo = |dev: &Rtl8733buBackend| -> Result<String, FaceErr> {
         Ok(format!(

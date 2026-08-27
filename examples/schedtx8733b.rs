@@ -505,6 +505,19 @@ fn diag(dev: &Rtl8733buBackend) -> Result<String, Box<dyn std::error::Error>> {
         ))
     };
     let mut out = Vec::new();
+    // The USB control round-trip is the floor under every host-timed release. Measure each shape
+    // rather than assuming: a release that is one write8 cannot beat the cost of one write8.
+    let cost = |n: u32, f: &dyn Fn() -> Result<(), FaceErr>| -> Result<f64, FaceErr> {
+        let t = Instant::now();
+        for _ in 0..n { f()?; }
+        Ok(t.elapsed().as_secs_f64() * 1e6 / n as f64)
+    };
+    out.push(format!(
+        "  usb control cost: read32 {:.0} us  write32 {:.0} us  write8 {:.0} us",
+        cost(200, &|| dev.read32(0x041C).map(|_| ()))?,
+        cost(200, &|| dev.write32(0x1500, 0))?,
+        cost(200, &|| dev.write8(0x1514, 0))?
+    ));
     let b0 = bb(dev)?;
     out.push(format!("  idle:        BB ofdm TX_EN={} TX_ON={}  cck TX_EN={} TX_ON={}", b0.0, b0.1, b0.2, b0.3));
     out.push(format!("  idle:        MGQ_FIFO {}", fifo(dev)?));
@@ -579,7 +592,11 @@ fn poll_kick(dev: &Rtl8733buBackend) -> Result<String, Box<dyn std::error::Error
     let knob = env_u32("NDN_SCHED_KNOB", 7) as u8;
     let reps = env_u32("NDN_SCHED_REPS", 10);
 
-    let mut pl = vec![0xC3u8; 96];
+    // ★ FRAME SIZE is the dimension where the staged page should actually pay: a kick is ONE
+    // fixed-cost control write no matter how big the frame, while an inject must push the whole
+    // frame over the bulk pipe every time. The 96 B default is the case most favourable to inject.
+    let size = env_u32("NDN_SCHED_SIZE", 96).max(16) as usize;
+    let mut pl = vec![0xC3u8; size];
     pl[0] = 0; pl[1] = knob; pl[2] = 0xC3;
     let f = InjectFrame {
         payload: Bytes::from(pl),
@@ -765,11 +782,18 @@ fn when_does_it_air(dev: &Rtl8733buBackend) -> Result<String, Box<dyn std::error
             // per frame) at the identical cadence, so the staged-kick's timing can be compared
             // against the thing it would replace. Without this arm, "the kick is precise" is an
             // unanchored number — the ordinary path might be just as good.
-            if std::env::var("NDN_SCHED_VIA").map(|v| v == "inject").unwrap_or(false) {
-                let _ = dev.inject_raw(&dot11, 4, i as u16);
-            } else {
-                let v = dev.read32(0x041C)?;
-                dev.write32(0x041C, v | (1 << 29))?;
+            match std::env::var("NDN_SCHED_VIA").as_deref() {
+                Ok("inject") => { let _ = dev.inject_raw(&dot11, 4, i as u16); }
+                // ★ FAST KICK: one 8-bit control write. BIT29 (CPUMGT_POLL_SET) lives in byte 3 of
+                // 0x041C, i.e. 0x041F bit 5. The read-modify-write version cost TWO USB round trips
+                // per release (~250 us each) — half the critical path was a read we did not need,
+                // since the hardware triggers on the WRITE, not on the level (proved by 10/10
+                // transmits when the bit was already set).
+                Ok("fast") => { dev.write8(0x041F, 0x20)?; }
+                _ => {
+                    let v = dev.read32(0x041C)?;
+                    dev.write32(0x041C, v | (1 << 29))?;
+                }
             }
             if pace_ms == 0 {
                 while t.elapsed() < Duration::from_millis(200) {
@@ -781,15 +805,55 @@ fn when_does_it_air(dev: &Rtl8733buBackend) -> Result<String, Box<dyn std::error
             } else {
                 lat.push(0.0);
             }
-            let v = dev.read32(0x041C)?;
-            dev.write32(0x041C, (v | (1 << 27)) & !(1 << 29))?;
-            let v = dev.read32(0x041C)?;
-            dev.write32(0x041C, v & !(1 << 27))?;
-            dev.dl_rsvd_page(page, &dot11)?;
+            // ⚠ CONFOUND, now removed. This used to POLL_CLR (4 control transfers) and re-download
+            // the whole page after EVERY kick — so the "one 125 us write8" arm was actually doing
+            // far more USB work per release than the inject arm it was being compared against, and
+            // its tails were correspondingly worse. The page PERSISTS across kicks (10 kicks from a
+            // single download, measured in the `poll` phase), so none of it is needed.
+            // NDN_SCHED_RESTAGE=1 restores the old behaviour for comparison.
+            if env_u32("NDN_SCHED_RESTAGE", 0) != 0 {
+                let v = dev.read32(0x041C)?;
+                dev.write32(0x041C, (v | (1 << 27)) & !(1 << 29))?;
+                let v = dev.read32(0x041C)?;
+                dev.write32(0x041C, v & !(1 << 27))?;
+                dev.dl_rsvd_page(page, &dot11)?;
+            }
         }
         dev.write32(0x041C, info0)?;
         if lat.is_empty() {
             return Ok("jitter: no transmits".into());
+        }
+        if lat.iter().all(|v| *v == 0.0) {
+            // Paced mode: report the HOST-SIDE cost of issuing each release, which is what the
+            // frame-size question is really about.
+            let pre_bb = dev.read16(0x2de0)?;
+            let t = Instant::now();
+            // ⚠ These 50 releases must be PACED, or this measures back-to-back behaviour while
+            // claiming to measure a pacing sweep — which is exactly what an earlier version did.
+            let gap = Duration::from_micros(env_u32("NDN_SCHED_GAP_US", 0) as u64);
+            for i in 0..50u32 {
+                if !gap.is_zero() {
+                    let next = t + gap * i;
+                    while Instant::now() < next { std::hint::spin_loop(); }
+                }
+                match std::env::var("NDN_SCHED_VIA").as_deref() {
+                    Ok("inject") => { let _ = dev.inject_raw(&dot11, 4, i as u16); }
+                    _ => { dev.write8(0x041F, 0x20)?; }
+                }
+            }
+            let per = t.elapsed().as_secs_f64() * 1e6 / 50.0;
+            // ★ AIRTIME, measured on the DUT so witness-side reception cannot confound it: BB TX_EN
+            // counts MAC->baseband transmit requests. If one mechanism issues more requests per
+            // logical frame, it is genuinely burning more airtime.
+            std::thread::sleep(Duration::from_millis(200));
+            let after = dev.read16(0x2de0)?;
+            return Ok(format!(
+                "gap {} us: release cost {per:.0} us   BB TX_EN +{} for 50 releases  \
+                 => {:.2} transmits per logical frame",
+                env_u32("NDN_SCHED_GAP_US", 0),
+                after.wrapping_sub(pre_bb),
+                f64::from(after.wrapping_sub(pre_bb)) / 50.0
+            ));
         }
         lat.sort_by(|a, b| a.partial_cmp(b).unwrap());
         let n = lat.len();

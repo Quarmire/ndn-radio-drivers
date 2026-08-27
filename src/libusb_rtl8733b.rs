@@ -4328,6 +4328,17 @@ impl RadioKnobs for Rtl8733buBackend {
         Ok(Some((c.ofdm_ok, c.ofdm_err)))
     }
 
+    /// `(tx_en, tx_on)` from the baseband's OFDM transmit counters — "signal which MAC to BB" and
+    /// "signal which BB to RF" (vendor `hw_dump_bb_tx_cnt`, `rtl8733b_ops.c:2576`). CCK has its own
+    /// pair at 0x2de4/0x2de6; OFDM is what our traffic uses.
+    ///
+    /// MEASURED: exactly +50 across 50 injects, so the counter is one-per-transmit-request and can
+    /// be differenced directly. A zero delta across an event that *should* have transmitted proves
+    /// the failure is upstream of the PHY — queue, descriptor or doorbell — not on the air.
+    fn read_tx_counters(&self) -> Result<Option<(u16, u16)>, FaceError> {
+        Ok(Some((self.read16(0x2de0)?, self.read16(0x2de2)?)))
+    }
+
     fn set_tx_hold(&self, hold: bool) -> Result<(), FaceError> {
         // All eight transmit queues, or none. See `set_tx_pause` for the measured semantics the
         // trait doc summarises — in particular that this HOLDS rather than drops.

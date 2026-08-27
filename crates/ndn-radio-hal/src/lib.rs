@@ -735,6 +735,27 @@ pub trait RadioKnobs: Send + Sync {
         Ok(None)
     }
 
+    /// **Did the MAC even ask the baseband to transmit?** Returns `(tx_en, tx_on)` — free-running
+    /// counters of MAC→baseband transmit *requests* and baseband→RF *keys*. Default: `None`.
+    ///
+    /// This is the register read that separates "we never asked" from "we asked and the air ate
+    /// it", which no frame count or delivery ratio can distinguish. On the RTL8733BU it settled
+    /// four questions in one session that had each survived days of on-air guessing:
+    ///
+    /// * a hardware TSF comparator fired 20/20 while `tx_en` moved **+0** — the trigger was real
+    ///   but the queue behind it was empty, which no amount of on-air measurement could have shown;
+    /// * 50 ordinary injects moved it **+50**, calibrating the counter exactly;
+    /// * ordinary injection transmits **1.00** times per logical frame — no retry waste, refuting
+    ///   a plausible airtime theory;
+    /// * a reserved-page release path was **lossy below a ~1 ms inter-release gap** (0.26 → 1.00),
+    ///   a rate limit invisible to delivery ratios because the frames were never sent at all.
+    ///
+    /// Reach for this FIRST on any "it does not transmit" question; it collapses the search space
+    /// from the whole radio to one side of the MAC/PHY boundary.
+    fn read_tx_counters(&self) -> Result<Option<(u16, u16)>, FaceError> {
+        Ok(None)
+    }
+
     /// **Hold or release transmissions at the MAC**, if the radio can. Default: no-op.
     ///
     /// The hardware side of a slot MAC. A software gate can only stop *us calling inject*; frames

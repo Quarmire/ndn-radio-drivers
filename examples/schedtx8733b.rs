@@ -761,8 +761,16 @@ fn when_does_it_air(dev: &Rtl8733buBackend) -> Result<String, Box<dyn std::error
                 }
             }
             let t = Instant::now();
-            let v = dev.read32(0x041C)?;
-            dev.write32(0x041C, v | (1 << 29))?;
+            // ★ HEAD-TO-HEAD. NDN_SCHED_VIA=inject uses the ORDINARY path (build + bulk transfer
+            // per frame) at the identical cadence, so the staged-kick's timing can be compared
+            // against the thing it would replace. Without this arm, "the kick is precise" is an
+            // unanchored number — the ordinary path might be just as good.
+            if std::env::var("NDN_SCHED_VIA").map(|v| v == "inject").unwrap_or(false) {
+                let _ = dev.inject_raw(&dot11, 4, i as u16);
+            } else {
+                let v = dev.read32(0x041C)?;
+                dev.write32(0x041C, v | (1 << 29))?;
+            }
             if pace_ms == 0 {
                 while t.elapsed() < Duration::from_millis(200) {
                     if dev.read16(0x2de0)? != pre {

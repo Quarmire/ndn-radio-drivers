@@ -38,6 +38,7 @@
 //!   NDN_SCHED_TSFSEL=0   NDN_SCHED_LIFETIME=0   NDN_SCHED_KNOB=7  NDN_SCHED_IDX=0
 use bytes::Bytes;
 use ndn_radio_drivers::{BROADCAST, FrameFormat, InjectFrame, Rtl8733buBackend, TxIntent, frame};
+use ndn_radio_drivers::FaceError as FaceErr;
 use std::time::{Duration, Instant};
 
 const REG_FTIMR: u16 = 0x0138;
@@ -170,6 +171,8 @@ fn run(
         "timer" => timer(dev, false),
         "tx" => timer(dev, true),
         "qtx" => queued_tx(dev),
+        "diag" => diag(dev),
+        "poll" => poll_kick(dev),
         other => Err(format!("unknown NDN_SCHED_PHASE={other}").into()),
     }
 }
@@ -198,6 +201,26 @@ fn probe(dev: &Rtl8733buBackend) -> Result<String, Box<dyn std::error::Error>> {
         };
         notes.push(format!("  {name}: wrote {pat:08x} read {back:08x} -> {verdict}"));
     }
+
+    // ★ QUEUE PLUMBING. Every HARDWARE-TRIGGERED transmit on this chip is silent (beacon at TBTT,
+    // CPUMGQ at its target) while host injects work perfectly. That points past the trigger and at
+    // the queue: if the beacon/mgmt queue is paused, unmapped, or disabled, no page-sourced frame
+    // can ever air no matter how correct the page or the timer.
+    notes.push(format!(
+        "  queues: TXPAUSE(0x522)={:#04x}  FWHW_TXQ_CTRL(0x420)={:#010x}  TRXDMA_CTRL(0x10C)={:#06x}",
+        dev.read8(0x0522)?,
+        dev.read32(0x0420)?,
+        dev.read16(0x010C)?
+    ));
+    notes.push(format!(
+        "  pages:  RQPN(0x200)={:#010x}  RQPN_NPQ(0x214)={:#010x}  BCNQ_BDNY(0x424)={:#04x}  \
+         DWBCN0_CTRL(0x208)={:#010x}  CR(0x100)={:#06x}",
+        dev.read32(0x0200)?,
+        dev.read32(0x0214)?,
+        dev.read8(0x0424)?,
+        dev.read32(0x0208)?,
+        dev.read16(0x0100)?
+    ));
 
     // Port-TSF tick. This chip's RX stamp counts 4 us per tick despite the 1 us declaration; if the
     // port TSF does too, every scheduling delta below is in 4 us units and a "200 ms" target is
@@ -267,11 +290,21 @@ fn timer(dev: &Rtl8733buBackend, do_tx: bool) -> Result<String, Box<dyn std::err
             FrameFormat::RawNdn { ethertype: ndn_radio_drivers::NDN_ETHERTYPE },
             &f,
         )?;
-        dev.dl_rsvd_page(page as u8, &dot11)?;
+        // ★ PAGE LAYOUT. The vendor stores [TXDESC][frame] in a reserved page; our dl_rsvd_page
+        // stores only the bare frame because its own descriptor is a transport header consumed by
+        // the download path. NDN_SCHED_PAGEDESC=0 reproduces the old (descriptor-less) page so the
+        // two layouts can be A/B'd in one session rather than argued about.
+        let with_desc = env_u32("NDN_SCHED_PAGEDESC", 1) != 0;
+        if with_desc {
+            dev.dl_rsvd_page_frame(page as u8, &dot11, env_u32("NDN_SCHED_RATE", 4) as u8, 0)?;
+        } else {
+            dev.dl_rsvd_page(page as u8, &dot11)?;
+        }
         println!(
             "  loaded {} B frame into rsvd page {page} (MGQ_TRI_HEAD={head} = 0x{head:03x}), \
-             tagged knob={knob} idx={idx}",
-            dot11.len()
+             page layout = {}, tagged knob={knob} idx={idx}",
+            dot11.len(),
+            if with_desc { "[TXDESC][frame]" } else { "[frame] (old, no descriptor)" }
         );
         let tri = (head << 16) | if lifetime > 0 { (1 << 8) | (lifetime & 0xff) } else { 0 };
         dev.write32(REG_TRI_CTRL, tri)?;
@@ -433,4 +466,214 @@ fn queued_tx(dev: &Rtl8733buBackend) -> Result<String, Box<dyn std::error::Error
     }
     Ok(format!("qtx: {sent}/{reps} injected while armed (knob={knob}); \
          witness gaps alternate => scheduled, uniform {period_ms} ms => immediate"))
+}
+
+/// ★★ THE MISSING ORACLE. Every hardware-triggered transmit on this chip is silent while host
+/// injects work, and until now we could not tell WHERE it dies. The vendor ships two cheap on-chip
+/// answers we never read:
+///
+/// * `hw_dump_bb_tx_cnt` (`rtl8733b_ops.c:2576`): "TX_EN: signal which MAC to BB, TX_ON: signal
+///   which BB to RF". `0x2de0`/`0x2de2` are the OFDM pair, `0x2de4`/`0x2de6` CCK. A TX_EN delta of
+///   ZERO across a comparator firing proves the MAC never even asked the baseband to transmit — the
+///   failure is upstream of the PHY (queue/FIFO/descriptor), not an air or EVM problem.
+/// * The **CPUMGQ packet-source FIFO** at `0x1470..0x147B` — write/read pointers, ENABLE, PAUSE, a
+///   VALID bitmap and a start page. Nothing in our driver, and nothing in the vendor *host* driver,
+///   ever writes these. If the FIFO is disabled, paused, or has no VALID slot, the TSF comparator
+///   can fire forever and no frame can ever be fetched.
+///
+/// This phase samples both across three moments: idle, after ordinary injects (the positive control
+/// — these DO air, so TX_EN must move), and after an armed comparator fires.
+fn diag(dev: &Rtl8733buBackend) -> Result<String, Box<dyn std::error::Error>> {
+    let bb = |dev: &Rtl8733buBackend| -> Result<(u16, u16, u16, u16), FaceErr> {
+        Ok((
+            dev.read16(0x2de0)?,
+            dev.read16(0x2de2)?,
+            dev.read16(0x2de4)?,
+            dev.read16(0x2de6)?,
+        ))
+    };
+    let fifo = |dev: &Rtl8733buBackend| -> Result<String, FaceErr> {
+        Ok(format!(
+            "wp={:#04x} rp={:#04x} EN={:#06x} INTFLAG={:#06x} VALID={:#06x} LIFETIME={:#06x}",
+            dev.read8(0x1470)?,
+            dev.read8(0x1471)?,
+            dev.read16(0x1472)?,
+            dev.read16(0x1476)?,
+            dev.read16(0x1478)?,
+            dev.read16(0x147A)?
+        ))
+    };
+    let mut out = Vec::new();
+    let b0 = bb(dev)?;
+    out.push(format!("  idle:        BB ofdm TX_EN={} TX_ON={}  cck TX_EN={} TX_ON={}", b0.0, b0.1, b0.2, b0.3));
+    out.push(format!("  idle:        MGQ_FIFO {}", fifo(dev)?));
+    out.push(format!("  idle:        CPU_MGQ_INFO(0x041C)={:#010x}  status(0x041A)={:#06x}",
+        dev.read32(0x041C)?, dev.read16(0x041A)?));
+
+    // Positive control: 50 ordinary injects, which we know reach the air.
+    let mut p = vec![0xC3u8; 64];
+    p[0] = 0xEE; p[1] = 0xEE; p[2] = 0xC3;
+    let f = InjectFrame {
+        payload: Bytes::from(p),
+        tx: TxIntent::CONSERVATIVE,
+        dst: BROADCAST,
+        src: [0x02, 0x50, 0x33, 0x07, 0xEE, 0x00],
+        addr3: None,
+        addr4: None,
+        htc: None,
+    };
+    let dot11 = frame::build_dot11(
+        FrameFormat::RawNdn { ethertype: ndn_radio_drivers::NDN_ETHERTYPE }, &f)?;
+    for seq in 0..50u16 { let _ = dev.inject_raw(&dot11, 4, seq); }
+    std::thread::sleep(Duration::from_millis(300));
+    let b1 = bb(dev)?;
+    out.push(format!("  after 50 injects (KNOWN TO AIR): BB ofdm TX_EN={} (+{}) TX_ON={} (+{})",
+        b1.0, b1.0.wrapping_sub(b0.0), b1.1, b1.1.wrapping_sub(b0.1)));
+
+    // Now arm the comparator with TX_EN and let it fire, with the page staged.
+    let page = env_u32("NDN_SCHED_PAGE", 0) as u8;
+    let head = env_u32("NDN_SCHED_HEAD", BCNQ_BDNY + page as u32) & 0xfff;
+    dev.dl_rsvd_page(page, &dot11)?;
+    dev.write32(REG_TRI_CTRL, head << 16)?;
+    let t0 = dev.read_tsf()?;
+    let w0 = Instant::now();
+    std::thread::sleep(Duration::from_millis(200));
+    let tps = (dev.read_tsf()?.wrapping_sub(t0)) as f64 / w0.elapsed().as_secs_f64();
+    let b2 = bb(dev)?;
+    let mut fired = 0;
+    for _ in 0..10 {
+        dev.write32(REG_FTISR, FTISR_FIRE | FTISR_EARLY)?;
+        let now = dev.read_tsf()?;
+        dev.write32(REG_TX_TIMER, (now as u32).wrapping_add((tps * 0.15) as u32))?;
+        dev.write32(REG_CTRL, TIMER_EN | TX_EN)?;
+        let dl = Instant::now();
+        while dl.elapsed() < Duration::from_millis(600) {
+            if dev.read32(REG_FTISR)? & FTISR_FIRE != 0 { fired += 1; break; }
+        }
+        dev.write32(REG_CTRL, 0)?;
+    }
+    let b3 = bb(dev)?;
+    out.push(format!("  armed+{fired}/10 fired:  BB ofdm TX_EN={} (+{}) TX_ON={} (+{})  <-- +0 means the MAC never asked the BB",
+        b3.0, b3.0.wrapping_sub(b2.0), b3.1, b3.1.wrapping_sub(b2.1)));
+    out.push(format!("  after fires: MGQ_FIFO {}", fifo(dev)?));
+    out.push(format!("  after fires: CPU_MGQ_INFO(0x041C)={:#010x}  status(0x041A)={:#06x}",
+        dev.read32(0x041C)?, dev.read16(0x041A)?));
+    Ok(out.join("\n"))
+}
+
+/// ★★★ THE KICK. `diag` proved the MAC never asks the baseband to transmit when the comparator
+/// fires (BB TX_EN +0 across 10 firings, vs +50 for 50 ordinary injects — a perfectly calibrated
+/// oracle). So the trigger works and the *queue* is empty. `REG_CPU_MGQ_INFO` (0x041C) is the
+/// missing half: `[7:0] CPUMGQ_HEAD_PG` says where the packet is, and `BIT29 CPUMGT_POLL_SET`
+/// tells the MAC one is queued there. We have never written it — and it already reads
+/// `HEAD_PG = 0xf6` (246), while firings set `BIT8 CPUMGQ_FW_NUM`.
+///
+/// Decomposed deliberately: kick with NO timer first. If a frame airs, we have a page->air path at
+/// last, and scheduling is then just arming the comparator on top. If it does not, the page image
+/// or the queue is still wrong and the timer was never the issue.
+fn poll_kick(dev: &Rtl8733buBackend) -> Result<String, Box<dyn std::error::Error>> {
+    let page = env_u32("NDN_SCHED_PAGE", 0xf6) as u8;
+    let with_timer = env_u32("NDN_SCHED_WITH_TIMER", 0) != 0;
+    let fifo_en = env_u32("NDN_SCHED_FIFO_EN", 0) != 0;
+    let knob = env_u32("NDN_SCHED_KNOB", 7) as u8;
+    let reps = env_u32("NDN_SCHED_REPS", 10);
+
+    let mut pl = vec![0xC3u8; 96];
+    pl[0] = 0; pl[1] = knob; pl[2] = 0xC3;
+    let f = InjectFrame {
+        payload: Bytes::from(pl),
+        tx: TxIntent::CONSERVATIVE,
+        dst: BROADCAST,
+        src: [0x02, 0x50, 0x33, 0x07, knob, 0],
+        addr3: None,
+        addr4: None,
+        htc: None,
+    };
+    let dot11 = frame::build_dot11(
+        FrameFormat::RawNdn { ethertype: ndn_radio_drivers::NDN_ETHERTYPE }, &f)?;
+    dev.dl_rsvd_page(page, &dot11)?;
+
+    let info0 = dev.read32(0x041C)?;
+    // Point the CPU management queue at the page we just wrote, preserving the upper control bits.
+    dev.write32(0x041C, (info0 & !0xff) | u32::from(page))?;
+    if fifo_en {
+        // MGQ_FIFO_EN (BIT15) with the start page in [11:0]; the FIFO reads 0x1000 (disabled) at rest.
+        let e = dev.read16(0x1472)?;
+        dev.write16(0x1472, (e & 0xf000) | 0x8000 | (u16::from(page) & 0x0fff))?;
+    }
+    let bb0 = (dev.read16(0x2de0)?, dev.read16(0x2de2)?);
+
+    let mut tsf_ticks_150ms = 0u32;
+    if with_timer {
+        let t0 = dev.read_tsf()?;
+        let w0 = Instant::now();
+        std::thread::sleep(Duration::from_millis(200));
+        let tps = (dev.read_tsf()?.wrapping_sub(t0)) as f64 / w0.elapsed().as_secs_f64();
+        tsf_ticks_150ms = (tps * 0.15) as u32;
+        dev.write32(REG_TRI_CTRL, (u32::from(page)) << 16)?;
+    }
+
+    for _ in 0..reps {
+        // ORDER MATTERS. Arming first was measured to BLOCK the kick (10 kicks -> 1 transmit).
+        // The natural design is the reverse: POLL_SET queues the packet, then the armed comparator
+        // releases it at the target. NDN_SCHED_ORDER=arm_first reproduces the blocking variant.
+        let arm_first = std::env::var("NDN_SCHED_ORDER").map(|v| v == "arm_first").unwrap_or(false);
+        let arm = |d: &Rtl8733buBackend| -> Result<(), FaceErr> {
+            d.write32(REG_FTISR, FTISR_FIRE | FTISR_EARLY)?;
+            let now = d.read_tsf()?;
+            d.write32(REG_TX_TIMER, (now as u32).wrapping_add(tsf_ticks_150ms))?;
+            // NDN_SCHED_CTRLVAL overrides the arm word so TIMER_EN (BIT31) and TX_EN (BIT28)
+            // can be separated against the BB oracle: which bit actually captures the TX path?
+            let ctrl = match std::env::var("NDN_SCHED_CTRLVAL").ok() {
+                Some(v) => u32::from_str_radix(v.trim_start_matches("0x"), 16).unwrap_or(TIMER_EN | TX_EN),
+                None => TIMER_EN | TX_EN,
+            };
+            d.write32(REG_CTRL, ctrl)
+        };
+        let kick = |d: &Rtl8733buBackend| -> Result<(), FaceErr> {
+            // Clear any stale poll first, then set. CPUMGT_POLL_CLR is BIT27.
+            let v = d.read32(0x041C)?;
+            d.write32(0x041C, (v | (1 << 27)) & !(1 << 29))?;
+            let v = d.read32(0x041C)?;
+            d.write32(0x041C, (v & !(1 << 27)) | (1 << 29))
+        };
+        if with_timer && arm_first {
+            arm(dev)?;
+            kick(dev)?;
+        } else if with_timer {
+            kick(dev)?;
+            arm(dev)?;
+        } else {
+            kick(dev)?;
+        }
+        std::thread::sleep(Duration::from_millis(if with_timer { 250 } else { 60 }));
+        if with_timer {
+            dev.write32(REG_CTRL, 0)?;
+        }
+        // With the timer armed exactly ONE frame goes out and then the queue latches
+        // CPUMGQ_FW_NUM (BIT8) — consistent with the comparator having released the queued packet
+        // and the poll state needing a reset before the next one. NDN_SCHED_RESET=1 does the full
+        // reset each rep: clear the poll, and re-stage the page.
+        if env_u32("NDN_SCHED_RESET", 0) != 0 {
+            let v = dev.read32(0x041C)?;
+            dev.write32(0x041C, (v | (1 << 27)) & !(1 << 29))?;
+            let v = dev.read32(0x041C)?;
+            dev.write32(0x041C, v & !(1 << 27))?;
+            dev.dl_rsvd_page(page, &dot11)?;
+        }
+    }
+    let bb1 = (dev.read16(0x2de0)?, dev.read16(0x2de2)?);
+    dev.write32(0x041C, info0)?;
+    if fifo_en {
+        dev.write16(0x1472, 0x1000)?;
+    }
+    Ok(format!(
+        "poll_kick(page={page:#04x}, timer={with_timer}, fifo_en={fifo_en}, reps={reps}):\n  \
+         BB ofdm TX_EN {} -> {} (+{})   TX_ON {} -> {} (+{})\n  \
+         CPU_MGQ_INFO {info0:#010x} -> {:#010x}   status(0x041A)={:#06x}   MGQ_FIFO EN={:#06x} VALID={:#06x} wp={:#04x} rp={:#04x}",
+        bb0.0, bb1.0, bb1.0.wrapping_sub(bb0.0),
+        bb0.1, bb1.1, bb1.1.wrapping_sub(bb0.1),
+        dev.read32(0x041C)?, dev.read16(0x041A)?,
+        dev.read16(0x1472)?, dev.read16(0x1478)?, dev.read8(0x1470)?, dev.read8(0x1471)?
+    ))
 }

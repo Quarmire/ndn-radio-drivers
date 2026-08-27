@@ -842,6 +842,40 @@ impl Rtl8733buBackend {
         }
     }
 
+    /// ⚠ **DO NOT USE — kept only so the refutation is not re-derived.** This was written on the
+    /// hypothesis that `dl_rsvd_page` stores a bare frame and the hardware wants
+    /// `[TXDESC][frame]`. **The hypothesis was backwards.** `halmac_init_87xx.c:731-788`
+    /// `verify_send_rsvd_page_87xx()` sends a descriptor-less buffer and then compares the dumped
+    /// page at a `+txdesc_size` shift — i.e. the descriptor put on the bulk pipe is stored
+    /// *verbatim* as the page head, not consumed as a transport header. So
+    /// [`dl_rsvd_page`](Self::dl_rsvd_page) **already** writes a descriptor there, and this
+    /// function writes a **second** one, whose TXPKTSIZE then counts the inner descriptor as frame
+    /// bytes. (The descriptor is also 40 bytes on this chip, not 48 — `TX_DESC_SIZE_87XX 40`.)
+    ///
+    /// MEASURED: plain `dl_rsvd_page` + the CPU-MGQ poll kick transmits 10/10; this variant is
+    /// simply wrong. Use `dl_rsvd_page`.
+    pub fn dl_rsvd_page_frame(
+        &self,
+        pg_addr: u8,
+        frame: &[u8],
+        rate: u8,
+        seq: u16,
+    ) -> Result<(), FaceError> {
+        let bcast = frame.len() > 4 && frame[4] & 0x01 != 0; // 802.11 addr1[0] group bit
+        let desc = build_data_txdesc(
+            frame.len(),
+            rate,
+            seq,
+            self.tx_pwr_ofs.load(Ordering::Relaxed),
+            bcast,
+            self.tx_flags.load(Ordering::Relaxed),
+        );
+        let mut page = Vec::with_capacity(desc.len() + frame.len());
+        page.extend_from_slice(&desc);
+        page.extend_from_slice(frame);
+        self.dl_rsvd_page(pg_addr, &page)
+    }
+
     /// **M5**: download the firmware and boot the WLAN CPU. Enable download mode,
     /// push each memory section (DMEM then IMEM) to the reserved page in 4 KB
     /// chunks and IDDMA-copy it into the CPU's IMEM/DMEM, verify per-section

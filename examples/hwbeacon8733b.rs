@@ -53,7 +53,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "beacon payload = {} bytes of our own 0x8624 frame",
         dot11.len()
     );
-    dev.dl_rsvd_page(0x80, &dot11)?;
+    // ★★ WHICH PAGE? `REG_DWBCN0_CTRL+1` (the beacon head page) reads 0xEC at rest — exactly
+    // `BCNQ_BDNY`, the first page of the reserved area — so it is an ABSOLUTE page index. This
+    // example passed 0x80 and the CPUMGQ harness passed 0, both BELOW the boundary, which points
+    // the beacon engine at the ordinary TX packet buffer rather than the reserved page we wrote.
+    // NDN_BCN_PAGE overrides; default is now the boundary itself.
+    let pg: u8 = std::env::var("NDN_BCN_PAGE")
+        .ok()
+        .and_then(|v| u8::from_str_radix(v.trim_start_matches("0x"), if v.starts_with("0x") { 16 } else { 10 }).ok())
+        .unwrap_or(0xEC);
+    println!("beacon head page = {pg:#04x} (BCNQ_BDNY = 0xec)");
+    // ★ PAGE LAYOUT — the candidate root cause of this example's long-standing null. The vendor
+    // stores [TXDESC][frame] in a reserved page (`hal_com.c` fills the descriptor at
+    // `&pframe[index - tx_desc]`; `rtl8733b_ops.c:3921 fill_fake_txdesc`), but `dl_rsvd_page`'s own
+    // descriptor is a TRANSPORT header consumed by the download path, so the page ended up holding
+    // a bare frame with no descriptor for the beacon engine to read at TBTT.
+    // NDN_BCN_PAGEDESC=0 reproduces the old layout for an A/B.
+    let with_desc = std::env::var("NDN_BCN_PAGEDESC").map(|v| v != "0").unwrap_or(true);
+    if with_desc {
+        dev.dl_rsvd_page_frame(pg, &dot11, 4, 0)?;
+    } else {
+        dev.dl_rsvd_page(pg, &dot11)?;
+    }
+    println!(
+        "page layout = {}",
+        if with_desc { "[TXDESC][frame]" } else { "[frame] (old)" }
+    );
     println!("reserved page loaded (BCN_VALID asserted)");
 
     // ★ REG_FWHW_TXQ_CTRL+2 BIT6 = "this page IS a real beacon frame". The vendor CLEARS it during
@@ -77,8 +102,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let r = dev.read8(0x0553)?;
     dev.write8(0x0553, r | 0x01)?;
     // enable the beacon function
+    // ★★ BIT4 of REG_BCN_CTRL is BIT_DIS_TSF_UDT ("disable TSF update"), and it is SET by default
+    // on this chip — the armed value read back 0x1c. TBTT is derived from the port TSF, so with the
+    // TSF frozen the beacon engine's target never comes around and no beacon can EVER fire, no
+    // matter how correct the reserved page is. Setting EN_BCN_FUNCTION while leaving DIS_TSF_UDT set
+    // is what this example did for its whole life. `set_tsf_run(true)` clears BIT4 *and* sets BIT3.
+    // NDN_BCN_TSFRUN=0 restores the old (frozen-TSF) behaviour for an A/B.
     let b = dev.read8(0x0550)?;
-    dev.write8(0x0550, b | (1 << 3))?;
+    if std::env::var("NDN_BCN_TSFRUN").map(|v| v != "0").unwrap_or(true) {
+        dev.write8(0x0550, (b & !(1 << 4)) | (1 << 3))?;
+    } else {
+        dev.write8(0x0550, b | (1 << 3))?;
+    }
     println!(
         "armed: net_type={:#04x} bcn_space={} TU ({:.1} ms) BCN_CTRL={:#04x}",
         dev.read8(0x0100 + 2)? & 0x03,

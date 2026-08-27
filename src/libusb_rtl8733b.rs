@@ -4355,49 +4355,29 @@ impl RadioKnobs for Rtl8733buBackend {
         let v = (self.read32(0x84c)? & 0x0000_FFFF) | (l2h << 16) | (h2l << 24);
         self.write32(0x84c, v)
     }
+    /// ⚠ **MEASURED 2026-08-27, and a scalar cannot describe it.** Two nodes, releases paced at a
+    /// fixed 100 ms cadence, timed by the witness's 4 µs hardware RX stamps, 269 samples, zero
+    /// losses, duplicate receptions removed (this witness reports ~10-30% of frames twice — dedupe
+    /// before computing any inter-arrival from it):
+    ///
+    /// | p50 | IQR | p90 | p99 | max |
+    /// |---|---|---|---|---|
+    /// | +36 µs | 428 µs | 3.6 ms | **22.9 ms** | 24.3 ms |
+    ///
+    /// So `1 ms` is honest to about p85 and ~23× optimistic at p99: the path is tight most of the
+    /// time with a rare, large tail. Sizing the slot guard from the p99 would cost
+    /// `984 µs airtime + 23 ms` per slot — a 200 ms superframe over 8 groups, worse than the
+    /// hand-set 20 ms slot the derived schedule exists to replace. So the bound stays near the
+    /// typical case and the tail is handled where it belongs: `SlotSchedule::fits_now` (#84)
+    /// refuses to launch a frame that no longer fits the slot, turning a late release into *our own*
+    /// lost airtime rather than a neighbour's corrupted turn.
+    ///
+    /// Raised 1 ms → 4 ms to cover p90 rather than p85; the remaining ~10% is the `fits_now` case.
+    /// ⚠ The ±25 ms tails seen on the reserved-page "poll kick" path are NOT this path and are not
+    /// comparable — that mechanism has a ~1 ms minimum inter-release interval and is not used.
     fn tx_discipline(&self) -> TxDiscipline {
-        // On owned spectrum with EDCCA-ignore + single-frame userspace injection this part
-        // delivers a bounded transmit delay (no CSMA backoff); the ~1 ms bound covers the USB
-        // inject + queue + airtime of one 6 Mbps MPDU.
-        // ⚠ Could plausibly be `ScheduledAt` instead. ASSESSED 2026-08-25, NOT implemented: this
-        // chip has a TSF-referenced transmit timer that is NOT the beacon engine, which is what
-        // `FrameIo::inject_at_clock` wants to bind to —
-        //
-        //   REG_CPUMGQ_TIMER_CTRL_8733B              0x04F4
-        //   REG_PS_TIMER_ABC_CPUMGQ_TIMER_CRTL_8733B 0x1510  BIT31 = CPUMGQ_TIMER_EN,
-        //                                                    [26:24] = CPUMGQ_TIMER_TSF_SEL
-        //   REG_PS_TIMER0/1/2_8733B                  0x0580/0x0584/0x0588  (A/B/C targets)
-        //   REG_TIMER0_SRC_SEL_8733B                 0x05B4
-        //   ISR: BIT_CPUMGQ_TX_TIMER_INT / _EARLY_INT
-        //
-        // A queue plus a TSF-referenced timer, with no AP/BSSID identity anywhere — unlike the
-        // beacon engine, whose remaining blockers are precisely "configure REG_MACID / REG_BSSID /
-        // net_type = AP", i.e. the host-identity apparatus this stack's doctrine rejects. That is a
-        // doctrine signal, not an implementation detail, and is why the beacon path was dropped as
-        // the scheduled-TX candidate in favour of this one.
-        //
-        // ⚠ COST RE-ASSESSED 2026-08-25, DOWNWARD. An earlier version of this note implied the
-        // work was wiring with a few named unknowns. It is not: **nothing in the vendor tree ever
-        // programs these registers.** They are present in `halmac_reg_8733b.h` and the bit file,
-        // and that is all — the only `REG_TIMER0_SRC_SEL` use is inter-port TSF sync, unrelated,
-        // and the only CPU-MGQ use is beacon-poll recovery. So there is NO reference sequence for:
-        // how a frame enters the CPU management queue (QSLT_CMD = 0x13 is the plausible selector,
-        // untested), whether the on-chip firmware must dequeue it, or the timer's units and
-        // trigger semantics. That is reverse engineering, not integration.
-        //
-        // Not attempted blind: this part has previously been wedged for weeks by poking an
-        // undocumented control (the `pltfm_reset` pulse), so the bar for speculative register
-        // writes here is high and a low-prior guess does not clear it.
-        //
-        // The unblock is a REFERENCE, not more staring: a Realtek tree for a chip that actually
-        // drives these — NAN/Wi-Fi-Aware support is the likely place, since a discovery window is
-        // exactly a TSF-scheduled transmit. Find that and this becomes integration again.
-        //
-        // The measuring instrument is ready either way: per-frame hardware RX stamps on a second
-        // f72b (`examples/rxgaps8733b.rs`, `rxseq8733b.rs`), which resolved the TXPAUSE gate to
-        // ~252 us and the slot gate to 99% confinement.
         TxDiscipline::PromptBounded {
-            max_delay_ns: 1_000_000,
+            max_delay_ns: 4_000_000,
         }
     }
 

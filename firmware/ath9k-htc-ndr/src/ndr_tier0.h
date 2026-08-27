@@ -121,4 +121,31 @@ a_uint32_t ndr_popcount(const ndr_filter_t *f);
 /* Lift the 94-bit filter out of a received 802.11 header's addr1||addr2. */
 void ndr_filter_from_hdr(ndr_filter_t *out, const a_uint8_t *wh);
 
+/* ── WIDE PROFILE (#39) — layered Blur + exact-match fingerprint on the pushed 802.11 header ──────
+ *
+ * A wide sender emits a 4-address QoS-Data+HTC frame. The base 126-bit Blur is byte-identical in
+ * addr1||addr2||addr3[0:4] (this firmware reads it with ndr_filter_from_hdr, unchanged); a second
+ * 48-bit projection rides addr4; the 24-bit name fingerprint rides HT Control. All copies MUST agree
+ * bit-for-bit — golden/tier0/vectors.txt `wide` rows pin it. */
+
+/* Fingerprint width (bits), carried little-endian in HT Control[0..3]; HTC[3] is the marker. */
+#define NDR_FP_BITS         24
+/* Extra Blur bytes on the Wi-Fi wide profile — addr4 only (48 bits). */
+#define NDR_WIDE_EXTRA_BYTES 6
+/* Profile marker written to HT Control[3]. */
+#define NDR_WIDE_MARKER     0x01
+
+/* The FP_BITS-wide exact-match fingerprint of a full name — low bits of the keyed name hash. */
+a_uint32_t ndr_name_fingerprint(const a_uint8_t key[NDR_KEY_LEN], const a_uint8_t *name,
+				a_uint32_t len);
+
+/* The extra-region mask a wide receiver precomputes per registered prefix (48 bits, no reserved
+ * bits). AND against a received addr4 to tighten the base match. */
+void ndr_extra_mask_for(a_uint8_t out[NDR_WIDE_EXTRA_BYTES], const a_uint8_t key[NDR_KEY_LEN],
+			const a_uint8_t *prefix, a_uint32_t len);
+
+/* Could this received addr4 be under the prefix `mask` was built from? Pure AND over the extra bits. */
+a_int32_t ndr_extra_may_match(const a_uint8_t extra[NDR_WIDE_EXTRA_BYTES],
+			      const a_uint8_t mask[NDR_WIDE_EXTRA_BYTES]);
+
 #endif /* _NDR_TIER0_H_ */

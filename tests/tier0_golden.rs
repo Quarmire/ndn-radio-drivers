@@ -20,7 +20,106 @@
 #[path = "../firmware/lr2021-nrf54l15-rs/src/tier0.rs"]
 mod fw_tier0;
 
-use fw_tier0::{FILL_CAP, K, M_BITS, MAX_DEPTH, PrefixFilter};
+use fw_tier0::{FILL_CAP, K, M_BITS, MAX_DEPTH, PrefixFilter, wide_fields};
+
+/// One `wide` row of the golden file: (label, key, name, id, flags, expected addr1..addr4 ‖ htc).
+struct WideRow {
+    label: String,
+    key: [u8; 16],
+    name: String,
+    id: u8,
+    flags: u8,
+    fp: u32,
+    addr1: [u8; 6],
+    addr2: [u8; 6],
+    addr3: [u8; 6],
+    addr4: [u8; 6],
+    htc: [u8; 4],
+}
+
+fn hex6(s: &str) -> [u8; 6] {
+    let mut a = [0u8; 6];
+    for (i, b) in a.iter_mut().enumerate() {
+        *b = u8::from_str_radix(&s[2 * i..2 * i + 2], 16).expect("hex6");
+    }
+    a
+}
+
+fn wide_vectors() -> Vec<WideRow> {
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/golden/tier0/vectors.txt");
+    let text = std::fs::read_to_string(path).expect("golden vectors present");
+    let mut rows = Vec::new();
+    for line in text.lines() {
+        let Some(rest) = line.strip_prefix("wide ") else {
+            continue;
+        };
+        // wide <label> <key> <name> <id-hex> <flags-hex> <fp-hex> <addr1><addr2><addr3><addr4> <htc>
+        let f: Vec<&str> = rest.split_whitespace().collect();
+        assert_eq!(f.len(), 8, "wide row shape");
+        let mut key = [0u8; 16];
+        key.copy_from_slice(f[1].as_bytes());
+        let bytes = f[6]; // 24 bytes = addr1..addr4 concatenated
+        rows.push(WideRow {
+            label: f[0].into(),
+            key,
+            name: f[2].into(),
+            id: u8::from_str_radix(f[3], 16).expect("id"),
+            flags: u8::from_str_radix(f[4], 16).expect("flags"),
+            fp: u32::from_str_radix(f[5], 16).expect("fp"),
+            addr1: hex6(&bytes[0..12]),
+            addr2: hex6(&bytes[12..24]),
+            addr3: hex6(&bytes[24..36]),
+            addr4: hex6(&bytes[36..48]),
+            htc: {
+                let mut h = [0u8; 4];
+                for (i, b) in h.iter_mut().enumerate() {
+                    *b = u8::from_str_radix(&f[7][2 * i..2 * i + 2], 16).expect("htc");
+                }
+                h
+            },
+        });
+    }
+    rows
+}
+
+/// **The firmware wide-profile port reproduces every `wide` golden row** — base Blur in addr1..addr3,
+/// the additive extra Blur in addr4, and the 24-bit fingerprint + marker in HT Control. A divergence
+/// here is a silent false negative between a Wi-Fi wide sender and an LR2021 wide receiver.
+#[test]
+fn firmware_regenerates_every_wide_row() {
+    let rows = wide_vectors();
+    assert!(!rows.is_empty(), "at least one wide row present");
+    for r in &rows {
+        let f = wide_fields(&r.key, r.name.as_bytes(), r.id, r.flags);
+        let got_fp = f.htc[0] as u32 | (f.htc[1] as u32) << 8 | (f.htc[2] as u32) << 16;
+        assert_eq!(got_fp, r.fp, "wide row '{}' fingerprint", r.label);
+        assert_eq!(f.addr1, r.addr1, "wide row '{}' addr1", r.label);
+        assert_eq!(f.addr2, r.addr2, "wide row '{}' addr2", r.label);
+        assert_eq!(f.addr3, r.addr3, "wide row '{}' addr3", r.label);
+        assert_eq!(f.addr4, r.addr4, "wide row '{}' addr4 (extra Blur)", r.label);
+        assert_eq!(f.htc, r.htc, "wide row '{}' HT Control", r.label);
+    }
+}
+
+/// Print the firmware's wide fields for the canonical inputs — the source of truth pinned into
+/// `vectors.txt`. Run with `--ignored --nocapture` to (re)generate the `wide` row.
+#[test]
+#[ignore]
+fn emit_wide_golden_row() {
+    let key: [u8; 16] = *b"ndr/tier0-vec-01";
+    let f = wide_fields(&key, b"/ndn/test/v1", 0x37, 0x00);
+    let fp = f.htc[0] as u32 | (f.htc[1] as u32) << 8 | (f.htc[2] as u32) << 16;
+    let cat = |a: &[u8]| a.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    println!(
+        "wide widev1 ndr/tier0-vec-01 /ndn/test/v1 37 00 {:06x} {}{}{}{} {}",
+        fp,
+        cat(&f.addr1),
+        cat(&f.addr2),
+        cat(&f.addr3),
+        cat(&f.addr4),
+        cat(&f.htc)
+    );
+}
 
 struct Row {
     label: String,

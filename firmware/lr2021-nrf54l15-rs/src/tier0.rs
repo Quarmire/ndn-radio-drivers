@@ -367,3 +367,102 @@ impl PrefixFilter {
         w
     }
 }
+
+// ── WIDE PROFILE (#39) — layered Blur + exact-match fingerprint on the pushed 802.11 header ──────────
+//
+// Mirrors `ndn-radio/crates/faces/ndn-radio/src/mac/tier0.rs`. A wide sender emits a 4-address
+// QoS-Data+HTC frame: the base 126-bit Blur stays byte-identical in addr1‖addr2‖addr3[0:4] (a base
+// receiver reads it unchanged), an additive 48-bit second projection rides addr4, and the 24-bit name
+// fingerprint rides HT Control. All three implementations (this firmware, the ath9k-htc C port, the
+// host) MUST reproduce the wide golden vector byte-for-byte, or a wide sender and receiver disagree.
+
+/// Exact-match fingerprint width (bits), carried in HT Control. A *separate* field — never carved
+/// from the Blur, so the Blur never shrinks.
+pub const FP_BITS: u32 = 24;
+
+/// Extra Blur bytes on the Wi-Fi wide profile — `addr4` only (48 bits).
+pub const WIFI_WIDE_EXTRA_BYTES: usize = 6;
+
+/// Profile marker written to `HT Control[3]`.
+pub const WIDE_PROFILE_MARKER: u8 = 0x01;
+
+/// Domain separator for the extra projection — a second, independent keyed projection so the extra
+/// region is not correlated with the base.
+const EXTRA_DOMAIN: [u8; 16] = *b"ndn/tier0-xtra!\0";
+
+/// [`positions`] parameterized by the Blur width `m_blur` — one algorithm for every profile (126 on
+/// the base frame, 48 for the extra region). `positions` is the `M_BITS` case, bit-identical.
+pub fn positions_m(key: &[u8; 16], prefix: &[u8], m_blur: u32) -> [u16; K as usize] {
+    let mut key2 = *key;
+    let mut i = 0;
+    while i < 16 {
+        key2[i] ^= KEY2_DOMAIN[i];
+        i += 1;
+    }
+    let h1 = name_hash(key, prefix) as u32;
+    let h2 = (name_hash(&key2, prefix) as u32) | 1;
+    let mut out = [0u16; K as usize];
+    for (i, o) in out.iter_mut().enumerate() {
+        *o = (h1.wrapping_add((i as u32).wrapping_mul(h2)) % m_blur) as u16;
+    }
+    out
+}
+
+/// The `FP_BITS`-wide exact-match fingerprint of a full name — the low bits of the keyed name hash.
+pub fn name_fingerprint(key: &[u8; 16], name: &[u8]) -> u32 {
+    (name_hash(key, name) as u32) & ((1u32 << FP_BITS) - 1)
+}
+
+/// A wide-profile frame's pushed-header fields, exactly as they land on the wire.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct WideFields {
+    pub addr1: [u8; 6],
+    pub addr2: [u8; 6],
+    pub addr3: [u8; 6], // base[12:16] ‖ id ‖ flags
+    pub addr4: [u8; 6], // extra Blur (48 bits)
+    pub htc: [u8; 4],   // fingerprint (24 bits, LE) ‖ profile marker
+}
+
+/// Build the wide-profile header fields for one name — the sender path. The base region is exactly
+/// [`PrefixFilter::insert_name`]; the extra region is an independent projection under the extra key.
+pub fn wide_fields(key: &[u8; 16], name: &[u8], id: u8, flags: u8) -> WideFields {
+    // Base region — identical to a base-only frame.
+    let mut base = PrefixFilter::new();
+    base.insert_name(key, name);
+    let bw = base.to_wire();
+
+    // Extra region — second projection into WIFI_WIDE_EXTRA_BYTES*8 bits, no reserved bits.
+    let mut xkey = *key;
+    let mut i = 0;
+    while i < 16 {
+        xkey[i] ^= EXTRA_DOMAIN[i];
+        i += 1;
+    }
+    let m_extra = (WIFI_WIDE_EXTRA_BYTES * 8) as u32;
+    let mut extra = [0u8; WIFI_WIDE_EXTRA_BYTES];
+    for_each_prefix(name, |pfx| {
+        for &p in positions_m(&xkey, pfx, m_extra).iter() {
+            extra[p as usize / 8] |= 1 << (p % 8);
+        }
+    });
+
+    let fp = name_fingerprint(key, name);
+    let mut f = WideFields {
+        addr1: [0; 6],
+        addr2: [0; 6],
+        addr3: [0; 6],
+        addr4: [0; 6],
+        htc: [0; 4],
+    };
+    f.addr1.copy_from_slice(&bw[0..6]);
+    f.addr2.copy_from_slice(&bw[6..12]);
+    f.addr3[0..4].copy_from_slice(&bw[12..16]);
+    f.addr3[4] = id;
+    f.addr3[5] = flags;
+    f.addr4.copy_from_slice(&extra);
+    f.htc[0] = fp as u8;
+    f.htc[1] = (fp >> 8) as u8;
+    f.htc[2] = (fp >> 16) as u8;
+    f.htc[3] = WIDE_PROFILE_MARKER;
+    f
+}

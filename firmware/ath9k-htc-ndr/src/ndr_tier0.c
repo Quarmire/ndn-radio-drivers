@@ -236,3 +236,70 @@ void ndr_filter_from_hdr(ndr_filter_t *out, const a_uint8_t *wh)
 	for (i = 0; i < 16; i++)
 		out->b[i] = wh[4 + i];
 }
+
+/* ── WIDE PROFILE (#39) ─────────────────────────────────────────────────────────────────────────
+ * Mirrors the wide additions in lr2021-nrf54l15-rs/src/tier0.rs and the host tier0.rs. */
+
+a_uint32_t ndr_name_fingerprint(const a_uint8_t key[NDR_KEY_LEN], const a_uint8_t *name,
+				a_uint32_t len)
+{
+	/* Low NDR_FP_BITS of the keyed name hash. Same hash family as the Blur (task #44). */
+	return (a_uint32_t)ndr_name_hash(key, name, len) & ((1u << NDR_FP_BITS) - 1u);
+}
+
+/* Domain separator for the extra projection — a second independent keyed projection, so the extra
+ * region is uncorrelated with the base. Must match EXTRA_DOMAIN in the Rust copies. */
+static const a_uint8_t NDR_EXTRA_DOMAIN[NDR_KEY_LEN] = {
+	'n', 'd', 'n', '/', 't', 'i', 'e', 'r', '0', '-', 'x', 't', 'r', 'a', '!', 0
+};
+
+/* The K extra-region positions one prefix occupies, mod (NDR_WIDE_EXTRA_BYTES*8). Same double-hash
+ * as ndr_positions but under the extra key and a smaller modulus, and with NO reserved bits. */
+static void ndr_extra_positions(a_uint8_t out[NDR_K], const a_uint8_t key[NDR_KEY_LEN],
+				const a_uint8_t *prefix, a_uint32_t len)
+{
+	a_uint8_t xkey[NDR_KEY_LEN], key2[NDR_KEY_LEN];
+	a_uint32_t h1, h2, i;
+	const a_uint32_t m_extra = NDR_WIDE_EXTRA_BYTES * 8;
+
+	/* The extra region keys off (key XOR EXTRA_DOMAIN); its own h2 uses that XOR'd KEY2_DOMAIN,
+	 * exactly as positions_m(&xkey, ..) in the Rust copy. */
+	for (i = 0; i < NDR_KEY_LEN; i++)
+		xkey[i] = key[i] ^ NDR_EXTRA_DOMAIN[i];
+	for (i = 0; i < NDR_KEY_LEN; i++)
+		key2[i] = xkey[i] ^ NDR_KEY2_DOMAIN[i];
+
+	h1 = (a_uint32_t)ndr_name_hash(xkey, prefix, len);
+	h2 = ((a_uint32_t)ndr_name_hash(key2, prefix, len)) | 1u;
+
+	for (i = 0; i < NDR_K; i++)
+		out[i] = (a_uint8_t)((h1 + i * h2) % m_extra);
+}
+
+void ndr_extra_mask_for(a_uint8_t out[NDR_WIDE_EXTRA_BYTES], const a_uint8_t key[NDR_KEY_LEN],
+			const a_uint8_t *prefix, a_uint32_t len)
+{
+	a_uint8_t pos[NDR_K];
+	a_uint32_t i;
+
+	len = ndr_clamp_prefix(prefix, len);
+
+	for (i = 0; i < NDR_WIDE_EXTRA_BYTES; i++)
+		out[i] = 0;
+
+	ndr_extra_positions(pos, key, prefix, len);
+	for (i = 0; i < NDR_K; i++)
+		out[pos[i] / 8] |= (a_uint8_t)(1 << (pos[i] % 8));
+}
+
+a_int32_t ndr_extra_may_match(const a_uint8_t extra[NDR_WIDE_EXTRA_BYTES],
+			      const a_uint8_t mask[NDR_WIDE_EXTRA_BYTES])
+{
+	a_uint32_t i;
+
+	for (i = 0; i < NDR_WIDE_EXTRA_BYTES; i++)
+		if ((extra[i] & mask[i]) != mask[i])
+			return 0;
+
+	return 1;
+}

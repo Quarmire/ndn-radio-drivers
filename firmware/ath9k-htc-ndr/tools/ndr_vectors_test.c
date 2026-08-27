@@ -94,6 +94,68 @@ int main(int argc, char **argv)
 			check(cap == NDR_FILL_CAP, "fill_cap matches NDR_FILL_CAP");
 			continue;
 		}
+		if (!strncmp(line, "wide ", 5)) {
+			/* Receive-side check of a wide row: this C copy's fingerprint hash and extra
+			 * projection must reproduce the recorded HT Control and addr4, and the base Blur
+			 * (addr1||addr2||addr3[0:4]) must still match the first-component mask. */
+			char whex[128], hhex[16];
+			unsigned id, flags, fp;
+			a_uint8_t addrs[24], htc[4], extra[NDR_WIDE_EXTRA_BYTES];
+			a_uint8_t extra_mask[NDR_WIDE_EXTRA_BYTES];
+			ndr_filter_t base, bmask;
+			a_uint32_t fc, wfp;
+			char what[256];
+			int i;
+
+			if (sscanf(line, "wide %63s %63s %511s %x %x %x %127s %15s",
+				   label, key, name, &id, &flags, &fp, whex, hhex) != 8)
+				continue;
+			rows++;
+			check(strlen(whex) == 48, "wide addr blob is 24 bytes");
+			for (i = 0; i < 24; i++) {
+				unsigned byte;
+				sscanf(whex + 2 * i, "%2x", &byte);
+				addrs[i] = (a_uint8_t)byte;
+			}
+			for (i = 0; i < 4; i++) {
+				unsigned byte;
+				sscanf(hhex + 2 * i, "%2x", &byte);
+				htc[i] = (a_uint8_t)byte;
+			}
+
+			/* 1. Fingerprint hash: this copy must reproduce it from the name. */
+			wfp = ndr_name_fingerprint((const a_uint8_t *)key, (const a_uint8_t *)name,
+						   (a_uint32_t)strlen(name));
+			snprintf(what, sizeof(what), "%s: fingerprint 0x%06x == recorded 0x%06x",
+				 label, wfp, fp);
+			check(wfp == fp, what);
+			/* 2. HT Control layout: fp little-endian in [0..3], marker in [3]. */
+			check(htc[0] == (a_uint8_t)(fp) && htc[1] == (a_uint8_t)(fp >> 8) &&
+			      htc[2] == (a_uint8_t)(fp >> 16) && htc[3] == NDR_WIDE_MARKER,
+			      "wide HT Control = fp_le24 || marker");
+			(void)id;
+			(void)flags;
+
+			/* 3. Base Blur (addr1||addr2||addr3[0:4] = first 16 bytes) matches its first
+			 * component mask — same guarantee as the base rows, on the wide frame. */
+			for (i = 0; i < 16; i++)
+				base.b[i] = addrs[i];
+			fc = first_component_len(name);
+			ndr_mask_for(&bmask, (const a_uint8_t *)key, (const a_uint8_t *)name, fc);
+			snprintf(what, sizeof(what), "%s: base Blur matches first-component mask", label);
+			check(ndr_may_match(&base, &bmask) != 0, what);
+
+			/* 4. Extra region (addr4 = bytes 18..24) matches the extra first-component mask —
+			 * pins the extra projection's hash + 48-bit modulus. */
+			for (i = 0; i < NDR_WIDE_EXTRA_BYTES; i++)
+				extra[i] = addrs[18 + i];
+			ndr_extra_mask_for(extra_mask, (const a_uint8_t *)key,
+					   (const a_uint8_t *)name, fc);
+			snprintf(what, sizeof(what), "%s: addr4 extra Blur matches first-component mask",
+				 label);
+			check(ndr_extra_may_match(extra, extra_mask) != 0, what);
+			continue;
+		}
 		if (strncmp(line, "row ", 4))
 			continue;
 		if (sscanf(line, "row %63s %63s %511s %63s %u", label, key, name, hex, &pop) != 5)

@@ -613,7 +613,9 @@ fn poll_kick(dev: &Rtl8733buBackend) -> Result<String, Box<dyn std::error::Error
         dev.write32(REG_TRI_CTRL, (u32::from(page)) << 16)?;
     }
 
-    for _ in 0..reps {
+    let mut per_rep = Vec::new();
+    for rep in 0..reps {
+        let pre = dev.read16(0x2de0)?;
         // ORDER MATTERS. Arming first was measured to BLOCK the kick (10 kicks -> 1 transmit).
         // The natural design is the reverse: POLL_SET queues the packet, then the armed comparator
         // releases it at the target. NDN_SCHED_ORDER=arm_first reproduces the blocking variant.
@@ -654,11 +656,31 @@ fn poll_kick(dev: &Rtl8733buBackend) -> Result<String, Box<dyn std::error::Error
         // CPUMGQ_FW_NUM (BIT8) — consistent with the comparator having released the queued packet
         // and the poll state needing a reset before the next one. NDN_SCHED_RESET=1 does the full
         // reset each rep: clear the poll, and re-stage the page.
+        // Per-rep BB delta + the comparator's own status: this shows exactly WHICH rep transmits
+        // and whether the timer fired at all on the ones that do not.
+        per_rep.push(format!(
+            "r{rep}:tx+{} isr={:#x} ctrl={:#x} info={:#x}",
+            dev.read16(0x2de0)?.wrapping_sub(pre),
+            dev.read32(REG_FTISR)? & (FTISR_FIRE | FTISR_EARLY),
+            dev.read32(REG_CTRL)?,
+            dev.read32(0x041C)?
+        ));
         if env_u32("NDN_SCHED_RESET", 0) != 0 {
+            // ★ BIT8 CPUMGQ_FW_NUM LATCHES on the first scheduled transmit and never clears by
+            // itself — the per-rep trace showed r0 transmitting and r1..r5 silent with info stuck
+            // at 0x1f6. Clearing POLL_SET alone is not enough; BIT8 must be knocked down too.
             let v = dev.read32(0x041C)?;
-            dev.write32(0x041C, (v | (1 << 27)) & !(1 << 29))?;
+            dev.write32(0x041C, (v | (1 << 27)) & !(1 << 29) & !(1 << 8))?;
             let v = dev.read32(0x041C)?;
-            dev.write32(0x041C, v & !(1 << 27))?;
+            dev.write32(0x041C, v & !(1 << 27) & !(1 << 8))?;
+            // BIT8 is hardware-driven status and will NOT clear by writing it. The documented way
+            // to flush this queue is MAC_STOP_CPUMGQ (0x1518 BIT16): stop, then release.
+            if env_u32("NDN_SCHED_MACSTOP", 1) != 0 {
+                let pv = dev.read32(REG_PARAM)?;
+                dev.write32(REG_PARAM, pv | (1 << 16))?;
+                std::thread::sleep(Duration::from_millis(2));
+                dev.write32(REG_PARAM, pv & !(1 << 16))?;
+            }
             dev.dl_rsvd_page(page, &dot11)?;
         }
     }
@@ -675,5 +697,5 @@ fn poll_kick(dev: &Rtl8733buBackend) -> Result<String, Box<dyn std::error::Error
         bb0.1, bb1.1, bb1.1.wrapping_sub(bb0.1),
         dev.read32(0x041C)?, dev.read16(0x041A)?,
         dev.read16(0x1472)?, dev.read16(0x1478)?, dev.read8(0x1470)?, dev.read8(0x1471)?
-    ))
+    ) + "\n  per-rep: " + &per_rep.join("  "))
 }

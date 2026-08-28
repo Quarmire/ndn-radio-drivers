@@ -3330,6 +3330,22 @@ impl Ath9kHtcBackend {
     /// firmware masks instead of divides, so `slots` and `slots · slot_tu · 1024` must both be powers of
     /// two. Defaults 4 slots × 8 TU = 32768 µs = 2¹⁵. `slots` here is the literal count (the firmware's
     /// control-frame path takes log2; this owned-memory path writes the count the firmware reads directly).
+    /// ⚠⚠ **REQUIRES OUR NDR FIRMWARE, AND HAS NO NON-EXAMPLE CALLER.** Two facts a caller must
+    /// know before depending on this:
+    ///
+    /// 1. The quiet block it drives lives in `firmware/ath9k-htc-ndr` (`ndr_mac.c`
+    ///    `ndr_quiet_rearm`, gated on `ndr_ctl_lease_override`). On **stock** `htc_9271` firmware
+    ///    these target-memory writes land in a build that has no NDR quiet logic, so the lease is
+    ///    silently INERT — the MAC keeps transmitting freely. As of 2026-08-27 no lab host has the
+    ///    NDR firmware built or flashed; every attached AR9271 runs stock.
+    /// 2. Nothing outside `examples/ath9k_lease.rs` calls this, and its TU-quantised geometry
+    ///    (power-of-two slots × `slot_tu` TU) has no reconciliation with the scheduler's µs
+    ///    `SlotSchedule`. They are two unrelated slot maps.
+    ///
+    /// So this is an EXPERIMENTAL path, not a capability the MAC may assume. Do not let a scheduler
+    /// depend on it without (a) a runtime check that NDR firmware is actually running, and (b) a
+    /// geometry reconciliation — otherwise the scheduler believes in a gate that does not exist,
+    /// which is the same defect that made `tx_discipline` claim `ScheduledAt` on this part.
     pub fn arm_airtime_lease(&self, slots: u32, slot_tu: u32, slot: u32) -> Result<(), FaceError> {
         // Shape first, then flip override on — so the next `ndr_quiet_rearm()` (driven by our injects)
         // reads a consistent lease. Clear the generic-timer enable to force a fresh arm (mirrors the
@@ -3555,14 +3571,32 @@ impl RadioKnobs for Ath9kHtcBackend {
         Ok(Some((busy >> 8) as u16))
     }
 
-    /// ★ The AR9271 can promise **`ScheduledAt`** — hardware-gated TX off the TSF via the generic-timer
-    /// airtime lease ([`arm_airtime_lease`](Self::arm_airtime_lease)), MEASURED sub-µs boundary on air
-    /// (M3b). This is the named-time Cut-2 capability the beacon-slot / URLLC lane / TSCH-by-name read,
-    /// and it is *unique to this part* among the Wi-Fi we own — every other backend is `BestEffort`.
+    /// ⚠ **`BestEffort` — downgraded from `ScheduledAt{1 µs}`, which was wrong and actively harmful.**
+    ///
+    /// `TxDiscipline` describes *placement*: "the frame leaves at a scheduled instant". This part
+    /// cannot do that. What it has is [`arm_airtime_lease`](Self::arm_airtime_lease) — a **periodic
+    /// TX-suppression gate** on the firmware's TU-quantised quiet schedule ("in a superframe of N
+    /// slots of `slot_tu` TU, I may transmit only in slot k"). A quiet schedule cannot express
+    /// "transmit 3.7 ms from now", so it is a slot GATE, not a placement primitive. The M3b sub-µs
+    /// boundary measurement was of that gate's edge, and it does not license this declaration.
+    ///
+    /// Why the old value was worse than useless, not merely optimistic: a scheduler dispatches the
+    /// hardware-TX path on `matches!(tx_discipline(), ScheduledAt{..})` and then hands the frame to
+    /// [`FrameIo::inject_after`] *instead of* running its own software gate. This backend implements
+    /// neither `inject_after` nor `inject_at_clock`, so the HAL default ran — which injects
+    /// immediately and drops the delay. Net effect with `NDN_SCHED_HW_TX=1`: transmit now, ungated,
+    /// no slot discipline at all. It also earned the tightest actuation guard in the tree (1 µs)
+    /// for the loosest actual mechanism, sizing slots ~1000× tighter than this transmitter can hold.
+    ///
+    /// `BestEffort` rather than `PromptBounded`: the send path here is an ordinary host `write_bulk`
+    /// over USB and no release-jitter bound has been measured on this part. (The same rule the
+    /// mt76x0 follows — hardware TSF, but no ported path from it to a gated transmit.) To earn a
+    /// bound, measure the release the way the 8733b's was: witness RX stamps at 4 µs, reporting the
+    /// TAIL and not the IQR. To earn `ScheduledAt` back, implement `inject_after` against the
+    /// firmware quiet/generic-timer path AND drive the lease from the scheduler's own slot map —
+    /// today they are two unrelated slot maps (µs here, TU there).
     fn tx_discipline(&self) -> ndn_radio_hal::TxDiscipline {
-        ndn_radio_hal::TxDiscipline::ScheduledAt {
-            granularity_ns: 1_000,
-        }
+        ndn_radio_hal::TxDiscipline::BestEffort
     }
     fn configure_name_filter(
         &self,

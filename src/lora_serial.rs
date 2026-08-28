@@ -1,105 +1,212 @@
-//! Waveshare USB-TO-LoRa (SX1262) serial-bridged [`FrameIo`] backend.
+//! Serial-bridged **sub-GHz LoRa-family** radio backend — one [`FrameIo`] for a fleet of nodes.
 //!
-//! The dongle is a GD32F103 MCU + Semtech SX1262 behind a CH343 USB-UART, presenting
-//! `/dev/ttyACM*` (Linux) / `/dev/cu.usbmodem*` (macOS) at 115200 8N1. It runs our **open Rust
-//! firmware** (`firmware/waveshare-lora-rs`), which replaced the closed factory firmware: the air
-//! side is now plain **standard LoRa** (no proprietary header — interoperates with any SX127x/
-//! SX126x peer), and the host link is a small **binary protocol** — `7E A5 | type | len | payload |
-//! xor-crc` — carrying commands (transmit a frame; set frequency / SF-BW-CR / power / sync word;
-//! query info) and events (received frame **with RSSI + SNR**; TX-done; info; ascii log).
+//! This started as *the Waveshare SX1262 driver* and had that one board's facts compiled into it:
+//! a 10–22 dBm power span, SF 7–12, `ts_ms` milliseconds, a 3 s transmit timeout, and an
+//! unconditional `SET_BEACON`/`SET_FREQ`/`SET_MOD`/`SET_PWR` at open. Three more nodes now speak the
+//! same `7E A5 | type | len | payload | xor-crc` wire protocol and *none* of those facts hold on all
+//! of them — the LR2021 has no spreading factor, stamps at 16 MHz, and its `CMD_SET_FREQ` was
+//! MEASURED to permanently break its transmit path. A driver that assumes is therefore a driver that
+//! damages hardware.
 //!
-//! Because the board now does its own LoRa framing, this backend no longer needs the transparent-
-//! mode workarounds the closed firmware forced (COBS to survive a `0x00`-truncating byte pipe, an
-//! `AT`/`+++` command mode, a DTR-reset settle): it just frames commands and parses events. Knobs
-//! are binary commands the firmware applies live, so there is no command-mode/data-mode switch and
-//! the reader never has to park. RX frames arrive with a real `rssi_dbm` (the closed path had none).
+//! So the shape is inverted: **the node describes itself and the host obeys**. At open the backend
+//! asks `CMD_GET_CAP` and parses [`NodeProfile`] out of `EVT_CAP`; every later decision — which
+//! commands to send at all, how to clamp a frequency or a power, what a frame's timestamp *means*,
+//! how long a transmission may take, whether TX can be scheduled — reads that profile. A node that
+//! does not answer (old firmware) gets a written-down legacy profile, so an un-reflashed dongle opens
+//! exactly as it did before.
 //!
-//! This keeps a long-range, low-rate, duty-cycled sub-GHz radio as just another `FrameIo` — the
-//! same seam the USB Wi-Fi drivers and the BW16 board sit behind. Its named-time surface is the
-//! honest floor: no hardware timestamp, only a `HostRecv` stamp latched when the serial line
-//! delivers the frame (see [`RadioTime`]).
+//! ## The protocol (7E-A5 v2)
+//!
+//! ```text
+//!   0x7E 0xA5 <type> <len> <payload…> <crc>        crc = XOR of type, len and every payload byte
+//! ```
+//!
+//! Strictly request/response, one command in flight — see [`CmdPort`]. v2 only ADDS opcodes; a node
+//! that does not implement one answers `EVT_UNSUPPORTED (0x8F) [cmd, reason]` rather than going
+//! silent, which is why an unsupported knob fails fast here instead of burning a timeout.
+//!
+//! ## What is deliberately NOT here
+//!
+//! * **No Tier-0 name filter.** [`RadioKnobs::configure_name_filter`] returns `Unsupported` on this
+//!   bearer, on purpose — see that method for the keyspace ruling.
+//! * **No fabricated capability numbers.** Where a node's firmware has never told us its power range
+//!   or its scheduling granularity, the profile carries `0` and the corresponding knob reports
+//!   `Unsupported`. A believable wrong number is worse than a refusal, because the planner acts on it.
 
 use std::os::unix::io::RawFd;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use ndn_frame_io::{
-    CapturedFrame, ClockDomainId, FrameIo, InjectFrame, LatchPoint, LinkStamp, RadioCapability,
-    RadioProfile, RadioTime, RadioTimeSource,
+    CapturedFrame, ClockDomainId, FrameIo, InjectFrame, LatchPoint, LinkStamp, PhyMetrics,
+    RadioCapability, RadioClockKind, RadioProfile, RadioTime, RadioTimeSource,
 };
-use ndn_radio_hal::{Bandwidth, RadioKnobs, TxDiscipline};
+use ndn_radio_hal::{
+    Band, Bandwidth, DbmRange, RadioKind, RadioKnobs, RateCapability, TxDiscipline,
+};
 use ndn_transport::FaceError;
 use tokio::sync::{Mutex as AsyncMutex, mpsc};
 
-/// Baud the CH343↔GD32 link (and thus the host) runs at.
+/// Baud the USB-serial bridge (and thus the host) runs at. Every node in the fleet uses it.
 pub const LORA_BAUD: u32 = 115_200;
 
-/// Host clock domain for LoRa `HostRecv` stamps ("LORA"); the module exposes no hardware counter.
+/// Host clock domain for `HostRecv` stamps ("LORA") — one per host process, shared by every
+/// serial LoRa node on it, because it *is* one counter (this process's monotonic clock).
 const HOST_CLOCK_DOMAIN: ClockDomainId = ClockDomainId(0x4C4F_5241);
 
-// --- Host ⇄ firmware binary protocol (mirrors firmware/waveshare-lora-rs) ---
+// ---------------------------------------------------------------------------
+// 7E-A5 v2 — the wire contract. Mirrors firmware/{waveshare-lora-rs,heltec-lora-rs,
+// lr2021-nrf54l15-rs}. Opcodes keep their meaning forever; v2 only adds.
+// ---------------------------------------------------------------------------
 const SYNC0: u8 = 0x7E;
 const SYNC1: u8 = 0xA5;
-// Host -> firmware commands.
-const CMD_TX: u8 = 0x01; //       payload = LoRa frame bytes
-const CMD_SET_FREQ: u8 = 0x02; //  payload = u32 BE Hz
-const CMD_SET_MOD: u8 = 0x03; //   payload = [sf, bw_code, cr_code]
-const CMD_SET_PWR: u8 = 0x04; //   payload = [i8 dBm]
-const CMD_SET_SYNC: u8 = 0x05; //  payload = [sx127x sync byte]
-#[allow(dead_code)]
-const CMD_GET_INFO: u8 = 0x06; //  payload = []
-const CMD_SET_BEACON: u8 = 0x07; // payload = [enabled(0/1)] (opt [enabled, period_mult])
-// #52 carrier-sense / LBT.
-const CMD_CAD: u8 = 0x08; //        payload = []            → EVT_CAD [busy]
-const CMD_GET_RSSI: u8 = 0x09; //   payload = []            → EVT_RSSI [rssi i16 BE]
-const CMD_SET_CAD_CFG: u8 = 0x0A; //payload = [sym, det_peak, det_min]
-const CMD_SET_LBT_CFG: u8 = 0x0B; //payload = [cw_ms(2 BE), max_backoff, max_attempts]
-const CMD_SET_PREAMBLE: u8 = 0x0C; //payload = [preamble(2 BE)]
-const CMD_SF_SCAN: u8 = 0x0D; //    payload = []            → EVT_SF_DETECTED [sf | 0]
-const CMD_TX_LBT: u8 = 0x0E; //     payload = LoRa bytes; firmware runs atomic CAD+backoff+key-up
-// #52 on-device NDN data plane (name filter / relay / CS-serve / dedup / hop / stats).
-const CMD_SET_NAME_FILTER: u8 = 0x0F; // payload = [u64 BE hash]*  (empty clears → pass-all)
+
+// ---- Host -> node ----
+const CMD_TX: u8 = 0x01; //            payload = frame bytes
+const CMD_SET_FREQ: u8 = 0x02; //      payload = u32 BE Hz
+const CMD_SET_MOD: u8 = 0x03; //       payload = [sf, bw_code, cr_code]  (bw_code is PER NODE — see `bw_to_fw`)
+const CMD_SET_PWR: u8 = 0x04; //       payload = [i8 dBm]
+const CMD_SET_SYNC: u8 = 0x05; //      payload = [sx127x sync byte]
+const CMD_GET_INFO: u8 = 0x06; //      payload = []                     -> EVT_INFO
+const CMD_SET_BEACON: u8 = 0x07; //    payload = [enabled(0/1)]  (opt [enabled, period_mult])
+const CMD_CAD: u8 = 0x08; //           payload = []                     -> EVT_CAD  [busy]
+const CMD_GET_RSSI: u8 = 0x09; //      payload = []                     -> EVT_RSSI [rssi i16 BE]
+const CMD_SET_CAD_CFG: u8 = 0x0A; //   payload = [sym, det_peak, det_min]
+const CMD_SET_LBT_CFG: u8 = 0x0B; //   payload = [cw_ms(2 BE), max_backoff, max_attempts]
+const CMD_SET_PREAMBLE: u8 = 0x0C; //  payload = [preamble(2 BE)]
+const CMD_SF_SCAN: u8 = 0x0D; //       payload = []                     -> EVT_SF_DETECTED [sf | 0]
+const CMD_TX_LBT: u8 = 0x0E; //        payload = frame bytes; firmware runs atomic CAD+backoff+key-up
+const CMD_SET_NAME_FILTER: u8 = 0x0F; // payload = [u64 BE hash]*  (empty clears -> pass-all)
 const CMD_SET_RELAY: u8 = 0x10; //       payload = [u64 BE hash]*  (relay set; empty clears)
 const CMD_DATAPLANE: u8 = 0x11; //       payload = [cs_serve, dedup, hop_on, hop_base_ch, hop_span]
-const CMD_GET_STATS: u8 = 0x13; //       payload = []              → EVT_STATS
-const CMD_RESET_STATS: u8 = 0x14; //     payload = []              (clear all counters)
-const CMD_SET_DEBUG: u8 = 0x15; //       payload = [on]            (toggle EVT_LOG diagnostics)
-const CMD_ENTER_BOOTLOADER: u8 = 0x16; // payload = [0xB0,0x07]    (jump to ROM UART bootloader)
-// Firmware -> host events.
-const EVT_RX: u8 = 0x81; //     payload = [rssi i16 BE, snr i16 BE, ts_ms u32 BE, LoRa bytes] (#52)
-const EVT_TXDONE: u8 = 0x82; // payload = [ok, attempts]  (#52: attempts=0 for a plain CMD_TX)
+const CMD_SET_SENSE_CFG: u8 = 0x12; //   payload = [rssi_thresh i16 BE, cad_repeat]
+const CMD_GET_STATS: u8 = 0x13; //       payload = []                   -> EVT_STATS
+const CMD_RESET_STATS: u8 = 0x14; //     payload = []                   (clear all counters)
+const CMD_SET_DEBUG: u8 = 0x15; //       payload = [on]                 (toggle EVT_LOG diagnostics)
+const CMD_ENTER_BOOTLOADER: u8 = 0x16; // payload = [0xB0,0x07]         (jump to the ROM bootloader)
+// --- v2 additions ---
+const CMD_READ_CLOCK: u8 = 0x17; //      payload = []                   -> EVT_CLOCK
+const CMD_TX_AT: u8 = 0x18; //           payload = [delay_us u32 BE][frame] -> EVT_TXDONE
+const CMD_GET_CAP: u8 = 0x1A; //         payload = []                   -> EVT_CAP
+const CMD_SENSE: u8 = 0x1B; //           payload = []                   -> EVT_SENSE
+
+// ---- Node -> host ----
+const EVT_RX: u8 = 0x81; //     payload = [rssi i16 BE, snr i16 BE, ts u32 BE, frame bytes]
+//                              ★ `ts` is in EVT_CAP.stamp_hz ticks — NOT milliseconds, NOT µs.
+const EVT_TXDONE: u8 = 0x82; // payload = [ok, attempts]
 const EVT_INFO: u8 = 0x83; //   payload = [status, sync(2), errors(2), freq(4), sf, bw, cr, pwr, lost(2), cad_busy(2), defer(2)]
-const EVT_LOG: u8 = 0x84; //    payload = ascii
-// #52 events (only parsed when the LBT/CAD host paths are wired; harmless to receive otherwise).
+const EVT_LOG: u8 = 0x84; //    payload = ascii (unsolicited; never satisfies a command wait)
 const EVT_CAD: u8 = 0x85; //    payload = [busy(0/1)]
 const EVT_RSSI: u8 = 0x86; //   payload = [rssi i16 BE]
 const EVT_SF_DETECTED: u8 = 0x87; // payload = [sf | 0]
-const EVT_TX_STARTED: u8 = 0x88; //  payload = [airtime_ms u16 BE]
-const EVT_STATS: u8 = 0x89; //   payload = [rx(4), filtered(4), deduped(4), served(4), relayed(4), cad_busy(2), defer(2)]
+const EVT_TX_STARTED: u8 = 0x88; //  payload = [airtime_ms u16 BE] — emitted just before key-up
+const EVT_STATS: u8 = 0x89; //  payload = [rx(4), filtered(4), deduped(4), served(4), relayed(4), cad_busy(2), defer(2)]
+// --- v2 additions ---
+const EVT_CLOCK: u8 = 0x8A; //  payload = [ticks u64 BE]   units = EVT_CAP.stamp_hz
+const EVT_CAP: u8 = 0x8B; //    payload = 29 bytes, all multi-byte fields BIG-ENDIAN (see `NodeProfile::parse`)
+const EVT_SENSE: u8 = 0x8C; //  payload = [activity u16 BE, rssi i16 BE]
+const EVT_UNSUPPORTED: u8 = 0x8F; // payload = [cmd, reason] — the node does not implement `cmd`
 
-/// Largest NDN payload carried in one LoRa frame. The SX1262 LoRa PHY caps a frame near 255 bytes;
-/// keeping a margin means one NDN packet is exactly one air frame — loss stays atomic (a dropped
-/// frame loses one packet, never desyncs a larger one).
+/// `EVT_UNSUPPORTED` reason codes — **the fleet-wide space**, written down once here so it stops
+/// drifting. The LR2021 firmware once numbered these 1/2/3 = not-implemented/param/hardware, which
+/// swapped `NO_HARDWARE` and `BAD_LENGTH` relative to the two LoRa nodes; nothing on the wire
+/// distinguished the conventions, so a `CMD_TX_AT` refusal decoded as "short payload".
+mod unsup {
+    /// The node does not know the opcode at all — an older firmware, or a different radio kind.
+    pub const UNKNOWN_OPCODE: u8 = 0x01;
+    /// The opcode is understood; this board's hardware cannot do it. No firmware fixes it.
+    pub const NO_HARDWARE: u8 = 0x02;
+    /// The opcode is understood; the payload did not satisfy its argument requirements.
+    pub const BAD_LENGTH: u8 = 0x03;
+    /// An argument outside the range the node's `EVT_CAP` advertises.
+    pub const OUT_OF_RANGE: u8 = 0x04;
+
+    /// Render a reason byte for a log line. Unknown codes print as the raw number rather than being
+    /// forced into a name they may not have.
+    pub fn name(r: u8) -> &'static str {
+        match r {
+            UNKNOWN_OPCODE => "unknown-opcode",
+            NO_HARDWARE => "no-hardware",
+            BAD_LENGTH => "bad-length",
+            OUT_OF_RANGE => "out-of-range",
+            _ => "?",
+        }
+    }
+}
+
+/// The 7E-A5 protocol version this host speaks and understands in `EVT_CAP[0]`.
+pub const PROTO_VER: u8 = 2;
+
+/// The host's own per-frame payload budget: one NDN packet is exactly one air frame, so a lost frame
+/// loses one packet and never desynchronises a larger one. A LoRa PHY caps a frame near 255 bytes;
+/// this keeps a margin.
+///
+/// **This is a ceiling, not the cap.** The effective cap is
+/// `min(MAX_LORA_PAYLOAD, NodeProfile::max_payload)` — see
+/// [`LoraSerialBackend::max_payload`] — because a node may be much smaller (the LR2021 runs a
+/// fixed 48-byte FLRC frame).
 pub const MAX_LORA_PAYLOAD: usize = 240;
 
-/// The Waveshare/firmware channel convention: channel index → carrier = `(850 + ch)` MHz
-/// (ch 18 = 868 EU, ch 65 = 915 US). Kept so cognition can keep thinking in channels.
+/// Legacy TX-power span, dBm — what this backend assumed for every node before `EVT_CAP` existed
+/// (and what [`RadioCapability::lora`] advertises). Used only for a node that reports no range of
+/// its own, and only on the *index* knob, which is a back-off dial where clamping low is safe.
+const LEGACY_PWR_MIN_DBM: i8 = 10;
+const LEGACY_PWR_MAX_DBM: i8 = 22;
+
+/// **The end-to-end payload cap of a node running PRE-v2 firmware — 64, not 240.**
+///
+/// A profile's `max_payload` is defined as `min(TX accept, RX buffer, on-air PDU)`, and on the old
+/// Waveshare firmware those three disagree badly: it accepts 240 bytes on `CMD_TX` and transmits
+/// them, but its receive path is `rxbuf = [0u8; 64]` with the event buffer sized `8 + 64`, so
+/// anything longer comes back **silently truncated** — the frame still arrives, so no delivery
+/// number shows it. Reporting 240 here would let the face size an MTU that corrupts on receive,
+/// which is the exact defect class this profile exists to stop.
+///
+/// A node whose firmware carries the fix reports its real cap in `EVT_CAP` and never reaches this
+/// constant. This is only the honest floor for a dongle nobody has reflashed.
+const LEGACY_RX_TRUNCATION_CAP: u16 = 64;
+
+/// The Waveshare/firmware channel convention: channel index -> carrier = `(850 + ch)` MHz
+/// (ch 18 = 868 EU, ch 65 = 915 US, ch 78 = 928 = the US band edge). Kept so cognition keeps
+/// thinking in channels.
 fn channel_to_hz(ch: u8) -> u32 {
     (850 + ch as u32) * 1_000_000
 }
 
-/// Host bandwidth code (0/1/2 = 125/250/500 kHz) → SX1262 modulation bandwidth code.
-fn bw_to_fw(bw: u8) -> u8 {
-    match bw {
-        0 => 0x04, // 125 kHz
-        1 => 0x05, // 250 kHz
-        _ => 0x06, // 500 kHz
+/// Inverse of [`channel_to_hz`], saturating below 850 MHz.
+fn hz_to_channel(hz: u32) -> u8 {
+    ((hz / 1_000_000).saturating_sub(850)).min(255) as u8
+}
+
+/// The three LoRa channel bandwidths this protocol can name, in kHz, indexed by the **host** code
+/// carried in [`LoraParams::bw`]. Airtime is computed from these, so they are the single source.
+const BW_KHZ: [u32; 3] = [125, 250, 500];
+
+/// Host bandwidth code (0/1/2 = 125/250/500 kHz) -> the byte **this node's firmware** expects in
+/// `CMD_SET_MOD[1]`.
+///
+/// ⚠ **The code space is per-node and the mismatch is silent.** The Waveshare firmware passes the
+/// byte straight through to the SX1262's `SetModulationParams`, whose LoRa bandwidth codes are
+/// `0x04/0x05/0x06`. The Heltec firmware instead decodes `0/1/2` (`bw_from` in
+/// `firmware/heltec-lora-rs/src/main.rs`) and maps **anything else to 125 kHz** — so sending the
+/// SX1262 codes there silently pins the radio to 125 kHz forever, with `EVT_INFO` reporting the
+/// value the host asked for. Nothing on the wire distinguishes the two conventions, which is why
+/// this is keyed on the node's own declared [`LoraRadioKind`] and pinned by a table test.
+fn bw_to_fw(kind: LoraRadioKind, bw: u8) -> u8 {
+    let bw = bw.min(2);
+    match kind {
+        // SX127x path (our Heltec firmware): the wire code IS the host code.
+        LoraRadioKind::Sx1276 => bw,
+        // SX126x path (Waveshare) and the default for anything that has not told us otherwise:
+        // the SX1262 LoRa modulation-bandwidth register values.
+        _ => 0x04 + bw,
     }
 }
 
 /// A `HostRecv` [`LinkStamp`]: nanoseconds since process start (monotonic), latched when the serial
-/// line delivered the frame — the coarsest but honest time a serial LoRa bridge can offer.
+/// line delivered the frame — the coarsest but honest time a serial bridge can offer.
 fn host_stamp() -> LinkStamp {
     static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
     let start = START.get_or_init(Instant::now);
@@ -111,14 +218,602 @@ fn host_stamp() -> LinkStamp {
     )
 }
 
-/// Radio parameters programmed over the binary protocol at open. Two dongles must agree on
-/// frequency, SF, BW, CR and sync word to hear each other; [`Default`] is 915 MHz (US) / SF7 /
-/// 125 kHz / 4-5 / private sync — matching the firmware defaults and the Heltec interop node.
+/// A per-device clock domain, derived from the port path.
+///
+/// Two dongles on one host are two different physical counters, so they MUST NOT share a domain —
+/// `ndn-time` would otherwise subtract stamps from unrelated oscillators and call the difference an
+/// offset. Same construction as [`crate::bw16_clock_domain`], tagged `"LR"`.
+pub fn lora_clock_domain(path: &str) -> ClockDomainId {
+    let mut h: u32 = 0x811c_9dc5;
+    for b in path.bytes() {
+        h ^= b as u32;
+        h = h.wrapping_mul(0x0100_0193);
+    }
+    ClockDomainId((h & 0x00ff_ffff) | 0x4C52_0000) // "LR" tag in the top bytes
+}
+
+// ---------------------------------------------------------------------------
+// The node profile — the ONE place a node describes itself.
+// ---------------------------------------------------------------------------
+
+/// Which radio is on the far end of the serial link (`EVT_CAP[1]`).
+///
+/// This is a *modem* identity, not a band or a rate: it selects the register conventions the wire
+/// bytes use (see [`bw_to_fw`]) and whether "spreading factor" is even a meaningful concept.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LoraRadioKind {
+    /// Semtech SX1262 (the Waveshare USB-TO-LoRa dongle).
+    Sx1262,
+    /// Semtech SX1276 (the Heltec LoRa32 V2).
+    Sx1276,
+    /// Semtech LR2021 running **FLRC** — a fixed-rate, non-LoRa modulation: no spreading factor,
+    /// no coding-rate dial in the LoRa sense.
+    Lr2021Flrc,
+    /// Semtech LR2021 running LoRa.
+    Lr2021Lora,
+    /// A code this host does not know. Treated conservatively (SX126x wire conventions).
+    Unknown(u8),
+}
+
+impl LoraRadioKind {
+    /// Decode `EVT_CAP[1]`.
+    pub fn from_code(c: u8) -> Self {
+        match c {
+            0 => LoraRadioKind::Sx1262,
+            1 => LoraRadioKind::Sx1276,
+            2 => LoraRadioKind::Lr2021Flrc,
+            3 => LoraRadioKind::Lr2021Lora,
+            other => LoraRadioKind::Unknown(other),
+        }
+    }
+
+    /// The `EVT_CAP[1]` code.
+    pub fn code(self) -> u8 {
+        match self {
+            LoraRadioKind::Sx1262 => 0,
+            LoraRadioKind::Sx1276 => 1,
+            LoraRadioKind::Lr2021Flrc => 2,
+            LoraRadioKind::Lr2021Lora => 3,
+            LoraRadioKind::Unknown(c) => c,
+        }
+    }
+
+    /// Whether the modulation is LoRa chirp spread spectrum — i.e. whether SF/BW/CR mean anything
+    /// and whether the LoRa airtime formula applies. `false` for FLRC.
+    pub fn is_lora_modulation(self) -> bool {
+        !matches!(self, LoraRadioKind::Lr2021Flrc)
+    }
+}
+
+/// What the `ts` field of `EVT_RX` actually is (`EVT_CAP[16]`).
+///
+/// The whole point of the field: **the units and the trustworthiness are per node**. The Waveshare
+/// fills it with a millisecond software counter; the LR2021 fills the same field with a 16 MHz
+/// hardware capture. Reading one as the other is a 16 000× error, so nothing here converts without
+/// consulting this.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StampKind {
+    /// No per-frame stamp at all; the `ts` field carries nothing.
+    NoStamp,
+    /// The node has no hardware stamp and says so — the host latches arrival instead.
+    HostRecv,
+    /// A software counter on the device (an MCU tick / millisecond count). Monotonic-ish, but it
+    /// runs in the firmware's scheduler, so it is NOT a common-view-grade counter.
+    SoftwareCounter,
+    /// A free-running **hardware** capture latched by the radio/timer peripheral. This is the one
+    /// that unlocks common view.
+    HardwareFreeRun,
+    /// A code this host does not know — treated as [`NoStamp`](Self::NoStamp).
+    Unknown(u8),
+}
+
+impl StampKind {
+    /// Decode `EVT_CAP[16]`.
+    pub fn from_code(c: u8) -> Self {
+        match c {
+            0 => StampKind::NoStamp,
+            1 => StampKind::HostRecv,
+            2 => StampKind::SoftwareCounter,
+            3 => StampKind::HardwareFreeRun,
+            other => StampKind::Unknown(other),
+        }
+    }
+
+    /// The `EVT_CAP[16]` code.
+    pub fn code(self) -> u8 {
+        match self {
+            StampKind::NoStamp => 0,
+            StampKind::HostRecv => 1,
+            StampKind::SoftwareCounter => 2,
+            StampKind::HardwareFreeRun => 3,
+            StampKind::Unknown(c) => c,
+        }
+    }
+}
+
+/// **What one node on the 7E-A5 link can actually do** — parsed from its `EVT_CAP`, or pinned from a
+/// written-down constant for firmware that predates `CMD_GET_CAP`.
+///
+/// Every field is either something the device told us or something recorded in this file with a
+/// citation. Nothing here is inferred from a family name: a "LoRa dongle" is not a power range, and
+/// "it's sub-GHz" is not a frequency span.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NodeProfile {
+    /// Protocol version the node speaks (`EVT_CAP[0]`; [`PROTO_VER`] here).
+    pub proto_ver: u8,
+    /// Which modem is on the far end.
+    pub radio_kind: LoraRadioKind,
+    /// Lowest carrier the node will accept, Hz.
+    pub freq_min_hz: u32,
+    /// Highest carrier the node will accept, Hz.
+    pub freq_max_hz: u32,
+    /// Lowest commandable TX power, **real dBm** (never a chip register unit).
+    pub pwr_min_dbm: i8,
+    /// Highest commandable TX power, real dBm. `pwr_min == pwr_max == 0` means *unknown*, and
+    /// [`dbm_range`](Self::dbm_range) then reports `None` rather than a fabricated span.
+    pub pwr_max_dbm: i8,
+    /// Ticks per second of the `EVT_RX` `ts` field. `0` = no per-frame stamp.
+    pub stamp_hz: u32,
+    /// What that stamp *is*.
+    pub stamp_kind: StampKind,
+    /// The REAL end-to-end payload cap: `min(TX accept, RX buffer, on-air PDU)`.
+    pub max_payload: u16,
+    /// Bit N set == opcode N implemented. All 7E-A5 opcodes are < 32.
+    pub cmd_bitmap: u32,
+    /// Spreading-factor span. `0/0` when the node has no spreading factor (FLRC).
+    pub sf_min: u8,
+    /// Spreading-factor span, upper end.
+    pub sf_max: u8,
+    /// Hardware-scheduled-TX granularity, ns. `0` = the node cannot place a frame in time.
+    pub sched_gran_ns: u32,
+    /// `true` when this came from the device's own `EVT_CAP`; `false` when it is a host-side
+    /// fallback. Surfaced so a bring-up tool can tell "the node said so" from "we assumed".
+    pub learned: bool,
+}
+
+impl NodeProfile {
+    /// Parse the 29-byte `EVT_CAP` payload. Returns `None` if it is short or the version is one this
+    /// host does not speak — a truncated capability is not a capability.
+    pub fn parse(p: &[u8]) -> Option<Self> {
+        if p.len() < 29 {
+            return None;
+        }
+        let u32be = |o: usize| u32::from_be_bytes([p[o], p[o + 1], p[o + 2], p[o + 3]]);
+        let u16be = |o: usize| u16::from_be_bytes([p[o], p[o + 1]]);
+        let proto_ver = p[0];
+        if proto_ver > PROTO_VER {
+            // A newer node may have re-laid the tail of this struct; refuse rather than mis-read it.
+            return None;
+        }
+        Some(Self {
+            proto_ver,
+            radio_kind: LoraRadioKind::from_code(p[1]),
+            freq_min_hz: u32be(2),
+            freq_max_hz: u32be(6),
+            pwr_min_dbm: p[10] as i8,
+            pwr_max_dbm: p[11] as i8,
+            stamp_hz: u32be(12),
+            stamp_kind: StampKind::from_code(p[16]),
+            max_payload: u16be(17),
+            cmd_bitmap: u32be(19),
+            sf_min: p[23],
+            sf_max: p[24],
+            sched_gran_ns: u32be(25),
+            learned: true,
+        })
+    }
+
+    /// Serialise back to the 29-byte `EVT_CAP` payload — used by the tests to pin the wire layout
+    /// from the host side, and by any host-side emulator of a node.
+    pub fn to_cap_payload(&self) -> [u8; 29] {
+        let mut p = [0u8; 29];
+        p[0] = self.proto_ver;
+        p[1] = self.radio_kind.code();
+        p[2..6].copy_from_slice(&self.freq_min_hz.to_be_bytes());
+        p[6..10].copy_from_slice(&self.freq_max_hz.to_be_bytes());
+        p[10] = self.pwr_min_dbm as u8;
+        p[11] = self.pwr_max_dbm as u8;
+        p[12..16].copy_from_slice(&self.stamp_hz.to_be_bytes());
+        p[16] = self.stamp_kind.code();
+        p[17..19].copy_from_slice(&self.max_payload.to_be_bytes());
+        p[19..23].copy_from_slice(&self.cmd_bitmap.to_be_bytes());
+        p[23] = self.sf_min;
+        p[24] = self.sf_max;
+        p[25..29].copy_from_slice(&self.sched_gran_ns.to_be_bytes());
+        p
+    }
+
+    /// Does this node implement `cmd`? Every 7E-A5 opcode is < 32, so an opcode outside that is a
+    /// host bug, not an unsupported command — report it as unsupported anyway rather than panic.
+    pub fn supports(&self, cmd: u8) -> bool {
+        cmd < 32 && self.cmd_bitmap & (1u32 << cmd) != 0
+    }
+
+    /// The absolute-dBm control range, or `None` when the node has never told us one. `None` is what
+    /// makes [`RadioKnobs::set_tx_power_dbm`] refuse rather than clamp into an invented span.
+    pub fn dbm_range(&self) -> Option<DbmRange> {
+        (self.pwr_min_dbm != 0 || self.pwr_max_dbm != 0)
+            .then(|| DbmRange::new(self.pwr_min_dbm, self.pwr_max_dbm))
+    }
+
+    /// Clamp a requested dBm into the node's range; falls back to the legacy 10–22 dBm span when the
+    /// node reports none, because the index knob still has to send *some* byte and a low clamp is the
+    /// safe direction for a back-off dial.
+    pub fn clamp_dbm(&self, dbm: i8) -> i8 {
+        match self.dbm_range() {
+            Some(r) => r.clamp(dbm),
+            None => dbm.clamp(LEGACY_PWR_MIN_DBM, LEGACY_PWR_MAX_DBM),
+        }
+    }
+
+    /// Clamp a carrier into the node's frequency span. A zero/degenerate span means "unknown", and
+    /// the request passes through untouched rather than being pinned to 0 Hz.
+    pub fn clamp_hz(&self, hz: u32) -> u32 {
+        if self.freq_min_hz == 0 || self.freq_max_hz < self.freq_min_hz {
+            hz
+        } else {
+            hz.clamp(self.freq_min_hz, self.freq_max_hz)
+        }
+    }
+
+    /// Clamp a spreading factor into the node's span; `None` when the node has no SF at all, which
+    /// is a different answer from "SF 7" and must not be collapsed into one.
+    pub fn clamp_sf(&self, sf: u8) -> Option<u8> {
+        (self.sf_min > 0 && self.sf_max >= self.sf_min).then(|| sf.clamp(self.sf_min, self.sf_max))
+    }
+
+    /// Does the `sf` byte of `CMD_SET_MOD`/`EVT_INFO` actually mean a spreading factor on this node?
+    ///
+    /// `false` for a fixed-rate modulation (FLRC), where the fleet's byte positions are reused with
+    /// chip-specific meanings — see [`LoraSerialBackend::send_mod`]. It gates the whole triple, not
+    /// just the `sf` byte, because `cr` is re-keyed on such a node too.
+    pub fn has_spreading_factor(&self) -> bool {
+        self.sf_min > 0 && self.sf_max >= self.sf_min
+    }
+
+    /// Nanoseconds per `ts` tick, or `None` when the node stamps nothing. 16 MHz -> 63 ns (the
+    /// integer-ns rounding of a MEASURED 62.5 ns tick).
+    pub fn tick_ns(&self) -> Option<u32> {
+        (self.stamp_hz > 0)
+            .then(|| ((1_000_000_000f64 / self.stamp_hz as f64).round() as u32).max(1))
+    }
+
+    /// Can the host read this node's clock on demand (`CMD_READ_CLOCK` -> `EVT_CLOCK`)?
+    pub fn has_readable_clock(&self) -> bool {
+        self.supports(CMD_READ_CLOCK) && self.stamp_hz > 0
+    }
+
+    /// **Does this node place TX in time?** Both halves must hold: a declared granularity AND the
+    /// opcode that actuates it. A node claiming one without the other is inconsistent, and believing
+    /// it is exactly the failure [`FrameIo::schedules_tx`] warns about — the caller would skip its
+    /// own software gate and the frame would go out ungated, now.
+    pub fn schedules_tx(&self) -> bool {
+        self.sched_gran_ns > 0 && self.supports(CMD_TX_AT)
+    }
+
+    /// The channels this node can actually be tuned to, in the `(850 + ch)` MHz convention.
+    /// `tuned` is the fallback when the node's frequency span names no channel in that convention
+    /// (e.g. a 2.4 GHz LR2021) — reporting the one channel we know is live beats reporting none.
+    pub fn channels(&self, tuned: u8) -> Vec<u8> {
+        let chans: Vec<u8> = (0u8..=255)
+            .filter(|&ch| {
+                let hz = channel_to_hz(ch);
+                hz >= self.freq_min_hz && hz <= self.freq_max_hz
+            })
+            .collect();
+        if chans.is_empty() { vec![tuned] } else { chans }
+    }
+
+    /// The regulatory TX-airtime ceiling for the band this carrier sits in.
+    ///
+    /// **`0.01` is the ETSI EU868 figure and is simply wrong in the US.** FCC part 15.247 imposes no
+    /// duty fraction on a digitally-modulated 902–928 MHz system (it constrains power and, for
+    /// frequency hoppers, dwell — neither is a duty cycle), so a US-915 node that declared 1% was
+    /// telling the planner it may use 1/100th of the airtime it actually may. Decided from the
+    /// carrier rather than baked into a constructor.
+    pub fn duty_cycle_max(&self, carrier_hz: u32) -> f32 {
+        match carrier_hz {
+            863_000_000..=870_000_000 => 0.01, // ETSI EN 300 220 g1 band: 1% duty cycle
+            902_000_000..=928_000_000 => 1.0,  // FCC 15.247 digital modulation: no duty fraction
+            _ => 1.0, // unknown band: do not invent a restriction the planner would obey
+        }
+    }
+
+    /// The RF band(s) this node's frequency span lands in — the coarse reach axis.
+    pub fn bands(&self) -> Vec<Band> {
+        let mut v = Vec::new();
+        if self.freq_min_hz < 1_000_000_000 {
+            v.push(Band::Sub1GHz);
+        }
+        if self.freq_max_hz >= 2_400_000_000 {
+            v.push(Band::Band2_4GHz);
+        }
+        if v.is_empty() {
+            v.push(Band::Sub1GHz);
+        }
+        v
+    }
+}
+
+/// Build a `cmd_bitmap` from a list of opcodes.
+const fn cmd_bits(cmds: &[u8]) -> u32 {
+    let mut m = 0u32;
+    let mut i = 0;
+    while i < cmds.len() {
+        m |= 1u32 << cmds[i];
+        i += 1;
+    }
+    m
+}
+
+/// **Which node to assume when its firmware predates `CMD_GET_CAP`.**
+///
+/// A hint is a *fallback*, never an override: [`LoraSerialBackend::open_as`] still asks the device
+/// first, and a real `EVT_CAP` always wins. Each variant's profile is written down below with the
+/// source of every number.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RadioKindHint {
+    /// The Waveshare USB-TO-LoRa dongle (GD32 + SX1262) running `firmware/waveshare-lora-rs`.
+    WaveshareSx1262,
+    /// The Heltec LoRa32 V2 (ESP32 + SX1276) running `firmware/heltec-lora-rs`.
+    HeltecSx1276,
+    /// The XIAO nRF54L15 + LR2021 bridge running `firmware/lr2021-nrf54l15-rs` (`m6_bridge`).
+    Lr2021Flrc,
+}
+
+impl RadioKindHint {
+    /// The pinned profile for this node. See [`NodeProfile::legacy_sx1262`] and friends.
+    pub fn profile(self) -> NodeProfile {
+        match self {
+            RadioKindHint::WaveshareSx1262 => NodeProfile::legacy_sx1262(),
+            RadioKindHint::HeltecSx1276 => NodeProfile::heltec_sx1276(),
+            RadioKindHint::Lr2021Flrc => NodeProfile::lr2021_flrc(),
+        }
+    }
+}
+
+impl NodeProfile {
+    /// **The legacy profile** — exactly what this backend assumed about every node before `EVT_CAP`
+    /// existed, so an un-reflashed Waveshare dongle opens and behaves as it always has.
+    ///
+    /// Sources, field by field: the 902–928 MHz span is the image calibration the firmware performs
+    /// (`firmware/waveshare-lora-rs/src/sx1262.rs`, "US 902-928 image cal"); 10–22 dBm is the span
+    /// this file has always clamped to and that [`RadioCapability::lora`] advertises; `stamp_hz =
+    /// 1000` / `SoftwareCounter` is the firmware's `ts_ms` MCU millisecond counter; the command set
+    /// is opcodes `0x01..=0x16`, every one of which that firmware implements; SF 7–12 is the SX1262
+    /// LoRa span. `sched_gran_ns = 0` because that firmware has no scheduled-TX path at all — not
+    /// because it was not measured.
+    pub fn legacy_sx1262() -> Self {
+        Self {
+            proto_ver: 1, // pre-v2: this node never answered CMD_GET_CAP
+            radio_kind: LoraRadioKind::Sx1262,
+            freq_min_hz: 902_000_000,
+            freq_max_hz: 928_000_000,
+            pwr_min_dbm: LEGACY_PWR_MIN_DBM,
+            pwr_max_dbm: LEGACY_PWR_MAX_DBM,
+            stamp_hz: 1_000,
+            stamp_kind: StampKind::SoftwareCounter,
+            // NOT `MAX_LORA_PAYLOAD` (240) — that is what this firmware ACCEPTS on TX; its receive
+            // path truncates at 64 and says nothing. See `LEGACY_RX_TRUNCATION_CAP`.
+            max_payload: LEGACY_RX_TRUNCATION_CAP,
+            cmd_bitmap: cmd_bits(&[
+                CMD_TX,
+                CMD_SET_FREQ,
+                CMD_SET_MOD,
+                CMD_SET_PWR,
+                CMD_SET_SYNC,
+                CMD_GET_INFO,
+                CMD_SET_BEACON,
+                CMD_CAD,
+                CMD_GET_RSSI,
+                CMD_SET_CAD_CFG,
+                CMD_SET_LBT_CFG,
+                CMD_SET_PREAMBLE,
+                CMD_SF_SCAN,
+                CMD_TX_LBT,
+                CMD_SET_NAME_FILTER,
+                CMD_SET_RELAY,
+                CMD_DATAPLANE,
+                CMD_SET_SENSE_CFG,
+                CMD_GET_STATS,
+                CMD_RESET_STATS,
+                CMD_SET_DEBUG,
+                CMD_ENTER_BOOTLOADER,
+            ]),
+            sf_min: 7,
+            sf_max: 12,
+            sched_gran_ns: 0,
+            learned: false,
+        }
+    }
+
+    /// The Heltec LoRa32 V2 (ESP32 + SX1276) as `firmware/heltec-lora-rs` currently stands.
+    ///
+    /// ⚠ **Not exercised on air** — mds-o5p-2's sshd is down, so this board has never been flashed or
+    /// measured; every field below comes from the firmware source or the SX1276 datasheet, and the
+    /// board's own `EVT_CAP` must replace it. The command set is the opcodes that firmware actually
+    /// decodes (note `CMD_SET_SYNC` is **absent** — it acks unknown commands with `EVT_INFO`, so
+    /// without this gate the host would "successfully" set a sync word that was never applied).
+    /// 2–17 dBm is the SX1276 PA_BOOST span (datasheet; PA_DAC +20 dBm is not enabled), corroborated
+    /// by the firmware's `pwr: 17` default.
+    pub fn heltec_sx1276() -> Self {
+        Self {
+            proto_ver: 1,
+            radio_kind: LoraRadioKind::Sx1276,
+            freq_min_hz: 902_000_000,
+            freq_max_hz: 928_000_000,
+            pwr_min_dbm: 2,
+            pwr_max_dbm: 17,
+            stamp_hz: 1_000, // firmware EVT_RX carries `ts_ms u32 BE`
+            stamp_kind: StampKind::SoftwareCounter,
+            max_payload: MAX_LORA_PAYLOAD as u16,
+            cmd_bitmap: cmd_bits(&[
+                CMD_TX,
+                CMD_SET_FREQ,
+                CMD_SET_MOD,
+                CMD_SET_PWR,
+                CMD_GET_INFO,
+                CMD_CAD,
+                CMD_GET_RSSI,
+                CMD_TX_LBT,
+                CMD_GET_STATS,
+            ]),
+            sf_min: 7,
+            sf_max: 12,
+            sched_gran_ns: 0,
+            learned: false,
+        }
+    }
+
+    /// The XIAO nRF54L15 + LR2021 bridge (`m6_bridge`), FLRC at 915 MHz.
+    ///
+    /// ★ **`CMD_SET_FREQ` is deliberately absent from the bitmap.** Retuning that firmware was
+    /// MEASURED to permanently break its transmit path, so the capability gate is the mechanism that
+    /// keeps a generic host — which would otherwise send `SET_FREQ` at every open — from bricking the
+    /// link. The frequency span is pinned to the one carrier the board is known-good on for the same
+    /// reason.
+    ///
+    /// `stamp_hz = 16_000_000` is MEASURED, not assumed: 15 frames at ~1 s spacing gave deltas of
+    /// 16 616 401..16 625 857 ticks, and `firmware/lr2021-nrf54l15-rs/src/timing.rs` declares
+    /// `TICKS_PER_US = 16`. That 62.5 ns hardware capture is what makes this node the only one in the
+    /// fleet that can source common view. `max_payload = 48` is `flrc_link::FRAME_LEN` — the fixed
+    /// on-air PDU, which is far below the 255 bytes its serial parser would accept, and the smaller
+    /// side is the one that must be reported. Power: this firmware implements `CMD_SET_PWR` but has
+    /// never declared or measured a dBm span, so the range is left **unknown (0/0)** and the absolute
+    /// power knob refuses rather than clamping into an invented one.
+    ///
+    /// ⚠ This profile describes the **pre-v2 `m6_bridge`** — the build that shipped before
+    /// `CMD_GET_CAP`, and the only situation in which this fallback is ever used. That build also
+    /// numbered `EVT_STATS` as 0x87, which the fleet assigns to `EVT_SF_DETECTED`, so
+    /// [`ndn_stats`](LoraSerialBackend::ndn_stats) times out against it; the host deliberately does
+    /// not shim that, because a compatibility shim would entrench the divergence in a second place.
+    /// A board carrying the v2 firmware answers `CMD_GET_CAP` and none of this is consulted — which
+    /// is the point: the numbers here are a floor for an un-reflashed board, not a claim about what
+    /// that firmware is today.
+    pub fn lr2021_flrc() -> Self {
+        Self {
+            proto_ver: 1,
+            radio_kind: LoraRadioKind::Lr2021Flrc,
+            freq_min_hz: 915_000_000,
+            freq_max_hz: 915_000_000,
+            pwr_min_dbm: 0, // UNKNOWN — never declared in firmware, never measured
+            pwr_max_dbm: 0,
+            stamp_hz: 16_000_000, // MEASURED (62.5 ns); timing.rs TICKS_PER_US = 16
+            stamp_kind: StampKind::HardwareFreeRun,
+            max_payload: 48, // flrc_link::FRAME_LEN — the fixed on-air PDU
+            cmd_bitmap: cmd_bits(&[
+                CMD_TX,
+                CMD_SET_PWR,
+                CMD_GET_INFO,
+                CMD_GET_RSSI,
+                CMD_SET_NAME_FILTER,
+                CMD_SET_RELAY,
+                CMD_DATAPLANE,
+                CMD_GET_STATS,
+                CMD_RESET_STATS,
+            ]),
+            sf_min: 0, // FLRC has no spreading factor — not "SF 7", none
+            sf_max: 0,
+            sched_gran_ns: 0, // no CMD_TX_AT in m6_bridge yet
+            learned: false,
+        }
+    }
+}
+
+/// Resolve the profile to use: the device's own `EVT_CAP` if it answered, else the pinned hint, else
+/// the legacy profile. Split out as a pure function so the fallback path is testable without hardware.
+fn resolve_profile(cap: Option<&[u8]>, hint: Option<RadioKindHint>) -> NodeProfile {
+    cap.and_then(NodeProfile::parse).unwrap_or_else(|| {
+        hint.map(RadioKindHint::profile)
+            .unwrap_or_else(NodeProfile::legacy_sx1262)
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Airtime — the physics that bounds every transmit wait.
+// ---------------------------------------------------------------------------
+
+/// **LoRa time-on-air, milliseconds** (Semtech AN1200.13 / SX1276 datasheet §4.1.1.7).
+///
+/// ```text
+///   T_sym     = 2^SF / BW
+///   T_preamble= (n_preamble + 4.25) · T_sym
+///   n_payload = 8 + max(ceil((8·PL − 4·SF + 28 + 16·CRC − 20·IH) / (4·(SF − 2·DE))), 0) · (CR + 4)
+/// ```
+///
+/// with an explicit header (`IH = 0`), CRC on, and the low-data-rate optimisation `DE = 1` where the
+/// standard requires it (SF11/SF12 at 125 kHz). This is why a fixed 3 s transmit timeout was a bug
+/// rather than a rounding error: at SF12/125 kHz/CR 4-5 a 240-byte frame is **~8.5 s** on air, so the
+/// host abandoned every long-reach transmission it ever asked for, ~5.5 s before the radio finished.
+fn lora_airtime_ms(sf: u8, bw_khz: u32, cr: u8, payload: usize, preamble: u16) -> u64 {
+    let sf = sf.clamp(6, 12) as f64;
+    let bw = (bw_khz.max(1) * 1000) as f64;
+    let t_sym = 2f64.powf(sf) / bw; // seconds
+    // Low-data-rate optimisation is mandatory where a symbol exceeds 16 ms — SF11/12 at 125 kHz.
+    let de = if t_sym > 0.016 { 1.0 } else { 0.0 };
+    let cr = cr.clamp(1, 4) as f64;
+    let num = 8.0 * payload as f64 - 4.0 * sf + 28.0 + 16.0; // explicit header, CRC on
+    let den = 4.0 * (sf - 2.0 * de);
+    let n_payload = 8.0 + (num / den).ceil().max(0.0) * (cr + 4.0);
+    let n_preamble = preamble as f64 + 4.25;
+    (((n_preamble + n_payload) * t_sym) * 1000.0).ceil() as u64
+}
+
+/// Slack added on top of a frame's airtime before a transmit is called lost: the serial round trip,
+/// the firmware's standby/apply/re-arm, and the host scheduler. Generous on purpose — the cost of
+/// waiting too long is latency, the cost of waiting too little is a phantom transmit failure.
+const AIRTIME_SLACK: Duration = Duration::from_millis(2_000);
+/// Floor under any transmit wait: the pre-existing 3 s budget, which is known to work for the short
+/// low-SF frames the fleet runs today. Airtime only ever raises it.
+const TXDONE_MIN_TIMEOUT: Duration = Duration::from_millis(3_000);
+/// How long to wait for a knob to be acknowledged. Each `SET_*` is standby -> apply -> re-arm RX ->
+/// reply, all well under this.
+const INFO_TIMEOUT: Duration = Duration::from_millis(1_000);
+/// How long to wait for the `EVT_CAP` answer at open. One short reply from an idle node; a node that
+/// does not implement `CMD_GET_CAP` costs exactly this once, then falls back.
+const CAP_TIMEOUT: Duration = Duration::from_millis(600);
+/// How many times to re-send an idempotent knob whose reply never came. See `exec_idempotent`.
+const KNOB_ATTEMPTS: usize = 4;
+
+/// The firmware's listen-before-talk tunables, mirrored host-side so the transmit deadline can
+/// include the worst-case contention budget instead of a magic constant. Defaults match
+/// `firmware/waveshare-lora-rs` (`Csma::new`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LbtCfg {
+    cw_ms: u16,
+    max_backoff: u8,
+    max_attempts: u8,
+}
+
+impl Default for LbtCfg {
+    fn default() -> Self {
+        Self {
+            cw_ms: 20,
+            max_backoff: 4,
+            max_attempts: 6,
+        }
+    }
+}
+
+impl LbtCfg {
+    /// Worst-case time the firmware may spend sensing and backing off before it keys up (or gives up):
+    /// `attempts × cw × 2^backoff`, the bound the firmware's own loop enforces.
+    fn worst_case(&self) -> Duration {
+        let per = self.cw_ms as u64 * (1u64 << self.max_backoff.min(16));
+        Duration::from_millis(per.saturating_mul(self.max_attempts.max(1) as u64))
+    }
+}
+
+/// Radio parameters programmed over the binary protocol at open. Two nodes must agree on frequency,
+/// SF, BW, CR and sync word to hear each other; [`Default`] is 915 MHz (US) / SF7 / 125 kHz / 4-5 /
+/// private sync — matching the firmware defaults and the Heltec interop node.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LoraParams {
-    /// Spreading factor 7–12. Higher = longer range, exponentially slower.
+    /// Spreading factor 7–12. Higher = longer range, exponentially slower. Ignored by a node with no
+    /// spreading factor (FLRC).
     pub sf: u8,
-    /// Bandwidth code: 0 = 125 kHz, 1 = 250 kHz, 2 = 500 kHz.
+    /// **Host** bandwidth code: 0 = 125 kHz, 1 = 250 kHz, 2 = 500 kHz. Translated to the node's own
+    /// register convention by [`bw_to_fw`] — the two are NOT the same byte.
     pub bw: u8,
     /// Coding-rate code: 1 = 4/5 … 4 = 4/8.
     pub cr: u8,
@@ -126,13 +821,16 @@ pub struct LoraParams {
     pub tx_ch: u8,
     /// RX channel index; LoRa is half-duplex so this tracks `tx_ch`.
     pub rx_ch: u8,
-    /// TX power, dBm, 10–22.
+    /// TX power, dBm.
     pub pwr: u8,
     /// LoRa sync word in the SX127x single-byte convention: 0x12 private / 0x34 public.
     pub sync: u8,
-    /// Emit the firmware's on-air heartbeat beacon. Off by default when a host drives the dongle
-    /// (its own traffic is liveness enough); set true to keep the node discoverable on-air.
+    /// Emit the firmware's on-air heartbeat beacon. Off by default when a host drives the node (its
+    /// own traffic is liveness enough); set true to keep the node discoverable on-air.
     pub beacon: bool,
+    /// Preamble length in symbols — mirrors the firmware default so airtime is computed from the
+    /// value actually programmed (see [`LoraSerialBackend::set_preamble`]).
+    pub preamble: u16,
 }
 
 impl Default for LoraParams {
@@ -146,7 +844,15 @@ impl Default for LoraParams {
             pwr: 22,
             sync: 0x12,
             beacon: false, // host-driven: silence the firmware beacon at open
+            preamble: 8,   // firmware default
         }
+    }
+}
+
+impl LoraParams {
+    /// Channel bandwidth in kHz for the current [`bw`](Self::bw) code.
+    pub fn bw_khz(&self) -> u32 {
+        BW_KHZ[(self.bw as usize).min(BW_KHZ.len() - 1)]
     }
 }
 
@@ -271,78 +977,215 @@ impl Drop for SerialFd {
     }
 }
 
-/// How long to wait for a transmission to complete. The firmware's transmit polls the chip for at
-/// most ~2 s (SF12 at 125 kHz is ~1.5 s on air for a full frame); the rest is serial slack.
-const TXDONE_TIMEOUT: Duration = Duration::from_millis(3_000);
-// LBT can spend several CAD+backoff attempts before it keys up (or defers), on top of the frame's
-// airtime — give it more headroom than a plain TX. The firmware caps attempts, so this is bounded.
-const LBT_TIMEOUT: Duration = Duration::from_millis(5_000);
-/// How long to wait for a knob to be acknowledged. Each `SET_*` is standby → apply → re-arm RX →
-/// reply, all well under this.
-const INFO_TIMEOUT: Duration = Duration::from_millis(1_000);
-/// How many times to re-send an idempotent knob whose reply never came. See `exec_idempotent`.
-const KNOB_ATTEMPTS: usize = 4;
-
 /// The command side of the link: the port, plus the firmware's replies to whatever we last sent.
 ///
 /// **This protocol is strictly request/response, one command in flight.** Every handler in the
-/// firmware runs to completion before the main loop drains the USART again — and the STM32F1's
-/// USART has no FIFO, so a second command sent while the first is still being serviced is not
-/// queued, it is destroyed by an overrun that neither side reports. A blocking transmit is the
-/// worst case (up to ~2 s on air), but even `SET_MOD` (standby → apply → re-arm → reply) is long
-/// enough to swallow the command behind it. So: hold this lock, send, and wait for the reply.
+/// firmware runs to completion before the main loop drains the USART again — and the MCU's USART has
+/// no FIFO, so a second command sent while the first is still being serviced is not queued, it is
+/// destroyed by an overrun that neither side reports. A blocking transmit is the worst case (seconds
+/// at high SF), but even `SET_MOD` (standby -> apply -> re-arm -> reply) is long enough to swallow the
+/// command behind it. So: hold this lock, send, and wait for the reply.
 struct CmdPort {
     port: SerialFd,
     /// `(event type, payload)` for every non-RX event the reader parses.
     resp: std::sync::mpsc::Receiver<(u8, Vec<u8>)>,
 }
 
-/// A Waveshare USB-TO-LoRa dongle (open firmware) reached over its serial port.
+/// Send one command and wait for the node's reply, with no other command in flight.
+///
+/// A free function rather than a method so the async data path can hand it to `spawn_blocking`
+/// without borrowing `&self` across an await point.
+///
+/// `tx_wait`: when the node emits `EVT_TX_STARTED [airtime_ms]` it is telling us the airtime it is
+/// about to spend — better than any host-side estimate, because it knows the parameters actually
+/// programmed. Consume it and re-base the deadline on it. (This event used to be silently discarded.)
+fn exec_on(
+    cmd: &Mutex<CmdPort>,
+    typ: u8,
+    payload: &[u8],
+    expect: u8,
+    timeout: Duration,
+    tx_wait: bool,
+) -> Result<Vec<u8>, FaceError> {
+    let cmd = cmd.lock().unwrap();
+    // Drop replies to earlier commands (e.g. one that timed out) so we read *this* one's.
+    while cmd.resp.try_recv().is_ok() {}
+    send_cmd(&cmd.port, typ, payload).map_err(|e| io_err(format!("lora cmd {typ:#04x}: {e}")))?;
+    let mut deadline = Instant::now() + timeout;
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(io_err(format!(
+                "lora cmd {typ:#04x}: no reply in {timeout:?}"
+            )));
+        }
+        match cmd.resp.recv_timeout(left) {
+            Ok((t, p)) if t == expect => return Ok(p),
+            // The node answering "I do not implement that" is a definite NO — return it now rather
+            // than burning the whole timeout waiting for a reply that will never come.
+            Ok((EVT_UNSUPPORTED, p)) if p.first() == Some(&typ) => {
+                return Err(unsupported(format!(
+                    "node does not implement 7E-A5 command {typ:#04x} (reason {})",
+                    p.get(1).copied().unwrap_or(0)
+                )));
+            }
+            Ok((EVT_TX_STARTED, p)) if tx_wait && p.len() >= 2 => {
+                // The device's own airtime figure, in ms. Re-base the deadline on it.
+                let airtime = u16::from_be_bytes([p[0], p[1]]) as u64;
+                deadline = Instant::now() + Duration::from_millis(airtime) + AIRTIME_SLACK;
+            }
+            Ok(_) => continue, // some other event slipped in; keep waiting for ours
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                return Err(io_err(format!(
+                    "lora cmd {typ:#04x}: no reply in {timeout:?}"
+                )));
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(FaceError::Closed);
+            }
+        }
+    }
+}
+
+/// A 7E-A5 serial radio node (Waveshare SX1262, Heltec SX1276, or LR2021 bridge) reached over its
+/// serial port. What it can do is read from its [`NodeProfile`], not from its family name.
 pub struct LoraSerialBackend {
     cmd: Arc<Mutex<CmdPort>>,
     rx: AsyncMutex<mpsc::UnboundedReceiver<CapturedFrame>>,
     /// Behind a mutex because [`RadioKnobs`] retunes the module at runtime; `capability()` and
     /// `params()` reflect the live values.
     params: Arc<Mutex<LoraParams>>,
-    /// #52: when set, `inject` uses the firmware's atomic listen-before-talk TX (`CMD_TX_LBT`) instead
-    /// of a plain blind `CMD_TX`. Off by default so a plain `lora_link` on any dongle still works.
-    lbt: std::sync::atomic::AtomicBool,
+    /// Learned at open from `EVT_CAP` (or pinned). Shared with the reader thread, which needs
+    /// `stamp_kind`/`stamp_hz` to interpret every frame's `ts` field.
+    profile: Arc<Mutex<NodeProfile>>,
+    /// #52: when set, `inject` uses the firmware's atomic listen-before-talk (`CMD_TX_LBT`) instead
+    /// of a plain blind `CMD_TX`. Off by default so a plain link on any node still works.
+    lbt: AtomicBool,
+    /// Mirror of the firmware's LBT tunables, so the transmit deadline includes the contention budget.
+    lbt_cfg: Mutex<LbtCfg>,
+    /// This device's own clock domain (per port — two nodes are two counters).
+    device_domain: ClockDomainId,
 }
 
 impl LoraSerialBackend {
-    /// Open the dongle at `path` with the default (915 MHz / SF7) parameters.
+    /// Open the node at `path` with the default (915 MHz / SF7) parameters, learning its capability
+    /// from `EVT_CAP`.
     pub fn open(path: &str) -> Result<Self, FaceError> {
-        Self::open_with(path, LoraParams::default())
+        Self::open_inner(path, LoraParams::default(), None)
     }
 
-    /// Open the dongle at `path`, program `params` over the binary protocol, and spawn the reader
-    /// that parses events and hands received NDN frames (with RSSI/SNR) up as [`CapturedFrame`]s.
+    /// Open the node at `path`, learn its capability, program `params` (only the parts it supports,
+    /// clamped into the ranges it declares), and spawn the reader that parses events and hands
+    /// received NDN frames up as [`CapturedFrame`]s.
     pub fn open_with(path: &str, params: LoraParams) -> Result<Self, FaceError> {
+        Self::open_inner(path, params, None)
+    }
+
+    /// Open a node whose firmware **predates `CMD_GET_CAP`**, pinning `hint`'s written-down profile
+    /// as the fallback. The device is still asked first and its own `EVT_CAP` always wins — the hint
+    /// only decides what to assume when nothing answers.
+    pub fn open_as(path: &str, hint: RadioKindHint) -> Result<Self, FaceError> {
+        Self::open_inner(path, LoraParams::default(), Some(hint))
+    }
+
+    /// [`open_as`](Self::open_as) with explicit radio parameters.
+    pub fn open_as_with(
+        path: &str,
+        params: LoraParams,
+        hint: RadioKindHint,
+    ) -> Result<Self, FaceError> {
+        Self::open_inner(path, params, Some(hint))
+    }
+
+    fn open_inner(
+        path: &str,
+        mut params: LoraParams,
+        hint: Option<RadioKindHint>,
+    ) -> Result<Self, FaceError> {
         let port = SerialFd::open(path, LORA_BAUD)
             .map_err(|e| io_err(format!("lora open {path}: {e}")))?;
-        configure(&port, &params)?;
+        // Drop the boot chatter before anyone parses it. The port open does not reset the MCU (DTR is
+        // not wired to nRST), so a short settle + flush suffices.
+        port.flush_input();
+        std::thread::sleep(Duration::from_millis(200));
+
         let reader = port
             .try_clone()
             .map_err(|e| io_err(format!("lora clone: {e}")))?;
         let (txch, rxch) = mpsc::unbounded_channel();
         let (respch, resprx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || reader_loop(reader, txch, respch));
+        let profile = Arc::new(Mutex::new(
+            hint.map(RadioKindHint::profile)
+                .unwrap_or_else(NodeProfile::legacy_sx1262),
+        ));
+        let device_domain = lora_clock_domain(path);
+        {
+            let profile = Arc::clone(&profile);
+            std::thread::spawn(move || reader_loop(reader, txch, respch, profile, device_domain));
+        }
+        let cmd = Arc::new(Mutex::new(CmdPort { port, resp: resprx }));
+
+        // ── The keystone: ask the node what it is, BEFORE sending it anything else. ──
+        // A node that does not implement CMD_GET_CAP answers nothing (old firmware) or
+        // EVT_UNSUPPORTED (v2 firmware without the opcode); both land on the fallback.
+        let cap = exec_on(&cmd, CMD_GET_CAP, &[], EVT_CAP, CAP_TIMEOUT, false).ok();
+        let learned = resolve_profile(cap.as_deref(), hint);
+        *profile.lock().unwrap() = learned;
+
+        // Only now program the radio, and only with what this node implements.
+        {
+            let g = cmd.lock().unwrap();
+            configure(&g.port, &mut params, &learned)?;
+        }
+
         Ok(Self {
-            cmd: Arc::new(Mutex::new(CmdPort { port, resp: resprx })),
+            cmd,
             rx: AsyncMutex::new(rxch),
             params: Arc::new(Mutex::new(params)),
-            lbt: std::sync::atomic::AtomicBool::new(false),
+            profile,
+            lbt: AtomicBool::new(false),
+            lbt_cfg: Mutex::new(LbtCfg::default()),
+            device_domain,
         })
     }
 
-    /// #52: route `inject` through the firmware's atomic listen-before-talk (`CMD_TX_LBT`) — carrier
-    /// sense + backoff before every key-up. Requires the #52 firmware; leave off for a plain dongle.
+    /// **What this node told us it can do** — the single source every knob, timeout and capability on
+    /// this backend reads. `learned == false` means the node never answered `CMD_GET_CAP` and this is
+    /// the host's written-down fallback.
+    pub fn profile(&self) -> NodeProfile {
+        *self.profile.lock().unwrap()
+    }
+
+    /// The clock domain this node's hardware RX stamps live in (per port).
+    pub fn device_clock_domain(&self) -> ClockDomainId {
+        self.device_domain
+    }
+
+    /// The effective per-frame payload cap: the smaller of the host's one-packet-per-frame budget
+    /// ([`MAX_LORA_PAYLOAD`]) and what the node says it can carry end to end.
+    pub fn max_payload(&self) -> usize {
+        MAX_LORA_PAYLOAD.min(self.profile().max_payload as usize)
+    }
+
+    /// The radio parameters currently programmed (reflects runtime [`RadioKnobs`] changes).
+    pub fn params(&self) -> LoraParams {
+        *self.params.lock().unwrap()
+    }
+
+    /// #52: route `inject` through the node's atomic listen-before-talk (`CMD_TX_LBT`) — carrier sense
+    /// + backoff before every key-up.
     pub fn set_lbt(&self, on: bool) {
-        self.lbt.store(on, std::sync::atomic::Ordering::Relaxed);
+        self.lbt.store(on, Ordering::Relaxed);
+    }
+
+    /// Whether listen-before-talk is currently armed.
+    pub fn lbt(&self) -> bool {
+        self.lbt.load(Ordering::Relaxed)
     }
 
     /// #52: tune the LBT contention window (ms), max backoff exponent, and max attempts at runtime —
     /// no reflash (Tier 2). Bigger `cw_ms` = better fairness (nodes separate more) at higher latency.
+    /// The values are mirrored host-side so the transmit deadline covers the contention budget.
     pub fn set_lbt_cfg(
         &self,
         cw_ms: u16,
@@ -351,6 +1194,11 @@ impl LoraSerialBackend {
     ) -> Result<(), FaceError> {
         let p = [(cw_ms >> 8) as u8, cw_ms as u8, max_backoff, max_attempts];
         self.exec_idempotent(CMD_SET_LBT_CFG, &p, EVT_INFO)?;
+        *self.lbt_cfg.lock().unwrap() = LbtCfg {
+            cw_ms,
+            max_backoff,
+            max_attempts,
+        };
         Ok(())
     }
 
@@ -358,6 +1206,136 @@ impl LoraSerialBackend {
     pub fn set_cad_cfg(&self, sym: u8, det_peak: u8, det_min: u8) -> Result<(), FaceError> {
         self.exec_idempotent(CMD_SET_CAD_CFG, &[sym, det_peak, det_min], EVT_INFO)?;
         Ok(())
+    }
+
+    /// **Tune the channel-busy sense** (`CMD_SET_SENSE_CFG`, 0x12) — an energy-detect threshold in dBm
+    /// OR'd into the CAD decision, plus how many CAD samples to OR per sense.
+    ///
+    /// This opcode has existed in the firmware since #52 and had **no host constant at all**, so the
+    /// only sense the host could ask for was the compiled-in default (CAD-only, one sample). The
+    /// energy detector is what catches *non-LoRa* interference — the co-band HaLow case — which CAD
+    /// structurally cannot see, because CAD looks for LoRa chirps.
+    pub fn set_sense_cfg(&self, rssi_thresh_dbm: i16, cad_repeat: u8) -> Result<(), FaceError> {
+        let p = [
+            (rssi_thresh_dbm >> 8) as u8,
+            rssi_thresh_dbm as u8,
+            cad_repeat.max(1),
+        ];
+        self.exec_idempotent(CMD_SET_SENSE_CFG, &p, EVT_INFO)?;
+        Ok(())
+    }
+
+    /// **Set the LoRa preamble length in symbols** (`CMD_SET_PREAMBLE`, 0x0C) — declared in this file
+    /// since #52 and never once sent. It is a real reach/airtime dial: a longer preamble buys a
+    /// receiver more chances to detect the frame (and is what a duty-cycled listener needs), at the
+    /// cost of airtime on every transmission. Kept in [`LoraParams`] so the airtime-derived transmit
+    /// timeout tracks it.
+    pub fn set_preamble(&self, symbols: u16) -> Result<(), FaceError> {
+        self.exec_idempotent(
+            CMD_SET_PREAMBLE,
+            &[(symbols >> 8) as u8, symbols as u8],
+            EVT_INFO,
+        )?;
+        self.params.lock().unwrap().preamble = symbols;
+        Ok(())
+    }
+
+    /// **The FLRC rate ladder**, in the LR2021's own code space (`CMD_SET_MOD` on a fixed-rate node).
+    ///
+    /// The portable [`RadioKnobs`] rate knobs deliberately refuse on a node with no spreading factor
+    /// (see [`send_mod`](Self::send_mod)): the fleet's `[sf, bw, cr]` byte positions carry
+    /// chip-specific meanings there, and composing them from a LoRa-shaped plan silently
+    /// re-modulates the link. That leaves the LR2021's rate genuinely settable but unreachable
+    /// through the typed API, so this is the reachable path — and it names the code space instead of
+    /// pretending it is the LoRa one.
+    ///
+    /// `bitrate` is the chip's own `FlrcBitrate` code (`0 = 2.6 Mbit/s` … `7 = 260 kbit/s`, the
+    /// firmware's default being 0) and `coding` its `FlrcCr` code (`0 = 1/2, 1 = 3/4, 2 = FEC off,
+    /// 3 = 2/3` — counter-intuitive, and it is what the silicon uses). Both ends of a link must be
+    /// moved together: a rate change is not negotiated on air.
+    ///
+    /// Refused on any node that does have a spreading factor, where these bytes would be read as one.
+    pub fn set_flrc_rate(&self, bitrate: u8, coding: u8) -> Result<(), FaceError> {
+        let prof = self.profile();
+        if prof.has_spreading_factor() {
+            return Err(unsupported(
+                "this node's CMD_SET_MOD bytes are a LoRa [sf, bw, cr]; use the RadioKnobs rate \
+                 methods instead"
+                    .into(),
+            ));
+        }
+        if !prof.supports(CMD_SET_MOD) {
+            return Err(unsupported(
+                "this node does not implement CMD_SET_MOD".into(),
+            ));
+        }
+        // Byte 1 is the fleet's `bw` slot; the LR2021 ignores it (FLRC bandwidth follows the rung),
+        // and it is sent as 0 to match what that node reports back in EVT_INFO.
+        self.exec_idempotent(CMD_SET_MOD, &[bitrate, 0, coding], EVT_INFO)?;
+        Ok(())
+    }
+
+    /// **Scan for a peer's spreading factor** (`CMD_SF_SCAN`, 0x0D) — also declared and never sent.
+    /// Returns the SF detected on air, or `None` when the scan found nothing.
+    ///
+    /// This is the missing half of the SF reach dial: two nodes at different SFs are quasi-orthogonal
+    /// and simply cannot hear each other, so an SF split is unrecoverable *in band* — a receiver-side
+    /// detect is the only way back without a rendezvous SF.
+    pub fn sf_scan(&self) -> Result<Option<u8>, FaceError> {
+        let p = self.exec(CMD_SF_SCAN, &[], EVT_SF_DETECTED, INFO_TIMEOUT)?;
+        Ok(p.first().copied().filter(|&sf| sf != 0))
+    }
+
+    /// **Set the LoRa sync word at runtime** (`CMD_SET_SYNC`, 0x05) — 0x12 private / 0x34 public in
+    /// the SX127x single-byte convention. Previously reachable only via the one shot inside `open`,
+    /// which made a sync word a boot-time property of the process rather than a live knob.
+    pub fn set_sync_word(&self, sync: u8) -> Result<(), FaceError> {
+        self.exec_idempotent(CMD_SET_SYNC, &[sync], EVT_INFO)?;
+        self.params.lock().unwrap().sync = sync;
+        Ok(())
+    }
+
+    /// **Read the channel-busy sense** (`CMD_SENSE`, 0x1B): `(activity, rssi_dbm)`.
+    ///
+    /// `activity` is a FREE-RUNNING, WRAPPING count of channel-busy observations — differences over a
+    /// window are meaningful, absolute values are not. `rssi` is the instantaneous channel RSSI in
+    /// dBm. Backs [`RadioKnobs::read_channel_activity`].
+    pub fn sense(&self) -> Result<(u16, i16), FaceError> {
+        let p = self.exec(CMD_SENSE, &[], EVT_SENSE, INFO_TIMEOUT)?;
+        if p.len() < 4 {
+            return Err(io_err(format!("EVT_SENSE short: {} bytes", p.len())));
+        }
+        Ok((
+            u16::from_be_bytes([p[0], p[1]]),
+            i16::from_be_bytes([p[2], p[3]]),
+        ))
+    }
+
+    /// **Read the node's clock** (`CMD_READ_CLOCK`, 0x17) in its own ticks — the units are
+    /// [`NodeProfile::stamp_hz`], the same as the `ts` on every `EVT_RX`.
+    pub fn read_device_clock(&self) -> Result<u64, FaceError> {
+        let p = self.exec(CMD_READ_CLOCK, &[], EVT_CLOCK, INFO_TIMEOUT)?;
+        if p.len() < 8 {
+            return Err(io_err(format!("EVT_CLOCK short: {} bytes", p.len())));
+        }
+        Ok(u64::from_be_bytes([
+            p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7],
+        ]))
+    }
+
+    /// One-shot carrier-sense (`CMD_CAD`): `true` when the channel is busy.
+    pub fn cad(&self) -> Result<bool, FaceError> {
+        let p = self.exec(CMD_CAD, &[], EVT_CAD, INFO_TIMEOUT)?;
+        Ok(p.first().copied().unwrap_or(0) != 0)
+    }
+
+    /// Instantaneous channel RSSI in dBm (`CMD_GET_RSSI`).
+    pub fn channel_rssi(&self) -> Result<i16, FaceError> {
+        let p = self.exec(CMD_GET_RSSI, &[], EVT_RSSI, INFO_TIMEOUT)?;
+        if p.len() < 2 {
+            return Err(io_err(format!("EVT_RSSI short: {} bytes", p.len())));
+        }
+        Ok(i16::from_be_bytes([p[0], p[1]]))
     }
 
     /// #52: read the firmware's CSMA observability counters `(cad_busy, deferred)` from `EVT_INFO`.
@@ -373,7 +1351,9 @@ impl LoraSerialBackend {
             Ok((0, 0)) // pre-#52 firmware: no counters
         }
     }
+}
 
+impl LoraSerialBackend {
     // ---- #52 on-device NDN data plane (all runtime; no reflash) ----
 
     /// Install the RX name filter as a set of **prefixes** (a FIB): an Interest is delivered up only if
@@ -381,6 +1361,9 @@ impl LoraSerialBackend {
     /// dropped at the antenna. So `["ndn/lora-cog/A"]` covers every `ndn/lora-cog/A/...` under it. Empty
     /// clears the filter (pass-all). Each prefix is hashed with the SAME [`name_hash`] the firmware's
     /// rolling per-component hash lands on at that boundary, so the keyspaces match (#44).
+    ///
+    /// ⚠ This is **not** the HAL's Tier-0 filter — see [`RadioKnobs::configure_name_filter`] on this
+    /// type for why the two cannot be bridged.
     pub fn set_name_filter(&self, prefixes: &[&[u8]]) -> Result<(), FaceError> {
         self.exec_idempotent(CMD_SET_NAME_FILTER, &hash_payload(prefixes), EVT_INFO)?;
         Ok(())
@@ -450,17 +1433,13 @@ impl LoraSerialBackend {
     /// fire-and-forget: the firmware branches away immediately, so there is no reply to await; the next
     /// thing on the wire is the ROM bootloader's autobaud. Follow with e.g.
     /// `stm32flash -w firmware.bin -v -g 0x08000000 /dev/ttyACM0`. Guarded by a 2-byte magic so a
-    /// corrupt frame cannot trigger it. Requires firmware with `CMD_ENTER_BOOTLOADER` (else a no-op).
+    /// corrupt frame cannot trigger it.
     pub fn enter_bootloader(&self) -> Result<(), FaceError> {
+        self.require(CMD_ENTER_BOOTLOADER)?;
         let cmd = self.cmd.lock().unwrap();
         send_cmd(&cmd.port, CMD_ENTER_BOOTLOADER, &[0xB0, 0x07])
             .map_err(|e| io_err(format!("lora enter_bootloader: {e}")))?;
         Ok(())
-    }
-
-    /// The radio parameters currently programmed (reflects runtime [`RadioKnobs`] changes).
-    pub fn params(&self) -> LoraParams {
-        *self.params.lock().unwrap()
     }
 
     /// Toggle the firmware's on-air heartbeat beacon at runtime (off by default under host control).
@@ -470,30 +1449,43 @@ impl LoraSerialBackend {
         Ok(())
     }
 
-    /// Send an **idempotent** command, retrying if the firmware never answers.
+    // ---- command plumbing ----
+
+    /// Refuse a command this node does not implement, **before** it goes on the wire. This is the
+    /// capability gate doing its job: `CMD_SET_FREQ` on the LR2021 is not a command that fails, it is
+    /// a command that permanently breaks the transmit path.
+    fn require(&self, cmd: u8) -> Result<(), FaceError> {
+        if self.profile().supports(cmd) {
+            Ok(())
+        } else {
+            Err(unsupported(format!(
+                "this node does not implement 7E-A5 command {cmd:#04x}"
+            )))
+        }
+    }
+
+    /// Send an **idempotent** command, retrying if the node never answers.
     ///
     /// The firmware polls its FIFO-less USART from the main loop, so a byte that lands while it is
-    /// busy (an SPI `poll_rx`, a previous handler, a transmission) is simply gone — commands are
-    /// lost at a measurable rate. Re-sending a `SET_*` is harmless because it re-asserts a state
-    /// rather than causing an event, so retry it. `CMD_TX` gets no retry: a lost *reply* is
-    /// indistinguishable from a lost *command*, and re-sending would risk a duplicate frame on air.
-    /// The real repair is interrupt/DMA-driven RX in the firmware; this only buys reliability
-    /// against a defect the host cannot fix.
+    /// busy (an SPI `poll_rx`, a previous handler, a transmission) is simply gone — commands are lost
+    /// at a measurable rate. Re-sending a `SET_*` is harmless because it re-asserts a state rather
+    /// than causing an event, so retry it. `CMD_TX` gets no retry: a lost *reply* is indistinguishable
+    /// from a lost *command*, and re-sending would risk a duplicate frame on air. An
+    /// `EVT_UNSUPPORTED` is a definite answer, so it is not retried either.
     fn exec_idempotent(&self, typ: u8, payload: &[u8], expect: u8) -> Result<Vec<u8>, FaceError> {
+        self.require(typ)?;
         let mut last = None;
         for _ in 0..KNOB_ATTEMPTS {
-            match self.exec(typ, payload, expect, INFO_TIMEOUT) {
+            match exec_on(&self.cmd, typ, payload, expect, INFO_TIMEOUT, false) {
                 Ok(v) => return Ok(v),
+                Err(e) if is_unsupported(&e) => return Err(e),
                 Err(e) => last = Some(e),
             }
         }
         Err(last.unwrap_or_else(|| io_err(format!("lora cmd {typ:#04x}: no attempt made"))))
     }
 
-    /// Send one command and wait for the firmware's reply, with no other command in flight.
-    ///
-    /// Blocking by construction — see [`CmdPort`]. The wait is bounded by the device's own physics
-    /// (a frame's airtime), and the reader runs on its own thread, so reception keeps up meanwhile.
+    /// One command, one reply, capability-gated. Blocking by construction — see [`CmdPort`].
     fn exec(
         &self,
         typ: u8,
@@ -501,39 +1493,107 @@ impl LoraSerialBackend {
         expect: u8,
         timeout: Duration,
     ) -> Result<Vec<u8>, FaceError> {
-        let cmd = self.cmd.lock().unwrap();
-        // Drop replies to earlier commands (e.g. one that timed out) so we read *this* one's.
-        while cmd.resp.try_recv().is_ok() {}
-        send_cmd(&cmd.port, typ, payload)
-            .map_err(|e| io_err(format!("lora cmd {typ:#04x}: {e}")))?;
-        let deadline = std::time::Instant::now() + timeout;
-        loop {
-            let left = deadline.saturating_duration_since(std::time::Instant::now());
-            if left.is_zero() {
-                return Err(io_err(format!(
-                    "lora cmd {typ:#04x}: no reply in {timeout:?}"
-                )));
-            }
-            match cmd.resp.recv_timeout(left) {
-                Ok((t, p)) if t == expect => return Ok(p),
-                Ok(_) => continue, // some other event slipped in; keep waiting for ours
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                    return Err(io_err(format!(
-                        "lora cmd {typ:#04x}: no reply in {timeout:?}"
-                    )));
-                }
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                    return Err(FaceError::Closed);
-                }
-            }
+        self.require(typ)?;
+        exec_on(&self.cmd, typ, payload, expect, timeout, false)
+    }
+
+    /// The **async** command path: run the blocking request/response off the runtime's worker.
+    ///
+    /// ★ This is why it exists. `inject` used to call the blocking `exec` directly from an
+    /// `async fn`, so a transmission parked a tokio worker thread for the frame's whole airtime —
+    /// seconds at high SF. On a multi-radio node that stalls every other future scheduled on that
+    /// worker, including the Wi-Fi radios' own I/O; the LoRa radio is the slowest bearer in the rig
+    /// and was the one holding the runtime hostage. Outside a runtime (a plain `block_on` harness)
+    /// there is no pool to move to, so it runs inline rather than panicking.
+    async fn exec_async(
+        &self,
+        typ: u8,
+        payload: Vec<u8>,
+        expect: u8,
+        timeout: Duration,
+        tx_wait: bool,
+    ) -> Result<Vec<u8>, FaceError> {
+        self.require(typ)?;
+        let cmd = Arc::clone(&self.cmd);
+        match tokio::runtime::Handle::try_current() {
+            Ok(_) => tokio::task::spawn_blocking(move || {
+                exec_on(&cmd, typ, &payload, expect, timeout, tx_wait)
+            })
+            .await
+            .map_err(|e| io_err(format!("lora cmd {typ:#04x}: blocking task: {e}")))?,
+            Err(_) => exec_on(&cmd, typ, &payload, expect, timeout, tx_wait),
         }
     }
 
-    /// Push the current SF/BW/CR triple to the firmware (any of them changing needs the full set).
+    /// [`read_device_clock`](Self::read_device_clock) off the async worker — the clock read is a
+    /// serial round trip, and blocking a runtime thread on one inside `inject_at_clock` would
+    /// reintroduce, in miniature, the stall the transmit path was just fixed for.
+    async fn read_device_clock_async(&self) -> Result<u64, FaceError> {
+        let p = self
+            .exec_async(CMD_READ_CLOCK, Vec::new(), EVT_CLOCK, INFO_TIMEOUT, false)
+            .await?;
+        if p.len() < 8 {
+            return Err(io_err(format!("EVT_CLOCK short: {} bytes", p.len())));
+        }
+        Ok(u64::from_be_bytes([
+            p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7],
+        ]))
+    }
+
+    /// **How long a transmission may honestly take**, from this node's live modulation and this
+    /// frame's length — not a fixed constant.
+    ///
+    /// The old 3 s was a constant chosen for SF7-class frames; at SF12/125 kHz a 240-byte frame is
+    /// ~8.5 s on air, so every long-reach transmission the stack ever asked for was abandoned before
+    /// the radio finished. `TXDONE_MIN_TIMEOUT` keeps the old floor for short frames. A node with no
+    /// spreading factor (FLRC) has no LoRa airtime to compute, and its frames are sub-millisecond, so
+    /// the floor is the whole budget there.
+    fn tx_timeout(&self, payload_len: usize) -> Duration {
+        let p = self.params();
+        let prof = self.profile();
+        let base = if prof.radio_kind.is_lora_modulation() && prof.sf_max > 0 {
+            Duration::from_millis(lora_airtime_ms(
+                p.sf,
+                p.bw_khz(),
+                p.cr,
+                payload_len,
+                p.preamble,
+            )) + AIRTIME_SLACK
+        } else {
+            AIRTIME_SLACK
+        };
+        base.max(TXDONE_MIN_TIMEOUT)
+    }
+
+    /// The transmit budget with listen-before-talk armed: airtime plus the firmware's own worst-case
+    /// sense-and-backoff bound (`attempts × cw × 2^backoff`), rather than a magic 5 s.
+    fn lbt_timeout(&self, payload_len: usize) -> Duration {
+        self.tx_timeout(payload_len) + self.lbt_cfg.lock().unwrap().worst_case()
+    }
+
+    /// Push the current SF/BW/CR triple to the node (any of them changing needs the full set).
+    /// Silently correct on a node with no `CMD_SET_MOD`: `require` refuses instead.
+    ///
+    /// ⚠ **Refuses outright on a node with no spreading factor** (`sf_min == 0`). `CMD_SET_MOD`'s
+    /// three bytes are only portable between nodes that share the LoRa meaning of them. On the
+    /// LR2021 the same positions are `[bitrate_rung, _, flrc_cr]` (`m6_bridge.rs`
+    /// `bitrate_of_code`/`cr_of_code`), so this host's default `sf = 7` decodes there as
+    /// `FlrcBitrate::Br0260` — a 10x rate drop from the firmware's `Br2600` default — and `cr = 1`
+    /// decodes as `FlrcCr::Cr34` rather than LoRa 4/5. Sending the triple blind would silently
+    /// re-modulate a link the host believes it left alone. The node's rate is reachable through the
+    /// device's own code space, not through this one.
     fn send_mod(&self) -> Result<(), FaceError> {
+        let prof = self.profile();
+        if !prof.has_spreading_factor() {
+            return Err(unsupported(
+                "CMD_SET_MOD's [sf, bw, cr] bytes carry chip-specific meanings on a node with no \
+                 spreading factor; refusing rather than re-modulating the link blind"
+                    .into(),
+            ));
+        }
         let (sf, bw, cr) = {
             let p = self.params.lock().unwrap();
-            (p.sf, bw_to_fw(p.bw), p.cr)
+            (p.sf, bw_to_fw(prof.radio_kind, p.bw), p.cr)
         };
         self.exec_idempotent(CMD_SET_MOD, &[sf, bw, cr], EVT_INFO)?;
         Ok(())
@@ -541,8 +1601,8 @@ impl LoraSerialBackend {
 }
 
 /// On-device NDN data-plane counters (from `EVT_STATS`). Each is a monotonic count since the last
-/// [`reset_ndn_stats`](LoraSerial::reset_ndn_stats) — nonzero proves the corresponding offload path
-/// fired on air, not just that the code compiled.
+/// [`reset_ndn_stats`](LoraSerialBackend::reset_ndn_stats) — nonzero proves the corresponding offload
+/// path fired on air, not just that the code compiled.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct NdnStats {
     /// Frames the data plane classified (matched the `KIND|SRC|SF|NAME` wire shape).
@@ -561,9 +1621,12 @@ pub struct NdnStats {
     pub defer: u16,
 }
 
-/// FNV-1a/64 over a name's bytes — the #44 shared name-hash keyspace. This MUST stay
-/// byte-for-byte identical to `ndn_embedded::pit::fnv1a64` (which the firmware uses), or the host and
-/// dongle would disagree on which names a filter/relay/CS entry covers.
+/// FNV-1a/64 over a name's bytes — the keyspace **this bearer's firmware** uses for its name filter,
+/// relay set and Content Store. This MUST stay byte-for-byte identical to `ndn_embedded::pit::fnv1a64`
+/// (which the firmware uses), or the host and node would disagree on which names an entry covers.
+///
+/// ⚠ **This is not the project's Tier-0 keyspace.** The MAC-layer prefix-set filter hashes keyed
+/// SipHash-2-4; see [`RadioKnobs::configure_name_filter`] on [`LoraSerialBackend`].
 pub fn name_hash(name: &[u8]) -> u64 {
     const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
     const PRIME: u64 = 0x0000_0100_0000_01b3;
@@ -601,41 +1664,131 @@ fn send_cmd(port: &SerialFd, typ: u8, payload: &[u8]) -> std::io::Result<()> {
     port.flush()
 }
 
-/// Program frequency, modulation, power and sync word at open. The firmware applies each live; the
-/// port open does not reset the MCU (DTR is not wired to nRST), so a short settle + flush suffices.
-fn configure(port: &SerialFd, p: &LoraParams) -> Result<(), FaceError> {
-    port.flush_input();
-    std::thread::sleep(Duration::from_millis(200));
+/// Program frequency, modulation, power and sync word at open — **only what `prof` says this node
+/// implements, clamped into the ranges it declares**, and `params` is corrected in place so the
+/// host's idea of the radio matches what was actually sent.
+///
+/// The unconditional version of this function is what made one backend dangerous across the fleet: it
+/// sent `SET_FREQ` to every node at every open, and on the LR2021 that command was MEASURED to
+/// permanently break the transmit path. It also sent `SET_MOD` to a radio with no LoRa modulation and
+/// `SET_SYNC` to firmware that acks unknown commands with `EVT_INFO` — a knob that reports success and
+/// actuates nothing.
+///
+/// Still fire-and-forget with a settle rather than a reply wait: each handler runs to completion
+/// before the FIFO-less USART is drained again, `SET_FREQ` runs a full image calibration, and blasting
+/// these back-to-back overruns the port and silently corrupts whatever follows.
+fn configure(
+    port: &SerialFd,
+    params: &mut LoraParams,
+    prof: &NodeProfile,
+) -> Result<(), FaceError> {
     let mkerr = |e: std::io::Error| io_err(format!("lora configure: {e}"));
-    // One command at a time, with room for the firmware to service it. The reader thread does not
-    // exist yet, so there is no reply to wait on here — but the same hazard applies as at runtime
-    // (see `CmdPort`): each handler runs to completion before the FIFO-less USART is drained again,
-    // and `SET_FREQ` runs a full image calibration. Blasting these back-to-back overruns the port
-    // and silently corrupts whatever follows, which is how the radio ends up half-configured.
     let settle = || std::thread::sleep(Duration::from_millis(150));
+
     // Beacon state first: a host silencing it must not be beaten by a stray beacon that would fire
     // during the slower radio reconfiguration below.
-    send_cmd(port, CMD_SET_BEACON, &[p.beacon as u8]).map_err(mkerr)?;
-    settle();
-    send_cmd(port, CMD_SET_FREQ, &channel_to_hz(p.tx_ch).to_be_bytes()).map_err(mkerr)?;
-    settle();
-    send_cmd(port, CMD_SET_MOD, &[p.sf, bw_to_fw(p.bw), p.cr]).map_err(mkerr)?;
-    settle();
-    send_cmd(port, CMD_SET_PWR, &[p.pwr]).map_err(mkerr)?;
-    settle();
-    send_cmd(port, CMD_SET_SYNC, &[p.sync]).map_err(mkerr)?;
-    settle();
-    port.flush_input();
+    if prof.supports(CMD_SET_BEACON) {
+        send_cmd(port, CMD_SET_BEACON, &[params.beacon as u8]).map_err(mkerr)?;
+        settle();
+    } else {
+        params.beacon = false; // no beacon engine on this node; do not claim one is running
+    }
+
+    if prof.supports(CMD_SET_FREQ) {
+        let hz = prof.clamp_hz(channel_to_hz(params.tx_ch));
+        params.tx_ch = hz_to_channel(hz);
+        params.rx_ch = params.tx_ch;
+        send_cmd(port, CMD_SET_FREQ, &hz.to_be_bytes()).map_err(mkerr)?;
+        settle();
+    } else {
+        // The node cannot retune. Report the carrier it is fixed on, not the one we wanted.
+        if prof.freq_min_hz != 0 {
+            params.tx_ch = hz_to_channel(prof.freq_min_hz);
+            params.rx_ch = params.tx_ch;
+        }
+    }
+
+    // Only on a node whose `sf` byte really is a spreading factor. On an LR2021 the same three
+    // positions are `[flrc_bitrate_rung, _, flrc_cr]`, so pushing this host's `sf = 7` default there
+    // would decode as `Br0260` and drop a VERIFIED-LIVE 2.6 Mbit/s link by 10x at open() time,
+    // reporting success. See `LoraSerialBackend::send_mod`.
+    if prof.supports(CMD_SET_MOD) && prof.has_spreading_factor() {
+        if let Some(sf) = prof.clamp_sf(params.sf) {
+            params.sf = sf;
+        }
+        send_cmd(
+            port,
+            CMD_SET_MOD,
+            &[params.sf, bw_to_fw(prof.radio_kind, params.bw), params.cr],
+        )
+        .map_err(mkerr)?;
+        settle();
+    }
+
+    if prof.supports(CMD_SET_PWR) {
+        let dbm = prof.clamp_dbm(params.pwr.min(i8::MAX as u8) as i8);
+        params.pwr = dbm.max(0) as u8;
+        send_cmd(port, CMD_SET_PWR, &[dbm as u8]).map_err(mkerr)?;
+        settle();
+    }
+
+    if prof.supports(CMD_SET_SYNC) {
+        send_cmd(port, CMD_SET_SYNC, &[params.sync]).map_err(mkerr)?;
+        settle();
+    }
+
+    if prof.supports(CMD_SET_PREAMBLE) {
+        send_cmd(
+            port,
+            CMD_SET_PREAMBLE,
+            &[(params.preamble >> 8) as u8, params.preamble as u8],
+        )
+        .map_err(mkerr)?;
+        settle();
+    }
     Ok(())
 }
 
-/// Background reader: accumulate serial bytes, parse protocol frames, and hand each received LoRa
-/// frame up as a `CapturedFrame` stamped `HostRecv` with its RSSI. Non-RX events are logged under
-/// `LORA_DEBUG` and otherwise ignored; a crc miss resyncs on the next sync word.
+/// **Turn an `EVT_RX` `ts` field into a [`LinkStamp`], using the node's declared units.**
+///
+/// This is the conversion the old code did not have. It read the field as milliseconds because the
+/// Waveshare firmware happens to fill it that way, and then discarded it and stamped `HostRecv`
+/// anyway. On the LR2021 the same four bytes are 16 MHz hardware ticks — reading them as µs is 16×
+/// wrong and as ms is 16 000× wrong — so the units come from [`NodeProfile::stamp_hz`], never from
+/// this file's memory of one board.
+///
+/// Only a **hardware** free-running stamp is promoted to the device clock domain. A
+/// `SoftwareCounter` is a firmware-scheduler tick: real, but its jitter is the firmware's main loop,
+/// so publishing it as a link clock would let a common-view computation difference two nodes'
+/// scheduler latencies and call the result a clock offset.
+///
+/// ⚠ KNOWN LOSS: `LinkStamp::new` clamps `precision_ns` up to the latch point's floor, and
+/// `LatchPoint::MacDone`'s floor is 1 µs — a figure calibrated for 802.11 TSFT. So a per-frame stamp
+/// from the LR2021's MEASURED 62.5 ns capture is published as 1 000 ns here, even though
+/// [`RadioTime::time_sources`] correctly advertises the 63 ns tick. Fixing that needs a latch point
+/// in `ndn-time` for a radio-peripheral hardware capture (or a lower `MacDone` floor); mislabelling
+/// this as `PhyPreamble` to slip under the clamp would be gaming the guard, not fixing it.
+fn rx_stamp(prof: &NodeProfile, domain: ClockDomainId, ts_raw: u32) -> LinkStamp {
+    match prof.stamp_kind {
+        StampKind::HardwareFreeRun if prof.stamp_hz > 0 => LinkStamp::new(
+            ts_raw as u64,
+            domain,
+            prof.tick_ns().unwrap_or(1),
+            LatchPoint::MacDone,
+        ),
+        _ => host_stamp(),
+    }
+}
+
+/// Background reader: accumulate serial bytes, parse protocol frames, and hand each received frame
+/// up as a `CapturedFrame` stamped per the node's profile and carrying its RSSI **and SNR**. Non-RX
+/// events go to whoever is blocked in `exec_on`; a crc miss resyncs on the next sync word.
 fn reader_loop(
     port: SerialFd,
     tx: mpsc::UnboundedSender<CapturedFrame>,
     resp: std::sync::mpsc::Sender<(u8, Vec<u8>)>,
+    profile: Arc<Mutex<NodeProfile>>,
+    domain: ClockDomainId,
 ) {
     let debug = std::env::var_os("LORA_DEBUG").is_some();
     let mut acc: Vec<u8> = Vec::new();
@@ -651,7 +1804,7 @@ fn reader_loop(
                             payload,
                             consumed,
                         } => {
-                            handle_event(typ, &payload, &tx, &resp, debug);
+                            handle_event(typ, &payload, &tx, &resp, &profile, domain, debug);
                             acc.drain(..consumed);
                             if tx.is_closed() {
                                 return;
@@ -674,16 +1827,19 @@ fn reader_loop(
     }
 }
 
-/// Dispatch one decoded event: an `EVT_RX` becomes a `CapturedFrame`; others are optional debug.
+/// Dispatch one decoded event: an `EVT_RX` becomes a `CapturedFrame`; others are replies.
+#[allow(clippy::too_many_arguments)]
 fn handle_event(
     typ: u8,
     payload: &[u8],
     tx: &mpsc::UnboundedSender<CapturedFrame>,
     resp: &std::sync::mpsc::Sender<(u8, Vec<u8>)>,
+    profile: &Mutex<NodeProfile>,
+    domain: ClockDomainId,
     debug: bool,
 ) {
     // Everything that is not a received frame is a reply to a command we sent; route it to the
-    // caller blocked in `exec` so the next command only goes out once this one is serviced.
+    // caller blocked in `exec_on` so the next command only goes out once this one is serviced.
     if typ != EVT_RX {
         if debug {
             match typ {
@@ -692,6 +1848,15 @@ fn handle_event(
                 }
                 EVT_INFO => eprintln!("lora INFO {}", hex(payload)),
                 EVT_LOG => eprintln!("lora LOG: {}", String::from_utf8_lossy(payload)),
+                EVT_CAP => eprintln!("lora CAP {}", hex(payload)),
+                EVT_UNSUPPORTED => {
+                    let reason = payload.get(1).copied().unwrap_or(0);
+                    eprintln!(
+                        "lora UNSUPPORTED cmd={:#04x} reason={reason} ({})",
+                        payload.first().copied().unwrap_or(0),
+                        unsup::name(reason)
+                    )
+                }
                 other => eprintln!("lora EVT {other:#04x} {}", hex(payload)),
             }
         }
@@ -701,36 +1866,42 @@ fn handle_event(
         }
         return;
     }
-    match typ {
-        // #52: EVT_RX gained a 4-byte device (MCU-ms) arrival timestamp between SNR and the payload:
-        // [rssi(2), snr(2), ts_ms(4 BE), bytes]. Skip it (the device clock is surfaced separately when
-        // needed for common-view timing); the payload now starts at offset 8.
-        EVT_RX if payload.len() >= 8 => {
-            let rssi = i16::from_be_bytes([payload[0], payload[1]]);
-            let snr = i16::from_be_bytes([payload[2], payload[3]]);
-            let ts_ms = u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]);
-            let ndn = &payload[8..];
-            if debug {
-                eprintln!(
-                    "lora RX [{rssi} dBm, SNR {snr}, ts {ts_ms}ms] {} bytes",
-                    ndn.len()
-                );
-            }
-            let cap = CapturedFrame {
-                payload: ndn.to_vec().into(),
-                addr: None,
-                group: None,
-                addr3: None,
-                addr4: None, // LoRa has no 802.11 wide-profile fields
-                htc: None,
-                rssi_dbm: Some(rssi.clamp(i8::MIN as i16, i8::MAX as i16) as i8),
-                mcs_index: None,
-                stamp: Some(host_stamp()),
-                phy: None,
-            };
-            let _ = tx.send(cap);
+    // EVT_RX = [rssi i16 BE, snr i16 BE, ts u32 BE, frame bytes] — payload starts at offset 8.
+    if payload.len() >= 8 {
+        let rssi = i16::from_be_bytes([payload[0], payload[1]]);
+        let snr = i16::from_be_bytes([payload[2], payload[3]]);
+        let ts = u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]);
+        let ndn = &payload[8..];
+        let prof = *profile.lock().unwrap();
+        if debug {
+            eprintln!(
+                "lora RX [{rssi} dBm, SNR {snr} dB, ts {ts} @{} Hz] {} bytes",
+                prof.stamp_hz,
+                ndn.len()
+            );
         }
-        _ => {}
+        let cap = CapturedFrame {
+            payload: ndn.to_vec().into(),
+            addr: None,
+            group: None,
+            addr3: None,
+            addr4: None, // LoRa has no 802.11 wide-profile fields
+            htc: None,
+            rssi_dbm: Some(rssi.clamp(i8::MIN as i16, i8::MAX as i16) as i8),
+            mcs_index: None,
+            stamp: Some(rx_stamp(&prof, domain, ts)),
+            // ★ Per-frame SNR, which this backend parsed and then threw away. On LoRa it is THE
+            // signal cognition needs: the chip demodulates well below the noise floor (down to
+            // ~-20 dB SNR at SF12), so RSSI alone says nothing about whether a rate will decode —
+            // a -120 dBm frame at +5 dB SNR is healthy and a -100 dBm frame at -15 dB is not.
+            // `PhyMetrics` already had the field; nothing had to change to carry it.
+            phy: Some(PhyMetrics {
+                snr_db: Some(snr.clamp(i8::MIN as i16, i8::MAX as i16) as i8),
+                evm_db: None,
+                cfo_hz: None,
+            }),
+        };
+        let _ = tx.send(cap);
     }
 }
 
@@ -791,26 +1962,44 @@ fn next_event(buf: &[u8]) -> EvParse {
     }
 }
 
+fn io_err(msg: String) -> FaceError {
+    FaceError::Io(std::io::Error::other(msg))
+}
+
+/// The honest refusal: this node does not have that knob. Distinguished from an I/O failure so a
+/// caller can fall back rather than retry.
+fn unsupported(msg: String) -> FaceError {
+    FaceError::Io(std::io::Error::new(std::io::ErrorKind::Unsupported, msg))
+}
+
+fn is_unsupported(e: &FaceError) -> bool {
+    matches!(e, FaceError::Io(io) if io.kind() == std::io::ErrorKind::Unsupported)
+}
+
 #[async_trait]
 impl FrameIo for LoraSerialBackend {
     async fn inject(&self, frame_in: InjectFrame) -> Result<(), FaceError> {
-        // The payload is the NDN packet itself; the firmware LoRa-frames it. `dst`/`src`/`tx` carry
-        // no link addressing on standard LoRa here, so they are advisory only.
-        if frame_in.payload.len() > MAX_LORA_PAYLOAD {
+        // The payload is the NDN packet itself; the firmware frames it. `dst`/`src`/`tx` carry no
+        // link addressing on this bearer, so they are advisory only.
+        let cap = self.max_payload();
+        if frame_in.payload.len() > cap {
             return Err(io_err(format!(
-                "lora payload {} > {MAX_LORA_PAYLOAD} (one frame)",
-                frame_in.payload.len()
+                "lora payload {} > {cap} (one frame; node cap {})",
+                frame_in.payload.len(),
+                self.profile().max_payload
             )));
         }
         // #52: with LBT on, the firmware runs an atomic CAD → backoff → key-up and replies
         // [sent, attempts]; sent=0 means the channel stayed busy for all attempts (DEFERRED), which we
-        // surface as a TX failure so the caller re-expresses (same as a lost frame). EVT_TX_STARTED
-        // arrives first but `exec` skips any non-matching event, so we still land on EVT_TXDONE.
-        let reply = if self.lbt.load(std::sync::atomic::Ordering::Relaxed) {
-            self.exec(CMD_TX_LBT, &frame_in.payload, EVT_TXDONE, LBT_TIMEOUT)?
+        // surface as a TX failure so the caller re-expresses (same as a lost frame).
+        let (typ, timeout) = if self.lbt.load(Ordering::Relaxed) {
+            (CMD_TX_LBT, self.lbt_timeout(frame_in.payload.len()))
         } else {
-            self.exec(CMD_TX, &frame_in.payload, EVT_TXDONE, TXDONE_TIMEOUT)?
+            (CMD_TX, self.tx_timeout(frame_in.payload.len()))
         };
+        let reply = self
+            .exec_async(typ, frame_in.payload.to_vec(), EVT_TXDONE, timeout, true)
+            .await?;
         match reply.first() {
             Some(1) => Ok(()),
             _ => Err(io_err("lora TX reported failure/deferred".into())),
@@ -821,73 +2010,283 @@ impl FrameIo for LoraSerialBackend {
         let mut rx = self.rx.lock().await;
         rx.recv().await.ok_or(FaceError::Closed)
     }
+
+    /// **Does this node place TX in time?** Read from the profile: it needs both a declared
+    /// `sched_gran_ns` and the `CMD_TX_AT` opcode that actuates it. Moves with
+    /// [`inject_after`](Self::inject_after) by construction, because both call
+    /// [`NodeProfile::schedules_tx`] — the two cannot drift apart, which is the trap this method's
+    /// HAL documentation warns about.
+    fn schedules_tx(&self) -> bool {
+        self.profile().schedules_tx()
+    }
+
+    /// Place the frame on air `delay_us` from now, on the **node's own** timebase (`CMD_TX_AT`), so no
+    /// host↔device clock reconcile is needed. Falls through to [`inject`](Self::inject) when this node
+    /// has no scheduled-TX engine — the caller's software gate has already waited in that case.
+    async fn inject_after(&self, frame: InjectFrame, delay_us: u64) -> Result<(), FaceError> {
+        if delay_us == 0 || !self.schedules_tx() {
+            return self.inject(frame).await;
+        }
+        let cap = self.max_payload();
+        if frame.payload.len() > cap {
+            return Err(io_err(format!(
+                "lora payload {} > {cap}",
+                frame.payload.len()
+            )));
+        }
+        let delay = delay_us.min(u32::MAX as u64) as u32;
+        let mut p = Vec::with_capacity(4 + frame.payload.len());
+        p.extend_from_slice(&delay.to_be_bytes());
+        p.extend_from_slice(&frame.payload);
+        let timeout =
+            self.tx_timeout(frame.payload.len()) + Duration::from_micros(delay_us.min(60_000_000));
+        let reply = self
+            .exec_async(CMD_TX_AT, p, EVT_TXDONE, timeout, true)
+            .await?;
+        match reply.first() {
+            Some(1) => Ok(()),
+            _ => Err(io_err("lora scheduled TX reported failure".into())),
+        }
+    }
+
+    /// Place the frame at an **absolute** instant on this node's clock: read the node's clock
+    /// (`CMD_READ_CLOCK`), turn the gap into a delay in µs through
+    /// [`NodeProfile::stamp_hz`], and hand it to `CMD_TX_AT`.
+    ///
+    /// The tick→µs conversion is the whole reason this cannot be a constant: the same `target_tick`
+    /// is a millisecond count on one node in this fleet and a 62.5 ns count on another. Falls through
+    /// to plain injection when the node has no readable clock, no scheduler, or the target is in a
+    /// domain that is not its own.
+    async fn inject_at_clock(
+        &self,
+        frame: InjectFrame,
+        target_tick: u64,
+        domain: ClockDomainId,
+    ) -> Result<(), FaceError> {
+        let prof = self.profile();
+        if domain != self.device_domain || !prof.schedules_tx() || !prof.has_readable_clock() {
+            return self.inject(frame).await;
+        }
+        let now = self.read_device_clock_async().await?;
+        let delta_ticks = target_tick.saturating_sub(now);
+        if delta_ticks == 0 {
+            return self.inject(frame).await; // already due (or past) — do not wait a wrap
+        }
+        let delay_us = (delta_ticks as u128 * 1_000_000u128 / prof.stamp_hz.max(1) as u128) as u64;
+        self.inject_after(frame, delay_us).await
+    }
 }
 
-/// Reference [`RadioTime`]: the LoRa bridge reports no hardware timestamp, so its only honest link
-/// clock is the host monotonic clock read when the serial line delivered the frame. Readable on
-/// demand, so `read_clock` returns it. (A [`ndn_radio_hal::FaceTimeProfile`] derived from this
-/// reports `HostRecv` precision and `can_common_view = false`.)
+/// The node's named-time surface, **derived from its profile**.
+///
+/// This used to be a hard-coded "the LoRa bridge reports no hardware timestamp". That was true of the
+/// Waveshare and false of the LR2021, whose 16 MHz DPPI capture is the single highest-value timing
+/// capability in the rig: a `FreeRunRxStamp` is what makes [`ndn_radio_hal::FaceTimeProfile::can_common_view`]
+/// true, and common view is what a named airtime lease needs.
 impl RadioTime for LoraSerialBackend {
     fn time_sources(&self) -> Vec<RadioTimeSource> {
-        vec![RadioTimeSource::host_recv(HOST_CLOCK_DOMAIN)]
+        let prof = self.profile();
+        let mut v = Vec::new();
+        // Only a HARDWARE free-running stamp qualifies. `stamp_kind` 1 (host-recv) and 2 (a firmware
+        // software counter) must NOT produce one: `FaceTimeProfile::derive` turns the presence of a
+        // FreeRunRxStamp directly into `can_common_view = true`, so promoting a scheduler tick here
+        // would have two nodes difference their firmware main-loop latencies and call it a clock
+        // offset. There is no `RadioClockKind` for a device software counter, and inventing one of the
+        // existing kinds for it would be worse than reporting only the host stamp.
+        if prof.stamp_kind == StampKind::HardwareFreeRun
+            && let Some(tick_ns) = prof.tick_ns()
+        {
+            v.push(RadioTimeSource {
+                kind: RadioClockKind::FreeRunRxStamp,
+                domain: self.device_domain,
+                latch: LatchPoint::MacDone,
+                // 1e9 / stamp_hz — 16 MHz gives 63 ns (a MEASURED 62.5 ns tick, rounded to integer ns).
+                precision_ns: tick_ns,
+                tick_ns,
+                monotonic: true,
+                read_now: prof.has_readable_clock(),
+            });
+        }
+        // Always available, always honest, always last: the host clock the serial line is read on.
+        v.push(RadioTimeSource::host_recv(HOST_CLOCK_DOMAIN));
+        v
     }
 
     fn read_clock(&self, domain: ClockDomainId) -> Result<Option<u64>, FaceError> {
-        Ok((domain == HOST_CLOCK_DOMAIN).then(|| host_stamp().raw))
+        if domain == HOST_CLOCK_DOMAIN {
+            return Ok(Some(host_stamp().raw));
+        }
+        if domain == self.device_domain && self.profile().has_readable_clock() {
+            return self.read_device_clock().map(Some);
+        }
+        Ok(None)
     }
 }
 
 impl RadioProfile for LoraSerialBackend {
+    /// Built from the node's own `EVT_CAP`, not from a preset.
+    ///
+    /// What each field now comes from, versus the `RadioCapability::lora(vec![tx_ch])` it replaces:
+    /// `channels` is the node's real frequency span rather than the one channel it happens to be
+    /// tuned to; `rate` is its real SF span, or [`RateCapability::None`] for a fixed-rate FLRC node
+    /// that has no spreading factor at all; `max_payload` is the smaller of the host budget and the
+    /// node's end-to-end cap (the preset's `256` is larger than either); `tx_power_dbm` is attached
+    /// only when the node declared a real range; and `duty_cycle_max` follows the band the carrier is
+    /// in, so a US-915 node stops claiming the ETSI 1% ceiling.
     fn capability(&self) -> RadioCapability {
-        // Sub-GHz LoRa: the channel the module is tuned to, duty-cycled, half-duplex, ~256 B frames.
-        RadioCapability::lora(vec![self.params.lock().unwrap().tx_ch])
+        let prof = self.profile();
+        let tuned = self.params().tx_ch;
+        let rate = match prof.clamp_sf(prof.sf_min) {
+            Some(_) => RateCapability::Lora {
+                min_sf: prof.sf_min,
+                max_sf: prof.sf_max,
+            },
+            // FLRC is a single fixed rate: not "SF 7", no rate ceiling to reason about.
+            None => RateCapability::None,
+        };
+        let mut cap = RadioCapability::lora_with(
+            // Every code in `LoraRadioKind` is a sub-GHz long-range/low-rate part, which is what
+            // `RadioKind::Lora` classifies — including the LR2021's FLRC mode. The modulation
+            // difference is carried by `rate`, where a planner can actually read it.
+            RadioKind::Lora,
+            prof.bands(),
+            prof.channels(tuned),
+            rate,
+            self.max_payload(),
+            prof.duty_cycle_max(channel_to_hz(tuned)),
+        );
+        // `max_tx_power` is documented as a chip TXAGC *index* ceiling, and both LoRa constructors
+        // fill it with 63 — a number no node in this fleet has, because `CMD_SET_PWR`'s wire byte is
+        // an i8 **dBm**: the index scale and the dBm scale are the same scale here. 63 made the
+        // cognition index back-off inert (`decide_power` returns `63 − backoff_idx`, which
+        // `set_tx_power` then clamps straight back up to the PA maximum for any realistic back-off).
+        // Deriving it through `clamp_dbm` — the very function the actuator uses — makes the declared
+        // ceiling provably the one that will be enforced, on an EVT_CAP range or the legacy fallback
+        // alike, so the two can never disagree.
+        cap.max_tx_power = prof.clamp_dbm(i8::MAX).max(0) as u8;
+        match prof.dbm_range() {
+            Some(r) => cap.with_tx_power_dbm(r),
+            None => cap,
+        }
     }
 }
 
-/// Control plane: LoRa's dials, actuated at runtime as binary commands the firmware applies live
-/// (no command-mode switch, no reader parking). `set_spreading_factor` is the reach/rate knob
-/// cognition drives (down for close/bulk, up for far/urgent); the rest tune channel, coding rate,
-/// bandwidth, and power.
+/// Control plane: the sub-GHz dials, actuated at runtime as binary commands the firmware applies
+/// live. Every one is gated on the node's capability bitmap first, so a knob this node does not have
+/// **refuses** instead of transmitting a command that another board in the fleet would answer.
 impl RadioKnobs for LoraSerialBackend {
     fn set_channel(&self, channel: u8, _bw: Bandwidth) -> Result<(), FaceError> {
+        let prof = self.profile();
+        if !prof.supports(CMD_SET_FREQ) {
+            // A node that cannot retune must say so. Silently succeeding would let a hopping plan
+            // believe it moved; on the LR2021, actually sending the command would break TX for good.
+            return if channel == self.params().tx_ch {
+                Ok(())
+            } else {
+                Err(unsupported(format!(
+                    "this node is fixed at {} Hz and does not implement CMD_SET_FREQ",
+                    prof.freq_min_hz
+                )))
+            };
+        }
+        let want = channel_to_hz(channel);
+        let hz = prof.clamp_hz(want);
+        if hz != want {
+            return Err(unsupported(format!(
+                "channel {channel} = {want} Hz is outside this node's {}–{} Hz range",
+                prof.freq_min_hz, prof.freq_max_hz
+            )));
+        }
         // LoRa is half-duplex on a single carrier: point TX and RX at it together.
-        self.exec_idempotent(
-            CMD_SET_FREQ,
-            &channel_to_hz(channel).to_be_bytes(),
-            EVT_INFO,
-        )?;
+        self.exec_idempotent(CMD_SET_FREQ, &hz.to_be_bytes(), EVT_INFO)?;
         let mut p = self.params.lock().unwrap();
         p.tx_ch = channel;
         p.rx_ch = channel;
         Ok(())
     }
 
+    /// The index knob. This bearer's "index" has always been dBm in disguise (the wire byte is an i8
+    /// dBm), so prefer [`set_tx_power_dbm`](Self::set_tx_power_dbm), which reports what was applied.
     fn set_tx_power(&self, idx: u32) -> Result<(), FaceError> {
-        let dbm = idx.clamp(10, 22) as u8;
-        self.exec_idempotent(CMD_SET_PWR, &[dbm], EVT_INFO)?;
-        self.params.lock().unwrap().pwr = dbm;
+        let dbm = self.profile().clamp_dbm(idx.min(i8::MAX as u32) as i8);
+        self.exec_idempotent(CMD_SET_PWR, &[dbm as u8], EVT_INFO)?;
+        self.params.lock().unwrap().pwr = dbm.max(0) as u8;
         Ok(())
     }
 
-    fn set_edcca_ignore(&self, _on: bool) -> Result<(), FaceError> {
-        // The open firmware transmits without listen-before-talk (standard LoRa TX), so EDCCA is
-        // effectively always ignored; nothing to actuate.
+    /// **The portable absolute-power knob**, returning the power actually applied.
+    ///
+    /// This closes a capability lie: [`RadioCapability::lora`] has always advertised
+    /// `DbmRange::new(10, 22)` — a promise that `set_tx_power_dbm` works on this bearer — while the
+    /// method was left at its `Unsupported` default, so a planner that budgeted link margin in dB got
+    /// an error from the one radio class whose power knob really is absolute dBm. Now the range comes
+    /// from the node (`EVT_CAP`), the request is clamped into it, and the clamped value is returned;
+    /// a node that has never declared a range gets a refusal rather than a clamp into an invented one.
+    fn set_tx_power_dbm(&self, dbm: i8) -> Result<i8, FaceError> {
+        let prof = self.profile();
+        let Some(range) = prof.dbm_range() else {
+            return Err(unsupported(
+                "this node has not declared a dBm TX-power range (EVT_CAP pwr_min/max = 0)".into(),
+            ));
+        };
+        let applied = range.clamp(dbm);
+        self.exec_idempotent(CMD_SET_PWR, &[applied as u8], EVT_INFO)?;
+        self.params.lock().unwrap().pwr = applied.max(0) as u8;
+        Ok(applied)
+    }
+
+    /// **Ignore listen-before-talk.** The inverse of the firmware's LBT toggle: EDCCA-ignore ON means
+    /// transmit without sensing, which on this bearer is exactly LBT OFF.
+    ///
+    /// The old body was a no-op whose comment claimed "the open firmware transmits without
+    /// listen-before-talk (standard LoRa TX), so EDCCA is effectively always ignored" — contradicted
+    /// on the same page by `CMD_TX_LBT` and by this type's own `set_lbt`. A scheduler that turned
+    /// EDCCA-ignore on to claim an owned slot got silence and kept contending.
+    fn set_edcca_ignore(&self, on: bool) -> Result<(), FaceError> {
+        if !on && !self.profile().supports(CMD_TX_LBT) {
+            // Asking for listen-before-talk on a node that has no LBT path: refuse rather than arm a
+            // flag whose transmit opcode does not exist.
+            return Err(unsupported(
+                "this node does not implement CMD_TX_LBT, so carrier sense cannot be enabled"
+                    .into(),
+            ));
+        }
+        self.set_lbt(!on);
         Ok(())
     }
 
     fn set_spreading_factor(&self, sf: u8) -> Result<(), FaceError> {
-        let sf = sf.clamp(7, 12);
+        let Some(sf) = self.profile().clamp_sf(sf) else {
+            return Err(unsupported(
+                "this node has no spreading factor (fixed-rate modulation)".into(),
+            ));
+        };
         self.params.lock().unwrap().sf = sf;
         self.send_mod()
     }
 
+    /// LoRa coding rate 4/5..4/8. Refused on a fixed-rate node **before** the cached params move,
+    /// so a rejected knob never leaves the host believing a value the node does not hold — the FLRC
+    /// `cr` code space is a different one (`0 = 1/2, 1 = 3/4, 2 = off, 3 = 2/3`).
     fn set_coding_rate(&self, cr: u8) -> Result<(), FaceError> {
+        if !self.profile().has_spreading_factor() {
+            return Err(unsupported(
+                "this node's CMD_SET_MOD cr byte is not a LoRa coding rate".into(),
+            ));
+        }
         let cr = cr.clamp(1, 4);
         self.params.lock().unwrap().cr = cr;
         self.send_mod()
     }
 
+    /// Channel bandwidth. Bearer-agnostic in principle, but it can only travel inside the
+    /// `CMD_SET_MOD` triple, so it inherits that opcode's gate — see [`Self::send_mod`].
     fn set_bandwidth_khz(&self, khz: u32) -> Result<(), FaceError> {
+        if !self.profile().has_spreading_factor() {
+            return Err(unsupported(
+                "this node has no CMD_SET_MOD bandwidth byte the host may write portably".into(),
+            ));
+        }
         let bw = match khz {
             0..=180 => 0,   // 125 kHz
             181..=360 => 1, // 250 kHz
@@ -897,21 +2296,107 @@ impl RadioKnobs for LoraSerialBackend {
         self.send_mod()
     }
 
+    /// From the profile: [`TxDiscipline::ScheduledAt`] only when the node declares a real scheduling
+    /// granularity AND implements `CMD_TX_AT`; otherwise the honest [`TxDiscipline::BestEffort`] —
+    /// a serial bridge plus a duty-cycled medium makes the on-air instant loose.
     fn tx_discipline(&self) -> TxDiscipline {
-        // The serial bridge + duty-cycle limit make the on-air instant loose; honest floor.
-        TxDiscipline::BestEffort
+        let prof = self.profile();
+        if prof.schedules_tx() {
+            TxDiscipline::ScheduledAt {
+                granularity_ns: prof.sched_gran_ns as u64,
+            }
+        } else {
+            TxDiscipline::BestEffort
+        }
     }
-}
 
-fn io_err(msg: String) -> FaceError {
-    FaceError::Io(std::io::Error::other(msg))
+    /// The frame-free occupancy counter, from `CMD_SENSE`'s free-running `activity` count.
+    ///
+    /// ⚠ `Ok(None)` is terminal for the caller: `spawn_occupancy_sampler` polls once and **kills its
+    /// task** on the first `None`, so a node that can sense must not answer `None` on a transient
+    /// serial hiccup — hence a read error propagates as `Err` (the sampler retries) and only a node
+    /// with no `CMD_SENSE` at all returns `None`.
+    fn read_channel_activity(&self) -> Result<Option<u16>, FaceError> {
+        if !self.profile().supports(CMD_SENSE) {
+            return Ok(None);
+        }
+        self.sense().map(|(activity, _rssi)| Some(activity))
+    }
+
+    /// `None`, deliberately.
+    ///
+    /// The HAL defines this as `(ok, err)` **PPDU** counters where `err` counts PPDUs the PHY *began
+    /// to demodulate and failed* — the collision / marginal-decode signature. Nothing on this bearer
+    /// answers that question. `EVT_STATS.rx` counts frames that already decoded AND matched the
+    /// data-plane wire shape (so it is neither all receptions nor a PHY-level count), `EVT_INFO`'s
+    /// `errors` field is the SX1262 `GetDeviceErrors` word (PA ramp / PLL / XOSC / image-calibration
+    /// faults — chip health, not reception), and `cad_busy` counts *channel-busy senses before our own
+    /// transmissions*, which is a TX-side observation. Mapping any of those onto `(ok, err)` would
+    /// hand the sense bus a number it would read as receive-side loss.
+    fn read_ofdm_counters(&self) -> Result<Option<(u16, u16)>, FaceError> {
+        Ok(None)
+    }
+
+    /// `None`, deliberately.
+    ///
+    /// The HAL defines this as `(tx_en, tx_on)` — MAC→baseband transmit *requests* versus
+    /// baseband→RF *keys*, whose whole value is separating "we never asked" from "we asked and the
+    /// air ate it". This firmware exposes no such pair: `EVT_TXDONE` is a per-command reply rather
+    /// than a free-running counter, and `(cad_busy, defer)` are contention outcomes on the far side of
+    /// that boundary. A pair that looked like the register read but answered a different question
+    /// would be worse than none, because this counter is precisely what one reaches for to *stop*
+    /// guessing.
+    fn read_tx_counters(&self) -> Result<Option<(u16, u16)>, FaceError> {
+        Ok(None)
+    }
+
+    /// **`Unsupported` — and this is a ruling, not a gap.**
+    ///
+    /// The HAL's Tier-0 filter and this bearer's on-device filter are two different filters, and there
+    /// is no mapping between them:
+    ///
+    /// * **Different hash family and keying.** Tier-0 hashes keyed **SipHash-2-4**
+    ///   (`ndn-radio/crates/faces/ndn-radio/src/mac/tier0.rs::name_hash`), chosen *because* FNV is not
+    ///   a PRF and its keying is invertible from observed output — the doctrine §8 unforgeability
+    ///   property. This bearer's firmware hashes **FNV-1a-64** (`ndn_embedded::pit::fnv1a64`, mirrored
+    ///   by [`name_hash`] in this file, which must stay byte-identical to it). Re-keying one into the
+    ///   other is not a transformation that exists.
+    /// * **Different objects.** A Tier-0 `mask` is a 126-bit *prefix-set Bloom projection* that the
+    ///   receiver ANDs against a filter the **sender wrote into the frame's address octets**. This
+    ///   bearer's filter is a *set of exact 64-bit prefix hashes* that the firmware recomputes from
+    ///   the name it parses out of the payload. One is a probabilistic set membership over bits the
+    ///   transmitter placed; the other is exact equality over a hash the receiver derives.
+    /// * **No carrier.** A LoRa/FLRC frame has no address octets. There is nowhere in this bearer's
+    ///   frame for the 126-bit filter to ride, so even with a shared hash the receiver would have
+    ///   nothing to AND against.
+    ///
+    /// Truncating the 16-byte masks into 8-byte hashes — the only mechanical "conversion" available —
+    /// would install eight arbitrary 64-bit values into the firmware's exact-match filter. Every one
+    /// would miss, and the node would drop **every** frame at the antenna while reporting success:
+    /// a silent, total, receive-side outage, which is the one failure mode a name filter must never
+    /// have. So this refuses, and the bearer's real filter stays reachable through
+    /// [`set_name_filter`](LoraSerialBackend::set_name_filter), which speaks its own keyspace honestly.
+    fn configure_name_filter(
+        &self,
+        _enabled: bool,
+        _key: &[u8; 16],
+        _masks: &[[u8; 16]],
+    ) -> Result<(), FaceError> {
+        Err(unsupported(
+            "this bearer's on-device filter is an FNV-1a-64 exact-prefix-hash set recomputed from \
+             the payload name; Tier-0 masks are keyed-SipHash prefix-set Bloom projections carried \
+             in 802.11 address octets, which a LoRa frame does not have. Use \
+             LoraSerialBackend::set_name_filter for this bearer's filter."
+                .into(),
+        ))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Build a wire frame the way the firmware would emit an event.
+    /// Build a wire frame the way a node would emit an event.
     fn wire(typ: u8, payload: &[u8]) -> Vec<u8> {
         let mut v = vec![SYNC0, SYNC1, typ, payload.len() as u8];
         v.extend_from_slice(payload);
@@ -922,6 +2407,8 @@ mod tests {
         v.push(crc);
         v
     }
+
+    // ── framing (unchanged behaviour, still pinned) ─────────────────────────────────────────────
 
     #[test]
     fn parses_a_clean_rx_event() {
@@ -1020,5 +2507,459 @@ mod tests {
     fn channel_maps_to_us_and_eu() {
         assert_eq!(channel_to_hz(65), 915_000_000);
         assert_eq!(channel_to_hz(18), 868_000_000);
+        assert_eq!(hz_to_channel(915_000_000), 65);
+        assert_eq!(hz_to_channel(928_000_000), 78);
+    }
+
+    // ── EVT_CAP -> NodeProfile ─────────────────────────────────────────────────────────────────
+
+    /// The 29-byte layout is a contract with three firmware repos; pin it byte by byte from a
+    /// hand-built payload rather than from `to_cap_payload` (which would only test itself).
+    #[test]
+    fn evt_cap_parses_into_a_node_profile() {
+        let mut p = Vec::new();
+        p.push(2); // [0]    proto_ver
+        p.push(2); // [1]    radio_kind = LR2021-FLRC
+        p.extend_from_slice(&915_000_000u32.to_be_bytes()); // [2..6]   freq_min
+        p.extend_from_slice(&928_000_000u32.to_be_bytes()); // [6..10]  freq_max
+        p.push((-9i8) as u8); // [10]   pwr_min dBm (negative, so this pins the i8 decode)
+        p.push(22); // [11]   pwr_max dBm
+        p.extend_from_slice(&16_000_000u32.to_be_bytes()); // [12..16] stamp_hz
+        p.push(3); // [16]   stamp_kind = hardware free-running
+        p.extend_from_slice(&48u16.to_be_bytes()); // [17..19] max_payload
+        p.extend_from_slice(&cmd_bits(&[CMD_TX, CMD_TX_AT, CMD_READ_CLOCK]).to_be_bytes()); // [19..23]
+        p.push(0); // [23]   sf_min (none)
+        p.push(0); // [24]   sf_max
+        p.extend_from_slice(&62_500u32.to_be_bytes()); // [25..29] sched_gran_ns
+        assert_eq!(p.len(), 29, "EVT_CAP is exactly 29 bytes");
+
+        let prof = NodeProfile::parse(&p).expect("29 bytes parse");
+        assert_eq!(prof.proto_ver, 2);
+        assert_eq!(prof.radio_kind, LoraRadioKind::Lr2021Flrc);
+        assert_eq!(prof.freq_min_hz, 915_000_000);
+        assert_eq!(prof.freq_max_hz, 928_000_000);
+        assert_eq!(prof.pwr_min_dbm, -9);
+        assert_eq!(prof.pwr_max_dbm, 22);
+        assert_eq!(prof.stamp_hz, 16_000_000);
+        assert_eq!(prof.stamp_kind, StampKind::HardwareFreeRun);
+        assert_eq!(prof.max_payload, 48);
+        assert_eq!(prof.sched_gran_ns, 62_500);
+        assert!(prof.learned, "an EVT_CAP-derived profile is learned");
+        assert!(prof.supports(CMD_TX) && prof.supports(CMD_TX_AT));
+        assert!(
+            !prof.supports(CMD_SET_FREQ),
+            "an unset bit must read as unsupported — this is the gate that keeps SET_FREQ off the \
+             LR2021, where it was measured to permanently break TX"
+        );
+        assert_eq!(prof.clamp_sf(7), None, "sf 0/0 means NO spreading factor");
+        // Round-trips through the host-side serialiser, so an emulator and the parser agree.
+        assert_eq!(&prof.to_cap_payload()[..], &p[..]);
+    }
+
+    #[test]
+    fn a_short_or_future_evt_cap_is_refused_rather_than_misread() {
+        let good = NodeProfile::legacy_sx1262().to_cap_payload();
+        assert!(
+            NodeProfile::parse(&good[..28]).is_none(),
+            "28 bytes is not a capability"
+        );
+        let mut future = good;
+        future[0] = PROTO_VER + 1;
+        assert!(
+            NodeProfile::parse(&future).is_none(),
+            "a newer node may have re-laid the tail; refuse rather than mis-read it"
+        );
+    }
+
+    // ── the legacy fallback ────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn an_unanswered_get_cap_falls_back_to_the_legacy_profile() {
+        // No EVT_CAP, no hint: exactly today's assumptions, so an un-reflashed dongle opens as it did.
+        let p = resolve_profile(None, None);
+        assert!(!p.learned, "a fallback must not claim the node said so");
+        assert_eq!(p.radio_kind, LoraRadioKind::Sx1262);
+        assert_eq!(p.dbm_range(), Some(DbmRange::new(10, 22)));
+        assert_eq!(p.clamp_sf(7), Some(7));
+        // 64, NOT `MAX_LORA_PAYLOAD` (240). The pre-v2 firmware accepts 240 on TX and truncates RX
+        // at 64 with no error, so 240 would hand the face an MTU that corrupts silently on receive.
+        // A capability must be the end-to-end cap, not the friendlier of the two directions.
+        assert_eq!(p.max_payload, LEGACY_RX_TRUNCATION_CAP);
+        assert!((p.max_payload as usize) < MAX_LORA_PAYLOAD);
+        assert!(p.supports(CMD_SET_FREQ) && p.supports(CMD_SET_MOD) && p.supports(CMD_SET_SYNC));
+        assert!(!p.supports(CMD_GET_CAP) && !p.supports(CMD_SENSE) && !p.supports(CMD_TX_AT));
+    }
+
+    #[test]
+    fn a_hint_pins_the_fallback_and_evt_cap_still_wins() {
+        let pinned = resolve_profile(None, Some(RadioKindHint::Lr2021Flrc));
+        assert_eq!(pinned.radio_kind, LoraRadioKind::Lr2021Flrc);
+        assert!(
+            !pinned.supports(CMD_SET_FREQ),
+            "the pinned LR2021 profile must never let SET_FREQ onto the wire"
+        );
+        assert_eq!(
+            pinned.dbm_range(),
+            None,
+            "no measured dBm span => no dBm knob"
+        );
+
+        // The device's own answer overrides the hint, even a contradictory one.
+        let cap = NodeProfile::legacy_sx1262().to_cap_payload();
+        let learned = resolve_profile(Some(&cap), Some(RadioKindHint::Lr2021Flrc));
+        assert_eq!(learned.radio_kind, LoraRadioKind::Sx1262);
+        assert!(learned.learned);
+    }
+
+    #[test]
+    fn the_pinned_heltec_profile_refuses_the_knobs_its_firmware_lacks() {
+        let p = RadioKindHint::HeltecSx1276.profile();
+        assert!(p.supports(CMD_SET_MOD) && p.supports(CMD_TX_LBT));
+        assert!(
+            !p.supports(CMD_SET_SYNC),
+            "that firmware acks unknown commands with EVT_INFO, so an ungated SET_SYNC would \
+             report success and actuate nothing"
+        );
+        assert!(!p.supports(CMD_SET_BEACON) && !p.supports(CMD_SET_NAME_FILTER));
+    }
+
+    // ── stamp units ───────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn stamp_units_come_from_the_profile_not_from_one_boards_memory() {
+        let dom = ClockDomainId(0x1234_5678);
+
+        // 16 MHz hardware capture: raw ticks in the DEVICE domain, 63 ns per tick (62.5 rounded).
+        let lr = RadioKindHint::Lr2021Flrc.profile();
+        assert_eq!(lr.tick_ns(), Some(63));
+        let s = rx_stamp(&lr, dom, 16_625_857);
+        assert_eq!(s.domain, dom);
+        assert_eq!(
+            s.raw, 16_625_857,
+            "raw ticks are published as ticks, never scaled"
+        );
+
+        // The same field on the Waveshare is a millisecond SOFTWARE counter. It must NOT be promoted
+        // to the device domain — reading LR2021 ticks as ms would be 16000x wrong, and publishing a
+        // firmware scheduler tick as a link clock would let common view difference two main loops.
+        let ws = NodeProfile::legacy_sx1262();
+        assert_eq!(ws.tick_ns(), Some(1_000_000));
+        let s = rx_stamp(&ws, dom, 1234);
+        assert_eq!(s.domain, HOST_CLOCK_DOMAIN);
+        assert_eq!(s.latch, LatchPoint::HostRecv);
+    }
+
+    #[test]
+    fn only_a_hardware_stamp_unlocks_common_view() {
+        use ndn_radio_hal::FaceTimeProfile;
+
+        struct Fake(NodeProfile, ClockDomainId);
+        impl RadioTime for Fake {
+            fn time_sources(&self) -> Vec<RadioTimeSource> {
+                let mut v = Vec::new();
+                if self.0.stamp_kind == StampKind::HardwareFreeRun
+                    && let Some(t) = self.0.tick_ns()
+                {
+                    v.push(RadioTimeSource {
+                        kind: RadioClockKind::FreeRunRxStamp,
+                        domain: self.1,
+                        latch: LatchPoint::MacDone,
+                        precision_ns: t,
+                        tick_ns: t,
+                        monotonic: true,
+                        read_now: self.0.has_readable_clock(),
+                    });
+                }
+                v.push(RadioTimeSource::host_recv(HOST_CLOCK_DOMAIN));
+                v
+            }
+        }
+        let dom = ClockDomainId(9);
+
+        let hw = FaceTimeProfile::derive(
+            &Fake(RadioKindHint::Lr2021Flrc.profile(), dom),
+            TxDiscipline::BestEffort,
+        );
+        assert!(hw.can_common_view, "stamp_kind 3 is the whole point");
+        assert_eq!(hw.stamp_precision_ns, Some(63));
+        assert_eq!(hw.best_clock, Some(RadioClockKind::FreeRunRxStamp));
+
+        for kind in [
+            StampKind::NoStamp,
+            StampKind::HostRecv,
+            StampKind::SoftwareCounter,
+        ] {
+            let mut p = RadioKindHint::Lr2021Flrc.profile();
+            p.stamp_kind = kind;
+            let f = FaceTimeProfile::derive(&Fake(p, dom), TxDiscipline::BestEffort);
+            assert!(!f.can_common_view, "{kind:?} must not claim common view");
+            assert_eq!(f.best_clock, Some(RadioClockKind::HostRecv));
+        }
+    }
+
+    // ── scheduling ────────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn schedules_tx_needs_both_a_granularity_and_the_opcode() {
+        let mut p = RadioKindHint::Lr2021Flrc.profile();
+        assert!(!p.schedules_tx(), "m6_bridge has neither");
+
+        // A granularity with no CMD_TX_AT is the exact trap FrameIo::schedules_tx warns about: the
+        // caller would skip its software gate and inject_after would fall through to inject-now.
+        p.sched_gran_ns = 62_500;
+        assert!(
+            !p.schedules_tx(),
+            "a declared granularity is not an actuator"
+        );
+
+        p.cmd_bitmap |= cmd_bits(&[CMD_TX_AT]);
+        assert!(p.schedules_tx());
+
+        // And the discipline follows the same predicate, so the two cannot disagree.
+        assert_eq!(
+            if p.schedules_tx() {
+                TxDiscipline::ScheduledAt {
+                    granularity_ns: p.sched_gran_ns as u64,
+                }
+            } else {
+                TxDiscipline::BestEffort
+            },
+            TxDiscipline::ScheduledAt {
+                granularity_ns: 62_500
+            }
+        );
+    }
+
+    // ── the airtime-derived transmit timeout ──────────────────────────────────────────────────
+
+    #[test]
+    fn airtime_matches_the_semtech_formula() {
+        // SF7/125 kHz/CR 4-5, 48-byte payload, 8-symbol preamble: ~97 ms.
+        let t = lora_airtime_ms(7, 125, 1, 48, 8);
+        assert!((90..=105).contains(&t), "SF7 48B was {t} ms");
+        // SF12/125 kHz/CR 4-5, a full 240-byte frame: ~8.5 s — nearly 3x the old fixed 3 s timeout.
+        let t12 = lora_airtime_ms(12, 125, 1, 240, 8);
+        assert!((8_000..=9_200).contains(&t12), "SF12 240B was {t12} ms");
+        assert!(
+            Duration::from_millis(t12) > TXDONE_MIN_TIMEOUT,
+            "this is the bug: a fixed 3 s timeout abandons an SF12 frame mid-flight"
+        );
+        // Monotone in every axis that costs airtime.
+        assert!(lora_airtime_ms(12, 125, 1, 240, 8) > lora_airtime_ms(11, 125, 1, 240, 8));
+        assert!(lora_airtime_ms(9, 125, 1, 240, 8) > lora_airtime_ms(9, 250, 1, 240, 8));
+        assert!(lora_airtime_ms(9, 125, 4, 240, 8) > lora_airtime_ms(9, 125, 1, 240, 8));
+        assert!(lora_airtime_ms(9, 125, 1, 240, 64) > lora_airtime_ms(9, 125, 1, 240, 8));
+    }
+
+    #[test]
+    fn the_lbt_budget_comes_from_the_firmwares_own_bound() {
+        // attempts x cw x 2^backoff, the loop bound the firmware enforces — not a magic 5 s.
+        assert_eq!(
+            LbtCfg::default().worst_case(),
+            Duration::from_millis(6 * 20 * 16)
+        );
+    }
+
+    // ── the bandwidth code space (a live Heltec bug) ──────────────────────────────────────────
+
+    /// The `CMD_SET_MOD[1]` byte means different things on different nodes and **nothing on the wire
+    /// says which**. The Waveshare firmware hands the byte straight to the SX1262
+    /// (`SetModulationParams` LoRa BW codes `0x04/0x05/0x06`); the Heltec firmware decodes `0/1/2`
+    /// and maps anything else to 125 kHz. Sending SX1262 codes to the Heltec therefore pins it to
+    /// 125 kHz forever while `EVT_INFO` echoes the value the host asked for — a silent, invisible
+    /// mismatch. This table is the pin.
+    #[test]
+    fn bandwidth_codes_are_per_node_and_pinned() {
+        let table = [
+            // (node kind,                  host code, wire byte)
+            (LoraRadioKind::Sx1262, 0u8, 0x04u8),
+            (LoraRadioKind::Sx1262, 1, 0x05),
+            (LoraRadioKind::Sx1262, 2, 0x06),
+            (LoraRadioKind::Sx1276, 0, 0x00),
+            (LoraRadioKind::Sx1276, 1, 0x01),
+            (LoraRadioKind::Sx1276, 2, 0x02),
+            (LoraRadioKind::Lr2021Lora, 0, 0x04),
+            (LoraRadioKind::Unknown(9), 2, 0x06),
+        ];
+        for (kind, host, wire) in table {
+            assert_eq!(
+                bw_to_fw(kind, host),
+                wire,
+                "{kind:?} host bw code {host} must go on the wire as {wire:#04x}"
+            );
+        }
+        // Out-of-range host codes saturate at 500 kHz rather than wrapping into a foreign register.
+        assert_eq!(bw_to_fw(LoraRadioKind::Sx1262, 7), 0x06);
+        assert_eq!(bw_to_fw(LoraRadioKind::Sx1276, 7), 0x02);
+        // And the kHz table the airtime formula reads is the same three widths.
+        assert_eq!(BW_KHZ, [125, 250, 500]);
+    }
+
+    /// **The `sf` byte is not portable.** A node with `sf_min == 0` reuses the `CMD_SET_MOD`
+    /// positions for its own modulation: on the LR2021 `[0]` is an FLRC bitrate rung and `[2]` an
+    /// FLRC coding rate (`m6_bridge.rs::bitrate_of_code`/`cr_of_code`). This host's default `sf = 7`
+    /// decodes there as rung 7 = `FlrcBitrate::Br0260`, ten times slower than the firmware's
+    /// `Br2600` default — so an unguarded `configure()` would re-modulate a verified-live link at
+    /// open() and report success. The gate is `has_spreading_factor`, and it covers the whole
+    /// triple because `cr` is re-keyed on such a node too.
+    #[test]
+    fn the_set_mod_triple_is_gated_on_a_real_spreading_factor() {
+        let flrc = RadioKindHint::Lr2021Flrc.profile();
+        assert!(!flrc.has_spreading_factor());
+        assert_eq!(flrc.clamp_sf(7), None, "no SF is not SF 7");
+
+        for lora in [NodeProfile::legacy_sx1262(), NodeProfile::heltec_sx1276()] {
+            assert!(lora.has_spreading_factor());
+            assert_eq!(lora.clamp_sf(7), Some(7));
+        }
+
+        // The live v2 LR2021 DOES advertise CMD_SET_MOD, so `supports()` alone is not the gate —
+        // that is exactly why the bug was reachable.
+        let live_flrc = NodeProfile::parse(&{
+            let mut c = flrc.to_cap_payload();
+            c[19..23].copy_from_slice(&(flrc.cmd_bitmap | 1 << CMD_SET_MOD).to_be_bytes());
+            c
+        })
+        .expect("29 bytes parse");
+        assert!(live_flrc.supports(CMD_SET_MOD));
+        assert!(!live_flrc.has_spreading_factor());
+    }
+
+    // ── capability from the profile ───────────────────────────────────────────────────────────
+
+    /// **The declared index ceiling must be the ceiling the actuator enforces.** Both LoRa
+    /// constructors fill `max_tx_power` with 63, a chip TXAGC index scale none of these nodes has —
+    /// `CMD_SET_PWR` carries an i8 dBm. With 63 declared, cognition's `decide_power` hands
+    /// `63 − backoff_idx` to `set_tx_power`, which clamps it straight back to the PA maximum, so the
+    /// back-off lever is inert for any realistic margin. `capability()` derives the ceiling through
+    /// `clamp_dbm` instead — the same function the actuator calls, so the two cannot disagree.
+    #[test]
+    fn the_index_power_ceiling_is_the_one_the_actuator_enforces() {
+        for prof in [
+            NodeProfile::legacy_sx1262(),
+            NodeProfile::heltec_sx1276(),
+            RadioKindHint::Lr2021Flrc.profile(),
+        ] {
+            let ceiling = prof.clamp_dbm(i8::MAX).max(0) as u8;
+            assert!(
+                ceiling > 0 && ceiling < 63,
+                "{prof:?} would inherit a fabricated 63-step scale"
+            );
+            // The ceiling is a fixed point of the clamp: asking for it applies it exactly.
+            assert_eq!(prof.clamp_dbm(ceiling as i8), ceiling as i8);
+            // And a 6 dB back-off from it lands 6 dB down rather than clamping back up.
+            assert_eq!(
+                prof.clamp_dbm(ceiling as i8 - 6),
+                ceiling as i8 - 6,
+                "{prof:?}: the back-off must bite"
+            );
+        }
+    }
+
+    #[test]
+    fn capability_is_built_from_the_profile_not_from_the_lora_preset() {
+        let lr = RadioKindHint::Lr2021Flrc.profile();
+        let cap = RadioCapability::lora_with(
+            RadioKind::Lora,
+            lr.bands(),
+            lr.channels(65),
+            RateCapability::None,
+            MAX_LORA_PAYLOAD.min(lr.max_payload as usize),
+            lr.duty_cycle_max(915_000_000),
+        );
+        assert_eq!(cap.rate, RateCapability::None, "FLRC has no SF span");
+        assert_eq!(cap.sf_range(), None);
+        assert_eq!(cap.max_payload, 48, "the REAL cap, not the preset's 256");
+        assert_eq!(
+            cap.channels,
+            vec![65],
+            "a fixed-carrier node has one channel"
+        );
+        assert_eq!(cap.tx_power_dbm, None, "no declared range => no dBm claim");
+        assert_eq!(
+            cap.duty_cycle_max, 1.0,
+            "FCC 15.247 has no duty fraction; the preset's ETSI 0.01 is wrong here"
+        );
+        assert_eq!(cap.retune_us, None, "unmeasured stays unmeasured");
+        assert_eq!(
+            cap.can_hop(20_000),
+            None,
+            "and can_hop must answer 'cannot say'"
+        );
+
+        // The Waveshare, by contrast, keeps a real SF span, a real dBm range, and a real band plan.
+        let ws = NodeProfile::legacy_sx1262();
+        let cap = RadioCapability::lora_with(
+            RadioKind::Lora,
+            ws.bands(),
+            ws.channels(65),
+            RateCapability::Lora {
+                min_sf: ws.sf_min,
+                max_sf: ws.sf_max,
+            },
+            MAX_LORA_PAYLOAD.min(ws.max_payload as usize),
+            ws.duty_cycle_max(channel_to_hz(65)),
+        )
+        .with_tx_power_dbm(ws.dbm_range().unwrap());
+        assert_eq!(cap.sf_range(), Some((7, 12)));
+        // The legacy profile's honest end-to-end cap, not `RadioCapability::lora`'s 256 and not the
+        // 240 this firmware accepts on TX — its RX truncates at 64. See `LEGACY_RX_TRUNCATION_CAP`.
+        assert_eq!(cap.max_payload, LEGACY_RX_TRUNCATION_CAP as usize);
+        assert_eq!(cap.tx_power_dbm, Some(DbmRange::new(10, 22)));
+        assert_eq!(cap.channels.first().copied(), Some(52), "902 MHz");
+        assert_eq!(cap.channels.last().copied(), Some(78), "928 MHz band edge");
+    }
+
+    #[test]
+    fn duty_cycle_follows_the_band_not_the_family() {
+        let p = NodeProfile::legacy_sx1262();
+        assert_eq!(p.duty_cycle_max(868_000_000), 0.01, "ETSI EN 300 220: 1%");
+        assert_eq!(
+            p.duty_cycle_max(915_000_000),
+            1.0,
+            "FCC 15.247: no duty fraction"
+        );
+        assert_eq!(p.duty_cycle_max(928_000_000), 1.0);
+    }
+
+    #[test]
+    fn power_clamps_come_from_the_node() {
+        let ws = NodeProfile::legacy_sx1262();
+        assert_eq!(ws.clamp_dbm(30), 22);
+        assert_eq!(ws.clamp_dbm(-5), 10);
+        let heltec = RadioKindHint::HeltecSx1276.profile();
+        assert_eq!(
+            heltec.clamp_dbm(22),
+            17,
+            "the SX1276 PA_BOOST ceiling, not the SX1262's"
+        );
+        // An undeclared range refuses rather than inventing one, but the index knob still clamps
+        // conservatively so it can send a byte at all.
+        let lr = RadioKindHint::Lr2021Flrc.profile();
+        assert_eq!(lr.dbm_range(), None);
+        assert_eq!(lr.clamp_dbm(99), LEGACY_PWR_MAX_DBM);
+    }
+
+    #[test]
+    fn frequency_clamps_and_channel_lists_come_from_the_node() {
+        let ws = NodeProfile::legacy_sx1262();
+        assert_eq!(ws.clamp_hz(868_000_000), 902_000_000, "below the US span");
+        assert_eq!(ws.clamp_hz(915_000_000), 915_000_000);
+        assert_eq!(ws.channels(65).len(), 27, "902..=928 MHz inclusive");
+        // A node with a degenerate span reports the one channel it is known-good on.
+        let lr = RadioKindHint::Lr2021Flrc.profile();
+        assert_eq!(lr.channels(65), vec![65]);
+    }
+
+    #[test]
+    fn the_fnv_keyspace_stays_byte_identical_to_the_firmwares() {
+        // Pinned vectors: if this changes, the host and the node disagree about which names a
+        // filter/relay/CS entry covers, and the failure is silent.
+        assert_eq!(name_hash(b""), 0xcbf2_9ce4_8422_2325);
+        assert_eq!(name_hash(b"a"), 0xaf63_dc4c_8601_ec8c);
+        // And the payload packer is 8 big-endian bytes per prefix.
+        let p = hash_payload(&[b"ndn/x".as_slice(), b"ndn/y".as_slice()]);
+        assert_eq!(p.len(), 16);
+        assert_eq!(&p[..8], &name_hash(b"ndn/x").to_be_bytes());
     }
 }

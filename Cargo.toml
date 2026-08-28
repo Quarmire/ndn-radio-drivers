@@ -109,3 +109,7 @@ async-trait = "0.1"
 tokio       = { version = "1", default-features = false }
 libc        = "0.2"
 proptest    = "1"
+
+[[example]]
+name = "ndr_node_report"
+required-features = ["lora"]

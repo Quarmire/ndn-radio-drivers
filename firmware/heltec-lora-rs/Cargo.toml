@@ -30,7 +30,17 @@ esp-rtos         = { version = "0.3.0", features = ["esp32", "embassy", "esp-all
 embassy-executor = "0.10"
 embassy-time     = "0.5"
 embassy-futures  = "0.1"
+# Used for the host-command channel between the UART reader task and the radio task (see
+# `uart_reader` in main.rs) — the equivalent of the Waveshare node's USART ISR ring, and what keeps
+# host commands alive while a long SF12 transmission occupies the radio task.
+embassy-sync     = "0.8"
 static_cell      = "2.1"
+
+# The SAME no_std NDN data plane the Waveshare/LR2021 nodes run — `src/ndn.rs` is included by
+# `#[path]` from ../waveshare-lora-rs, not copied, so name-hash/filter/dedup semantics cannot drift
+# between nodes that must interoperate. `default-features = false, features = ["cs"]` selects the
+# allocation-free path.
+ndn-embedded = { path = "../../../ndn-embedded/crates/ndn-embedded", default-features = false, features = ["cs"] }
 
 [profile.dev]
 opt-level = "s"

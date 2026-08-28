@@ -11,6 +11,27 @@
 //! frame; set frequency / SF-BW-CR / power / sync word; query info) and firmware events (received
 //! frame with RSSI+SNR; TX-done; info; ascii log). No proprietary header — the air side is plain
 //! LoRa, so it interoperates with any SX127x/SX126x peer (verified against the Heltec).
+//!
+//! ## 7E-A5 **v2** (2026-08-28) — this node is the fleet reference
+//!
+//! The framing is unchanged and every existing opcode keeps its meaning; v2 only ADDS
+//! self-description, and makes two silent failures loud:
+//!
+//!  * **CMD_GET_CAP → EVT_CAP** (`send_cap`): the ONE place this node describes itself — band, real
+//!    dBm range, timestamp rate and kind, the true `max_payload`, an exact `cmd_bitmap`, the SF span,
+//!    and `sched_gran_ns = 0` because there is no scheduled-TX engine here.
+//!  * **CMD_READ_CLOCK → EVT_CLOCK**, the same µs counter EVT_RX stamps with, at full 64-bit width.
+//!  * **CMD_SENSE → EVT_SENSE**, free-running channel-busy count + instantaneous RSSI.
+//!  * **CMD_TX_AT → EVT_UNSUPPORTED**, explicitly: no scheduled TX on this radio.
+//!  * Nothing answers with **silence** any more — an unknown or badly-argued command gets
+//!    `EVT_UNSUPPORTED [cmd, reason]` instead of costing the host four retries and a timeout.
+//!
+//! Two correctness fixes ship with it:
+//!  * **C1** — the RX path buffered 64 bytes while CMD_TX accepted 240 and the host face declared an
+//!    MTU of 200, so every received frame over 64 B was silently truncated. RX now runs to `RX_MAX`
+//!    (247, the serial framing's real ceiling) and counts anything longer.
+//!  * **C2** — the on-device NDN data plane recognised only the ASCII demo wire, so every offload
+//!    path was INERT on the real face. It now parses NDNLPv2/NDN-TLV (see `ndn.rs`).
 
 #![no_std]
 #![no_main]
@@ -110,10 +131,15 @@ static RING: Ring = Ring::new();
 /// Reading DR *after* SR is also what clears an overrun (ORE). That matters: a latched ORE stops the
 /// peripheral delivering anything further, so missing this would take the host link down for good
 /// rather than costing a single byte.
-/// 1 kHz SysTick → the free-running millisecond clock behind `millis()` (EVT_RX timestamps).
+/// 1 kHz SysTick → the free-running millisecond clock behind `millis()`/`micros()` (EVT_RX
+/// timestamps). Also carries the ms counter's own wrap into `MILLIS_HI`, which is what lets
+/// `micros64` (CMD_READ_CLOCK) be a genuine 64-bit monotonic µs clock instead of a u32 that silently
+/// restarts every ~71 minutes.
 #[exception]
 fn SysTick() {
-    MILLIS.fetch_add(1, Ordering::Relaxed);
+    if MILLIS.fetch_add(1, Ordering::Relaxed) == u32::MAX {
+        MILLIS_HI.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 #[interrupt]
@@ -160,16 +186,76 @@ const CMD_SET_DEBUG: u8 = 0x15; //       payload = [on] (toggle EVT_LOG diagnost
 const CMD_ENTER_BOOTLOADER: u8 = 0x16; // payload = [0xB0,0x07] guard → jump to the GD32 ROM UART
 //                                       bootloader on USART1, so `stm32flash` reflashes over the SAME
 //                                       CH343/USB link — no ST-Link, no BOOT0 pin, no replug.
+// --- 7E-A5 v2 (fleet-wide self-description; the Waveshare is the reference node) ---
+const CMD_READ_CLOCK: u8 = 0x17; //  payload = []  → EVT_CLOCK [ticks u64 BE], units = EVT_CAP.stamp_hz
+const CMD_TX_AT: u8 = 0x18; //       payload = [delay_us u32 BE][frame] — NOT IMPLEMENTED on this node;
+//                                   answered EVT_UNSUPPORTED (see the explicit arm in `handle_cmd`).
+const CMD_GET_CAP: u8 = 0x1A; //     payload = []  → EVT_CAP (29 bytes)
+const CMD_SENSE: u8 = 0x1B; //       payload = []  → EVT_SENSE [activity u16 BE, rssi i16 BE]
+// --- Waveshare-local extension. Outside the v2 block (0x17..0x1B) so it cannot collide with a future
+// fleet assignment there; the host discovers it from EVT_CAP's cmd_bitmap, which is what the bitmap
+// is for.
+const CMD_SET_RX_GAIN: u8 = 0x1C; // payload = [0 = power-saving | 1 = boosted] → EVT_INFO
 // Firmware -> host events.
-const EVT_RX: u8 = 0x81; //    payload = [rssi i16 BE, snr i16 BE, ts_ms u32 BE, LoRa bytes]
+const EVT_RX: u8 = 0x81; //    payload = [rssi i16 BE, snr i16 BE, ts_us u32 BE, LoRa bytes]
+//                             ts_us is MICROseconds (`micros()`), not ms — the field was mislabelled
+//                             `ts_ms` here and on the host. EVT_CAP.stamp_hz states the true rate.
 const EVT_TXDONE: u8 = 0x82; //payload = [ok, attempts]  (attempts=0 for a plain CMD_TX)
 const EVT_INFO: u8 = 0x83; //  payload = [status, sync(2), errors(2), freq(4), sf, bw, cr, pwr, lost(2), cad_busy(2), defer(2)]
+//                             19 bytes, FIXED: the host reads cad_busy/defer as the LAST 4 bytes, so
+//                             nothing may ever be appended here. New counters go in EVT_STATS.
 const EVT_LOG: u8 = 0x84; //   payload = ascii
 const EVT_CAD: u8 = 0x85; //   payload = [busy(0/1)]
 const EVT_RSSI: u8 = 0x86; //  payload = [rssi i16 BE]
 const EVT_SF_DETECTED: u8 = 0x87; // payload = [sf | 0 = none]
 const EVT_TX_STARTED: u8 = 0x88; //  payload = [airtime_ms u16 BE] — emitted just before key-up
-const EVT_STATS: u8 = 0x89; //       payload = [rx(4), filtered(4), deduped(4), served(4), relayed(4), cad_busy(2), defer(2)]
+const EVT_STATS: u8 = 0x89; //       payload = [rx(4), filtered(4), deduped(4), served(4), relayed(4),
+//                                   cad_busy(2), defer(2)  <- v1 ends at 24 B; a v1 host stops here
+//                                   chip_rx(2), chip_crc_err(2), chip_hdr_err(2), rx_trunc(2)] = 32 B
+const EVT_CLOCK: u8 = 0x8A; //       payload = [ticks u64 BE] (µs; see EVT_CAP.stamp_hz)
+const EVT_CAP: u8 = 0x8B; //         payload = 29 bytes, all multi-byte fields BIG-ENDIAN (see `send_cap`)
+const EVT_SENSE: u8 = 0x8C; //       payload = [activity u16 BE, rssi i16 BE]
+const EVT_UNSUPPORTED: u8 = 0x8F; // payload = [cmd, reason] — never silence, never a fake success
+
+// EVT_UNSUPPORTED reason codes.
+const UNSUP_UNKNOWN_OPCODE: u8 = 0x01; // this firmware does not know the opcode at all
+const UNSUP_NO_HARDWARE: u8 = 0x02; //   opcode understood, but this radio/firmware has no such engine
+const UNSUP_BAD_LENGTH: u8 = 0x03; //    opcode understood, payload does not satisfy its argument
+//                                       requirements (too short, or a guard magic wrong)
+const UNSUP_OUT_OF_RANGE: u8 = 0x04; //  argument outside the range EVT_CAP advertises
+
+/// **The self-description bitmap** (EVT_CAP `cmd_bitmap`): bit N set ⇔ opcode N is implemented and
+/// will act. The host uses it to decide what it may send, so it must be EXACT — and it is also the
+/// firmware's own "is this a known opcode?" oracle in `handle_cmd`, so the bitmap and the dispatcher
+/// physically cannot drift apart.
+///
+/// Set: 0x01..=0x17 (every command from CMD_TX through CMD_READ_CLOCK) = bits 1..23 → `0x00FF_FFFE`
+///      0x1A CMD_GET_CAP  → bit 26 → `0x0400_0000`
+///      0x1B CMD_SENSE    → bit 27 → `0x0800_0000`
+///      0x1C CMD_SET_RX_GAIN → bit 28 → `0x1000_0000`
+/// Clear: bit 0 (no opcode 0), bit 24 (0x18 CMD_TX_AT — no scheduled-TX engine; answered
+///        EVT_UNSUPPORTED), bit 25 (0x19 unassigned), bits 29..31 (unassigned).
+/// Total = 0x1CFF_FFFE.
+const CMD_BITMAP: u32 = 0x1CFF_FFFE;
+
+/// Largest LoRa frame this firmware will receive and report — the REAL end-to-end cap, and what
+/// EVT_CAP advertises as `max_payload`.
+///
+/// It is set by the SERIAL FRAMING, not the radio: an event's `len` field is one byte, so an
+/// EVT_RX payload can be at most 255 B, of which 8 are the rssi/snr/timestamp header → 247 B of
+/// frame. The SX1262 FIFO (256 B) and the LoRa PDU (255 B) are both larger, and `CMD_TX` accepts up
+/// to 255 B, so 247 is the binding constraint and therefore the honest number to report.
+///
+/// (Before 2026-08-28 this was 64 while TX accepted 240: every received frame over 64 B was
+/// silently truncated — bug C1.
+///
+/// **RAM budget worked to**, all measured on the built image, not estimated: the linker gives 20 KB
+/// − 8 B (the boot-flag slot) = 20 472 B. `.bss` is 536 B (the 512 B host ring + its indices);
+/// everything else is stack, and `main`'s frame — which holds `rxbuf`, the EVT_RX scratch, the
+/// parser, the CS-serve buffer and the whole `DataPlane` — measures 0xcb0 = 3 248 B, with no callee
+/// frame above 0x2c. Peak ≈ 3.8 KB of 20.4 KB, so ~16.5 KB spare. That is what paid for `rxbuf`
+/// 64→247, the EVT_RX scratch 72→255, and `ndn::CS_MAX_LEN` 96→192.)
+const RX_MAX: usize = 247;
 
 /// Runtime diagnostics toggle (CMD_SET_DEBUG) — emit EVT_LOG traces of data-plane decisions on demand,
 /// no reflash. Off by default (quiet link).
@@ -193,8 +279,14 @@ struct Csma {
     lbt_max_attempts: u8,
     /// Backoff PRNG (xorshift32), seeded once from the SX1262 hardware RNG.
     rng: u32,
-    /// Observability counters, reported in EVT_INFO (you cannot tune CSMA blind).
+    /// Channel-busy observations — **free-running and wrapping, never cleared**, because EVT_SENSE
+    /// (`activity`) is defined as a free-running counter the host differences over a window. One
+    /// increment site, one piece of state.
     cad_busy: u16,
+    /// Baseline subtracted for the *resettable* EVT_INFO / EVT_STATS view. CMD_RESET_STATS moves this
+    /// forward instead of zeroing `cad_busy`, so re-baselining the stats view cannot make EVT_SENSE
+    /// appear to run backwards.
+    cad_busy_base: u16,
     defer: u16,
     /// Energy-detect threshold (dBm) OR'd into the busy sense; `i16::MIN` disables it. Catches
     /// non-LoRa interference. Runtime-tunable (CMD_SET_SENSE_CFG).
@@ -206,18 +298,23 @@ impl Csma {
     fn new() -> Self {
         Self {
             preamble: 8,
-            cad_sym: 0x02, // 4 symbols
-            cad_peak: 0x18, // 24 — a mid default; tune on air per SF
-            cad_min: 0x0A, // 10
+            cad_sym: 0x02,      // 4 symbols
+            cad_peak: 0x18,     // 24 — a mid default; tune on air per SF
+            cad_min: 0x0A,      // 10
             lbt_cw: 20, // ms — the initial-backoff window must be ~a CAD slot (SF10 CAD ≈ 33 ms) to
             lbt_max_backoff: 4, // separate two nodes; runtime-tunable via CMD_SET_LBT_CFG, no reflash
             lbt_max_attempts: 6,
             rng: 0x1234_5678,
             cad_busy: 0,
+            cad_busy_base: 0,
             defer: 0,
             rssi_thresh: i16::MIN, // energy-detect disabled by default (CAD only)
             cad_repeat: 1,
         }
+    }
+    /// The resettable CAD-busy view reported by EVT_INFO / EVT_STATS.
+    fn cad_busy_view(&self) -> u16 {
+        self.cad_busy.wrapping_sub(self.cad_busy_base)
     }
     fn next_rand(&mut self) -> u32 {
         let mut x = self.rng;
@@ -229,25 +326,47 @@ impl Csma {
     }
 }
 
-/// Free-running millisecond clock (SysTick ISR).
+/// Free-running millisecond clock (SysTick ISR), and its wrap count.
 static MILLIS: AtomicU32 = AtomicU32::new(0);
+static MILLIS_HI: AtomicU32 = AtomicU32::new(0);
 fn millis() -> u32 {
     MILLIS.load(Ordering::Relaxed)
 }
 
-/// Microsecond clock for the EVT_RX hardware timestamp (#41 common-view timing needs sub-ms). Combines
-/// the ms tick with the SysTick down-counter (reloads every 8000 cycles = 1 ms @ 8 MHz). Retries if a
-/// tick lands mid-read. u32 µs wraps ~every 71 min — fine for relative timing.
-fn micros() -> u32 {
-    const RELOAD: u32 = 8_000 - 1;
+/// SysTick reload: 8000 cycles = 1 ms at the 8 MHz HSI core clock, so the down-counter resolves
+/// 1/8000 ms = 0.125 µs and the value below is in whole MICROseconds.
+const SYSTICK_RELOAD: u32 = 8_000 - 1;
+/// **`stamp_hz` = 1_000_000.** This is the unit of the EVT_RX timestamp and of EVT_CLOCK, and it is
+/// microseconds, not milliseconds: `micros64` adds `RELOAD - CVR` SysTick cycles / 8 to `ms * 1000`.
+/// The old `ts_ms` label on EVT_RX was simply wrong.
+const STAMP_HZ: u32 = 1_000_000;
+
+/// 64-bit monotonic microsecond clock — the counter EVT_RX stamps with and CMD_READ_CLOCK returns
+/// (#41 common-view timing needs sub-ms). Combines the ms tick (plus its wrap count) with the SysTick
+/// down-counter. Retries if a tick lands mid-read.
+///
+/// This is a SOFTWARE counter (EVT_CAP `stamp_kind = 2`): the MCU reads it when it notices the
+/// SX1262's RxDone IRQ in the poll loop, not a hardware capture at the air interface. Its resolution
+/// is ~1 µs but its ACCURACY against the air is bounded by the poll interval, so do not read it as an
+/// LR2021-style hardware RX stamp.
+fn micros64() -> u64 {
     const SYST_CVR: *const u32 = 0xE000_E018 as *const u32; // SysTick current-value register
     loop {
-        let ms1 = MILLIS.load(Ordering::Relaxed);
+        let hi1 = MILLIS_HI.load(Ordering::Relaxed);
+        let ms = MILLIS.load(Ordering::Relaxed);
         let cvr = unsafe { core::ptr::read_volatile(SYST_CVR) } & 0x00FF_FFFF;
-        if MILLIS.load(Ordering::Relaxed) == ms1 {
-            return ms1.wrapping_mul(1000).wrapping_add(RELOAD.saturating_sub(cvr) / 8);
+        if MILLIS.load(Ordering::Relaxed) == ms && MILLIS_HI.load(Ordering::Relaxed) == hi1 {
+            let ms64 = ((hi1 as u64) << 32) | ms as u64;
+            return ms64 * 1000 + (SYSTICK_RELOAD.saturating_sub(cvr) / 8) as u64;
         }
     }
+}
+
+/// The low 32 bits of [`micros64`] — the EVT_RX `ts_us` field. Exactly the truncation of the 64-bit
+/// clock (`(hi << 32) * 1000` is a multiple of 2^32), so the two never disagree; it wraps every
+/// ~71 min, which is fine for relative timing and is why CMD_READ_CLOCK returns the full 64 bits.
+fn micros() -> u32 {
+    micros64() as u32
 }
 
 // Heartbeat-beacon base period in main-loop iterations (~seconds; the loop is SPI-poll bound).
@@ -262,7 +381,10 @@ struct BufWriter {
 }
 impl BufWriter {
     fn new() -> Self {
-        Self { buf: [0; 64], pos: 0 }
+        Self {
+            buf: [0; 64],
+            pos: 0,
+        }
     }
     fn as_slice(&self) -> &[u8] {
         &self.buf[..self.pos]
@@ -292,7 +414,14 @@ struct Parser {
 }
 impl Parser {
     fn new() -> Self {
-        Self { state: 0, typ: 0, len: 0, idx: 0, crc: 0, buf: [0; 255] }
+        Self {
+            state: 0,
+            typ: 0,
+            len: 0,
+            idx: 0,
+            crc: 0,
+            buf: [0; 255],
+        }
     }
     /// Feed one byte; returns `Some((type, payload_len))` when a valid frame completes.
     fn push(&mut self, b: u8) -> Option<(u8, usize)> {
@@ -440,11 +569,23 @@ fn main() -> ! {
             "waveshare-lora-rs stage4: init sync=0x{:04X} err=0x{:04X}",
             diag.sync_readback, diag.device_errors
         );
-        send_frame(|b| { let _ = block!(tx.write(b)); }, EVT_LOG, log.as_slice());
+        send_frame(
+            |b| {
+                let _ = block!(tx.write(b));
+            },
+            EVT_LOG,
+            log.as_slice(),
+        );
     }
 
     let mut parser = Parser::new();
-    let mut rxbuf = [0u8; 64];
+    // C1: sized to RX_MAX (247), the real end-to-end cap. This was 64 while CMD_TX accepted 240 and
+    // the host face declared an MTU of 200 — every received frame over 64 B was silently truncated,
+    // so any real NDN packet was corrupted on RX with nothing reporting it.
+    let mut rxbuf = [0u8; RX_MAX];
+    // Frames the radio reported LONGER than RX_MAX (so still truncated). Should stay 0 — reported in
+    // EVT_STATS so a peer transmitting past our advertised max_payload is visible instead of silent.
+    let mut rx_trunc: u16 = 0;
     // Default OFF: a fresh/reset dongle stays quiet (no stray beacon before a host attaches). Opt in
     // on-air discovery with CMD_SET_BEACON[1] (or the host's LoraParams.beacon = true).
     let mut beacon_enabled = false;
@@ -471,6 +612,7 @@ fn main() -> ! {
                     &mut beacon_period,
                     &mut csma,
                     &mut plane,
+                    &mut rx_trunc,
                 );
             }
         }
@@ -480,6 +622,11 @@ fn main() -> ! {
         if let Some(pkt) = radio.poll_rx(&mut rxbuf) {
             let ts = micros();
             let n = core::cmp::min(pkt.len as usize, rxbuf.len());
+            // `pkt.len` is the TRUE on-air length. With rxbuf at RX_MAX this can only trip if a peer
+            // ignores our advertised max_payload; count it rather than corrupt the frame in silence.
+            if pkt.len as usize > rxbuf.len() {
+                rx_trunc = rx_trunc.wrapping_add(1);
+            }
             // Copy any CS-serve payload out so we don't hold the data-plane borrow across the TX below.
             let mut serve = [0u8; ndn::CS_MAX_LEN];
             let mut serve_len = 0usize;
@@ -496,8 +643,18 @@ fn main() -> ! {
             };
             if debug_on() {
                 let mut lg = BufWriter::new();
-                let _ = write!(lg, "rx n={n} serve={} relay={relay} deliver={deliver}", serve_len > 0);
-                send_frame(|b| { let _ = block!(tx.write(b)); }, EVT_LOG, lg.as_slice());
+                let _ = write!(
+                    lg,
+                    "rx n={n} serve={} relay={relay} deliver={deliver}",
+                    serve_len > 0
+                );
+                send_frame(
+                    |b| {
+                        let _ = block!(tx.write(b));
+                    },
+                    EVT_LOG,
+                    lg.as_slice(),
+                );
             }
             // Content-Store hit: serve the cached Data ourselves (LBT), the host never wakes.
             if serve_len > 0 {
@@ -510,12 +667,20 @@ fn main() -> ! {
                 radio.start_rx();
             }
             if deliver {
-                let mut ev = [0u8; 72];
+                // 8 header bytes + up to RX_MAX frame bytes = 255, the largest payload the one-byte
+                // `len` field of the 7E-A5 framing can carry. That is what sets RX_MAX.
+                let mut ev = [0u8; 8 + RX_MAX];
                 ev[0..2].copy_from_slice(&pkt.rssi_dbm.to_be_bytes());
                 ev[2..4].copy_from_slice(&pkt.snr_db.to_be_bytes());
                 ev[4..8].copy_from_slice(&ts.to_be_bytes());
                 ev[8..8 + n].copy_from_slice(&rxbuf[..n]);
-                send_frame(|b| { let _ = block!(tx.write(b)); }, EVT_RX, &ev[..8 + n]);
+                send_frame(
+                    |b| {
+                        let _ = block!(tx.write(b));
+                    },
+                    EVT_RX,
+                    &ev[..8 + n],
+                );
             }
         }
 
@@ -529,13 +694,61 @@ fn main() -> ! {
                 let _ = write!(msg, "LORA-BEACON seq={}", beacon_seq);
                 let ok = radio.transmit(msg.as_slice());
                 radio.start_rx();
-                send_frame(|b| { let _ = block!(tx.write(b)); }, EVT_TXDONE, &[ok as u8]);
+                send_frame(
+                    |b| {
+                        let _ = block!(tx.write(b));
+                    },
+                    EVT_TXDONE,
+                    &[ok as u8],
+                );
                 beacon_seq = beacon_seq.wrapping_add(1);
             }
         } else {
             beacon_ctr = 0;
         }
     }
+}
+
+/// **One channel-busy observation**, and the SINGLE site that advances [`Csma::cad_busy`].
+///
+/// Sense = `cad_repeat` CADs OR'd, then the RSSI energy-detect threshold (which catches non-LoRa
+/// interference a LoRa CAD is blind to). The caller must already have put the chip in standby and
+/// programmed the CAD parameters.
+///
+/// ⚠ **Why every sensing path routes through here.** `EVT_SENSE.activity` is contracted as a
+/// free-running count of channel-busy observations that the host differences over a window. It used
+/// to be incremented only inside the LBT backoff loop, so a node that was not transmitting never
+/// advanced it — a host polling `CMD_SENSE` on an idle dongle read a *saturated* channel as
+/// permanently free, silently, and the occupancy sampler it feeds would have believed that. The
+/// counter can only be honest if it counts the observations the host asks for as well as the ones
+/// the transmit path makes for itself.
+fn sense_busy<SPI, NSS, RST, BSY, DIO1, RFSW, E>(
+    radio: &mut Sx1262<SPI, NSS, RST, BSY, DIO1, RFSW>,
+    csma: &mut Csma,
+) -> bool
+where
+    SPI: embedded_hal::blocking::spi::Transfer<u8, Error = E>
+        + embedded_hal::blocking::spi::Write<u8, Error = E>,
+    NSS: embedded_hal::digital::v2::OutputPin,
+    RST: embedded_hal::digital::v2::OutputPin,
+    RFSW: embedded_hal::digital::v2::OutputPin,
+    BSY: embedded_hal::digital::v2::InputPin,
+    DIO1: embedded_hal::digital::v2::InputPin,
+{
+    let mut busy = false;
+    for _ in 0..csma.cad_repeat.max(1) {
+        if radio.do_cad() {
+            busy = true;
+            break;
+        }
+    }
+    if !busy && csma.rssi_thresh > i16::MIN {
+        busy = radio.rssi_busy(csma.rssi_thresh);
+    }
+    if busy {
+        csma.cad_busy = csma.cad_busy.wrapping_add(1);
+    }
+    busy
 }
 
 /// The atomic listen-before-talk TX loop (#52): a random backoff BEFORE each CAD (CSMA/CA, so no node
@@ -565,22 +778,10 @@ where
         let window = (csma.lbt_cw << shift).max(1);
         let wait_ms = csma.next_rand() % window;
         cortex_m::asm::delay(wait_ms.saturating_mul(8_000)); // 8 MHz core → 8000 cycles/ms
-        // Sense = CAD (N repeats OR'd) OR RSSI energy-detect (catches non-LoRa interference).
-        let mut busy = false;
-        for _ in 0..csma.cad_repeat.max(1) {
-            if radio.do_cad() {
-                busy = true;
-                break;
-            }
-        }
-        if !busy && csma.rssi_thresh > i16::MIN {
-            busy = radio.rssi_busy(csma.rssi_thresh);
-        }
-        if !busy {
+        if !sense_busy(radio, csma) {
             sent = radio.transmit(payload);
             break;
         }
-        csma.cad_busy = csma.cad_busy.wrapping_add(1);
         attempt += 1;
     }
     if !sent {
@@ -606,6 +807,7 @@ fn handle_cmd<SPI, NSS, RST, BSY, DIO1, RFSW, E, TX>(
     beacon_period: &mut u32,
     csma: &mut Csma,
     plane: &mut ndn::DataPlane,
+    rx_trunc: &mut u16,
 ) where
     SPI: embedded_hal::blocking::spi::Transfer<u8, Error = E>
         + embedded_hal::blocking::spi::Write<u8, Error = E>,
@@ -636,11 +838,13 @@ fn handle_cmd<SPI, NSS, RST, BSY, DIO1, RFSW, E, TX>(
             radio.start_rx();
             send_frame(&mut put, EVT_TXDONE, &[sent as u8, attempt]);
         }
-        // #52: one CAD at the current modulation → busy/clear (sensing, not the access loop).
+        // #52: one sense at the current modulation → busy/clear (sensing, not the access loop).
+        // Routed through `sense_busy` so it counts into `activity` like every other observation, and
+        // so a host-driven CAD honours `cad_repeat`/`rssi_thresh` exactly as the LBT loop does.
         CMD_CAD => {
             radio.standby();
             radio.set_cad_params(csma.cad_sym, csma.cad_peak, csma.cad_min);
-            let busy = radio.do_cad();
+            let busy = sense_busy(radio, csma);
             radio.start_rx();
             send_frame(&mut put, EVT_CAD, &[busy as u8]);
         }
@@ -667,54 +871,156 @@ fn handle_cmd<SPI, NSS, RST, BSY, DIO1, RFSW, E, TX>(
             radio.start_rx();
             send_frame(&mut put, EVT_SF_DETECTED, &[found]);
         }
+        // The band is enforced, not merely advertised: `set_frequency` hard-codes the 902-928 MHz
+        // image calibration, so tuning outside it yields a mis-calibrated receiver. Refusing keeps
+        // EVT_CAP's freq_min/freq_max a TRUE statement and tells the host why, where silently
+        // accepting would have left it believing a carrier the radio cannot properly hear.
         CMD_SET_FREQ if len >= 4 => {
-            *freq = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
+            let want = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
+            if !(sx1262::FREQ_MIN_HZ..=sx1262::FREQ_MAX_HZ).contains(&want) {
+                send_frame(
+                    &mut put,
+                    EVT_UNSUPPORTED,
+                    &[CMD_SET_FREQ, UNSUP_OUT_OF_RANGE],
+                );
+                return;
+            }
+            *freq = want;
             radio.standby();
             radio.set_frequency(*freq);
             radio.start_rx();
-            send_info(&mut put, radio, *freq, *sf, *bw, *cr, *pwr, lost, csma.cad_busy, csma.defer);
+            send_info(
+                &mut put,
+                radio,
+                *freq,
+                *sf,
+                *bw,
+                *cr,
+                *pwr,
+                lost,
+                csma.cad_busy_view(),
+                csma.defer,
+            );
         }
+        // Same contract as the frequency: SF is refused outside the advertised sf_min..sf_max rather
+        // than applied, so EVT_CAP's span stays true. (SF5/SF6 are chip-supported but need different
+        // sync-word handling and do not interop with the SX127x peers in this fleet.)
         CMD_SET_MOD if len >= 3 => {
+            if !(sx1262::SF_MIN..=sx1262::SF_MAX).contains(&buf[0]) {
+                send_frame(
+                    &mut put,
+                    EVT_UNSUPPORTED,
+                    &[CMD_SET_MOD, UNSUP_OUT_OF_RANGE],
+                );
+                return;
+            }
             *sf = buf[0];
             *bw = buf[1];
             *cr = buf[2];
             radio.standby();
             radio.set_modulation(*sf, *bw, *cr);
             radio.start_rx();
-            send_info(&mut put, radio, *freq, *sf, *bw, *cr, *pwr, lost, csma.cad_busy, csma.defer);
+            send_info(
+                &mut put,
+                radio,
+                *freq,
+                *sf,
+                *bw,
+                *cr,
+                *pwr,
+                lost,
+                csma.cad_busy_view(),
+                csma.defer,
+            );
         }
         CMD_SET_PWR if len >= 1 => {
-            *pwr = buf[0] as i8;
             radio.standby();
-            radio.set_power(*pwr);
+            // `set_power` clamps to the SX1262's real SetTxParams range and returns what it applied,
+            // so the mirror EVT_INFO reports (and EVT_CAP's advertised range) cannot lie.
+            *pwr = radio.set_power(buf[0] as i8);
             radio.start_rx();
-            send_info(&mut put, radio, *freq, *sf, *bw, *cr, *pwr, lost, csma.cad_busy, csma.defer);
+            send_info(
+                &mut put,
+                radio,
+                *freq,
+                *sf,
+                *bw,
+                *cr,
+                *pwr,
+                lost,
+                csma.cad_busy_view(),
+                csma.defer,
+            );
         }
         CMD_SET_SYNC if len >= 1 => {
             radio.standby();
             radio.set_sync(buf[0]);
             radio.start_rx();
-            send_info(&mut put, radio, *freq, *sf, *bw, *cr, *pwr, lost, csma.cad_busy, csma.defer);
+            send_info(
+                &mut put,
+                radio,
+                *freq,
+                *sf,
+                *bw,
+                *cr,
+                *pwr,
+                lost,
+                csma.cad_busy_view(),
+                csma.defer,
+            );
         }
         // #52 Tier 2: tune CAD/LBT/preamble at runtime — so calibration never needs a reflash.
         CMD_SET_CAD_CFG if len >= 3 => {
             csma.cad_sym = buf[0];
             csma.cad_peak = buf[1];
             csma.cad_min = buf[2];
-            send_info(&mut put, radio, *freq, *sf, *bw, *cr, *pwr, lost, csma.cad_busy, csma.defer);
+            send_info(
+                &mut put,
+                radio,
+                *freq,
+                *sf,
+                *bw,
+                *cr,
+                *pwr,
+                lost,
+                csma.cad_busy_view(),
+                csma.defer,
+            );
         }
         CMD_SET_LBT_CFG if len >= 4 => {
             csma.lbt_cw = u16::from_be_bytes([buf[0], buf[1]]) as u32;
             csma.lbt_max_backoff = buf[2];
             csma.lbt_max_attempts = buf[3];
-            send_info(&mut put, radio, *freq, *sf, *bw, *cr, *pwr, lost, csma.cad_busy, csma.defer);
+            send_info(
+                &mut put,
+                radio,
+                *freq,
+                *sf,
+                *bw,
+                *cr,
+                *pwr,
+                lost,
+                csma.cad_busy_view(),
+                csma.defer,
+            );
         }
         CMD_SET_PREAMBLE if len >= 2 => {
             csma.preamble = u16::from_be_bytes([buf[0], buf[1]]).max(1);
             radio.standby();
             radio.set_preamble(csma.preamble);
             radio.start_rx();
-            send_info(&mut put, radio, *freq, *sf, *bw, *cr, *pwr, lost, csma.cad_busy, csma.defer);
+            send_info(
+                &mut put,
+                radio,
+                *freq,
+                *sf,
+                *bw,
+                *cr,
+                *pwr,
+                lost,
+                csma.cad_busy_view(),
+                csma.defer,
+            );
         }
         CMD_SET_BEACON if len >= 1 => {
             *beacon_enabled = buf[0] != 0;
@@ -722,7 +1028,18 @@ fn handle_cmd<SPI, NSS, RST, BSY, DIO1, RFSW, E, TX>(
                 // Optional second byte scales the base period (min ×1).
                 *beacon_period = BEACON_BASE_PERIOD.saturating_mul(buf[1].max(1) as u32);
             }
-            send_info(&mut put, radio, *freq, *sf, *bw, *cr, *pwr, lost, csma.cad_busy, csma.defer);
+            send_info(
+                &mut put,
+                radio,
+                *freq,
+                *sf,
+                *bw,
+                *cr,
+                *pwr,
+                lost,
+                csma.cad_busy_view(),
+                csma.defer,
+            );
         }
         // #52 data-centric offload config. Filter/relay payloads are a list of u64 BE name-hashes.
         CMD_SET_NAME_FILTER => {
@@ -731,12 +1048,29 @@ fn handle_cmd<SPI, NSS, RST, BSY, DIO1, RFSW, E, TX>(
             for (i, h) in hashes[..count].iter_mut().enumerate() {
                 let o = i * 8;
                 *h = u64::from_be_bytes([
-                    buf[o], buf[o + 1], buf[o + 2], buf[o + 3],
-                    buf[o + 4], buf[o + 5], buf[o + 6], buf[o + 7],
+                    buf[o],
+                    buf[o + 1],
+                    buf[o + 2],
+                    buf[o + 3],
+                    buf[o + 4],
+                    buf[o + 5],
+                    buf[o + 6],
+                    buf[o + 7],
                 ]);
             }
             plane.set_filter(&hashes[..count]);
-            send_info(&mut put, radio, *freq, *sf, *bw, *cr, *pwr, lost, csma.cad_busy, csma.defer);
+            send_info(
+                &mut put,
+                radio,
+                *freq,
+                *sf,
+                *bw,
+                *cr,
+                *pwr,
+                lost,
+                csma.cad_busy_view(),
+                csma.defer,
+            );
         }
         CMD_SET_RELAY => {
             let mut hashes = [0u64; 24];
@@ -744,48 +1078,136 @@ fn handle_cmd<SPI, NSS, RST, BSY, DIO1, RFSW, E, TX>(
             for (i, h) in hashes[..count].iter_mut().enumerate() {
                 let o = i * 8;
                 *h = u64::from_be_bytes([
-                    buf[o], buf[o + 1], buf[o + 2], buf[o + 3],
-                    buf[o + 4], buf[o + 5], buf[o + 6], buf[o + 7],
+                    buf[o],
+                    buf[o + 1],
+                    buf[o + 2],
+                    buf[o + 3],
+                    buf[o + 4],
+                    buf[o + 5],
+                    buf[o + 6],
+                    buf[o + 7],
                 ]);
             }
             plane.set_relay(&hashes[..count]);
-            send_info(&mut put, radio, *freq, *sf, *bw, *cr, *pwr, lost, csma.cad_busy, csma.defer);
+            send_info(
+                &mut put,
+                radio,
+                *freq,
+                *sf,
+                *bw,
+                *cr,
+                *pwr,
+                lost,
+                csma.cad_busy_view(),
+                csma.defer,
+            );
         }
         CMD_DATAPLANE if len >= 5 => {
             plane.set_cs_serve(buf[0] != 0);
             plane.set_dedup(buf[1] != 0);
             plane.set_hop(buf[2] != 0, buf[3], buf[4]);
-            send_info(&mut put, radio, *freq, *sf, *bw, *cr, *pwr, lost, csma.cad_busy, csma.defer);
+            send_info(
+                &mut put,
+                radio,
+                *freq,
+                *sf,
+                *bw,
+                *cr,
+                *pwr,
+                lost,
+                csma.cad_busy_view(),
+                csma.defer,
+            );
         }
         // #52 tunables + diagnostics (all runtime — no reflash).
         CMD_SET_SENSE_CFG if len >= 3 => {
             csma.rssi_thresh = i16::from_be_bytes([buf[0], buf[1]]);
             csma.cad_repeat = buf[2].max(1);
-            send_info(&mut put, radio, *freq, *sf, *bw, *cr, *pwr, lost, csma.cad_busy, csma.defer);
+            send_info(
+                &mut put,
+                radio,
+                *freq,
+                *sf,
+                *bw,
+                *cr,
+                *pwr,
+                lost,
+                csma.cad_busy_view(),
+                csma.defer,
+            );
         }
+        // EVT_STATS v2 = 32 bytes. Bytes 0..24 are byte-identical to v1 and the existing host parser
+        // checks `len < 24` (not `!= 24`), so a v1 host reads it unchanged and simply ignores the
+        // tail; the host contract gains the extra fields when it is updated to read them.
         CMD_GET_STATS => {
-            let mut p = [0u8; 24];
+            let chip = radio.get_stats();
+            let mut p = [0u8; 32];
             p[0..4].copy_from_slice(&plane.rx.to_be_bytes());
             p[4..8].copy_from_slice(&plane.filtered.to_be_bytes());
             p[8..12].copy_from_slice(&plane.deduped.to_be_bytes());
             p[12..16].copy_from_slice(&plane.served.to_be_bytes());
             p[16..20].copy_from_slice(&plane.relayed.to_be_bytes());
-            p[20..22].copy_from_slice(&csma.cad_busy.to_be_bytes());
+            p[20..22].copy_from_slice(&csma.cad_busy_view().to_be_bytes());
             p[22..24].copy_from_slice(&csma.defer.to_be_bytes());
+            // --- v2 tail: the SX126x's OWN counters (P5). A CRC failure used to vanish inside
+            // `poll_rx` with nothing counting it, so RX loss was invisible; chip_crc_err is now the
+            // difference between "quiet channel" and "channel we are failing to decode".
+            p[24..26].copy_from_slice(&chip.pkt_received.to_be_bytes());
+            p[26..28].copy_from_slice(&chip.pkt_crc_error.to_be_bytes());
+            p[28..30].copy_from_slice(&chip.pkt_header_error.to_be_bytes());
+            // Frames whose on-air length exceeded RX_MAX and were therefore truncated. Should stay 0
+            // — a non-zero value means a peer is transmitting past our advertised max_payload.
+            p[30..32].copy_from_slice(&rx_trunc.to_be_bytes());
             send_frame(&mut put, EVT_STATS, &p);
         }
         CMD_RESET_STATS => {
             plane.reset_stats();
-            csma.cad_busy = 0;
+            // Re-baseline the resettable VIEW; `cad_busy` itself keeps free-running for EVT_SENSE.
+            csma.cad_busy_base = csma.cad_busy;
             csma.defer = 0;
-            send_info(&mut put, radio, *freq, *sf, *bw, *cr, *pwr, lost, csma.cad_busy, csma.defer);
+            *rx_trunc = 0;
+            radio.reset_stats(); // zero the chip's packet counters too
+            send_info(
+                &mut put,
+                radio,
+                *freq,
+                *sf,
+                *bw,
+                *cr,
+                *pwr,
+                lost,
+                csma.cad_busy_view(),
+                csma.defer,
+            );
         }
         CMD_SET_DEBUG if len >= 1 => {
             DEBUG.store(buf[0] != 0, Ordering::Relaxed);
-            send_info(&mut put, radio, *freq, *sf, *bw, *cr, *pwr, lost, csma.cad_busy, csma.defer);
+            send_info(
+                &mut put,
+                radio,
+                *freq,
+                *sf,
+                *bw,
+                *cr,
+                *pwr,
+                lost,
+                csma.cad_busy_view(),
+                csma.defer,
+            );
         }
         CMD_GET_INFO => {
-            send_info(&mut put, radio, *freq, *sf, *bw, *cr, *pwr, lost, csma.cad_busy, csma.defer);
+            send_info(
+                &mut put,
+                radio,
+                *freq,
+                *sf,
+                *bw,
+                *cr,
+                *pwr,
+                lost,
+                csma.cad_busy_view(),
+                csma.defer,
+            );
         }
         // Software DFU: arm the boot flag and system-reset. The #[pre_init] hook below re-enters as
         // the ROM UART bootloader from a CLEAN reset state, so `stm32flash` reflashes over the same
@@ -798,8 +1220,124 @@ fn handle_cmd<SPI, NSS, RST, BSY, DIO1, RFSW, E, TX>(
             cortex_m::asm::dsb();
             cortex_m::peripheral::SCB::sys_reset(); // -> ! ; pre_init handles the rest post-reset
         }
-        _ => {}
+        // 7E-A5 v2 §P2: the SAME counter EVT_RX stamps with, at full 64-bit width (the EVT_RX field
+        // is its low 32 bits and wraps every ~71 min). Units are EVT_CAP.stamp_hz = 1 MHz.
+        CMD_READ_CLOCK => {
+            send_frame(&mut put, EVT_CLOCK, &micros64().to_be_bytes());
+        }
+        // 7E-A5 v2 §P4: this firmware has NO scheduled-TX engine. The SX1262 can be armed from a
+        // DIO/timeout but nothing here implements a delayed key-up, and the MCU has no TX timer, so
+        // there is no honest way to serve a `delay_us`. Answer explicitly rather than falling through
+        // the catch-all, so the reason is NO_HARDWARE (a real capability statement) and not
+        // UNKNOWN_OPCODE (which would suggest a firmware too old to know the opcode). EVT_CAP's
+        // cmd_bitmap bit 24 is clear and sched_gran_ns is 0 for the same reason.
+        CMD_TX_AT => {
+            send_frame(&mut put, EVT_UNSUPPORTED, &[CMD_TX_AT, UNSUP_NO_HARDWARE]);
+        }
+        // 7E-A5 v2 §P1: the one place this node describes itself.
+        CMD_GET_CAP => {
+            send_cap(&mut put);
+        }
+        // 7E-A5 v2 §P3: channel occupancy, reusing state that already exists — `cad_busy` is the
+        // free-running CAD-busy counter the LBT loop increments, and the RSSI is the same
+        // instantaneous read CMD_GET_RSSI and the energy-detect sense config use. Nothing duplicated.
+        CMD_SENSE => {
+            // Make an OBSERVATION, then report the counter — do not merely read it. The counter is
+            // free-running and the host differences two reads, so a `CMD_SENSE` that sensed nothing
+            // would return the same value forever on a node that is not transmitting, and the
+            // difference would say "channel free" no matter how busy the air was.
+            radio.standby();
+            radio.set_cad_params(csma.cad_sym, csma.cad_peak, csma.cad_min);
+            sense_busy(radio, csma);
+            radio.start_rx();
+            // RSSI after RX is re-armed: `rssi_inst` outside an RX mode is not a channel measurement.
+            let r = radio.rssi_inst();
+            let mut p = [0u8; 4];
+            p[0..2].copy_from_slice(&csma.cad_busy.to_be_bytes());
+            p[2..4].copy_from_slice(&r.to_be_bytes());
+            send_frame(&mut put, EVT_SENSE, &p);
+        }
+        // Waveshare-local (P6): pick the LNA gain. 1/default = boosted (this firmware's default,
+        // ~+3 dB sensitivity), 0 = the chip's power-saving power-on default.
+        CMD_SET_RX_GAIN if len >= 1 => {
+            radio.standby();
+            radio.set_rx_gain(if buf[0] == 0 {
+                sx1262::RX_GAIN_POWER_SAVING
+            } else {
+                sx1262::RX_GAIN_BOOSTED
+            });
+            radio.start_rx();
+            send_info(
+                &mut put,
+                radio,
+                *freq,
+                *sf,
+                *bw,
+                *cr,
+                *pwr,
+                lost,
+                csma.cad_busy_view(),
+                csma.defer,
+            );
+        }
+        // NEVER silence (7E-A5 v2 rule): a command that returns nothing costs the host its full retry
+        // budget and then a failure, for what is really a one-frame answer. Two distinct reasons, and
+        // `CMD_BITMAP` is the oracle for which — so the dispatcher and the bitmap EVT_CAP advertises
+        // cannot drift apart:
+        //   * the opcode is in the bitmap ⇒ we implement it, so we only got here because a length
+        //     guard above rejected the payload  → BAD_LENGTH;
+        //   * it is not                        → UNKNOWN_OPCODE.
+        _ => {
+            let known = typ < 32 && (CMD_BITMAP >> typ) & 1 != 0;
+            let reason = if known {
+                UNSUP_BAD_LENGTH
+            } else {
+                UNSUP_UNKNOWN_OPCODE
+            };
+            send_frame(&mut put, EVT_UNSUPPORTED, &[typ, reason]);
+        }
     }
+}
+
+/// **EVT_CAP — the one place this node describes itself** (7E-A5 v2). 29 bytes, every multi-byte
+/// field big-endian. Every value below comes from a source constant or a verified property of this
+/// firmware; where nothing is known the field is 0 and says so, because a fabricated number is worse
+/// than 0 — the host believes it.
+///
+/// ```text
+///  [0]      proto_ver     = 2
+///  [1]      radio_kind    = 0 (SX1262)
+///  [2..6]   freq_min_hz   = 902_000_000   } the band this firmware image-calibrates for; NOT the
+///  [6..10]  freq_max_hz   = 928_000_000   } SX1262's 150-960 MHz silicon range (sx1262::FREQ_*_HZ)
+///  [10]     pwr_min_dbm   = -9            } real dBm, the SetTxParams range `set_power` clamps to
+///  [11]     pwr_max_dbm   = 22            } (sx1262::PWR_*_DBM) — not a chip register unit
+///  [12..16] stamp_hz      = 1_000_000     MICROseconds; see STAMP_HZ / `micros64`
+///  [16]     stamp_kind    = 2 (software counter — the MCU reads its own clock when it notices
+///                              RxDone in the poll loop; there is NO hardware capture on this radio)
+///  [17..19] max_payload   = 247           RX_MAX — the binding serial-framing limit, below the
+///                                         255 B CMD_TX accept and the 255 B LoRa PDU
+///  [19..23] cmd_bitmap    = CMD_BITMAP
+///  [23]     sf_min        = 7             } sx1262::SF_MIN/SF_MAX — the SFs this firmware operates
+///  [24]     sf_max        = 12            } and CMD_SF_SCAN sweeps
+///  [25..29] sched_gran_ns = 0             this firmware exposes NO scheduled-TX engine (see
+///                                         CMD_TX_AT above); 0 is the truth, not a placeholder
+/// ```
+fn send_cap<F: FnMut(u8)>(put: F) {
+    let mut c = [0u8; 29];
+    c[0] = 2; // proto_ver
+    c[1] = 0; // radio_kind: SX1262
+    c[2..6].copy_from_slice(&sx1262::FREQ_MIN_HZ.to_be_bytes());
+    c[6..10].copy_from_slice(&sx1262::FREQ_MAX_HZ.to_be_bytes());
+    c[10] = sx1262::PWR_MIN_DBM as u8;
+    c[11] = sx1262::PWR_MAX_DBM as u8;
+    c[12..16].copy_from_slice(&STAMP_HZ.to_be_bytes());
+    c[16] = 2; // stamp_kind: software counter
+    c[17..19].copy_from_slice(&(RX_MAX as u16).to_be_bytes());
+    c[19..23].copy_from_slice(&CMD_BITMAP.to_be_bytes());
+    c[23] = sx1262::SF_MIN;
+    c[24] = sx1262::SF_MAX;
+    c[25..29].copy_from_slice(&0u32.to_be_bytes()); // sched_gran_ns: none
+    send_frame(put, EVT_CAP, &c);
 }
 
 /// Reset-surviving handshake between CMD_ENTER_BOOTLOADER and [`maybe_enter_bootloader`]. The slot is

@@ -50,6 +50,34 @@ pub struct UartParts {
     pub rx: Peri<'static, peripherals::P1_08>,
 }
 
+/// Bring up the MCU with the **crystal** as the high-frequency clock source, then hand back the
+/// peripherals. Use this rather than `embassy_nrf::init(Default::default())` in any binary that
+/// reports a timestamp.
+///
+/// ⚠ **MEASURED 2026-08-28: the default is the internal oscillator, and it is ~2000 ppm off.**
+/// `embassy-nrf` 0.11's `Config::default()` sets `hfclk_source: HfclkSource::Internal`, and every
+/// binary here used it — so TIMER20, which is what [`crate::timing`] stamps with, was running off an
+/// RC source. Two on-air runs against a precise host cadence agreed:
+///
+/// | host cadence | single-gap mean | implied tick rate | error |
+/// |---|---|---|---|
+/// | 250 ms | 4,009,010 ticks | 16,036,040 Hz | +2253 ppm |
+/// | 100 ms | 1,603,230 ticks | 16,032,301 Hz | +2019 ppm |
+///
+/// A crystal is ±20 ppm; ~0.2% is the RC signature. [`crate::timing`]'s 62.5 ns is a RESOLUTION
+/// figure and stays true either way — but on the internal source it sits on a timebase that walks,
+/// so no absolute-time or common-view claim survives without this. The XIAO is a BLE part, so an
+/// HFXO is fitted.
+///
+/// The M3–M5 milestone binaries still call `embassy_nrf::init(Default::default())`; their timing
+/// numbers were taken on the RC source and should be re-taken through this before being quoted as
+/// accuracy rather than resolution.
+pub fn init_peripherals() -> Peripherals {
+    let mut cfg = embassy_nrf::config::Config::default();
+    cfg.hfclk_source = embassy_nrf::config::HfclkSource::ExternalXtal;
+    embassy_nrf::init(cfg)
+}
+
 /// Claim the pins named in [`crate::board`] and build the radio, handing back the peripherals the
 /// timestamp path needs. `dio` is deliberately *not* turned into an `Input` here: at M4 it becomes a
 /// GPIOTE `InputChannel` instead, and that constructor wants the raw pin.

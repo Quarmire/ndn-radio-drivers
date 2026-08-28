@@ -1508,6 +1508,14 @@ impl RadioCapability {
     }
 
     /// A sub-GHz LoRa-class radio (long range, low rate).
+    ///
+    /// ⚠ **A preset, and every number in it is one board's guess.** `duty_cycle_max: 0.01` is the
+    /// ETSI EU868 1% figure and is wrong anywhere FCC 15.247 applies (US 902–928 has no duty
+    /// fraction); `max_payload: 256` is above what any firmware in this rig actually carries
+    /// (`MAX_LORA_PAYLOAD` is 240 and an LR2021 FLRC frame is 48); and the 10–22 dBm span is the
+    /// SX1262's, not the SX1276's or the LR2021's. It is kept **unchanged** because callers depend on
+    /// its exact values, but a backend that knows its own node should build with
+    /// [`lora_with`](Self::lora_with) instead of inheriting these.
     pub fn lora(channels: Vec<u8>) -> Self {
         Self {
             kind: RadioKind::Lora,
@@ -1529,6 +1537,48 @@ impl RadioCapability {
             // tiny frames, half-duplex.
             duty_cycle_max: 0.01,
             max_payload: 256,
+            half_duplex: true,
+            csi: CsiSupport::None,
+        }
+    }
+
+    /// **A sub-GHz packet radio described by the radio itself**, rather than by a preset.
+    ///
+    /// The parameterised sibling of [`lora`](Self::lora), for a backend that learns its node's real
+    /// capability at runtime (the 7E-A5 serial fleet learns all of this from `EVT_CAP`). Every axis a
+    /// preset had to guess is an argument here:
+    ///
+    /// * `rate` — [`RateCapability::Lora`] with the node's true SF span, or [`RateCapability::None`]
+    ///   for a genuinely fixed-rate modulation (FLRC), which is a different statement from "SF 7".
+    /// * `max_payload` — the REAL end-to-end cap, which on a fixed-frame PHY is far below 256.
+    /// * `duty_cycle_max` — a regulatory fact about the *band*, not about the family: 0.01 for ETSI
+    ///   EU868, 1.0 under FCC 15.247 digital modulation.
+    ///
+    /// `tx_power_dbm` is deliberately absent: attach it with
+    /// [`with_tx_power_dbm`](Self::with_tx_power_dbm) *only* when the radio reported a real range, so
+    /// a node that has never declared one advertises `None` instead of inheriting another part's span.
+    /// `retune_us` stays `None` (never measured on these modules), which correctly makes
+    /// [`can_hop`](Self::can_hop) answer "I cannot say" rather than guess.
+    pub fn lora_with(
+        kind: RadioKind,
+        bands: Vec<Band>,
+        channels: Vec<u8>,
+        rate: RateCapability,
+        max_payload: usize,
+        duty_cycle_max: f32,
+    ) -> Self {
+        Self {
+            kind,
+            he_cap: false,
+            bands,
+            rate,
+            channels,
+            max_tx_power: 63,
+            tx_power_dbm: None, // attach only from a real declared range
+            retune_us: None,    // not measured on any module in the sub-GHz fleet
+            rx_only: false,
+            duty_cycle_max,
+            max_payload,
             half_duplex: true,
             csi: CsiSupport::None,
         }

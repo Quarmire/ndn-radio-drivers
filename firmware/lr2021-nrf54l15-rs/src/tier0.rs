@@ -466,3 +466,215 @@ pub fn wide_fields(key: &[u8; 16], name: &[u8], id: u8, flags: u8) -> WideFields
     f.htc[3] = WIDE_PROFILE_MARKER;
     f
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `/Users/…/ndn-radio-drivers/golden/tier0/vectors.txt`, transcribed.
+    ///
+    /// That file has claimed **"Reproduced by the firmware (Rust)"** since the wide profile landed,
+    /// and until now this crate had no test at all — the claim rested on a hand-run comparison. It is
+    /// exactly the claim that must not rest on one: a filter built under a different hash, k, m or
+    /// clamp does not degrade gracefully or report an error. Names simply stop matching, on air,
+    /// between two nodes that each believe they are correct.
+    ///
+    /// Regenerate the file with
+    /// `NDN_TIER0_REGEN=1 cargo test -p ndn-face-monitor-wifi tier0_golden`, then update here.
+    const KEY1: [u8; 16] = *b"ndr/tier0-vec-01";
+    const KEY2: [u8; 16] = *b"ndr/tier0-vec-02";
+
+    fn unhex(s: &str) -> Vec<u8> {
+        (0..s.len() / 2).map(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).unwrap()).collect()
+    }
+
+    /// `params version=2 k=4 m=126 max_depth=8 fill_cap=64 hash=siphash24 key_len=16
+    /// reserved_mask0=0x03` — the header line of the golden file is itself part of the contract.
+    /// A row can only be reproduced by an implementation that agrees on all of it.
+    #[test]
+    fn golden_params_line() {
+        assert_eq!(K, 4);
+        assert_eq!(M_BITS, 126);
+        assert_eq!(MAX_DEPTH, 8);
+        assert_eq!(FILL_CAP, 64);
+        assert_eq!(RESERVED_MASK0, 0x03);
+        // wide-params fp_bits=24 extra_bytes=6 marker=0x01
+        assert_eq!(FP_BITS, 24);
+        assert_eq!(WIFI_WIDE_EXTRA_BYTES, 6);
+        assert_eq!(WIDE_PROFILE_MARKER, 0x01);
+    }
+
+    /// The four base rows: `row <label> <key> <name> <16 wire bytes> <popcount>`.
+    #[test]
+    fn golden_base_rows() {
+        for (label, key, name, wire, popcount) in [
+            ("depth2", &KEY1, "/ndn/alarm", "83080804010000820040040090000010", 12),
+            ("depth8", &KEY1, "/c0/c1/c2/c3/c4/c5/c6/c7", "332819522211a01084010e60c4006218", 33),
+            // Past the depth cap: the filter stops inserting, so it is a *different* (sparser)
+            // filter than the depth-8 row — 30 bits, not 33. That divergence is the cap working.
+            (
+                "depth12-over-cap",
+                &KEY1,
+                "/c0/c1/c2/c3/c4/c5/c6/c7/c8/c9/c10/c11",
+                "332019102211a01084010e60c4006218",
+                30,
+            ),
+            // Same name, different group key: an observer without the key cannot recompute the
+            // filter, which is the unlinkability property the addressing doctrine assigns to it.
+            ("wrongkey", &KEY2, "/ndn/alarm", "83000100010082100804084080100000", 12),
+        ] {
+            let mut f = PrefixFilter::new();
+            f.insert_name(key, name.as_bytes());
+            assert_eq!(f.to_wire().to_vec(), unhex(wire), "golden row {label}: wire bytes");
+            assert_eq!(f.popcount(), popcount, "golden row {label}: popcount");
+        }
+    }
+
+    /// The wide row (#39): the base Blur must be **byte-identical** to a base-only frame, so a base
+    /// receiver reads a wide sender's frame unchanged. addr4 carries the additive 48-bit second
+    /// projection; HT Control carries the 24-bit fingerprint little-endian, then the marker.
+    #[test]
+    fn golden_wide_row() {
+        let name = b"/ndn/test/v1";
+        let w = wide_fields(&KEY1, name, 0x37, 0x00);
+        let mut all = Vec::new();
+        all.extend_from_slice(&w.addr1);
+        all.extend_from_slice(&w.addr2);
+        all.extend_from_slice(&w.addr3);
+        all.extend_from_slice(&w.addr4);
+        assert_eq!(all, unhex("87000800c10308820040040080000011370041a14230d880"));
+        assert_eq!(w.htc.to_vec(), unhex("1486e901"));
+        assert_eq!(name_fingerprint(&KEY1, name), 0x00e9_8614);
+
+        // The base half of a wide frame IS a base frame.
+        let mut base = PrefixFilter::new();
+        base.insert_name(&KEY1, name);
+        let bw = base.to_wire();
+        assert_eq!(&all[0..12], &bw[0..12]);
+        assert_eq!(&all[12..16], &bw[12..16]);
+        // …and the last two octets of addr3 are the 8-bit id and the flags byte (the 128:8 split).
+        assert_eq!(all[16], 0x37);
+        assert_eq!(all[17], 0x00);
+    }
+
+    /// Aumasson & Bernstein's published SipHash-2-4 vectors, key `00 01 … 0f`, input `00 01 … n-1`.
+    ///
+    /// Pinned because [`siphash24`] is **vendored** from `ndn-frame-io` rather than depended on, so
+    /// that this module compiles for the FLPR RISC-V coprocessor with no dependencies. A vendored
+    /// copy is only safe if something stops it drifting.
+    #[test]
+    fn siphash24_reference_vector() {
+        let key: [u8; 16] = core::array::from_fn(|i| i as u8);
+        let inp = |n: usize| -> Vec<u8> { (0..n).map(|i| i as u8).collect() };
+        assert_eq!(siphash24(&key, &inp(0)), 0x726f_db47_dd0e_0e31);
+        assert_eq!(siphash24(&key, &inp(1)), 0x74f8_39c5_93dc_67fd);
+        assert_eq!(siphash24(&key, &inp(8)), 0x93f5_f579_9a93_2462);
+        assert_eq!(siphash24(&key, &inp(15)), 0xa129_ca61_49be_45e5);
+    }
+
+    /// **The safety invariant**: a receiver registered on a genuine ancestor of the transmitted name
+    /// must never drop the frame. False positives cost a parse; a false negative is a lost packet
+    /// with no error anywhere, and no amount of software-tier work can recover it.
+    #[test]
+    fn zero_false_negatives_at_every_depth() {
+        let key = KEY1;
+        for depth in 1..=12usize {
+            let mut name = String::new();
+            for c in 0..depth {
+                name.push_str(&format!("/c{c}"));
+            }
+            let mut f = PrefixFilter::new();
+            f.insert_name(&key, name.as_bytes());
+
+            // Every registrable prefix of the name, including ones deeper than the cap — those are
+            // exactly the case `clamp_prefix` exists for.
+            for cut in 0..=depth {
+                let mut pfx = String::new();
+                for c in 0..cut {
+                    pfx.push_str(&format!("/c{c}"));
+                }
+                if pfx.is_empty() {
+                    pfx.push('/');
+                }
+                let mask = PrefixFilter::mask_for(&key, pfx.as_bytes());
+                assert!(
+                    f.may_match(&mask),
+                    "FALSE NEGATIVE: name {name} vs registered prefix {pfx}"
+                );
+            }
+        }
+    }
+
+    /// ★ The specific false negative `clamp_prefix` was added for, isolated so a "simplification"
+    /// that removes the clamp fails here instead of on air. Found by cross-checking the C port for
+    /// the AR9271 firmware against this implementation.
+    #[test]
+    fn clamp_prefix_saves_an_over_deep_registration() {
+        let key = KEY1;
+        let name = b"/a/b/c/d/e/f/g/h/i";
+        let mut f = PrefixFilter::new();
+        f.insert_name(&key, name);
+
+        // The sender's deepest inserted prefix is SEVEN components (`for_each_prefix` stops at the
+        // cap), so a registration on eight must degrade to that ancestor rather than build a mask
+        // over bits nobody set.
+        assert_eq!(clamp_prefix(b"/a/b/c/d/e/f/g/h"), b"/a/b/c/d/e/f/g".len());
+        assert!(f.may_match(&PrefixFilter::mask_for(&key, b"/a/b/c/d/e/f/g/h")));
+        assert!(f.may_match(&PrefixFilter::mask_for(&key, b"/a/b/c/d/e/f/g")));
+        // A prefix inside the cap that the name is genuinely NOT under stays droppable.
+        assert!(!f.may_match(&PrefixFilter::mask_for(&key, b"/z/y/x")));
+    }
+
+    /// The depth → popcount curve the `FILL_CAP` sizing is argued from: a legitimate filter at the
+    /// depth cap sets ~33 of 126 bits, so 64 leaves headroom while still bounding an adversary.
+    /// Measured here rather than asserted in prose.
+    #[test]
+    fn depth_popcount_table() {
+        let key = KEY1;
+        let mut deepest = 0;
+        for depth in 1..=MAX_DEPTH {
+            let mut name = String::new();
+            for c in 0..depth {
+                name.push_str(&format!("/c{c}"));
+            }
+            let mut f = PrefixFilter::new();
+            f.insert_name(&key, name.as_bytes());
+            let pc = f.popcount();
+            // K bits per prefix, depth+1 prefixes, minus collisions — so never above the product.
+            assert!(pc <= K * (depth as u32 + 1), "depth {depth}: popcount {pc} exceeds K*(d+1)");
+            assert!(pc > 0);
+            deepest = pc;
+        }
+        // At the cap this is 33/126 — comfortably under FILL_CAP, which is the whole sizing claim.
+        assert_eq!(deepest, 33);
+        assert!(deepest < FILL_CAP);
+    }
+
+    /// The admission cap: a saturated filter matches every mask at every node for free, which is a
+    /// one-frame universal wake and — once the scheduler keys on this field — a network-wide claim
+    /// suppression. It must be rejected before the AND is even considered.
+    #[test]
+    fn over_filled_filters_are_inadmissible() {
+        let all_ones = PrefixFilter([0xFF; 16]);
+        assert_eq!(all_ones.popcount(), M_BITS);
+        assert!(all_ones.popcount() > FILL_CAP);
+        assert!(!all_ones.may_match(&PrefixFilter::mask_for(&KEY1, b"/ndn/alarm")));
+        // …while a legitimate filter at the depth cap still passes.
+        let mut f = PrefixFilter::new();
+        f.insert_name(&KEY1, b"/c0/c1/c2/c3/c4/c5/c6/c7");
+        assert!(f.popcount() <= FILL_CAP);
+        assert!(f.may_match(&PrefixFilter::mask_for(&KEY1, b"/c0/c1")));
+    }
+
+    /// The two reserved bits of octet 0 must always leave the wire as locally-administered group,
+    /// whatever the filter's own bit pattern is — otherwise we put a globally-unique unicast address
+    /// on the air, which is a doctrine violation and makes our traffic look like a real station's.
+    #[test]
+    fn reserved_bits_are_forced_on_the_wire() {
+        for name in ["/ndn/alarm", "/a", "/c0/c1/c2/c3/c4/c5/c6/c7"] {
+            let mut f = PrefixFilter::new();
+            f.insert_name(&KEY1, name.as_bytes());
+            assert_eq!(f.to_wire()[0] & RESERVED_MASK0, RESERVED_MASK0, "{name}");
+        }
+    }
+}

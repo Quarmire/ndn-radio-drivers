@@ -47,10 +47,22 @@ const OP_SET_REGULATOR: u8 = 0x96;
 const OP_SET_CAD_PARAMS: u8 = 0x88; // #52: Channel Activity Detection config
 const OP_SET_CAD: u8 = 0xC5; //        #52: run one CAD
 const OP_GET_RSSI_INST: u8 = 0x15; //  #52: instantaneous channel RSSI (must be in RX)
+// The chip's own packet counters (DS §13.5.5). Without these a CRC failure vanishes inside
+// `poll_rx` with nothing counting it, so RX loss is invisible to the host (bug P5).
+const OP_GET_STATS: u8 = 0x10; //      GetStats   -> [nbPktReceived(2), nbPktCrcError(2), nbPktHeaderErr(2)]
+const OP_RESET_STATS: u8 = 0x00; //    ResetStats -> zero all three (takes six 0x00 param bytes)
 
 // --- Registers ---
 const REG_LORA_SYNC_MSB: u16 = 0x0740;
 const REG_RANDOM_GEN: u16 = 0x0819; // #52: SX1262 hardware random-number registers (0x0819..0x081C)
+/// RX gain (DS §9.6). The power-on default is power-saving; on a bearer whose entire purpose is
+/// reach that is the wrong default, so this firmware writes BOOSTED at init and on every RX arm
+/// (the register is not retained across a warm start, so re-writing it is the safe pattern).
+const REG_RX_GAIN: u16 = 0x08AC;
+/// Boosted LNA gain: ~+3 dB sensitivity for ~+2 mA in RX. This firmware's default.
+pub const RX_GAIN_BOOSTED: u8 = 0x94;
+/// Power-saving LNA gain — the SX126x power-on default, selectable by the host.
+pub const RX_GAIN_POWER_SAVING: u8 = 0x96;
 
 // --- IRQ bits ---
 pub const IRQ_TX_DONE: u16 = 0x0001;
@@ -72,11 +84,28 @@ pub const CR_4_8: u8 = 0x04;
 // TCXO control voltage codes.
 const TCXO_1_7V: u8 = 0x01;
 
+// --- Capability constants (the source of truth EVT_CAP reports; see main.rs `send_cap`) ---
+/// Carrier range THIS firmware constrains itself to. Not the SX1262's silicon range (150-960 MHz):
+/// `init`/`set_frequency` hard-code the 902-928 MHz image calibration (`calibrate_image(0xE1,0xE9)`,
+/// DS §13.1.12 table), so outside this band the image rejection is simply wrong. Reporting the
+/// silicon range would be a lie the host would act on.
+pub const FREQ_MIN_HZ: u32 = 902_000_000;
+pub const FREQ_MAX_HZ: u32 = 928_000_000;
+/// SetTxParams power range for an SX1262 PA (DS §13.4.4). `set_power` clamps to this, so it is the
+/// range the host can actually obtain — the value it reports back in EVT_INFO.
+pub const PWR_MIN_DBM: i8 = -9;
+pub const PWR_MAX_DBM: i8 = 22;
+/// Spreading factors this firmware operates and `CMD_SF_SCAN` sweeps. The chip also supports SF5/SF6,
+/// but those need a different sync-word handling and do not interop with the SX127x peers in this
+/// fleet, so they are outside the advertised range.
+pub const SF_MIN: u8 = 7;
+pub const SF_MAX: u8 = 12;
+
 // Assumes an 8 MHz core clock (HSI default) for the busy-wait delays.
 const CYCLES_PER_US: u32 = 8;
 
 pub struct Diagnostics {
-    pub status: u8,        // GetStatus byte (chip mode + command status)
+    pub status: u8,         // GetStatus byte (chip mode + command status)
     pub sync_readback: u16, // LoRa sync-word registers read back (should equal what we set)
     pub device_errors: u16, // GetDeviceErrors op-error bitfield (0 = clean)
     pub busy_ok: bool,      // BUSY settled low within the timeout after reset
@@ -88,6 +117,15 @@ pub struct RxPacket {
     pub snr_db: i16,
 }
 
+/// The SX126x's own RX packet counters (`GetStats`, DS §13.5.5). These are the ONLY place a CRC
+/// failure is visible: `poll_rx` drops such a frame and returns `None`, so without reading these the
+/// host cannot tell a quiet channel from a channel it is failing to decode.
+pub struct ChipStats {
+    pub pkt_received: u16,
+    pub pkt_crc_error: u16,
+    pub pkt_header_error: u16,
+}
+
 pub struct Sx1262<SPI, NSS, RST, BSY, DIO1, RFSW> {
     spi: SPI,
     nss: NSS,
@@ -97,6 +135,8 @@ pub struct Sx1262<SPI, NSS, RST, BSY, DIO1, RFSW> {
     rfsw: RFSW,
     /// LoRa preamble length in symbols (runtime-tunable, #52). Longer = more reliable CAD by peers.
     preamble: u16,
+    /// LNA gain written to [`REG_RX_GAIN`] on every RX arm. Defaults to [`RX_GAIN_BOOSTED`].
+    rx_gain: u8,
 }
 
 impl<SPI, NSS, RST, BSY, DIO1, RFSW, E> Sx1262<SPI, NSS, RST, BSY, DIO1, RFSW>
@@ -109,7 +149,16 @@ where
     DIO1: InputPin,
 {
     pub fn new(spi: SPI, nss: NSS, rst: RST, busy: BSY, dio1: DIO1, rfsw: RFSW) -> Self {
-        let mut s = Self { spi, nss, rst, busy, dio1, rfsw, preamble: 8 };
+        let mut s = Self {
+            spi,
+            nss,
+            rst,
+            busy,
+            dio1,
+            rfsw,
+            preamble: 8,
+            rx_gain: RX_GAIN_BOOSTED,
+        };
         let _ = s.nss.set_high();
         s
     }
@@ -162,7 +211,9 @@ where
     fn write_regs(&mut self, addr: u16, data: &[u8]) {
         self.wait_busy();
         let _ = self.nss.set_low();
-        let _ = self.spi.write(&[OP_WRITE_REGISTER, (addr >> 8) as u8, addr as u8]);
+        let _ = self
+            .spi
+            .write(&[OP_WRITE_REGISTER, (addr >> 8) as u8, addr as u8]);
         let _ = self.spi.write(data);
         let _ = self.nss.set_high();
     }
@@ -220,7 +271,12 @@ where
     fn set_dio3_tcxo(&mut self, voltage: u8, timeout: u32) {
         self.cmd(
             OP_SET_DIO3_TCXO,
-            &[voltage, (timeout >> 16) as u8, (timeout >> 8) as u8, timeout as u8],
+            &[
+                voltage,
+                (timeout >> 16) as u8,
+                (timeout >> 8) as u8,
+                timeout as u8,
+            ],
         );
     }
     fn calibrate(&mut self, mask: u8) {
@@ -265,9 +321,14 @@ where
         self.cmd(
             OP_SET_DIO_IRQ,
             &[
-                (irq >> 8) as u8, irq as u8,
-                (dio1 >> 8) as u8, dio1 as u8,
-                0, 0, 0, 0,
+                (irq >> 8) as u8,
+                irq as u8,
+                (dio1 >> 8) as u8,
+                dio1 as u8,
+                0,
+                0,
+                0,
+                0,
             ],
         );
     }
@@ -280,10 +341,16 @@ where
         ((b[0] as u16) << 8) | b[1] as u16
     }
     fn set_tx(&mut self, timeout: u32) {
-        self.cmd(OP_SET_TX, &[(timeout >> 16) as u8, (timeout >> 8) as u8, timeout as u8]);
+        self.cmd(
+            OP_SET_TX,
+            &[(timeout >> 16) as u8, (timeout >> 8) as u8, timeout as u8],
+        );
     }
     fn set_rx(&mut self, timeout: u32) {
-        self.cmd(OP_SET_RX, &[(timeout >> 16) as u8, (timeout >> 8) as u8, timeout as u8]);
+        self.cmd(
+            OP_SET_RX,
+            &[(timeout >> 16) as u8, (timeout >> 8) as u8, timeout as u8],
+        );
     }
 
     pub fn get_status(&mut self) -> u8 {
@@ -331,6 +398,12 @@ where
         let ldro = if sf >= 11 && bw == BW_125 { 1 } else { 0 };
         self.set_mod_params(sf, bw, cr, ldro);
         self.set_sync_word(0x12);
+        // Boosted LNA (P6). Previously never written, so the receiver ran at the chip's power-saving
+        // power-on default on a bearer that exists for reach.
+        let g = self.rx_gain;
+        self.write_regs(REG_RX_GAIN, &[g]);
+        // No ResetStats here: `init` begins with a hard RESET-pin reset, which already zeroes the
+        // chip's packet counters. Issuing the extra command would only add a way for init to fail.
         self.set_pkt_params(8, 0x00, 0xFF, 0x01, 0x00);
         self.set_dio_irq(0xFFFF, IRQ_TX_DONE | IRQ_RX_DONE | IRQ_TIMEOUT);
         self.clear_irq(0xFFFF);
@@ -390,7 +463,12 @@ where
 
     /// Set TX power in dBm (SX1262: up to +22), also re-optimising the PA config for the power band
     /// (Semtech DS §13.1.14) so lower powers are efficient instead of using the fixed +22 dBm PA setup.
-    pub fn set_power(&mut self, dbm: i8) {
+    /// Returns the dBm actually applied — clamped to [`PWR_MIN_DBM`]..=[`PWR_MAX_DBM`], the SX1262
+    /// SetTxParams range (DS §13.4.4). Before this clamp an out-of-range request was passed straight
+    /// through to the chip as a raw register byte, so EVT_INFO reported a power the PA never produced
+    /// and EVT_CAP's advertised range could not have been true.
+    pub fn set_power(&mut self, dbm: i8) -> i8 {
+        let dbm = dbm.clamp(PWR_MIN_DBM, PWR_MAX_DBM);
         // (paDutyCycle, hpMax) tiers; txParams power then fine-tunes within the band.
         let (duty, hp) = match dbm {
             d if d >= 20 => (0x04, 0x07), // +22 dBm optimal
@@ -400,6 +478,7 @@ where
         };
         self.set_pa_config(duty, hp);
         self.set_tx_params(dbm, 0x04);
+        dbm
     }
 
     /// Energy-detect the channel: arm RX, sample instantaneous RSSI, return true if it exceeds
@@ -429,6 +508,10 @@ where
     /// Arm continuous RX. Call once, then poll with `poll_rx`.
     pub fn start_rx(&mut self) {
         self.rf_rx();
+        // REG_RX_GAIN is not retained across a warm start, so re-write it on every arm — one 4-byte
+        // SPI write, negligible against the SetPacketParams/ClearIrq/SetRx that follow.
+        let g = self.rx_gain;
+        self.write_regs(REG_RX_GAIN, &[g]);
         let pre = self.preamble;
         self.set_pkt_params(pre, 0x00, 0xFF, 0x01, 0x00);
         self.clear_irq(0xFFFF);
@@ -436,7 +519,13 @@ where
     }
 
     /// Non-blocking: if a frame arrived, copy it into `out` and return its metadata.
-    /// A CRC error is dropped (returns None) after clearing the IRQ so RX stays armed.
+    ///
+    /// A CRC error is dropped (returns None) after clearing the IRQ so RX stays armed. That drop is
+    /// NOT silent any more: the chip's own `nbPktCrcError` counts it, readable via [`get_stats`] and
+    /// reported in EVT_STATS (P5).
+    ///
+    /// `RxPacket::len` is the TRUE on-air length, which may exceed `out.len()`; the caller must
+    /// compare the two to notice a truncation rather than assume `len` bytes landed in `out`.
     pub fn poll_rx(&mut self, out: &mut [u8]) -> Option<RxPacket> {
         let irq = self.get_irq();
         if irq & IRQ_RX_DONE == 0 {
@@ -459,7 +548,11 @@ where
         // LoRa: rssiPkt = -rssi/2 dBm, snrPkt = (i8)snr / 4 dB.
         let rssi_dbm = -(ps[0] as i16) / 2;
         let snr_db = (ps[1] as i8) as i16 / 4;
-        Some(RxPacket { len, rssi_dbm, snr_db })
+        Some(RxPacket {
+            len,
+            rssi_dbm,
+            snr_db,
+        })
     }
 
     // --- #52: carrier sense (CAD), instantaneous RSSI, hardware RNG, preamble ---
@@ -472,7 +565,10 @@ where
     /// Configure Channel Activity Detection. `sym` = cadSymbolNum code (0..4 → 1/2/4/8/16 symbols);
     /// `det_peak`/`det_min` = detector sensitivity (SF-dependent, tune on air). Exit-mode STDBY.
     pub fn set_cad_params(&mut self, sym: u8, det_peak: u8, det_min: u8) {
-        self.cmd(OP_SET_CAD_PARAMS, &[sym, det_peak, det_min, 0x00, 0x00, 0x00, 0x00]);
+        self.cmd(
+            OP_SET_CAD_PARAMS,
+            &[sym, det_peak, det_min, 0x00, 0x00, 0x00, 0x00],
+        );
     }
 
     /// Run one CAD at the current modulation and block until it completes. Returns true if the channel
@@ -500,6 +596,41 @@ where
         let mut b = [0u8; 1];
         self.read_cmd(OP_GET_RSSI_INST, &mut b);
         -(b[0] as i16) / 2
+    }
+
+    /// Select the LNA gain used from the next RX arm on: [`RX_GAIN_BOOSTED`] (this firmware's
+    /// default, ~+3 dB sensitivity) or [`RX_GAIN_POWER_SAVING`] (the chip's power-on default).
+    /// Applied immediately as well as on every subsequent `start_rx`.
+    pub fn set_rx_gain(&mut self, gain: u8) {
+        self.rx_gain = if gain == RX_GAIN_POWER_SAVING {
+            RX_GAIN_POWER_SAVING
+        } else {
+            RX_GAIN_BOOSTED
+        };
+        let g = self.rx_gain;
+        self.write_regs(REG_RX_GAIN, &[g]);
+    }
+
+    /// The LNA gain currently selected.
+    pub fn rx_gain(&self) -> u8 {
+        self.rx_gain
+    }
+
+    /// Read the chip's own RX packet counters (P5). Safe to call with RX armed — it is a status
+    /// command and does not disturb the receiver.
+    pub fn get_stats(&mut self) -> ChipStats {
+        let mut b = [0u8; 6];
+        self.read_cmd(OP_GET_STATS, &mut b);
+        ChipStats {
+            pkt_received: ((b[0] as u16) << 8) | b[1] as u16,
+            pkt_crc_error: ((b[2] as u16) << 8) | b[3] as u16,
+            pkt_header_error: ((b[4] as u16) << 8) | b[5] as u16,
+        }
+    }
+
+    /// Zero the chip's packet counters (`ResetStats`), so the host can re-baseline without a reflash.
+    pub fn reset_stats(&mut self) {
+        self.cmd(OP_RESET_STATS, &[0, 0, 0, 0, 0, 0]);
     }
 
     /// One 32-bit sample from the SX1262 hardware RNG (LNA noise, read with IRQ masked while in RX).
@@ -532,7 +663,11 @@ pub fn airtime_ms(sf: u8, bw_code: u8, cr: u8, payload_len: u8, preamble: u16) -
     // payloadSymbNb = 8 + max(ceil((8*PL - 4*SF + 28 + 16)/(4*(SF-2*DE))) * (CR+4), 0)
     let num = 8 * pl - 4 * sf_i + 28 + 16;
     let den = 4 * (sf_i - 2 * de);
-    let mut steps = if num <= 0 || den <= 0 { 0 } else { (num + den - 1) / den };
+    let mut steps = if num <= 0 || den <= 0 {
+        0
+    } else {
+        (num + den - 1) / den
+    };
     if steps < 0 {
         steps = 0;
     }

@@ -70,10 +70,44 @@ pub const COVERAGE: &[Row] = &[
         time: Provided,
         profile: Provided,
     },
+    // ── The 7E-A5 serial sub-GHz fleet ─────────────────────────────────────────────────────────
+    // ONE backend (`LoraSerialBackend`) drives all three, so the Rust type is the same in every row
+    // and the witnesses below repeat. The rows are per NODE on purpose: what a row claims is what
+    // that node's `EVT_CAP` makes reachable, and those differ sharply — the LR2021 has a hardware RX
+    // clock, no spreading factor and no `CMD_SET_SYNC`; the Waveshare has the full knob set and only
+    // a software counter. Reading one row as a statement about the type would lose exactly the
+    // distinction the capability rewrite exists to carry.
     Row {
         backend: "LoraSerialBackend (Waveshare SX1262)",
         pids: &[0x55d3],
         campaign: true, // campaign (c) reports Wi-Fi and LoRa separately
+        frame_io: Provided,
+        knobs: Provided,
+        time: Provided,
+        profile: Provided,
+    },
+    Row {
+        backend: "LoraSerialBackend (XIAO nRF54L15 + LR2021)",
+        // No PID recorded: this board is reached by path (/dev/ttyACM*) and its USB ids have not been
+        // read off the rig. An empty list is the honest entry — a plausible-looking PID here would
+        // silently claim a device the dispatch never matches.
+        pids: &[],
+        // Not in the pre-registered campaign set. The link is live and MEASURED (o5p-0 -> o5p-1,
+        // 100/100 at 915 MHz FLRC), but no campaign run has driven this node through `FrameIo` end
+        // to end. Admit it when a run has, not on the strength of a working link.
+        campaign: false,
+        frame_io: Provided,
+        knobs: Provided,
+        // ★ The only node in this fleet whose clock cell means what the Realtek ones mean: a
+        // free-running per-frame HARDWARE stamp (16 MHz DPPI capture, 62.5 ns), so
+        // `FaceTimeProfile::can_common_view` is true here and false on every other sub-GHz node.
+        time: Provided,
+        profile: Provided,
+    },
+    Row {
+        backend: "LoraSerialBackend (Heltec LoRa32 V2, SX1276)",
+        pids: &[], // CP2102 bridge; ids not read off the rig (see the LR2021 row)
+        campaign: false, // flashed and self-describing, but no campaign run has driven it
         frame_io: Provided,
         knobs: Provided,
         time: Provided,
@@ -201,8 +235,12 @@ mod tests {
         // Feature-gated backends: witnesses ride the gate; without the feature the cells are
         // counted as vacuously witnessed (the table describes the FULL build — campaign tooling
         // builds with these features on).
+        // Three ROWS, one TYPE: the Waveshare SX1262, the nRF54L15+LR2021 bridge and the Heltec
+        // SX1276 are all driven by `LoraSerialBackend`, so the same four witnesses are claimed once
+        // per row. (The witness gate proves the impl exists; which of the three nodes is on the far
+        // end is a runtime `NodeProfile` fact no type check can see.)
         #[cfg(feature = "lora")]
-        {
+        for _node in 0..3 {
             claim!(is_frame_io::<crate::LoraSerialBackend>);
             claim!(is_knobs::<crate::LoraSerialBackend>);
             claim!(is_time::<crate::LoraSerialBackend>);
@@ -210,7 +248,7 @@ mod tests {
         }
         #[cfg(not(feature = "lora"))]
         {
-            n += 4;
+            n += 12;
         }
         claim!(is_frame_io::<crate::Rtl8733buBackend>);
         claim!(is_knobs::<crate::Rtl8733buBackend>);

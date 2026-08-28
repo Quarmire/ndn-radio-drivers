@@ -159,22 +159,99 @@ pub const SYNCWORD: u32 = match option_env!("PHY_VENDOR") {
     None => 0xCD05_CAFE,
 };
 
-/// TX power, dBm. The HF PA table in the shield devicetree tops out at **12 dBm**; the two kits sit
-/// on a bench, so start low — a strong link is not the goal and an overloaded receiver produces
-/// garbage timing. Raise deliberately, never by default.
-/// TX power. **Note the unit: `set_tx_params` takes HALF-dB steps** (HF range −39..24 ⇒ −19.5 to
-/// +12 dBm), so this constant's name is a half-truth inherited from the first draft. `PHY_PWR`
-/// sweeps it — power is the one HF transmit knob #108 never varied (the PA *duty cycle* was swept,
-/// which is a different register).
-pub const TX_POWER_DBM: i8 = match option_env!("PHY_PWR") {
-    Some(v) if matches!(v.as_bytes(), b"n30") => -30,
-    Some(v) if matches!(v.as_bytes(), b"n16") => -16,
-    Some(v) if matches!(v.as_bytes(), b"p12") => 12,
-    Some(v) if matches!(v.as_bytes(), b"p24") => 24,
-    // Default +6 dBm, raised from 0. The LF power sweep showed the link is CLEAN at +6 and +12 dBm
-    // and receives NOTHING at −8 dBm, so 0 dBm was sitting far closer to the cliff than intended.
-    _ => 12,
+/// TX power in the chip's **HALF-dB register unit** — the unit `set_tx_params` actually takes.
+///
+/// Renamed from `TX_POWER_DBM`, which was a half-truth its own doc comment admitted to and which
+/// the host bridge then believed: `CMD_SET_PWR` passed the host's i8 dBm straight into
+/// `set_tx_params`, so every host power request came out **2× too low**. The value here is
+/// unchanged — the default is register 12, i.e. **+6 dBm** — only the name now says what it is.
+/// Convert at the boundary with [`dbm_to_half_db`]; nothing above this module should ever see the
+/// register unit.
+///
+/// `PHY_PWR` sweeps it. The label sets differ per band because they always did: the LF sweep names
+/// register values (`n30`/`p24`) and the HF sweep names Table 7-18 *rows* (`0`/`6`), and the HF rows
+/// are a **matched pair** with [`PA_HF_DUTY`] (§1.5.2 + Table 7-18) rather than two free knobs.
+pub const TX_POWER_HALF_DB: i8 = match option_env!("PHY_HF") {
+    // HF rows from Table 7-18 (2445 MHz Semtech reference design):
+    //   +12 dBm -> tx_power reg 24, duty 16   |   +6 dBm -> reg 16, duty 30   |   0 dBm -> reg 4, duty 30
+    Some(_) => match option_env!("PHY_PWR") {
+        Some(v) if matches!(v.as_bytes(), b"0") => 4,
+        Some(v) if matches!(v.as_bytes(), b"6") => 16,
+        _ => 24,
+    },
+    None => match option_env!("PHY_PWR") {
+        Some(v) if matches!(v.as_bytes(), b"n30") => -30,
+        Some(v) if matches!(v.as_bytes(), b"n16") => -16,
+        Some(v) if matches!(v.as_bytes(), b"p12") => 12,
+        Some(v) if matches!(v.as_bytes(), b"p24") => 24,
+        // Default +6 dBm (register 12), raised from 0. The LF power sweep showed the link is CLEAN
+        // at +6 and +12 dBm and receives NOTHING at −8 dBm, so 0 dBm was sitting far closer to the
+        // cliff than intended.
+        _ => 12,
+    },
 };
+
+/// `pa_hf_duty_cycle`, the other half of the HF power pair. **§7.4.1: only 16-31 are authorised**,
+/// outside that range the datasheet warns of incorrect output power, excessive current and PA
+/// damage. Unused on an LF build.
+pub const PA_HF_DUTY: u8 = match option_env!("PHY_PWR") {
+    Some(v) if matches!(v.as_bytes(), b"0") => 30,
+    Some(v) if matches!(v.as_bytes(), b"6") => 30,
+    _ => 16,
+};
+
+/// The PA's register range on the band this firmware was built for.
+///
+/// From the driver's own contract on `set_tx_params`: *"TX Power in given in half-dB unit. Range is
+/// -19..44 for LF Path and -39..24 for HF path"* ⇒ **LF −9.5..+22 dBm, HF −19.5..+12 dBm**. These
+/// are the numbers `EVT_CAP` reports, so they must come from that source constant and not from a
+/// recollection of what the board "does".
+pub const PWR_REG_MIN: i8 = match option_env!("PHY_HF") { Some(_) => -39, None => -19 };
+/// See [`PWR_REG_MIN`].
+pub const PWR_REG_MAX: i8 = match option_env!("PHY_HF") { Some(_) => 24, None => 44 };
+
+/// Lowest whole dBm this PA can be asked for (`PWR_REG_MIN/2`, truncated toward zero so the value
+/// is always *inside* the register range: LF's true floor is −9.5 dBm, and −9 is reachable).
+pub const PWR_MIN_DBM: i8 = PWR_REG_MIN / 2;
+/// Highest whole dBm this PA can be asked for.
+pub const PWR_MAX_DBM: i8 = PWR_REG_MAX / 2;
+
+/// Convert a host's real dBm into the chip's half-dB register unit, clamped to the PA range.
+///
+/// Clamping rather than rejecting: a host asking for more power than the part has should get the
+/// most it has (and see the applied value echoed in `EVT_INFO`), not a failed command — but it must
+/// never get a register write outside the authorised range, which §7.4.1 lists as a way to damage
+/// the PA.
+pub fn dbm_to_half_db(dbm: i8) -> i8 {
+    let reg = (dbm as i16) * 2;
+    if reg < PWR_REG_MIN as i16 {
+        PWR_REG_MIN
+    } else if reg > PWR_REG_MAX as i16 {
+        PWR_REG_MAX
+    } else {
+        reg as i8
+    }
+}
+
+/// The band this firmware was **built** for, and the only range `retune` will accept.
+///
+/// LF: the US 902-928 MHz ISM band the rest of this bench uses, which is also what [`CAL_POINTS`]
+/// (900 / 912 / 928 MHz) brackets. HF: the 2.4 GHz ISM band.
+///
+/// The bound exists because a `SetRfFrequency` outside the calibrated front end does not fail — it
+/// returns success and the receiver goes deaf with `RXFREQ_NO_FE_CAL` set, which reads exactly like
+/// a dead link. Answering `EVT_UNSUPPORTED` instead is the difference between "the host asked for
+/// something this build cannot do" and an hour of bisecting a radio that is fine.
+pub const BAND_MIN_HZ: u32 = match option_env!("PHY_HF") { Some(_) => 2_400_000_000, None => 902_000_000 };
+/// See [`BAND_MIN_HZ`]. **HF caveat:** [`CAL_POINTS`] brackets only 2448-2480 MHz, so an HF build
+/// retuned below 2448 MHz is extrapolating its front-end calibration. Recorded, not silently
+/// accepted; the HF path is broken for other reasons anyway (see [`FREQ_HZ`]).
+pub const BAND_MAX_HZ: u32 = match option_env!("PHY_HF") { Some(_) => 2_483_500_000, None => 928_000_000 };
+
+/// Is `hz` inside the band this firmware was built for?
+pub const fn in_band(hz: u32) -> bool {
+    hz >= BAND_MIN_HZ && hz <= BAND_MAX_HZ
+}
 
 /// **Fixed frame size, both roles.**
 ///
@@ -204,6 +281,69 @@ pub const FRAME_LEN: u16 = match option_env!("PHY_LEN") {
 
 /// Kept as the name other modules use; now the fixed frame size.
 pub const MAX_PAYLOAD: u16 = FRAME_LEN;
+
+/// [`FRAME_LEN`] as a `usize`, for array sizes.
+pub const FRAME_BYTES: usize = FRAME_LEN as usize;
+
+/// **The real end-to-end payload cap**: one on-air frame minus the in-frame length byte.
+///
+/// This is the number `EVT_CAP.max_payload` carries. It is small (47 bytes at the default
+/// `FRAME_LEN` = 48) and that is the truth of this bearer — reporting the serial link's 255 would
+/// be a lie the host would size packets against.
+pub const PAYLOAD_MAX: usize = FRAME_BYTES - 1;
+
+/// Pack a variable-length payload into the **fixed** on-air frame, whitened, ready for the FIFO.
+///
+/// ```text
+///   [0]        payload length n
+///   [1..1+n]   payload
+///   [1+n..]    zero padding to FRAME_LEN
+/// ```
+///
+/// ★ **This is the fix for the measured "6 bytes then 44 bytes of stale FIFO" bug.** With
+/// [`PktFormat::Fixed`] the chip transmits exactly `pld_len` bytes whatever the FIFO holds, so a
+/// short FIFO write puts whatever the previous frame left behind on the air. Two ways out:
+///
+/// 1. re-program `pld_len` per frame, or
+/// 2. keep the on-air PDU constant and carry the real length **inside** it.
+///
+/// (2) is what this does, because `pld_len` is **one register serving both roles** — on TX it is
+/// the transmit length, on RX the accepted length — so per-frame TX lengths would need the receiver
+/// to know each frame's size before it arrives, which it cannot. Constant airtime per frame is also
+/// what the slot MAC wants (#93: the base slot is a constant, not something re-derived per frame),
+/// and it keeps the PHY framing byte-identical to the configuration that is verified live on air.
+///
+/// Whitening covers the length byte and the padding, which is the point: the padding is exactly the
+/// transition-free run that starves the demodulator's clock recovery (see [`whiten`]).
+///
+/// Returns `None` if the payload does not fit — never a truncated frame, because a silently
+/// truncated NDN packet is worse than a refused transmit.
+pub fn build_frame(payload: &[u8]) -> Option<[u8; FRAME_BYTES]> {
+    if payload.len() > PAYLOAD_MAX {
+        return None;
+    }
+    let mut f = [0u8; FRAME_BYTES];
+    f[0] = payload.len() as u8;
+    f[1..1 + payload.len()].copy_from_slice(payload);
+    whiten(&mut f);
+    Some(f)
+}
+
+/// Un-whiten a received on-air frame **in place** and return the real payload length, so the
+/// payload is `frame[1..1 + n]`.
+///
+/// `None` means the length byte is impossible for this frame size — a frame that got through the
+/// PHY CRC with a corrupt header, or a peer built with a different `PHY_LEN`. Dropping it is right
+/// either way: delivering 200 bytes of padding to the host as "payload" is how a link problem gets
+/// mistaken for an application one.
+pub fn unpack_frame(frame: &mut [u8]) -> Option<usize> {
+    whiten(frame); // self-inverse
+    let n = *frame.first()? as usize;
+    if n > PAYLOAD_MAX || 1 + n > frame.len() {
+        return None;
+    }
+    Some(n)
+}
 
 /// FLRC packet parameters, rebuilt with a given payload length.
 ///
@@ -388,12 +528,61 @@ where
     radio.set_flrc_packet(&pkt_params(len.max(6))).await
 }
 
-/// Bring a reset LR2021 up as an FLRC node on [`FREQ_HZ`].
+/// The **runtime-mutable half of the link** — everything a host command can change without a
+/// reflash, gathered into one value so the whole RF chain can be re-programmed from it atomically.
 ///
-/// Ordering matters and follows the driver's documented sequence: packet type first (it selects
-/// which modulation/packet registers exist), then modulation, syncword, packet params, then the
-/// front end. Both nodes call this, so TX and RX cannot drift apart.
-pub async fn configure<O, SPI, M>(radio: &mut Lr2021<O, SPI, M>) -> Result<(), Lr2021Error>
+/// It exists because of a measured failure: `CMD_SET_FREQ` used to call `set_rf` while the chip sat
+/// in RX-continuous, and after **any** retune — even to the 915 MHz it was already on — every
+/// subsequent transmit returned `ok = 0` until the board was reset, and a later `CMD_SET_PWR` did
+/// not restore it. A frequency change invalidates the front-end/PA/tx-params state that was
+/// programmed *for the old frequency*, and the Semtech ordering
+/// (`pkt_type → rf_freq → tx_cfg → mod_params → pkt_params → syncword → PA → rx_path → calibrate`)
+/// is not a suggestion: half of it must be re-issued after the retune.
+///
+/// The obvious fix — a second copy of that sequence inside the retune path — is how the two copies
+/// drift apart three commits later. So there is exactly one copy, [`apply`], and both `configure`
+/// and [`retune`] call it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct LinkState {
+    /// Carrier, Hz. Must satisfy [`in_band`].
+    pub freq_hz: u32,
+    /// TX power in the chip's **half-dB register unit** — see [`TX_POWER_HALF_DB`] and
+    /// [`dbm_to_half_db`]. Deliberately stored in the register unit, at the one layer that is
+    /// allowed to know it.
+    pub tx_power_half_db: i8,
+    /// FLRC bitrate rung. Runtime-settable (`CMD_SET_MOD`); a rate change used to need a reflash.
+    pub bitrate: FlrcBitrate,
+    /// FLRC coding rate.
+    pub coding: FlrcCr,
+}
+
+impl Default for LinkState {
+    /// The build-time link both nodes agree on with no host in the loop.
+    fn default() -> Self {
+        Self {
+            freq_hz: FREQ_HZ,
+            tx_power_half_db: TX_POWER_HALF_DB,
+            bitrate: BITRATE,
+            coding: CODING,
+        }
+    }
+}
+
+impl LinkState {
+    /// TX power in real dBm — what `EVT_INFO`/`EVT_CAP` report, never the register unit.
+    pub fn tx_power_dbm(&self) -> i8 {
+        self.tx_power_half_db / 2
+    }
+}
+
+/// Program the **entire** RF chain from `link`, in Semtech's validated order, ending in Standby RC.
+///
+/// Safe to call at any time and from any chip mode: it drops to Standby RC first, which is what
+/// `Calibrate` and `CalibFe` require ("does not work if device is in Rx or Tx mode") and what makes
+/// a retune out of RX-continuous legal. It does **not** re-arm RX and does not touch DIO routing —
+/// the caller owns both, because `m5_tx` deliberately repurposes DIO8 after `configure` and an
+/// `apply` that reset it would silently undo that.
+pub async fn apply<O, SPI, M>(radio: &mut Lr2021<O, SPI, M>, link: &LinkState) -> Result<(), Lr2021Error>
 where
     O: OutputPin,
     SPI: SpiBus<u8>,
@@ -405,10 +594,6 @@ where
     // "lf_xosc did not start correctly ... or there is a TCXO instead which must be enabled through
     // SetTcxoMode command."
     //
-    // Running the radio off an un-started reference is consistent with the whole failure signature:
-    // syncword matches (wide capture), length decodes, signal is strong at −33 dBm, and the payload
-    // arrives cleanly BIT-INVERTED partway through — a mid-frame polarity/clock slip, which is what
-    // a frequency-erroneous reference produces. Must precede any modulation or RF configuration.
     // **NO TCXO ON THIS BOARD — do not enable TCXO mode.** Proven, not assumed:
     // `SetTcxoMode` with a real (non-zero) start_time returns **CmdFail**, even from Standby RC,
     // which §6.11.3 names as the command's only valid mode. A non-zero start_time is a *timeout* for
@@ -422,18 +607,6 @@ where
     // enables something and does the opposite — that silent no-op was committed once already as a
     // fix, and it should not be re-introduced.
 
-    // **All THREE calibration points must be supplied, and each carries its own path bit.**
-    //
-    // `CalibFe` declares freq1/freq2/freq3 as `optional: false`, and the MSB of each selects the
-    // path (0 = LF, 1 = HF). Passing a single frequency leaves the crate to fill freq2/freq3 with
-    // ZERO — which does not mean "unused", it encodes *LF path, 0 MHz*. On the LF path that is
-    // merely redundant. On HF it hands the front end one HF point and two LF-path zeros, i.e. a
-    // MIXED-PATH calibration of the ADC offset, PPF and image blocks.
-    //
-    // That is HF-specific, uniform across the band, and invisible to every modem parameter — which
-    // is the exact signature #108 has: identical failure at 2405/2425/2445/2465/2477 MHz, unchanged
-    // by bitrate, coding rate, packet format, CRC, syncword, whitening, the RF switch, and every
-    // pa_hf_duty_cycle from 4 to 31.
     // **§6.3.18: `SetRegMode` defaults to SIMO_OFF (LDO) and must be issued in Standby RC.**
     // The shield devicetree specifies `reg-mode = DCDC`, and every PA figure in the datasheet is
     // characterised at "3.3 V SIMO". We had never called this at all.
@@ -454,7 +627,7 @@ where
     // when seed and polynomial are both 0 — "keep the default CRC params as is" — which is exactly
     // what the PER example passes. So it is a no-op for us, not a missing call.)
     radio.set_packet_type(PacketType::Flrc).await?;
-    radio.set_rf(FREQ_HZ).await?;
+    radio.set_rf(link.freq_hz).await?;
 
     // One syncword, and RX matches only that one: this is a two-node experiment, and accepting
     // other syncwords would let stray traffic masquerade as our packets.
@@ -465,10 +638,11 @@ where
     // one while the packet params still declare `Sw32b`. Both ends misconfigure identically, so they
     // still sync (`sw_num = 1`) and the length still decodes — and every frame fails CRC, because
     // the frame is delimited differently from the region the CRC covers.
-
-    // Defaults to the RX role; a transmitter MUST call `set_payload_len` with the real frame size.
-    radio.set_flrc_modulation(BITRATE, CODING, PULSE_SHAPE).await?;
+    radio.set_flrc_modulation(link.bitrate, link.coding, PULSE_SHAPE).await?;
     dcdc_workaround(radio).await;
+    // `pld_len` = the fixed on-air PDU, identical in both roles. TX transmits exactly this many
+    // bytes and RX accepts exactly this many, which is why the payload length has to travel INSIDE
+    // the frame — see [`build_frame`].
     radio.set_flrc_packet(&pkt_params(MAX_PAYLOAD)).await?;
     radio.set_flrc_syncword(1, SYNCWORD, false).await?;
 
@@ -498,15 +672,9 @@ where
         // 3. §7.4.3: `tx_power` is in **0.5 dB steps** (PA_HF −39..24 ⇒ −19.5..+12 dBm), so the
         //    register is 2x the dBm figure printed in Table 7-18.
         //
-        // Rows used, from Table 7-18 (2445 MHz Semtech reference design):
-        //   +12 dBm -> tx_power 12 dBm (reg 24), duty 16
-        //    +6 dBm -> tx_power  8 dBm (reg 16), duty 30
-        //     0 dBm -> tx_power  2 dBm (reg  4), duty 30
-        let (hf_tx_pow, hf_duty): (i8, u8) = match option_env!("PHY_PWR") {
-            Some(v) if matches!(v.as_bytes(), b"0") => (4, 30),
-            Some(v) if matches!(v.as_bytes(), b"6") => (16, 30),
-            _ => (24, 16),
-        };
+        // A runtime `CMD_SET_PWR` moves `tx_power` and leaves [`PA_HF_DUTY`] at its build value,
+        // because only three rows of the matched pair are known. HF is the broken path (see
+        // [`FREQ_HZ`]); do not read a runtime HF power number as calibrated.
         let mut cmd = [0u8; 5];
         cmd[0] = 0x02;
         cmd[1] = 0x02;
@@ -514,17 +682,17 @@ where
         // stated values for "LF PA not used".
         cmd[2] = (1 << 7) | (6 << 4);
         cmd[3] = 7;
-        cmd[4] = hf_duty & 0x1f;
+        cmd[4] = PA_HF_DUTY & 0x1f;
         radio.cmd_wr(&cmd).await?;
-        radio.set_tx_params(hf_tx_pow, ramp_time()).await?;
     }
     // **Ramp2u, not Ramp16u** (#104 lever 3). The PA ramp sits between the TX trigger and the first
     // on-air symbol, so its duration is pure transmit-instant offset — and any variation in it is
     // transmit-instant jitter, which is exactly the residual M5 left unexplained. 16 µs was an
     // arbitrary bring-up default; the shortest ramp is the right default for a slot MAC.
-    if option_env!("PHY_HF").is_none() {
-        radio.set_tx_params(TX_POWER_DBM, ramp_time()).await?;
-    }
+    //
+    // One call for both paths now: the HF branch used to issue its own `set_tx_params` inside the
+    // `else`, so the two paths could disagree about the ramp. They cannot now.
+    radio.set_tx_params(link.tx_power_half_db, ramp_time()).await?;
     // **RX boost OFF, not Max.**
     //
     // The shield devicetree says `rx-boost-cfg = 7` and that was copied without asking what it is
@@ -575,9 +743,43 @@ where
     // **Verified by `m113_errors`:** with this sequence `GetErrors` is clean through configure, TX
     // and RX entry. Without it the chip reports `RXFREQ_NO_FE_CAL` — "front end calibration was not
     // available for Rx operation with specified RF frequency" — on entering RX.
+    //
+    // Running here rather than only in `configure` is what makes a retune safe: a host that moves
+    // the carrier gets the image/PLL/AAF calibration re-run for the new one, which §6.4 requires for
+    // any move over 10 MHz.
     radio.set_chip_mode(ChipMode::StandbyRc).await?;
     radio.calibrate(true, true, true, true, false, false).await?; // PA_OFF, MU, AAF, PLL
     radio.calib_fe(&CAL_POINTS).await?;
+
+    Ok(())
+}
+
+/// Bring a reset LR2021 up as an FLRC node on the build-time link ([`LinkState::default`]).
+///
+/// Ordering matters and follows the driver's documented sequence: packet type first (it selects
+/// which modulation/packet registers exist), then modulation, syncword, packet params, then the
+/// front end. Both nodes call this, so TX and RX cannot drift apart.
+pub async fn configure<O, SPI, M>(radio: &mut Lr2021<O, SPI, M>) -> Result<(), Lr2021Error>
+where
+    O: OutputPin,
+    SPI: SpiBus<u8>,
+    M: BusyPin,
+{
+    configure_with(radio, &LinkState::default()).await
+}
+
+/// [`configure`] with a caller-supplied starting [`LinkState`] — for a binary that boots on
+/// something other than the build-time defaults.
+pub async fn configure_with<O, SPI, M>(
+    radio: &mut Lr2021<O, SPI, M>,
+    link: &LinkState,
+) -> Result<(), Lr2021Error>
+where
+    O: OutputPin,
+    SPI: SpiBus<u8>,
+    M: BusyPin,
+{
+    apply(radio, link).await?;
 
     // Route interrupts out on **DIO8**, which the shield wires to the MCU's P1.04.
     //
@@ -589,6 +791,28 @@ where
     radio.set_dio_irq(DioNum::Dio8, Intr::new_txrx()).await?;
 
     Ok(())
+}
+
+/// **Re-program the link and go back to listening.** The one supported way to change frequency,
+/// power or rate at runtime.
+///
+/// Takes the whole [`LinkState`], not just a frequency, precisely so it cannot half-apply: a
+/// retune that re-issued only `set_rf` would silently revert power and rate to the build defaults
+/// on every channel change, which is the same class of bug as the one it fixes.
+///
+/// The caller is responsible for checking [`in_band`] first and answering the host `EVT_UNSUPPORTED`
+/// for an out-of-band request — bricking the transmit path is not an acceptable way to say no.
+pub async fn retune<O, SPI, M>(
+    radio: &mut Lr2021<O, SPI, M>,
+    link: &LinkState,
+) -> Result<(), Lr2021Error>
+where
+    O: OutputPin,
+    SPI: SpiBus<u8>,
+    M: BusyPin,
+{
+    apply(radio, link).await?;
+    radio.set_rx_continous().await
 }
 
 /// **DCDC switcher workaround — `lr20xx_workarounds_dcdc_configure()` from Semtech's driver.**

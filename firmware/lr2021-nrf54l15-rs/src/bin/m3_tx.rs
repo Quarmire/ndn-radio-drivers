@@ -35,7 +35,9 @@ async fn main(_spawner: Spawner) {
         "m3_tx: FLRC {=u32} Hz, 2.6 Mbit/s, syncword {=u32:#010x}, {} dBm — beaconing",
         flrc_link::FREQ_HZ,
         flrc_link::SYNCWORD,
-        flrc_link::TX_POWER_DBM
+        // dBm, not the half-dB register unit the constant is in — the two differ by 2x and the
+        // whole point of the rename was to stop that conversion being skipped at a boundary.
+        flrc_link::TX_POWER_HALF_DB / 2
     );
 
     let mut seq: u32 = 0;

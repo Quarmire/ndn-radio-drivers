@@ -77,12 +77,18 @@ mod serial_radio;
 pub use serial_radio::{Esp32SerialBackend, SERIAL_RADIO_BAUD, SerialRadioBackend};
 
 // Waveshare USB-TO-LoRa (SX1262) serial-bridged sub-GHz backend: a transparent-mode byte pipe with
-// host-supplied framing and AT-programmed radio params, implementing the same FrameIo/RadioTime/
-// RadioProfile contract as the USB drivers (see src/lora_serial.rs).
+// The 7E-A5 serial sub-GHz fleet — Waveshare SX1262, Heltec SX1276, and the nRF54L15+LR2021 bridge —
+// behind ONE capability-driven backend implementing the same FrameIo/RadioKnobs/RadioTime/
+// RadioProfile contract as the USB drivers. The node describes itself over `CMD_GET_CAP`, so the
+// three are told apart by what they report rather than by which constructor was called
+// (see src/lora_serial.rs).
 #[cfg(feature = "lora")]
 mod lora_serial;
 #[cfg(feature = "lora")]
-pub use lora_serial::{LORA_BAUD, LoraParams, LoraSerialBackend, MAX_LORA_PAYLOAD};
+pub use lora_serial::{
+    LORA_BAUD, LoraParams, LoraRadioKind, LoraSerialBackend, MAX_LORA_PAYLOAD, NdnStats,
+    NodeProfile, PROTO_VER, RadioKindHint, StampKind, lora_clock_domain, name_hash,
+};
 
 /// The canonical named-data-over-802.11 EtherType — the LLC/SNAP protocol id every backend uses so a
 /// payload injected on one radio de-frames identically on any other. (Matches `FrameFormat::default()`.)

@@ -16,7 +16,18 @@ license = "MIT OR Apache-2.0"
 # Leave the board RF-switch control pins floating, to A/B against driving them (#105).
 no-rf-switch = []
 
-[dependencies]
+# ── Embedded dependencies, DEVICE TARGET ONLY ───────────────────────────────────────────────────
+#
+# Under `cfg(target_os = "none")` rather than plain `[dependencies]` so that `cargo test --target
+# <host>` can build the pure-logic half of the lib (`tier0`, `serial`, `gcs`, `board`) and run its
+# tests. Those modules carry WIRE CONTRACTS shared with three other firmwares and two host crates,
+# and they had no tests at all because `cargo test` could not get past `nrf-pac`, which fails to
+# compile for any non-Cortex-M target ("mach-o section specifier requires a segment and section
+# separated by a comma"). `lib.rs` gates the modules to match.
+#
+# This changes nothing about the firmware build: `.cargo/config.toml` pins the target to
+# `thumbv8m.main-none-eabihf`, which IS `target_os = "none"`.
+[target.'cfg(target_os = "none")'.dependencies]
 cortex-m = { version = "0.7", features = ["inline-asm", "critical-section-single-core"] }
 cortex-m-rt = "0.7"
 embassy-executor = { version = "0.9", features = ["arch-cortex-m", "executor-thread"] }

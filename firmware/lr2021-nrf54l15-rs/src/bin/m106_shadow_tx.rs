@@ -48,7 +48,7 @@ pub fn make_name(buf: &mut [u8], ns: u32, seq: u32) -> usize {
 
 #[embassy_executor::main]
 async fn main(_spawner: Spawner) {
-    let p = embassy_nrf::init(Default::default());
+    let p = hw::init_peripherals();
     let (mut radio, _t, _u) = hw::init(p);
 
     radio.reset().await.unwrap();

@@ -22,7 +22,6 @@
 //!    and `sched_gran_ns = 0` because there is no scheduled-TX engine here.
 //!  * **CMD_READ_CLOCK → EVT_CLOCK**, the same µs counter EVT_RX stamps with, at full 64-bit width.
 //!  * **CMD_SENSE → EVT_SENSE**, free-running channel-busy count + instantaneous RSSI.
-//!  * **CMD_TX_AT → EVT_UNSUPPORTED**, explicitly: no scheduled TX on this radio.
 //!  * Nothing answers with **silence** any more — an unknown or badly-argued command gets
 //!    `EVT_UNSUPPORTED [cmd, reason]` instead of costing the host four retries and a timeout.
 //!
@@ -32,6 +31,44 @@
 //!    (247, the serial framing's real ceiling) and counts anything longer.
 //!  * **C2** — the on-device NDN data plane recognised only the ASCII demo wire, so every offload
 //!    path was INERT on the real face. It now parses NDNLPv2/NDN-TLV (see `ndn.rs`).
+//!
+//! ## Scheduled TX (2026-08-28) — CMD_TX_AT is real on this node
+//!
+//! v2 shipped `CMD_TX_AT → EVT_UNSUPPORTED[NO_HARDWARE]`, reasoning that the SX1262 has no delayed
+//! key-up engine. True — but the wrong conclusion, because on this dongle **the MCU is the transmit
+//! queue**: nothing reaches the air except through `transmit()`, so a GD32 timer compare that
+//! releases the key-up at a deadline IS the scheduler, and it is scheduled on the same microsecond
+//! counter EVT_RX stamps with. See [`Sched`] for the state machine, [`SCHED_GRAN_NS`] for the
+//! granularity arithmetic, and `sx1262::stage_tx` for why the slow work happens before the deadline.
+//!
+//! ## 7E-A5 **v3** (2026-08-28) — the PHY is a knob, and the deadline is absolute
+//!
+//! v3 corrects a design error and closes a measured gap. Framing and every v2 opcode are unchanged.
+//!
+//!  * **`CMD_SET_PHY` (0x1D) — modulation is a KNOB, not an identity.** `SetPacketType` is a runtime
+//!    command on every part in this fleet: the SX1262 does LoRa *and* (G)FSK, the SX1276 adds OOK,
+//!    the LR2021 a dozen more. v2 encoded one part's boot-time choice as its `radio_kind`,
+//!    which made "the same chip in another mode" look like a different radio. `radio_kind` now names
+//!    the **part** (0 = SX1262, 1 = SX1276, 2 = LR2021) and the mode is selected at runtime.
+//!  * **EVT_CAP describes the CURRENT PHY** and grows to 34 bytes: `phy_bitmap` (which
+//!    `SetPacketType` values this node brings up, in the LR20xx wire numbering) and `phy_current`.
+//!    `max_payload`, `sf_min`/`sf_max`, the airtime model and the usable `cmd_bitmap` are all
+//!    per-PHY — a GFSK SX1262 has no spreading factor and no CAD — so `CMD_SET_PHY` replies with the
+//!    WHOLE new EVT_CAP and the host replaces its profile rather than patching fields.
+//!  * **`CMD_TX_AT_ABS` (0x1F) — an absolute deadline.** `CMD_TX_AT`'s delay is counted from when
+//!    the FIRMWARE decodes the arm, so the host→device serial latency lands inside the placement.
+//!    Measured on the LR2021: 45/45 slots fired with a mean gap 182 ticks off 2 400 000 nominal
+//!    (accuracy is excellent) but a jitter sd of 553 µs against a declared 50 µs granularity — the
+//!    same number as that node's 550 µs `CMD_GET_INFO` round-trip spread. Placing the deadline on
+//!    the node's own `micros64()` removes the term entirely.
+//!  * **`EVT_PHY_ERR` (0x8D)** `[requested_phy, chip_status]` — a PHY this node advertises that the
+//!    silicon declined at runtime, carrying the chip's literal `GetStatus` byte.
+//!  * **`CMD_SET_HOP` (0x1E) → `EVT_UNSUPPORTED[0x1E, NO_HARDWARE]`**, from an explicit arm: the
+//!    SX126x has no intra-packet FHSS engine, so this node is structurally outside the hopping pair.
+//!
+//! A retune also stopped costing 161 ms: three independent latency subtractions showed the extra
+//! ~80 ms was a second **TCXO startup** forced by a redundant `CalibrateImage`, not the calibration
+//! itself — `sx1262::set_frequency` now skips it while the target stays inside the calibrated band.
 
 #![no_std]
 #![no_main]
@@ -188,19 +225,31 @@ const CMD_ENTER_BOOTLOADER: u8 = 0x16; // payload = [0xB0,0x07] guard → jump t
 //                                       CH343/USB link — no ST-Link, no BOOT0 pin, no replug.
 // --- 7E-A5 v2 (fleet-wide self-description; the Waveshare is the reference node) ---
 const CMD_READ_CLOCK: u8 = 0x17; //  payload = []  → EVT_CLOCK [ticks u64 BE], units = EVT_CAP.stamp_hz
-const CMD_TX_AT: u8 = 0x18; //       payload = [delay_us u32 BE][frame] — NOT IMPLEMENTED on this node;
-//                                   answered EVT_UNSUPPORTED (see the explicit arm in `handle_cmd`).
+const CMD_TX_AT: u8 = 0x18; //       payload = [delay_us u32 BE][frame] → EVT_TXDONE when it airs.
+//                                   Scheduled on `micros64()`, the SAME counter EVT_RX stamps with
+//                                   and CMD_READ_CLOCK returns, so a host converts freely between
+//                                   "when it arrived" and "when to send". See [`Sched`].
 const CMD_GET_CAP: u8 = 0x1A; //     payload = []  → EVT_CAP (29 bytes)
 const CMD_SENSE: u8 = 0x1B; //       payload = []  → EVT_SENSE [activity u16 BE, rssi i16 BE]
 // --- Waveshare-local extension. Outside the v2 block (0x17..0x1B) so it cannot collide with a future
 // fleet assignment there; the host discovers it from EVT_CAP's cmd_bitmap, which is what the bitmap
 // is for.
 const CMD_SET_RX_GAIN: u8 = 0x1C; // payload = [0 = power-saving | 1 = boosted] → EVT_INFO
+// --- 7E-A5 v3 (the PHY becomes a knob; the scheduled deadline becomes absolute) ---
+const CMD_SET_PHY: u8 = 0x1D; //     payload = [packet_type u8, LR20xx wire numbering] → EVT_CAP
+//                                   (the WHOLE new capability record — every field is per-PHY)
+const CMD_SET_HOP: u8 = 0x1E; //     [hop_ctrl u8][hop_period u16 BE][n u8][freq_hz u32 BE]*n
+//                                   → EVT_UNSUPPORTED[0x1E, NO_HARDWARE] on this node; see the arm
+const CMD_TX_AT_ABS: u8 = 0x1F; //   payload = [target_ticks u64 BE][frame] → EVT_TXDONE when it airs
 // Firmware -> host events.
 const EVT_RX: u8 = 0x81; //    payload = [rssi i16 BE, snr i16 BE, ts_us u32 BE, LoRa bytes]
 //                             ts_us is MICROseconds (`micros()`), not ms — the field was mislabelled
 //                             `ts_ms` here and on the host. EVT_CAP.stamp_hz states the true rate.
 const EVT_TXDONE: u8 = 0x82; //payload = [ok, attempts]  (attempts=0 for a plain CMD_TX)
+//                             + an 8-byte Waveshare-local tail ONLY for a CMD_TX_AT reply:
+//                             [late_us u32 BE, keyup_us u32 BE] — how far past the requested instant
+//                             SetTx was issued, and the chip's measured key-up. A host that reads
+//                             only byte 0/1 (as ndn-radio-drivers does) is unaffected.
 const EVT_INFO: u8 = 0x83; //  payload = [status, sync(2), errors(2), freq(4), sf, bw, cr, pwr, lost(2), cad_busy(2), defer(2)]
 //                             19 bytes, FIXED: the host reads cad_busy/defer as the LAST 4 bytes, so
 //                             nothing may ever be appended here. New counters go in EVT_STATS.
@@ -209,13 +258,82 @@ const EVT_CAD: u8 = 0x85; //   payload = [busy(0/1)]
 const EVT_RSSI: u8 = 0x86; //  payload = [rssi i16 BE]
 const EVT_SF_DETECTED: u8 = 0x87; // payload = [sf | 0 = none]
 const EVT_TX_STARTED: u8 = 0x88; //  payload = [airtime_ms u16 BE] — emitted just before key-up
-const EVT_STATS: u8 = 0x89; //       payload = [rx(4), filtered(4), deduped(4), served(4), relayed(4),
-//                                   cad_busy(2), defer(2)  <- v1 ends at 24 B; a v1 host stops here
-//                                   chip_rx(2), chip_crc_err(2), chip_hdr_err(2), rx_trunc(2)] = 32 B
+const EVT_STATS: u8 = 0x89; //       payload = 32 B; the offsets are named in [`stats`], which the
+//                                   emitter indexes with and the README's table transcribes, so the
+//                                   wire and the documentation cannot drift.
 const EVT_CLOCK: u8 = 0x8A; //       payload = [ticks u64 BE] (µs; see EVT_CAP.stamp_hz)
-const EVT_CAP: u8 = 0x8B; //         payload = 29 bytes, all multi-byte fields BIG-ENDIAN (see `send_cap`)
+const EVT_CAP: u8 = 0x8B; //         payload = 34 bytes in v3 (29 in v2 + the PHY tail), all
+//                                   multi-byte fields BIG-ENDIAN (see `send_cap`)
 const EVT_SENSE: u8 = 0x8C; //       payload = [activity u16 BE, rssi i16 BE]
+const EVT_PHY_ERR: u8 = 0x8D; //     payload = [requested_phy u8, chip_status u8] — a PHY this node
+//                                   ADVERTISES that the chip refused at runtime, with the SX126x's
+//                                   literal GetStatus byte (see `sx1262::cmd_status_ok`)
 const EVT_UNSUPPORTED: u8 = 0x8F; // payload = [cmd, reason] — never silence, never a fake success
+
+/// **EVT_STATS (0x89) v2 — the byte offsets, named once.**
+///
+/// Every field is BIG-ENDIAN and unsigned. `CMD_GET_STATS` indexes the payload with these constants
+/// and the README's STATS table is a transcription of this block, so a host reader written against
+/// the documentation is written against the emitter.
+///
+/// Bytes `0..V1_LEN` are byte-identical to the v1 layout, and the existing host parser length-checks
+/// `< 24` rather than `!= 24`, so a v1 host reads the same 24 bytes it always did and ignores the
+/// tail. The tail exists because RX loss was otherwise invisible: `poll_rx` drops a CRC failure and
+/// returns `None`, so without the chip's own counters a quiet channel and a channel we are failing
+/// to decode look identical from the host.
+///
+/// Reset semantics differ per field and matter to anyone differencing them:
+///   * `RX`..`RELAYED` and `DEFER` are firmware counters zeroed by `CMD_RESET_STATS` (0x14);
+///   * `CAD_BUSY` here is the *resettable view* (`Csma::cad_busy_view`) — `CMD_RESET_STATS` moves a
+///     baseline forward, while the free-running counter EVT_SENSE reports keeps advancing, so the
+///     two never disagree about direction;
+///   * `CHIP_RX`/`CHIP_CRC_ERR`/`CHIP_HDR_ERR` are the SX126x's own 16-bit `GetStats` registers,
+///     zeroed on the chip by `CMD_RESET_STATS` (which issues `ResetStats`) and by any hard reset;
+///   * `RX_TRUNC` is a firmware counter, also zeroed by `CMD_RESET_STATS`.
+mod stats {
+    /// `rx` u32 — frames the on-device data plane classified.
+    pub const RX: usize = 0;
+    /// `filtered` u32 — dropped because no installed prefix covers the name.
+    pub const FILTERED: usize = 4;
+    /// `deduped` u32 — dropped as a duplicate Data object.
+    pub const DEDUPED: usize = 8;
+    /// `served` u32 — answered from the on-device Content Store.
+    pub const SERVED: usize = 12;
+    /// `relayed` u32 — re-broadcast by the relay set.
+    pub const RELAYED: usize = 16;
+    /// `cad_busy` u16 — channel sensed busy (resettable view).
+    pub const CAD_BUSY: usize = 20;
+    /// `defer` u16 — transmissions abandoned after the LBT backoff budget.
+    pub const DEFER: usize = 22;
+    /// End of the v1 payload. A v1 host stops here.
+    pub const V1_LEN: usize = 24;
+    /// `chip_rx` u16 — SX126x GetStats `nbPktReceived`.
+    pub const CHIP_RX: usize = 24;
+    /// `chip_crc_err` u16 — SX126x GetStats `nbPktCrcError`. The ONLY place a failed decode shows.
+    pub const CHIP_CRC_ERR: usize = 26;
+    /// `chip_hdr_err` u16 — SX126x GetStats `nbPktHeaderErr`.
+    pub const CHIP_HDR_ERR: usize = 28;
+    /// `rx_trunc` u16 — frames whose on-air length exceeded `RX_MAX`. Should stay 0.
+    pub const RX_TRUNC: usize = 30;
+    /// Total v2 payload length.
+    pub const LEN: usize = 32;
+}
+
+// The layout is contiguous, in order, and exactly 32 bytes — asserted rather than trusted, because
+// the README's byte offsets are being read by another agent as the contract.
+const _: () = assert!(stats::FILTERED == stats::RX + 4);
+const _: () = assert!(stats::DEDUPED == stats::FILTERED + 4);
+const _: () = assert!(stats::SERVED == stats::DEDUPED + 4);
+const _: () = assert!(stats::RELAYED == stats::SERVED + 4);
+const _: () = assert!(stats::CAD_BUSY == stats::RELAYED + 4);
+const _: () = assert!(stats::DEFER == stats::CAD_BUSY + 2);
+const _: () = assert!(stats::V1_LEN == stats::DEFER + 2);
+const _: () = assert!(stats::CHIP_RX == stats::V1_LEN);
+const _: () = assert!(stats::CHIP_CRC_ERR == stats::CHIP_RX + 2);
+const _: () = assert!(stats::CHIP_HDR_ERR == stats::CHIP_CRC_ERR + 2);
+const _: () = assert!(stats::RX_TRUNC == stats::CHIP_HDR_ERR + 2);
+const _: () = assert!(stats::LEN == stats::RX_TRUNC + 2);
+const _: () = assert!(stats::LEN == 32 && stats::V1_LEN == 24);
 
 // EVT_UNSUPPORTED reason codes.
 const UNSUP_UNKNOWN_OPCODE: u8 = 0x01; // this firmware does not know the opcode at all
@@ -224,19 +342,326 @@ const UNSUP_BAD_LENGTH: u8 = 0x03; //    opcode understood, payload does not sat
 //                                       requirements (too short, or a guard magic wrong)
 const UNSUP_OUT_OF_RANGE: u8 = 0x04; //  argument outside the range EVT_CAP advertises
 
+// =====================================================================================================
+// 7E-A5 v3 §PHY — the modulation is a KNOB, and the two numberings that describe it
+// =====================================================================================================
+//
+// **The design error v3 undoes.** `SetPacketType` is a runtime command on every part in this fleet,
+// so which modulation a node is running is a *state*, actuated like MCS or spreading factor — not an
+// identity. v2 encoded one part's boot-time choice into `radio_kind`, which made the same silicon in
+// a second mode look like a different radio. `radio_kind` now names the PART; the mode is
+// `phy_current`, and `phy_bitmap` says which modes can be reached from here.
+//
+// ⚠ **Two numberings, and they disagree on both modes this part has.** The wire uses the LR20xx
+// `SetPacketType` values; the SX126x has its own (`sx1262::SX126X_PKT_*`). LoRa is 0x0 on the wire
+// and 0x01 on the chip; FSK is 0x2 on the wire and 0x00 on the chip. Note what that means: passing a
+// wire value straight to the chip would select GFSK when the host asked for LoRa, and the chip would
+// accept it — the failure is entirely silent and shows up only as an air link that never forms. The
+// translation therefore happens exactly once, here at the protocol boundary, and the table below is
+// asserted at build time rather than trusted.
+
+/// The LR20xx `SetPacketType` values, which are what travels on the wire (datasheet Table 8-1; the
+/// vendored crate's `PacketType` in `vendor/lr2021/src/cmd/cmd_common.rs` enumerates the same set).
+/// Listed in full — including the twelve this part cannot do — so `phy_bitmap` can be read against
+/// the whole space instead of against a list that only contains the answers.
+mod wire_phy {
+    pub const LORA: u8 = 0x0;
+    // 0x1 is unassigned in the table.
+    pub const FSK: u8 = 0x2;
+    pub const BLE: u8 = 0x3;
+    pub const RTTOF: u8 = 0x4;
+    pub const FLRC: u8 = 0x5;
+    pub const BPSK: u8 = 0x6;
+    pub const LR_FHSS: u8 = 0x7;
+    pub const WM_BUS: u8 = 0x8;
+    pub const WISUN: u8 = 0x9;
+    pub const OOK: u8 = 0xA;
+    pub const RAW: u8 = 0xB;
+    pub const Z_WAVE: u8 = 0xC;
+    pub const O_QPSK_15_4: u8 = 0xD;
+}
+
+/// Returned by [`wire_to_chip_phy`] for a wire PHY this node cannot enter.
+const PHY_CHIP_NONE: u8 = 0xFF;
+
+/// Wire `SetPacketType` value -> the SX126x's own `SetPacketType` argument.
+///
+/// Only the two modes this firmware actually brings up map. Everything else — including LR-FHSS,
+/// which the SX1262 silicon does have but only as a transmit-only mode that builds its own hop
+/// sequence — returns [`PHY_CHIP_NONE`], and `CMD_SET_PHY` refuses it. A mode that cannot receive
+/// is not a PHY this node can advertise.
+const fn wire_to_chip_phy(wire: u8) -> u8 {
+    match wire {
+        wire_phy::LORA => sx1262::SX126X_PKT_LORA,
+        wire_phy::FSK => sx1262::SX126X_PKT_GFSK,
+        _ => PHY_CHIP_NONE,
+    }
+}
+
+/// The inverse, for reporting `phy_current` from whatever the driver holds.
+const fn chip_to_wire_phy(chip: u8) -> u8 {
+    match chip {
+        sx1262::SX126X_PKT_LORA => wire_phy::LORA,
+        sx1262::SX126X_PKT_GFSK => wire_phy::FSK,
+        _ => PHY_CHIP_NONE,
+    }
+}
+
+// --- The mapping table, pinned. This is the one piece of v3 whose failure mode is silent. ---------
+// The two numberings really are different on both modes (if they ever coincided the rest of these
+// assertions would pass vacuously, so assert the disagreement itself first):
+const _: () = assert!(wire_phy::LORA != sx1262::SX126X_PKT_LORA);
+const _: () = assert!(wire_phy::FSK != sx1262::SX126X_PKT_GFSK);
+// The two rows that exist:
+const _: () = assert!(wire_to_chip_phy(wire_phy::LORA) == sx1262::SX126X_PKT_LORA); // 0x0 -> 0x01
+const _: () = assert!(wire_to_chip_phy(wire_phy::FSK) == sx1262::SX126X_PKT_GFSK); //  0x2 -> 0x00
+// ...and they round-trip, so `phy_current` reports back what `CMD_SET_PHY` was given:
+const _: () = assert!(chip_to_wire_phy(wire_to_chip_phy(wire_phy::LORA)) == wire_phy::LORA);
+const _: () = assert!(chip_to_wire_phy(wire_to_chip_phy(wire_phy::FSK)) == wire_phy::FSK);
+// Every OTHER wire value in the LR20xx table is refused, named one by one rather than by a range, so
+// adding a mode to `wire_to_chip_phy` without adding it to `PHY_BITMAP` fails the build:
+const _: () = assert!(wire_to_chip_phy(0x1) == PHY_CHIP_NONE);
+const _: () = assert!(wire_to_chip_phy(wire_phy::BLE) == PHY_CHIP_NONE);
+const _: () = assert!(wire_to_chip_phy(wire_phy::RTTOF) == PHY_CHIP_NONE);
+const _: () = assert!(wire_to_chip_phy(wire_phy::FLRC) == PHY_CHIP_NONE);
+const _: () = assert!(wire_to_chip_phy(wire_phy::BPSK) == PHY_CHIP_NONE);
+const _: () = assert!(wire_to_chip_phy(wire_phy::LR_FHSS) == PHY_CHIP_NONE);
+const _: () = assert!(wire_to_chip_phy(wire_phy::WM_BUS) == PHY_CHIP_NONE);
+const _: () = assert!(wire_to_chip_phy(wire_phy::WISUN) == PHY_CHIP_NONE);
+const _: () = assert!(wire_to_chip_phy(wire_phy::OOK) == PHY_CHIP_NONE);
+const _: () = assert!(wire_to_chip_phy(wire_phy::RAW) == PHY_CHIP_NONE);
+const _: () = assert!(wire_to_chip_phy(wire_phy::Z_WAVE) == PHY_CHIP_NONE);
+const _: () = assert!(wire_to_chip_phy(wire_phy::O_QPSK_15_4) == PHY_CHIP_NONE);
+const _: () = assert!(wire_to_chip_phy(0x0E) == PHY_CHIP_NONE);
+const _: () = assert!(wire_to_chip_phy(0x0F) == PHY_CHIP_NONE);
+
+/// **EVT_CAP `phy_bitmap`** — bit N set ⇔ wire `SetPacketType` value N is usable on this node.
+///
+/// Bit 0 (LoRa) + bit 2 (FSK) = **0x0000_0005**. Both are brought up in
+/// `sx1262::Sx1262::apply_phy`, both receive, and both have a real airtime model here; nothing is
+/// claimed on the strength of the silicon's datasheet alone. The bitmap and the mapping cannot
+/// disagree — the assertion below derives one from the other.
+const PHY_BITMAP: u32 = (1u32 << wire_phy::LORA) | (1u32 << wire_phy::FSK);
+const _: () = assert!(PHY_BITMAP == 0x0000_0005);
+const _: () = assert!(PHY_BITMAP.count_ones() == 2);
+// Every advertised bit maps to a chip value, and every unadvertised one does not. Written as an
+// explicit loop over the whole u32 so a bit added to either side alone cannot pass.
+const _: () = {
+    let mut i = 0u8;
+    while i < 32 {
+        let advertised = (PHY_BITMAP >> i) & 1 != 0;
+        assert!(advertised == (wire_to_chip_phy(i) != PHY_CHIP_NONE));
+        i += 1;
+    }
+};
+
+/// The per-PHY half of EVT_CAP. **`max_payload`, the SF span and the usable command set all move
+/// with the PHY** — which is why `CMD_SET_PHY` answers with a whole new capability record and the
+/// host replaces its profile instead of patching fields.
+struct PhyCaps {
+    sf_min: u8,
+    sf_max: u8,
+    max_payload: u16,
+    cmd_bitmap: u32,
+}
+
+/// The capability record for a wire PHY. Only called for PHYs in [`PHY_BITMAP`].
+///
+/// **Band**: both PHYs report `sx1262::FREQ_MIN_HZ`..`FREQ_MAX_HZ`, and that is not a copy-paste —
+/// the binding constraint is `CalibrateImage`, which takes a frequency *band* and is independent of
+/// the packet type, so the two modes genuinely share it.
+///
+/// **`max_payload`**: 247 in both, and for the same reason in both — the 7E-A5 framing's one-byte
+/// `len` minus EVT_RX's 8-byte header. The radio limits are larger and therefore not binding (LoRa
+/// PDU 255, `sx1262::GFSK_PDU_MAX` 255).
+const fn phy_caps(wire: u8) -> PhyCaps {
+    match wire {
+        wire_phy::FSK => PhyCaps {
+            // GFSK has no spreading factor. 0/0 is the explicit "this PHY has none" — not a
+            // leftover LoRa span that a planner would read as a real knob.
+            sf_min: 0,
+            sf_max: 0,
+            max_payload: RX_MAX as u16,
+            cmd_bitmap: CMD_BITMAP_FSK,
+        },
+        // LoRa, and the default for anything else — `CMD_SET_PHY` never admits another value.
+        _ => PhyCaps {
+            sf_min: sx1262::SF_MIN,
+            sf_max: sx1262::SF_MAX,
+            max_payload: RX_MAX as u16,
+            cmd_bitmap: CMD_BITMAP_LORA,
+        },
+    }
+}
+
+// --- The v3 capability surface, checked at build time. -------------------------------------------
+//
+// `#[cfg(test)]` cannot do this job: the crate is `no_std`/`no_main` for thumbv7m, so a test harness
+// never runs. A `const` block does — it is evaluated by the same compiler invocation that produces
+// the firmware, on the real constants the emitter indexes with, and a violation is a build failure
+// rather than a test somebody forgot to run.
+const _: () = {
+    // The LoRa profile is the v2 one, unchanged.
+    let l = phy_caps(wire_phy::LORA);
+    assert!(l.sf_min == sx1262::SF_MIN && l.sf_max == sx1262::SF_MAX);
+    assert!(l.cmd_bitmap == CMD_BITMAP);
+    assert!(l.max_payload == RX_MAX as u16);
+    // The GFSK profile differs in exactly the ways GFSK differs from LoRa, and agrees where the
+    // constraint is shared.
+    let f = phy_caps(wire_phy::FSK);
+    assert!(f.sf_min == 0 && f.sf_max == 0); // no spreading factor exists in this modem
+    assert!(f.cmd_bitmap & opbit(CMD_CAD) == 0); // no CAD either
+    assert!(f.cmd_bitmap & opbit(CMD_SF_SCAN) == 0);
+    assert!(f.cmd_bitmap & opbit(CMD_SET_MOD) == 0);
+    assert!(f.cmd_bitmap & opbit(CMD_SET_CAD_CFG) == 0);
+    assert!(f.cmd_bitmap & opbit(CMD_TX) != 0); // ...but it still transmits and receives
+    assert!(f.cmd_bitmap & opbit(CMD_SENSE) != 0); // and still senses, via the energy detector
+    // Both PHYs are bound by the SERIAL framing, not by the radio, so they land on the same number
+    // for the same reason — this is the assertion that catches someone "fixing" one of them to a
+    // radio limit (255 in both cases) and quietly breaking EVT_RX.
+    assert!(f.max_payload == l.max_payload);
+    assert!(f.max_payload as usize + 8 == 255);
+};
+
+// The two airtime models are genuinely different arithmetic, not a shared formula with a parameter:
+// a 32-byte frame is ~72 ms at SF7/BW125 and ~8 ms at 50 kbps GFSK. `airtime_ms_for` picks between
+// them, and EVT_TX_STARTED (which the host re-bases its reply deadline on) carries the result — so
+// picking wrong would misstate a transmission by nearly an order of magnitude.
+const _: () = assert!(sx1262::gfsk_airtime_ms(32, 8) == 8);
+const _: () = assert!(sx1262::airtime_ms(7, sx1262::BW_125, sx1262::CR_4_5, 32, 8) == 72);
+const _: () = assert!(
+    sx1262::airtime_ms(7, sx1262::BW_125, sx1262::CR_4_5, 32, 8) > 5 * sx1262::gfsk_airtime_ms(32, 8)
+);
+
+// `cmd_status_ok` is the oracle behind EVT_PHY_ERR, so pin the SX126x `GetStatus` decode against the
+// datasheet's cmdStatus values (bits [3:1]) rather than against the shift that implements it.
+// STBY_RC (chipMode 2) with each cmdStatus in turn:
+const _: () = assert!(sx1262::cmd_status_ok(0x2 << 4 | 0x2 << 1)); //  data available
+const _: () = assert!(sx1262::cmd_status_ok(0x2 << 4 | 0x6 << 1)); //  command TX done
+const _: () = assert!(!sx1262::cmd_status_ok(0x2 << 4 | 0x3 << 1)); // command timeout
+const _: () = assert!(!sx1262::cmd_status_ok(0x2 << 4 | 0x4 << 1)); // command processing error
+const _: () = assert!(!sx1262::cmd_status_ok(0x2 << 4 | 0x5 << 1)); // failure to execute command
+// ...and the chip-mode bits must not leak into the verdict: the same cmdStatus in TX mode (5) reads
+// the same way.
+const _: () = assert!(!sx1262::cmd_status_ok(0x5 << 4 | 0x5 << 1));
+const _: () = assert!(sx1262::cmd_status_ok(0x5 << 4 | 0x6 << 1));
+
+/// Energy-detect threshold used when the host has not set one **and the current PHY has no CAD**.
+///
+/// In LoRa, sensing is CAD and the RSSI threshold is an optional addition for non-LoRa interference,
+/// so leaving it disabled is a real choice. In GFSK there is no CAD at all, so a disabled threshold
+/// would make `sense_busy` structurally incapable of ever returning busy — an LBT that always
+/// transmits and a `CMD_SENSE` that reports a saturated channel as free, both silently. −95 dBm is
+/// well above this receiver's noise floor at 117.3 kHz and well below any frame worth deferring for.
+/// A host-set `rssi_thresh` always wins; this only replaces the *absence* of one.
+const GFSK_FALLBACK_RSSI_THRESH: i16 = -95;
+
+/// The effective energy-detect threshold for one sense: the host's if it set one, otherwise the
+/// GFSK fallback when the PHY has no CAD, otherwise disabled.
+fn effective_rssi_thresh(host_thresh: i16, has_cad: bool) -> i16 {
+    if host_thresh > i16::MIN {
+        host_thresh
+    } else if has_cad {
+        i16::MIN
+    } else {
+        GFSK_FALLBACK_RSSI_THRESH
+    }
+}
+
 /// **The self-description bitmap** (EVT_CAP `cmd_bitmap`): bit N set ⇔ opcode N is implemented and
 /// will act. The host uses it to decide what it may send, so it must be EXACT — and it is also the
 /// firmware's own "is this a known opcode?" oracle in `handle_cmd`, so the bitmap and the dispatcher
 /// physically cannot drift apart.
 ///
 /// Set: 0x01..=0x17 (every command from CMD_TX through CMD_READ_CLOCK) = bits 1..23 → `0x00FF_FFFE`
+///      0x18 CMD_TX_AT    → bit 24 → `0x0100_0000`  (scheduled TX; see [`Sched`])
 ///      0x1A CMD_GET_CAP  → bit 26 → `0x0400_0000`
 ///      0x1B CMD_SENSE    → bit 27 → `0x0800_0000`
 ///      0x1C CMD_SET_RX_GAIN → bit 28 → `0x1000_0000`
-/// Clear: bit 0 (no opcode 0), bit 24 (0x18 CMD_TX_AT — no scheduled-TX engine; answered
-///        EVT_UNSUPPORTED), bit 25 (0x19 unassigned), bits 29..31 (unassigned).
-/// Total = 0x1CFF_FFFE.
-const CMD_BITMAP: u32 = 0x1CFF_FFFE;
+///      0x1D CMD_SET_PHY  → bit 29 → `0x2000_0000`  (v3: the PHY knob)
+///      0x1F CMD_TX_AT_ABS → bit 31 → `0x8000_0000` (v3: absolute-deadline scheduled TX)
+/// Clear: bit 0 (no opcode 0), bit 25 (0x19 unassigned), and **bit 30 (0x1E CMD_SET_HOP), which
+///        this node understands and refuses** — see [`REFUSED_OPCODES`].
+/// Total = 0xBDFF_FFFE.
+const CMD_BITMAP: u32 = 0xBDFF_FFFE;
+
+/// Opcodes with a `handle_cmd` arm that exists ONLY to refuse them, by name and with a reason.
+/// They are deliberately absent from [`CMD_BITMAP`] — the bitmap means "implemented and will act" —
+/// so the assertion below is what keeps a refusal from being mistaken for an implementation.
+const REFUSED_OPCODES: u32 = opbit(CMD_SET_HOP);
+const _: () = assert!(CMD_BITMAP & REFUSED_OPCODES == 0);
+
+/// **Opcodes that have no actuator in GFSK.** Every one of them is a LoRa-modem function:
+/// `SET_MOD` carries `[sf, bw, cr]` and GFSK has none of the three; `CAD`, `SET_CAD_CFG` and
+/// `SF_SCAN` all rest on `SetCad`, which correlates against a LoRa preamble and does not exist in
+/// the GFSK modem (see `sx1262::supports_cad`).
+///
+/// They are cleared from the `cmd_bitmap` EVT_CAP reports while the node is in GFSK — that is what
+/// "EVT_CAP describes the CURRENT PHY" means for the command surface — and the dispatcher answers
+/// them `UNSUPPORTED[.., NO_HARDWARE]` there, so a host that ignores the bitmap still gets a true
+/// answer rather than a knob that silently does nothing.
+const CMD_LORA_ONLY: u32 =
+    opbit(CMD_SET_MOD) | opbit(CMD_CAD) | opbit(CMD_SET_CAD_CFG) | opbit(CMD_SF_SCAN);
+const CMD_BITMAP_LORA: u32 = CMD_BITMAP;
+const CMD_BITMAP_FSK: u32 = CMD_BITMAP & !CMD_LORA_ONLY;
+// The per-PHY bitmap is a SUBSET of the firmware's, and drops exactly the four opcodes named above.
+const _: () = assert!(CMD_BITMAP_FSK & !CMD_BITMAP == 0);
+const _: () = assert!(CMD_LORA_ONLY.count_ones() == 4);
+const _: () = assert!(CMD_BITMAP_FSK.count_ones() == CMD_BITMAP.count_ones() - 4);
+// The literal the README's CAP table prints, pinned here so the documentation cannot drift from the
+// emitter — the same reason the `stats` offsets are asserted.
+const _: () = assert!(CMD_BITMAP_FSK == 0xBDFF_DAF6);
+// Nothing in v3 is LoRa-only: the PHY knob and both scheduling opcodes must survive the switch, or
+// a node that entered GFSK could not be told to leave it.
+const _: () = assert!(CMD_BITMAP_FSK & opbit(CMD_SET_PHY) != 0);
+const _: () = assert!(CMD_BITMAP_FSK & opbit(CMD_TX_AT) != 0);
+const _: () = assert!(CMD_BITMAP_FSK & opbit(CMD_TX_AT_ABS) != 0);
+
+/// **B4: compile-time proof that the bitmap is the dispatcher.** `IMPLEMENTED_OPCODES` lists one
+/// entry per `handle_cmd` match arm; the assertion below fails the build if the two ever disagree.
+/// Without it the bitmap is a hand-maintained claim about code somewhere else — exactly the kind of
+/// capability statement the host has no way to check and every reason to believe.
+const fn opbit(op: u8) -> u32 {
+    1u32 << op
+}
+const IMPLEMENTED_OPCODES: u32 = opbit(CMD_TX)
+    | opbit(CMD_SET_FREQ)
+    | opbit(CMD_SET_MOD)
+    | opbit(CMD_SET_PWR)
+    | opbit(CMD_SET_SYNC)
+    | opbit(CMD_GET_INFO)
+    | opbit(CMD_SET_BEACON)
+    | opbit(CMD_CAD)
+    | opbit(CMD_GET_RSSI)
+    | opbit(CMD_SET_CAD_CFG)
+    | opbit(CMD_SET_LBT_CFG)
+    | opbit(CMD_SET_PREAMBLE)
+    | opbit(CMD_SF_SCAN)
+    | opbit(CMD_TX_LBT)
+    | opbit(CMD_SET_NAME_FILTER)
+    | opbit(CMD_SET_RELAY)
+    | opbit(CMD_DATAPLANE)
+    | opbit(CMD_SET_SENSE_CFG)
+    | opbit(CMD_GET_STATS)
+    | opbit(CMD_RESET_STATS)
+    | opbit(CMD_SET_DEBUG)
+    | opbit(CMD_ENTER_BOOTLOADER)
+    | opbit(CMD_READ_CLOCK)
+    | opbit(CMD_TX_AT)
+    | opbit(CMD_GET_CAP)
+    | opbit(CMD_SENSE)
+    | opbit(CMD_SET_RX_GAIN)
+    | opbit(CMD_SET_PHY)
+    | opbit(CMD_TX_AT_ABS);
+const _: () = assert!(CMD_BITMAP == IMPLEMENTED_OPCODES);
+// 29 opcodes are implemented, and opcode 0 must never be claimed (there is no command 0).
+const _: () = assert!(CMD_BITMAP.count_ones() == 29);
+const _: () = assert!(CMD_BITMAP & 1 == 0);
+// The dispatcher's "is this a known opcode?" test shifts by `typ`, so every claimed bit must be
+// below 32 or that test would be undefined for it. 0x1F is the last opcode the one-byte type field
+// can carry into this bitmap at all — a v4 command past it needs a wider oracle, not another bit.
+const _: () = assert!(CMD_TX_AT_ABS < 32);
+const _: () = assert!(CMD_TX_AT_ABS == 31);
 
 /// Largest LoRa frame this firmware will receive and report — the REAL end-to-end cap, and what
 /// EVT_CAP advertises as `max_payload`.
@@ -252,9 +677,10 @@ const CMD_BITMAP: u32 = 0x1CFF_FFFE;
 /// **RAM budget worked to**, all measured on the built image, not estimated: the linker gives 20 KB
 /// − 8 B (the boot-flag slot) = 20 472 B. `.bss` is 536 B (the 512 B host ring + its indices);
 /// everything else is stack, and `main`'s frame — which holds `rxbuf`, the EVT_RX scratch, the
-/// parser, the CS-serve buffer and the whole `DataPlane` — measures 0xcb0 = 3 248 B, with no callee
-/// frame above 0x2c. Peak ≈ 3.8 KB of 20.4 KB, so ~16.5 KB spare. That is what paid for `rxbuf`
-/// 64→247, the EVT_RX scratch 72→255, and `ndn::CS_MAX_LEN` 96→192.)
+/// parser, the CS-serve buffer, the scheduled-TX queue and the whole `DataPlane` — measures
+/// 3 536 B at v3 (3 528 at v2; 3 248 before [`Sched`] added its 251-byte frame buffer), with no
+/// callee frame above 140 B. Peak ≈ 3.7 KB of 20.4 KB, so ~16 KB spare. That is what paid for
+/// `rxbuf` 64→247, the EVT_RX scratch 72→255, and `ndn::CS_MAX_LEN` 96→192.)
 const RX_MAX: usize = 247;
 
 /// Runtime diagnostics toggle (CMD_SET_DEBUG) — emit EVT_LOG traces of data-plane decisions on demand,
@@ -369,20 +795,402 @@ fn micros() -> u32 {
     micros64() as u32
 }
 
+// =====================================================================================================
+// Scheduled TX (CMD_TX_AT 0x18)
+// =====================================================================================================
+//
+// **Why this node can do it at all.** The SX1262 has no delayed key-up engine: `SetTx` starts the
+// transmitter now, and the only "later" the chip understands is an RX timeout. But nothing reaches
+// the air here except through the MCU, so the MCU *is* the transmit queue, and a GD32 timer compare
+// that releases `SetTx` at a deadline is a real scheduled transmission rather than a re-labelled
+// busy-wait. Answering EVT_UNSUPPORTED[NO_HARDWARE] was honest about the radio and wrong about the
+// node.
+//
+// **The shape of the problem is the TCXO.** A cold key-up out of STDBY_RC costs
+// `sx1262::TCXO_STARTUP_US` = 78.125 ms (the DIO3 startup timeout) — the same quantum that shows up
+// three times over in the measured knob latencies (see `sx1262::set_frequency`). Scheduling on top
+// of that would give a granularity of tens of milliseconds. So the design is: do every slow step
+// AHEAD of the deadline (`sx1262::stage_tx`, which leaves the chip in STDBY_XOSC with the crystal
+// still running), and leave exactly one four-byte SPI transaction to perform at it.
+//
+// **And it must not eat the host link.** USART1 has no FIFO; the ISR rescues each byte into `RING`,
+// which holds 512 bytes ~= 44 ms of continuous 115200 traffic. So the scheduler is a state machine
+// the main loop *services*, never a delay it *waits out*: while `Armed` the radio stays in RX and
+// the loop runs normally; the only blocking stretches are the staging SPI (~2.7 ms for a full frame)
+// and the final `SCHED_GATE_US` = 4 ms handed to the hardware timer.
+
+/// The frame a `CMD_TX_AT` can carry: the command payload is at most 255 bytes (the framing's `len`
+/// is one byte) and 4 of them are the delay, so 251 is the exact ceiling, not a chosen one.
+const SCHED_FRAME_MAX: usize = 251;
+
+/// The frame a `CMD_TX_AT_ABS` can carry: the same 255-byte command payload, minus the 8-byte
+/// absolute target. **247** — which is `RX_MAX` and for exactly the same reason, the framing's
+/// one-byte `len`. Also derived rather than chosen.
+const SCHED_ABS_FRAME_MAX: usize = 247;
+const _: () = assert!(8 + SCHED_ABS_FRAME_MAX == 255);
+// Both entry points share `Sched::buf`, so the absolute path must fit the buffer the relative one
+// sizes. It does, with room to spare — but asserted, because the copy below indexes with it.
+const _: () = assert!(SCHED_ABS_FRAME_MAX <= SCHED_FRAME_MAX);
+
+/// TIM2 tick rate. 1 MHz makes one tick one microsecond, matching `micros64`'s unit exactly, so the
+/// deadline arithmetic never converts between timebases.
+const SCHED_TIMER_HZ: u32 = 1_000_000;
+
+/// How long before the deadline the frame is pushed into the SX1262.
+///
+/// Must exceed the staging cost: `write_buffer` of 251 bytes at SCK = 1 MHz is 253 bytes x 8 us =
+/// 2.02 ms, plus SetStandby/SetPacketParams/ClearIrq (~12 bytes) and the `wait_busy` poll's 10 us
+/// granularity — call it 2.7 ms worst case. 8 ms gives ~3x margin and is still far inside the ring's
+/// 44 ms. It is a starting value, not an assumption: `Sched::observe_stage` raises it if a staging
+/// pass ever measures longer (which is what would happen if STDBY_XOSC did not keep the crystal
+/// alive and staging had to absorb a 78 ms TCXO restart).
+const SCHED_LEAD_US: u32 = 8_000;
+
+/// Ceiling on the adaptive lead, so a pathological measurement cannot make the node refuse to
+/// schedule anything. 200 ms comfortably covers a TCXO restart plus a full frame.
+const SCHED_LEAD_MAX_US: u32 = 200_000;
+
+/// The last stretch, handed to the hardware timer. Bounded by TIM2's 16-bit ARR (65 535 us) and kept
+/// far below it: this is the only interval in which the main loop stops draining `RING`, so 4 ms of
+/// the ring's 44 ms is the budget it may spend to buy a hardware-precise release.
+const SCHED_GATE_US: u32 = 4_000;
+const _: () = assert!(SCHED_GATE_US <= 65_535);
+
+/// Iteration ceiling on the UIF spin, so a TIM2 that never fires (a clock-gating mistake, a future
+/// peripheral init that disables it) costs one late transmission instead of hanging the firmware
+/// with the host link un-drained. The loop is ~10 cycles at 8 MHz = 1.25 us, so 200 000 iterations
+/// is ~250 ms — far above any legitimate [`SCHED_GATE_US`] wait and far below "forever".
+const SCHED_GATE_SPIN_MAX: u32 = 200_000;
+
+/// Bound on the post-`SetTx` BUSY measurement, so a wedged chip cannot hang the loop. Larger than a
+/// TCXO restart (78.125 ms) on purpose — the point of the measurement is to SEE one if it happens.
+const SCHED_KEYUP_TIMEOUT_US: u64 = 250_000;
+
+/// Largest `CMD_TX_AT` delay this node accepts: **60 s**, matching the Heltec and the host.
+///
+/// The bound is not arbitrary — it is the host's own reply-timeout cap. `inject_after` waits
+/// `tx_timeout(len) + delay_us.min(60_000_000)` (`ndn-radio-drivers/src/lora_serial.rs`), so a
+/// longer schedule is one the caller has already decided it will not wait for.
+///
+/// Without a bound the field is a `u32` of microseconds: a host bug could arm this node for over an
+/// hour, and because the queue is one deep and [`Sched::pending`] refuses while it is occupied,
+/// every subsequent `CMD_TX_AT` would be answered `EVT_TXDONE[0, 0]` for that whole hour with no
+/// way to clear it short of a reset. Refused with `UNSUP_OUT_OF_RANGE` rather than clamped, on the
+/// same rule the other two nodes use: a frame placed in a slot other than the one the host asked
+/// for is worse than a frame not sent.
+const SCHED_MAX_DELAY_US: u32 = 60_000_000;
+
+/// Everything about the release instant that is not the chip: TIM2's 1 us tick, the 1 us truncation
+/// in `micros64` (it reports whole microseconds), and the ~12-cycle UIF poll at 8 MHz = 1.5 us,
+/// rounded up to 2.
+const SCHED_JITTER_US: u32 = 1 + 1 + 2;
+
+/// **`sched_gran_ns`** — EVT_CAP [25..29], and the number a planner will believe.
+///
+/// The contract it states: *`SetTx` is issued at the requested instant, and the first symbol leaves
+/// within `sched_gran_ns` of it.* The fixed part is not compensated away, because a compensation
+/// derived from an unmeasured latency would be a bias dressed as precision.
+///
+/// ```text
+///   TIM2 tick                  1 us   1 MHz timer; a compare cannot resolve finer than one tick
+///   deadline quantization      1 us   micros64() reports whole us (SysTick CVR / 8)
+///   UIF poll loop              2 us   read TIM2.SR + test + branch ~= 12 cycles at 8 MHz = 1.5 us,
+///                                     rounded up                          } SCHED_JITTER_US = 4 us
+///   SetTx SPI transaction     50 us   4 bytes at SCK = 1 MHz = 8 us/byte = 32 us, plus the two NSS
+///                                     edges and the call boundary; rounded up
+///   SetTx -> transmitter     100 us   BUSY-high while the chip processes SetTx out of STDBY_XOSC.
+///                                     The datasheet does not state this crisply for a TCXO part, so
+///                                     it is rounded UP generously -- and it is the ONE term that is
+///                                     measured at runtime (`Sched::observe_keyup`), which can only
+///                                     raise what EVT_CAP reports, never lower it
+///   PA ramp                  200 us   sx1262::TX_RAMP_US -- SetTxParams ramp code 0x04 (SET_RAMP_200U)
+///                                     ------
+///                                     354 us
+/// ```
+///
+/// Rounded UP to **400 us = 400 000 ns**. Where a term is uncertain it is rounded up, and the single
+/// most uncertain term is replaced by a measurement as soon as the node schedules anything.
+const SCHED_KEYUP_DESIGN_US: u32 = 50 + 100; // SPI transaction + SetTx -> transmitter
+const SCHED_GRAN_NS: u32 = 400_000;
+
+/// **Which of the two scheduling opcodes [`SCHED_GRAN_NS`] describes, and what the other one costs.**
+///
+/// Every term in the table above is internal — a timer tick, an SPI transaction, a PA ramp. None of
+/// them involves the host. That is the whole granularity of `CMD_TX_AT_ABS` (0x1F), whose deadline
+/// is a `micros64()` instant the host names outright, so nothing about when the command arrived can
+/// move the release. **`sched_gran_ns` in EVT_CAP is that figure**, and it is what a planner should
+/// build slots against.
+///
+/// `CMD_TX_AT` (0x18) releases just as precisely, but against a different reference: its delay is
+/// counted from the moment the FIRMWARE decodes the arm, so the host→device transport sits between
+/// "when the host meant" and "when the node starts counting". The node cannot measure that term —
+/// it never sees the host's clock — so it is BOUNDED here from the closest thing this node has
+/// measured: its own command round trips. `CMD_GET_INFO` on this dongle has a 4 758 µs mean floor
+/// with a **sub-millisecond spread** (2026-08-28, n = 8..10), and the spread is what lands in the
+/// placement — a constant offset a host can calibrate away, a varying one it cannot. So:
+///
+/// ```text
+///   CMD_TX_AT_ABS (0x1F)   400 000 ns   derived above, entirely internal        <- EVT_CAP
+///   CMD_TX_AT     (0x18)   400 000 ns + up to ~1 000 000 ns of host transport
+/// ```
+///
+/// The same effect was MEASURED end-to-end on the LR2021, which has a 50 µs granularity and a 550 µs
+/// `CMD_GET_INFO` spread: an absolute-boundary slot train fired 45/45 with a mean gap 182 ticks off
+/// 2 400 000 nominal — the accuracy is excellent — while the jitter came out at sd 553 µs, the
+/// round-trip number rather than the granularity. Host-armed relative scheduling was WORSE than that
+/// node's software path (sd 553 vs 155 µs) purely because it pays an extra round trip. **Prefer
+/// 0x1F.** 0x18 stays for hosts that have not moved.
+const SCHED_REL_PLACEMENT_BOUND_NS: u32 = 1_000_000;
+// The relative path can only be worse than the absolute one, never better.
+const _: () = assert!(SCHED_REL_PLACEMENT_BOUND_NS > 0);
+// The published figure must never be below the terms it is built from.
+const _: () =
+    assert!(SCHED_GRAN_NS >= (SCHED_JITTER_US + SCHED_KEYUP_DESIGN_US + sx1262::TX_RAMP_US) * 1000);
+
+// --- Invariants the build enforces, because every one of them is a claim the host acts on. ---
+
+// `NodeProfile::schedules_tx()` on the host is `sched_gran_ns > 0 && supports(CMD_TX_AT)`. The two
+// halves of that must agree HERE, or the node advertises a scheduler with no actuator (or an
+// actuator with no declared granularity) — precisely the drift `FrameIo::schedules_tx` warns about.
+const _: () = assert!((CMD_BITMAP & opbit(CMD_TX_AT) != 0) == (SCHED_GRAN_NS > 0));
+// ...and the same for the absolute entry point, which is the one `sched_gran_ns` actually describes.
+const _: () = assert!((CMD_BITMAP & opbit(CMD_TX_AT_ABS) != 0) == (SCHED_GRAN_NS > 0));
+
+// The one-byte `len` of the 7E-A5 framing is what bounds both directions, and both bounds are
+// derived from it rather than chosen: EVT_RX spends 8 bytes on rssi/snr/timestamp, CMD_TX_AT spends
+// 4 on the delay.
+const _: () = assert!(8 + RX_MAX == 255);
+const _: () = assert!(4 + SCHED_FRAME_MAX == 255);
+// ...and the scheduled frame must still be a legal LoRa PDU.
+const _: () = assert!(SCHED_FRAME_MAX <= 255);
+
+// The gate must fit inside the staged window, and the adaptive lead inside its ceiling.
+const _: () = assert!(SCHED_GATE_US < SCHED_LEAD_US);
+const _: () = assert!(SCHED_LEAD_US < SCHED_LEAD_MAX_US);
+
+/// How long `RING` can absorb host traffic with nobody draining it: 512 bytes at 115200 8N1
+/// (10 bits per byte) = 44.4 ms. The scheduler's only non-draining stretch is the hardware gate, so
+/// the assertion below is what keeps "a scheduled transmit must not block command intake" a
+/// property of the code rather than a note in a comment.
+const RING_DRAIN_BUDGET_US: u32 = ((RING_SZ as u64) * 10 * 1_000_000 / 115_200) as u32; // 44_444
+const _: () = assert!(SCHED_GATE_US * 4 < RING_DRAIN_BUDGET_US);
+
+/// **B3: when a refined `sched_gran_ns` is worth an unsolicited EVT_CAP.**
+///
+/// `Sched::gran_ns` sharpens the published figure from real key-up timing, but the host reads
+/// EVT_CAP once at open and never again — so until now the refinement was unreachable and the host
+/// went on planning against the derived 400 µs no matter what the hardware turned out to do. The
+/// node therefore re-publishes EVT_CAP, unsolicited, when the measured figure has moved materially
+/// from what was last published.
+///
+/// **25 %**, and the trigger is self-limiting rather than merely rate-limited: `gran_ns()` is the
+/// maximum of a constant and a running worst-case, so it never decreases, and each re-publish must
+/// clear 1.25x the last one. From 400 µs to the ceiling a stuck-BUSY measurement can reach
+/// ([`SCHED_KEYUP_TIMEOUT_US`] + the fixed terms ≈ 250 ms) is a factor of 626, i.e. at most
+/// ⌈log₁.₂₅ 626⌉ = **29 events in the lifetime of the node**, however many frames it schedules.
+const CAP_REPUBLISH_RATIO_PCT: u32 = 25;
+/// Belt-and-braces floor between two unsolicited EVT_CAPs, so even a pathological sequence cannot
+/// put one inside a burst of scheduled frames. 5 s.
+const CAP_REPUBLISH_MIN_US: u64 = 5_000_000;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SchedState {
+    /// Nothing scheduled.
+    Idle,
+    /// A deadline and a frame are held; the radio is still in RX and the node behaves normally.
+    Armed,
+    /// The frame is in the SX1262's buffer and the chip sits in STDBY_XOSC. Only `SetTx` remains.
+    Staged,
+}
+
+/// The one-deep scheduled-TX queue and its self-measurement.
+struct Sched {
+    state: SchedState,
+    /// Absolute release instant on the `micros64()` timebase — the SAME clock EVT_RX stamps with and
+    /// CMD_READ_CLOCK returns, which is the whole point: the host converts between "when it arrived"
+    /// and "when to send" without reconciling two clocks.
+    deadline: u64,
+    len: usize,
+    /// Adaptive staging lead; starts at [`SCHED_LEAD_US`].
+    lead_us: u32,
+    /// Worst staging duration observed (us).
+    stage_us: u32,
+    /// Worst key-up observed (us): `micros64()` across `tx_issue` plus the chip's BUSY-high window.
+    keyup_us: u32,
+    /// Worst lateness observed (us): how far past `deadline` `SetTx` was actually issued.
+    late_us: u32,
+    /// Scheduled transmissions released so far.
+    fired: u32,
+    /// The `sched_gran_ns` value most recently PUBLISHED in an EVT_CAP — the baseline the B3
+    /// re-publish trigger measures against. Starts at the derived figure, which is what a node that
+    /// has never been asked for its capabilities would answer.
+    published_gran_ns: u32,
+    /// `micros64()` of the last EVT_CAP emission (solicited or not), for the rate limit.
+    last_cap_us: u64,
+    /// Airtime of the queued frame, whole ms — computed at arm time, where the modulation
+    /// parameters are in scope, and carried here so `sched_service` can announce it without
+    /// needing `sf`/`bw`/`cr`/`preamble` threaded through its signature.
+    air_ms: u16,
+    buf: [u8; SCHED_FRAME_MAX],
+}
+
+impl Sched {
+    const fn new() -> Self {
+        Self {
+            state: SchedState::Idle,
+            deadline: 0,
+            len: 0,
+            lead_us: SCHED_LEAD_US,
+            stage_us: 0,
+            keyup_us: 0,
+            late_us: 0,
+            fired: 0,
+            published_gran_ns: SCHED_GRAN_NS,
+            last_cap_us: 0,
+            air_ms: 0,
+            buf: [0; SCHED_FRAME_MAX],
+        }
+    }
+
+    fn pending(&self) -> bool {
+        !matches!(self.state, SchedState::Idle)
+    }
+
+    /// Fold a staging measurement in, and widen the lead if staging turned out to cost more than the
+    /// lead allowed for. 1.5x the observed cost, so the next arm has margin rather than exactly
+    /// enough. This is what makes the STDBY_XOSC assumption safe to hold: if it is wrong the first
+    /// scheduled frame is late, says so in EVT_TXDONE, and the ones after it are on time.
+    fn observe_stage(&mut self, us: u32) {
+        if us > self.stage_us {
+            self.stage_us = us;
+        }
+        let want = us.saturating_add(us / 2);
+        if want > self.lead_us {
+            self.lead_us = want.min(SCHED_LEAD_MAX_US);
+        }
+    }
+
+    fn observe_keyup(&mut self, keyup_us: u32, late_us: u32) {
+        if keyup_us > self.keyup_us {
+            self.keyup_us = keyup_us;
+        }
+        if late_us > self.late_us {
+            self.late_us = late_us;
+        }
+        self.fired = self.fired.wrapping_add(1);
+    }
+
+    /// What EVT_CAP publishes as `sched_gran_ns`: the derived design figure until this node has
+    /// actually released a scheduled frame, and the MEASURED key-up once it has, whichever is
+    /// larger. A capability can get more conservative from evidence; it can never get more
+    /// optimistic from it.
+    fn gran_ns(&self) -> u32 {
+        let measured = self
+            .keyup_us
+            .saturating_add(SCHED_JITTER_US)
+            .saturating_add(sx1262::TX_RAMP_US)
+            .saturating_mul(1000);
+        if measured > SCHED_GRAN_NS {
+            measured
+        } else {
+            SCHED_GRAN_NS
+        }
+    }
+
+    /// Record that `gran_ns` has just gone out on the wire, so the B3 trigger measures against what
+    /// the host actually holds rather than against the last thing that was computed.
+    fn note_cap_published(&mut self, gran_ns: u32, now: u64) {
+        self.published_gran_ns = gran_ns;
+        self.last_cap_us = now;
+    }
+
+    /// **B3's trigger.** True when the live figure differs from the published one by more than
+    /// [`CAP_REPUBLISH_RATIO_PCT`] AND the rate limit has elapsed. The comparison is written both
+    /// ways even though `gran_ns()` is monotone non-decreasing: a one-directional test would quietly
+    /// become wrong the day the derivation gains a term that can fall.
+    fn cap_republish_due(&self, gran_ns: u32, now: u64) -> bool {
+        if now.saturating_sub(self.last_cap_us) < CAP_REPUBLISH_MIN_US {
+            return false;
+        }
+        let published = self.published_gran_ns.max(1) as u64;
+        let live = gran_ns as u64;
+        let up = live.saturating_mul(100) > published.saturating_mul(100 + CAP_REPUBLISH_RATIO_PCT as u64);
+        let down = live.saturating_mul(100 + CAP_REPUBLISH_RATIO_PCT as u64) < published.saturating_mul(100);
+        up || down
+    }
+}
+
+/// **The deadline timer: TIM2, one-pulse, 1 MHz.**
+///
+/// SysTick is already the millisecond clock, so the scheduler needs its own compare. TIM2 is
+/// otherwise unused on this board. It is driven through the PAC rather than the HAL timer wrapper
+/// because the one thing that matters here is that arming and polling are a handful of register
+/// accesses with nothing between the compare firing and NSS going low.
+struct SchedTimer;
+
+impl SchedTimer {
+    /// Enable TIM2 and prescale it to [`SCHED_TIMER_HZ`]. Returns the prescaler actually programmed
+    /// so the caller can report it: at the 8 MHz HSI core clock APB1 is undivided, so the timer
+    /// clock is 8 MHz and PSC = 7, giving exactly 1 us per tick.
+    ///
+    /// SAFETY: TIM2 is owned by the caller (it holds `pac::TIM2`) and RCC's APB1ENR is only touched
+    /// here, once, before the main loop starts.
+    fn init(pclk1_tim_hz: u32) -> u16 {
+        let psc = (pclk1_tim_hz / SCHED_TIMER_HZ).saturating_sub(1) as u16;
+        unsafe {
+            (*pac::RCC::ptr())
+                .apb1enr
+                .modify(|_, w| w.tim2en().set_bit());
+            let t = &*pac::TIM2::ptr();
+            t.cr1.reset();
+            t.psc.write(|w| w.psc().bits(psc));
+            t.arr.write(|w| w.arr().bits(0xFFFF));
+            t.egr.write(|w| w.ug().set_bit()); // load PSC/ARR
+            t.sr.write(|w| w.uif().clear_bit()); // UG raised UIF; start clean
+        }
+        psc
+    }
+
+    /// Arm a one-shot for `us` microseconds. `us` must be non-zero and <= [`SCHED_GATE_US`].
+    fn arm(us: u16) {
+        unsafe {
+            let t = &*pac::TIM2::ptr();
+            t.cr1.write(|w| w.cen().clear_bit());
+            t.arr.write(|w| w.arr().bits(us.saturating_sub(1)));
+            t.egr.write(|w| w.ug().set_bit()); // reload counter + ARR now
+            t.sr.write(|w| w.uif().clear_bit()); // and clear the UIF that UG just set
+            t.cr1.write(|w| w.opm().set_bit().cen().set_bit());
+        }
+    }
+
+    /// Has the one-shot fired? The hardware clears CEN itself in one-pulse mode.
+    fn expired() -> bool {
+        unsafe { (*pac::TIM2::ptr()).sr.read().uif().bit_is_set() }
+    }
+}
+
 // Heartbeat-beacon base period in main-loop iterations (~seconds; the loop is SPI-poll bound).
 // The beacon is runtime-toggleable via CMD_SET_BEACON and defaults OFF, so a fresh/reset dongle stays
 // quiet; enable on-air discovery explicitly with CMD_SET_BEACON[1].
 const BEACON_BASE_PERIOD: u32 = 250_000;
 
 /// Formats into a fixed stack buffer so we can build payloads/logs with `write!`.
+///
+/// ⚠ `write_str` DROPS anything past the end — a formatted line longer than this is truncated with
+/// no error, since `core::fmt::Write` has nowhere to report one and an EVT_LOG is not worth failing
+/// a boot over. 96 bytes, sized so the longest line here (the boot diagnostic, ~61 characters with
+/// every field at its widest) has real margin rather than fitting exactly. The RAM budget carries it
+/// easily: peak stack measures ~4.2 KB of 20.4 KB.
+const LOG_BUF: usize = 96;
+
 struct BufWriter {
-    buf: [u8; 64],
+    buf: [u8; LOG_BUF],
     pos: usize,
 }
 impl BufWriter {
     fn new() -> Self {
         Self {
-            buf: [0; 64],
+            buf: [0; LOG_BUF],
             pos: 0,
         }
     }
@@ -504,6 +1312,11 @@ fn main() -> ! {
     cp.SYST.enable_counter();
     cp.SYST.enable_interrupt();
 
+    // TIM2 = the scheduled-TX deadline compare (CMD_TX_AT). Taken here so ownership is explicit even
+    // though the register block is reached through the PAC pointer inside `SchedTimer`.
+    let _tim2 = dp.TIM2;
+    let sched_psc = SchedTimer::init(clocks.pclk1_tim().raw());
+
     let mut afio = dp.AFIO.constrain();
     let mut gpioa = dp.GPIOA.split();
     let mut gpiob = dp.GPIOB.split();
@@ -548,8 +1361,14 @@ fn main() -> ! {
     let mut bw: u8 = sx1262::BW_125;
     let mut cr: u8 = sx1262::CR_4_5;
     let mut pwr: i8 = 22;
+    // 7E-A5 v3: the PHY in effect, in the WIRE numbering. `Sx1262::apply_phy` is the actuator and
+    // `Sx1262::packet_type()` is the chip-side truth; this is the mirror EVT_CAP/EVT_INFO report,
+    // kept in the same shape as the freq/sf/bw/cr/pwr mirrors beside it. `init` brings the chip up
+    // in LoRa, so they agree from the first instruction.
+    let mut phy: u8 = wire_phy::LORA;
 
     let diag = radio.init(freq, sf, bw, cr);
+    debug_assert!(chip_to_wire_phy(radio.packet_type()) == phy);
     // #52 CSMA state; seed the backoff PRNG from the SX1262 hardware RNG (leaves the chip in standby).
     let mut csma = Csma::new();
     let seed = radio.hw_random();
@@ -566,8 +1385,13 @@ fn main() -> ! {
         let mut log = BufWriter::new();
         let _ = write!(
             log,
-            "waveshare-lora-rs stage4: init sync=0x{:04X} err=0x{:04X}",
-            diag.sync_readback, diag.device_errors
+            "ws-lora v3 sync=0x{:04X} err=0x{:04X} psc={} phy={} physt=0x{:02X} ok={}",
+            diag.sync_readback,
+            diag.device_errors,
+            sched_psc,
+            phy,
+            diag.phy_status,
+            sx1262::cmd_status_ok(diag.phy_status) as u8
         );
         send_frame(
             |b| {
@@ -588,6 +1412,9 @@ fn main() -> ! {
     let mut rx_trunc: u16 = 0;
     // Default OFF: a fresh/reset dongle stays quiet (no stray beacon before a host attaches). Opt in
     // on-air discovery with CMD_SET_BEACON[1] (or the host's LoraParams.beacon = true).
+    // One-deep scheduled-TX queue (CMD_TX_AT). Idle until the host arms it, so a node that never
+    // schedules behaves exactly as before.
+    let mut sched = Sched::new();
     let mut beacon_enabled = false;
     let mut beacon_period = BEACON_BASE_PERIOD;
     let mut beacon_ctr: u32 = 0;
@@ -608,85 +1435,99 @@ fn main() -> ! {
                     &mut bw,
                     &mut cr,
                     &mut pwr,
+                    &mut phy,
                     &mut beacon_enabled,
                     &mut beacon_period,
                     &mut csma,
                     &mut plane,
                     &mut rx_trunc,
+                    &mut sched,
                 );
+                // A single command can cost 80+ ms (any SET_* re-arms RX and pays a TCXO startup), so
+                // service the deadline INSIDE the drain loop: a burst of queued commands must not sit
+                // between a scheduled frame and the instant it was promised.
+                sched_service(&mut radio, &mut tx, &mut sched, phy);
             }
         }
 
+        // 1b) Advance the scheduled TX. Returns immediately unless a deadline is close.
+        sched_service(&mut radio, &mut tx, &mut sched, phy);
+
         // 2) Classify a received frame by NAME (data-centric offload). With no host-installed filter /
         //    CS / relay it always Delivers — identical to the plain modem; features light up on opt-in.
-        if let Some(pkt) = radio.poll_rx(&mut rxbuf) {
-            let ts = micros();
-            let n = core::cmp::min(pkt.len as usize, rxbuf.len());
-            // `pkt.len` is the TRUE on-air length. With rxbuf at RX_MAX this can only trip if a peer
-            // ignores our advertised max_payload; count it rather than corrupt the frame in silence.
-            if pkt.len as usize > rxbuf.len() {
-                rx_trunc = rx_trunc.wrapping_add(1);
-            }
-            // Copy any CS-serve payload out so we don't hold the data-plane borrow across the TX below.
-            let mut serve = [0u8; ndn::CS_MAX_LEN];
-            let mut serve_len = 0usize;
-            let (deliver, relay) = match plane.on_rx(&rxbuf[..n], millis()) {
-                ndn::RxAction::Drop => (false, false),
-                ndn::RxAction::Serve(data) => {
-                    let m = data.len().min(serve.len());
-                    serve[..m].copy_from_slice(&data[..m]);
-                    serve_len = m;
-                    (false, false)
+        // While a scheduled frame is `Staged` the chip sits in STDBY_XOSC with the payload loaded —
+        // it is not receiving, and an SPI status read here would only add jitter ahead of the key-up.
+        // While merely `Armed` the radio is still in RX and this runs exactly as usual.
+        if sched.state != SchedState::Staged {
+            if let Some(pkt) = radio.poll_rx(&mut rxbuf) {
+                let ts = micros();
+                let n = core::cmp::min(pkt.len as usize, rxbuf.len());
+                // `pkt.len` is the TRUE on-air length. With rxbuf at RX_MAX this can only trip if a peer
+                // ignores our advertised max_payload; count it rather than corrupt the frame in silence.
+                if pkt.len as usize > rxbuf.len() {
+                    rx_trunc = rx_trunc.wrapping_add(1);
                 }
-                ndn::RxAction::Deliver => (true, false),
-                ndn::RxAction::RelayAndDeliver => (true, true),
-            };
-            if debug_on() {
-                let mut lg = BufWriter::new();
-                let _ = write!(
-                    lg,
-                    "rx n={n} serve={} relay={relay} deliver={deliver}",
-                    serve_len > 0
-                );
-                send_frame(
-                    |b| {
-                        let _ = block!(tx.write(b));
-                    },
-                    EVT_LOG,
-                    lg.as_slice(),
-                );
-            }
-            // Content-Store hit: serve the cached Data ourselves (LBT), the host never wakes.
-            if serve_len > 0 {
-                let _ = lbt_tx(&mut radio, &mut csma, &serve[..serve_len]);
-                radio.start_rx();
-            }
-            // Relay: re-broadcast (LBT) for cooperative forwarding, then also deliver.
-            if relay {
-                let _ = lbt_tx(&mut radio, &mut csma, &rxbuf[..n]);
-                radio.start_rx();
-            }
-            if deliver {
-                // 8 header bytes + up to RX_MAX frame bytes = 255, the largest payload the one-byte
-                // `len` field of the 7E-A5 framing can carry. That is what sets RX_MAX.
-                let mut ev = [0u8; 8 + RX_MAX];
-                ev[0..2].copy_from_slice(&pkt.rssi_dbm.to_be_bytes());
-                ev[2..4].copy_from_slice(&pkt.snr_db.to_be_bytes());
-                ev[4..8].copy_from_slice(&ts.to_be_bytes());
-                ev[8..8 + n].copy_from_slice(&rxbuf[..n]);
-                send_frame(
-                    |b| {
-                        let _ = block!(tx.write(b));
-                    },
-                    EVT_RX,
-                    &ev[..8 + n],
-                );
+                // Copy any CS-serve payload out so we don't hold the data-plane borrow across the TX below.
+                let mut serve = [0u8; ndn::CS_MAX_LEN];
+                let mut serve_len = 0usize;
+                let (deliver, relay) = match plane.on_rx(&rxbuf[..n], millis()) {
+                    ndn::RxAction::Drop => (false, false),
+                    ndn::RxAction::Serve(data) => {
+                        let m = data.len().min(serve.len());
+                        serve[..m].copy_from_slice(&data[..m]);
+                        serve_len = m;
+                        (false, false)
+                    }
+                    ndn::RxAction::Deliver => (true, false),
+                    ndn::RxAction::RelayAndDeliver => (true, true),
+                };
+                if debug_on() {
+                    let mut lg = BufWriter::new();
+                    let _ = write!(
+                        lg,
+                        "rx n={n} serve={} relay={relay} deliver={deliver}",
+                        serve_len > 0
+                    );
+                    send_frame(
+                        |b| {
+                            let _ = block!(tx.write(b));
+                        },
+                        EVT_LOG,
+                        lg.as_slice(),
+                    );
+                }
+                // Content-Store hit: serve the cached Data ourselves (LBT), the host never wakes.
+                if serve_len > 0 {
+                    let _ = lbt_tx(&mut radio, &mut csma, &serve[..serve_len]);
+                    radio.start_rx();
+                }
+                // Relay: re-broadcast (LBT) for cooperative forwarding, then also deliver.
+                if relay {
+                    let _ = lbt_tx(&mut radio, &mut csma, &rxbuf[..n]);
+                    radio.start_rx();
+                }
+                if deliver {
+                    // 8 header bytes + up to RX_MAX frame bytes = 255, the largest payload the one-byte
+                    // `len` field of the 7E-A5 framing can carry. That is what sets RX_MAX.
+                    let mut ev = [0u8; 8 + RX_MAX];
+                    ev[0..2].copy_from_slice(&pkt.rssi_dbm.to_be_bytes());
+                    ev[2..4].copy_from_slice(&pkt.snr_db.to_be_bytes());
+                    ev[4..8].copy_from_slice(&ts.to_be_bytes());
+                    ev[8..8 + n].copy_from_slice(&rxbuf[..n]);
+                    send_frame(
+                        |b| {
+                            let _ = block!(tx.write(b));
+                        },
+                        EVT_RX,
+                        &ev[..8 + n],
+                    );
+                }
             }
         }
 
         // 3) Optional heartbeat beacon (host-toggleable via CMD_SET_BEACON) so TX is exercised and
         //    the node is discoverable on-air without a host driving it.
-        if beacon_enabled {
+        if beacon_enabled && !sched.pending() {
             beacon_ctr += 1;
             if beacon_ctr >= beacon_period {
                 beacon_ctr = 0;
@@ -715,6 +1556,12 @@ fn main() -> ! {
 /// interference a LoRa CAD is blind to). The caller must already have put the chip in standby and
 /// programmed the CAD parameters.
 ///
+/// **In GFSK there is no CAD** — `SetCad` is a LoRa-modem function — so the CAD half is skipped
+/// entirely (issuing it there would earn a command error and be read back as "channel clear"), and
+/// the energy detector carries the whole sense. That makes the threshold load-bearing rather than
+/// optional in that PHY, which is what [`effective_rssi_thresh`] supplies when the host has set
+/// none. Same counter, same contract, one less mechanism.
+///
 /// ⚠ **Why every sensing path routes through here.** `EVT_SENSE.activity` is contracted as a
 /// free-running count of channel-busy observations that the host differences over a window. It used
 /// to be incremented only inside the LBT backoff loop, so a node that was not transmitting never
@@ -735,15 +1582,19 @@ where
     BSY: embedded_hal::digital::v2::InputPin,
     DIO1: embedded_hal::digital::v2::InputPin,
 {
+    let has_cad = radio.supports_cad();
     let mut busy = false;
-    for _ in 0..csma.cad_repeat.max(1) {
-        if radio.do_cad() {
-            busy = true;
-            break;
+    if has_cad {
+        for _ in 0..csma.cad_repeat.max(1) {
+            if radio.do_cad() {
+                busy = true;
+                break;
+            }
         }
     }
-    if !busy && csma.rssi_thresh > i16::MIN {
-        busy = radio.rssi_busy(csma.rssi_thresh);
+    let thresh = effective_rssi_thresh(csma.rssi_thresh, has_cad);
+    if !busy && thresh > i16::MIN {
+        busy = radio.rssi_busy(thresh);
     }
     if busy {
         csma.cad_busy = csma.cad_busy.wrapping_add(1);
@@ -770,7 +1621,9 @@ where
     DIO1: embedded_hal::digital::v2::InputPin,
 {
     radio.standby();
-    radio.set_cad_params(csma.cad_sym, csma.cad_peak, csma.cad_min);
+    if radio.supports_cad() {
+        radio.set_cad_params(csma.cad_sym, csma.cad_peak, csma.cad_min);
+    }
     let mut attempt: u8 = 0;
     let mut sent = false;
     while attempt < csma.lbt_max_attempts {
@@ -790,6 +1643,183 @@ where
     (sent, attempt)
 }
 
+/// **Advance the scheduled-TX state machine by one main-loop pass.** Never blocks for the scheduled
+/// delay — that is the whole contract with the host link (see the `Sched` block for why).
+///
+/// * `Armed`   — the radio is still in RX and the node behaves exactly as if nothing were pending.
+///               Once the deadline is within `lead_us`, stage the frame (a ~2.7 ms SPI burst).
+/// * `Staged`  — the frame is in the chip and only `SetTx` remains. Poll until the deadline is
+///               within `SCHED_GATE_US`, then hand the remainder to TIM2 and release on its compare.
+///
+/// A deadline that is already in the past at either step is not an error: the frame goes at the
+/// first opportunity and the lateness is measured and reported, which is also what `delay_us = 0`
+/// means ("now"). Silently pretending it was on time is the one thing that would make the number
+/// EVT_CAP publishes a lie.
+///
+/// No LBT here, deliberately: a listen-before-talk backoff would move the transmission off the
+/// instant that was asked for, and a scheduled TX exists precisely because the caller has already
+/// decided when the air is theirs.
+#[allow(clippy::too_many_arguments)]
+fn sched_service<SPI, NSS, RST, BSY, DIO1, RFSW, E, TX>(
+    radio: &mut Sx1262<SPI, NSS, RST, BSY, DIO1, RFSW>,
+    tx: &mut TX,
+    sched: &mut Sched,
+    phy: u8,
+) where
+    SPI: embedded_hal::blocking::spi::Transfer<u8, Error = E>
+        + embedded_hal::blocking::spi::Write<u8, Error = E>,
+    NSS: embedded_hal::digital::v2::OutputPin,
+    RST: embedded_hal::digital::v2::OutputPin,
+    RFSW: embedded_hal::digital::v2::OutputPin,
+    BSY: embedded_hal::digital::v2::InputPin,
+    DIO1: embedded_hal::digital::v2::InputPin,
+    TX: embedded_hal::serial::Write<u8>,
+{
+    match sched.state {
+        SchedState::Idle => {}
+        SchedState::Armed => {
+            let now = micros64();
+            if sched.deadline.saturating_sub(now) > sched.lead_us as u64 {
+                return; // plenty of time; keep receiving and keep draining the host link
+            }
+            let t0 = micros64();
+            let settled = radio.stage_tx(&sched.buf[..sched.len]);
+            let t1 = micros64();
+            sched.observe_stage(us_since(t0, t1));
+            if !settled && debug_on() {
+                let mut lg = BufWriter::new();
+                let _ = write!(lg, "sched: BUSY did not settle after staging");
+                send_frame(
+                    |b| {
+                        let _ = block!(tx.write(b));
+                    },
+                    EVT_LOG,
+                    lg.as_slice(),
+                );
+            }
+            // ★ `EVT_TX_STARTED` goes out HERE — at the staging point, `lead_us` (8 ms nominal,
+            // 200 ms ceiling) before key-up — for the same reason the Heltec emits from its own
+            // staging point, and NOT from either of the two obvious alternatives:
+            //
+            //  * NOT between the gate and `tx_issue`. `send_frame` blocks on the USART until the
+            //    bytes are out, which at 115200 8N1 is ~87 us per byte — an unbounded term against
+            //    the 400 us this node declares as `sched_gran_ns`, i.e. the precise lie that field
+            //    exists to prevent.
+            //  * NOT at acceptance. The host REPLACES its reply deadline with
+            //    `now + airtime + AIRTIME_SLACK` (2 s) the moment it sees this event, so announcing
+            //    at acceptance would make every schedule longer than ~2 s time out at the host —
+            //    and this node accepts up to `SCHED_MAX_DELAY_US` (60 s).
+            //
+            // From here it is out of the timing path and at most `SCHED_LEAD_MAX_US` (200 ms)
+            // before key-up, so the host's re-based deadline is still correct.
+            send_frame(
+                |b| {
+                    let _ = block!(tx.write(b));
+                },
+                EVT_TX_STARTED,
+                &sched.air_ms.to_be_bytes(),
+            );
+            sched.state = SchedState::Staged;
+        }
+        SchedState::Staged => {
+            let now = micros64();
+            let rem = sched.deadline.saturating_sub(now);
+            if rem > SCHED_GATE_US as u64 {
+                return; // still waiting; the loop keeps draining RING
+            }
+            // Hand the last stretch to the hardware compare. `rem == 0` means the deadline has
+            // already passed (a long command ran, or the host asked for `delay_us = 0`) — release
+            // immediately and let `late_us` report it.
+            if rem > 0 {
+                SchedTimer::arm(rem as u16);
+                let mut spin = 0u32;
+                while !SchedTimer::expired() {
+                    spin += 1;
+                    if spin > SCHED_GATE_SPIN_MAX {
+                        break; // dead timer: release now and let `late_us` say how late
+                    }
+                }
+            }
+            let t_issue = micros64();
+            radio.tx_issue();
+            // The chip's own key-up indicator: BUSY is high while SetTx is processed and drops when
+            // the transmitter is running. Timing it here is what turns `sched_gran_ns` from a
+            // derivation into a measurement — and it is exactly where a TCXO restart would show up
+            // as ~78 ms if `stage_tx`'s STDBY_XOSC ever failed to keep the crystal alive.
+            let mut t_up = t_issue;
+            while radio.busy_high() {
+                t_up = micros64();
+                if t_up.saturating_sub(t_issue) > SCHED_KEYUP_TIMEOUT_US {
+                    break;
+                }
+            }
+            // If BUSY had not risen yet on the first read this under-measures — which is harmless,
+            // because `Sched::gran_ns` floors the published granularity at the derived
+            // [`SCHED_GRAN_NS`] and only ever raises it. The case that matters, a 78 ms TCXO
+            // restart, cannot be missed: BUSY is high for the whole of it.
+            let keyup_us = us_since(t_issue, micros64().max(t_up));
+            let late_us = us_since(sched.deadline, t_issue);
+            let ok = radio.wait_txdone();
+            radio.start_rx();
+            sched.observe_keyup(keyup_us, late_us);
+            sched.state = SchedState::Idle;
+            // EVT_TXDONE with the Waveshare-local scheduling tail. `attempts` is 0 because a
+            // scheduled TX makes exactly one, by definition.
+            let mut p = [0u8; 10];
+            p[0] = ok as u8;
+            p[1] = 0;
+            p[2..6].copy_from_slice(&late_us.to_be_bytes());
+            p[6..10].copy_from_slice(&keyup_us.to_be_bytes());
+            send_frame(
+                |b| {
+                    let _ = block!(tx.write(b));
+                },
+                EVT_TXDONE,
+                &p,
+            );
+            // ★ B3: the measurement that just happened may have moved `sched_gran_ns`. The host read
+            // EVT_CAP once, at open, and will never ask again — so if the refined figure is
+            // materially different from what it holds, say so unsolicited. Emitted HERE, after the
+            // EVT_TXDONE and with the radio already back in RX, so it is outside every timing path:
+            // `send_frame` blocks on the USART (~87 us/byte), which is exactly why it must never sit
+            // between the gate and the key-up.
+            let g = sched.gran_ns();
+            let now = micros64();
+            if sched.cap_republish_due(g, now) {
+                send_cap(
+                    |b| {
+                        let _ = block!(tx.write(b));
+                    },
+                    g,
+                    phy,
+                );
+                sched.note_cap_published(g, now);
+            }
+        }
+    }
+}
+
+/// **Airtime for the CURRENT PHY**, in whole milliseconds — the number EVT_TX_STARTED carries and
+/// the host re-bases its reply deadline on.
+///
+/// The two modems do not share a model: LoRa's is symbol arithmetic over SF/BW/CR, GFSK's is a bit
+/// count over a fixed bitrate. Reporting the LoRa figure for a GFSK frame would overstate a 32-byte
+/// transmission by roughly 8x (≈60 ms at SF7/BW125 against 7.4 ms at 50 kbps) — which is not a
+/// cosmetic error, because a lease or a slot plan sized from it would reserve airtime nobody uses.
+fn airtime_ms_for(phy: u8, sf: u8, bw: u8, cr: u8, len: u8, preamble: u16) -> u32 {
+    if phy == wire_phy::LORA {
+        sx1262::airtime_ms(sf, bw, cr, len, preamble)
+    } else {
+        sx1262::gfsk_airtime_ms(len, preamble)
+    }
+}
+
+/// Elapsed microseconds from `a` to `b`, saturating at 0 and at `u32::MAX`. The clock is monotonic
+/// 64-bit, so `b < a` only happens where the "elapsed" is genuinely zero (a deadline already past).
+fn us_since(a: u64, b: u64) -> u32 {
+    b.saturating_sub(a).min(u32::MAX as u64) as u32
+}
+
 /// Apply a decoded host command and emit its acknowledging event.
 #[allow(clippy::too_many_arguments)]
 fn handle_cmd<SPI, NSS, RST, BSY, DIO1, RFSW, E, TX>(
@@ -803,11 +1833,13 @@ fn handle_cmd<SPI, NSS, RST, BSY, DIO1, RFSW, E, TX>(
     bw: &mut u8,
     cr: &mut u8,
     pwr: &mut i8,
+    phy: &mut u8,
     beacon_enabled: &mut bool,
     beacon_period: &mut u32,
     csma: &mut Csma,
     plane: &mut ndn::DataPlane,
     rx_trunc: &mut u16,
+    sched: &mut Sched,
 ) where
     SPI: embedded_hal::blocking::spi::Transfer<u8, Error = E>
         + embedded_hal::blocking::spi::Write<u8, Error = E>,
@@ -831,7 +1863,7 @@ fn handle_cmd<SPI, NSS, RST, BSY, DIO1, RFSW, E, TX>(
         // #52: atomic listen-before-talk. CAD → HW-RNG backoff → key-up, all on the MCU so no serial
         // round-trip sits inside the sense-then-transmit window. Replies [sent, attempts].
         CMD_TX_LBT => {
-            let air = sx1262::airtime_ms(*sf, *bw, *cr, len as u8, csma.preamble);
+            let air = airtime_ms_for(*phy, *sf, *bw, *cr, len as u8, csma.preamble);
             let air16 = (air.min(u16::MAX as u32) as u16).to_be_bytes();
             send_frame(&mut put, EVT_TX_STARTED, &air16);
             let (sent, attempt) = lbt_tx(radio, csma, &buf[..len]);
@@ -841,6 +1873,13 @@ fn handle_cmd<SPI, NSS, RST, BSY, DIO1, RFSW, E, TX>(
         // #52: one sense at the current modulation → busy/clear (sensing, not the access loop).
         // Routed through `sense_busy` so it counts into `activity` like every other observation, and
         // so a host-driven CAD honours `cad_repeat`/`rssi_thresh` exactly as the LBT loop does.
+        // `SetCad` correlates against a LoRa preamble; the GFSK modem has no such function, and the
+        // chip would answer a command error that reads back as "channel clear". Refused by name.
+        // (`CMD_SENSE` still works in GFSK — it falls back to the energy detector, which is real
+        // there; what does not exist is *this* mechanism, so this is the opcode that goes away.)
+        CMD_CAD if *phy != wire_phy::LORA => {
+            send_frame(&mut put, EVT_UNSUPPORTED, &[CMD_CAD, UNSUP_NO_HARDWARE]);
+        }
         CMD_CAD => {
             radio.standby();
             radio.set_cad_params(csma.cad_sym, csma.cad_peak, csma.cad_min);
@@ -854,6 +1893,10 @@ fn handle_cmd<SPI, NSS, RST, BSY, DIO1, RFSW, E, TX>(
             send_frame(&mut put, EVT_RSSI, &r.to_be_bytes());
         }
         // #52: sweep SF7..12 by CAD, report whichever a transmitter is actually using (ASFS primitive).
+        // A sweep of SF7..12 by CAD needs both a spreading factor and a CAD. GFSK has neither.
+        CMD_SF_SCAN if *phy != wire_phy::LORA => {
+            send_frame(&mut put, EVT_UNSUPPORTED, &[CMD_SF_SCAN, UNSUP_NO_HARDWARE]);
+        }
         CMD_SF_SCAN => {
             radio.standby();
             radio.set_cad_params(csma.cad_sym, csma.cad_peak, csma.cad_min);
@@ -887,11 +1930,20 @@ fn handle_cmd<SPI, NSS, RST, BSY, DIO1, RFSW, E, TX>(
             }
             *freq = want;
             radio.standby();
-            radio.set_frequency(*freq);
+            // Returns whether an image calibration was actually needed. Inside 902-928 MHz — the only
+            // band this arm accepts — it never is after `init`, which is what took the measured
+            // retune from 161 ms (two TCXO startups) to one. See `sx1262::set_frequency`.
+            let recalibrated = radio.set_frequency(*freq);
             radio.start_rx();
+            if debug_on() {
+                let mut lg = BufWriter::new();
+                let _ = write!(lg, "retune {} recal={}", *freq, recalibrated);
+                send_frame(&mut put, EVT_LOG, lg.as_slice());
+            }
             send_info(
                 &mut put,
                 radio,
+                *phy,
                 *freq,
                 *sf,
                 *bw,
@@ -905,6 +1957,15 @@ fn handle_cmd<SPI, NSS, RST, BSY, DIO1, RFSW, E, TX>(
         // Same contract as the frequency: SF is refused outside the advertised sf_min..sf_max rather
         // than applied, so EVT_CAP's span stays true. (SF5/SF6 are chip-supported but need different
         // sync-word handling and do not interop with the SX127x peers in this fleet.)
+        // `[sf, bw_code, cr_code]` names three LoRa concepts. GFSK has none of them, and this node
+        // deliberately does NOT reinterpret the three bytes as a bitrate/deviation/bandwidth triple:
+        // overloading a fleet-wide opcode with node-local meaning is how a shared contract stops
+        // being shared. This firmware runs ONE GFSK profile (50 kbps / 25 kHz / 117.3 kHz, the
+        // LoRaWAN FSK point — see `sx1262`'s GFSK constants); a GFSK modulation knob needs its own
+        // fleet opcode assignment, not this one's bytes.
+        CMD_SET_MOD if *phy != wire_phy::LORA => {
+            send_frame(&mut put, EVT_UNSUPPORTED, &[CMD_SET_MOD, UNSUP_NO_HARDWARE]);
+        }
         CMD_SET_MOD if len >= 3 => {
             if !(sx1262::SF_MIN..=sx1262::SF_MAX).contains(&buf[0]) {
                 send_frame(
@@ -923,6 +1984,7 @@ fn handle_cmd<SPI, NSS, RST, BSY, DIO1, RFSW, E, TX>(
             send_info(
                 &mut put,
                 radio,
+                *phy,
                 *freq,
                 *sf,
                 *bw,
@@ -942,6 +2004,7 @@ fn handle_cmd<SPI, NSS, RST, BSY, DIO1, RFSW, E, TX>(
             send_info(
                 &mut put,
                 radio,
+                *phy,
                 *freq,
                 *sf,
                 *bw,
@@ -959,6 +2022,7 @@ fn handle_cmd<SPI, NSS, RST, BSY, DIO1, RFSW, E, TX>(
             send_info(
                 &mut put,
                 radio,
+                *phy,
                 *freq,
                 *sf,
                 *bw,
@@ -970,6 +2034,11 @@ fn handle_cmd<SPI, NSS, RST, BSY, DIO1, RFSW, E, TX>(
             );
         }
         // #52 Tier 2: tune CAD/LBT/preamble at runtime — so calibration never needs a reflash.
+        // Storing CAD detector parameters in a PHY with no CAD would be a knob that accepts a value
+        // and actuates nothing — the exact failure mode this fleet keeps finding. Refused.
+        CMD_SET_CAD_CFG if *phy != wire_phy::LORA => {
+            send_frame(&mut put, EVT_UNSUPPORTED, &[CMD_SET_CAD_CFG, UNSUP_NO_HARDWARE]);
+        }
         CMD_SET_CAD_CFG if len >= 3 => {
             csma.cad_sym = buf[0];
             csma.cad_peak = buf[1];
@@ -977,6 +2046,7 @@ fn handle_cmd<SPI, NSS, RST, BSY, DIO1, RFSW, E, TX>(
             send_info(
                 &mut put,
                 radio,
+                *phy,
                 *freq,
                 *sf,
                 *bw,
@@ -994,6 +2064,7 @@ fn handle_cmd<SPI, NSS, RST, BSY, DIO1, RFSW, E, TX>(
             send_info(
                 &mut put,
                 radio,
+                *phy,
                 *freq,
                 *sf,
                 *bw,
@@ -1012,6 +2083,7 @@ fn handle_cmd<SPI, NSS, RST, BSY, DIO1, RFSW, E, TX>(
             send_info(
                 &mut put,
                 radio,
+                *phy,
                 *freq,
                 *sf,
                 *bw,
@@ -1031,6 +2103,7 @@ fn handle_cmd<SPI, NSS, RST, BSY, DIO1, RFSW, E, TX>(
             send_info(
                 &mut put,
                 radio,
+                *phy,
                 *freq,
                 *sf,
                 *bw,
@@ -1062,6 +2135,7 @@ fn handle_cmd<SPI, NSS, RST, BSY, DIO1, RFSW, E, TX>(
             send_info(
                 &mut put,
                 radio,
+                *phy,
                 *freq,
                 *sf,
                 *bw,
@@ -1092,6 +2166,7 @@ fn handle_cmd<SPI, NSS, RST, BSY, DIO1, RFSW, E, TX>(
             send_info(
                 &mut put,
                 radio,
+                *phy,
                 *freq,
                 *sf,
                 *bw,
@@ -1109,6 +2184,7 @@ fn handle_cmd<SPI, NSS, RST, BSY, DIO1, RFSW, E, TX>(
             send_info(
                 &mut put,
                 radio,
+                *phy,
                 *freq,
                 *sf,
                 *bw,
@@ -1126,6 +2202,7 @@ fn handle_cmd<SPI, NSS, RST, BSY, DIO1, RFSW, E, TX>(
             send_info(
                 &mut put,
                 radio,
+                *phy,
                 *freq,
                 *sf,
                 *bw,
@@ -1141,23 +2218,26 @@ fn handle_cmd<SPI, NSS, RST, BSY, DIO1, RFSW, E, TX>(
         // tail; the host contract gains the extra fields when it is updated to read them.
         CMD_GET_STATS => {
             let chip = radio.get_stats();
-            let mut p = [0u8; 32];
-            p[0..4].copy_from_slice(&plane.rx.to_be_bytes());
-            p[4..8].copy_from_slice(&plane.filtered.to_be_bytes());
-            p[8..12].copy_from_slice(&plane.deduped.to_be_bytes());
-            p[12..16].copy_from_slice(&plane.served.to_be_bytes());
-            p[16..20].copy_from_slice(&plane.relayed.to_be_bytes());
-            p[20..22].copy_from_slice(&csma.cad_busy_view().to_be_bytes());
-            p[22..24].copy_from_slice(&csma.defer.to_be_bytes());
+            let mut p = [0u8; stats::LEN];
+            p[stats::RX..stats::RX + 4].copy_from_slice(&plane.rx.to_be_bytes());
+            p[stats::FILTERED..stats::FILTERED + 4].copy_from_slice(&plane.filtered.to_be_bytes());
+            p[stats::DEDUPED..stats::DEDUPED + 4].copy_from_slice(&plane.deduped.to_be_bytes());
+            p[stats::SERVED..stats::SERVED + 4].copy_from_slice(&plane.served.to_be_bytes());
+            p[stats::RELAYED..stats::RELAYED + 4].copy_from_slice(&plane.relayed.to_be_bytes());
+            p[stats::CAD_BUSY..stats::CAD_BUSY + 2]
+                .copy_from_slice(&csma.cad_busy_view().to_be_bytes());
+            p[stats::DEFER..stats::DEFER + 2].copy_from_slice(&csma.defer.to_be_bytes());
             // --- v2 tail: the SX126x's OWN counters (P5). A CRC failure used to vanish inside
             // `poll_rx` with nothing counting it, so RX loss was invisible; chip_crc_err is now the
             // difference between "quiet channel" and "channel we are failing to decode".
-            p[24..26].copy_from_slice(&chip.pkt_received.to_be_bytes());
-            p[26..28].copy_from_slice(&chip.pkt_crc_error.to_be_bytes());
-            p[28..30].copy_from_slice(&chip.pkt_header_error.to_be_bytes());
+            p[stats::CHIP_RX..stats::CHIP_RX + 2].copy_from_slice(&chip.pkt_received.to_be_bytes());
+            p[stats::CHIP_CRC_ERR..stats::CHIP_CRC_ERR + 2]
+                .copy_from_slice(&chip.pkt_crc_error.to_be_bytes());
+            p[stats::CHIP_HDR_ERR..stats::CHIP_HDR_ERR + 2]
+                .copy_from_slice(&chip.pkt_header_error.to_be_bytes());
             // Frames whose on-air length exceeded RX_MAX and were therefore truncated. Should stay 0
             // — a non-zero value means a peer is transmitting past our advertised max_payload.
-            p[30..32].copy_from_slice(&rx_trunc.to_be_bytes());
+            p[stats::RX_TRUNC..stats::RX_TRUNC + 2].copy_from_slice(&rx_trunc.to_be_bytes());
             send_frame(&mut put, EVT_STATS, &p);
         }
         CMD_RESET_STATS => {
@@ -1170,6 +2250,7 @@ fn handle_cmd<SPI, NSS, RST, BSY, DIO1, RFSW, E, TX>(
             send_info(
                 &mut put,
                 radio,
+                *phy,
                 *freq,
                 *sf,
                 *bw,
@@ -1185,6 +2266,7 @@ fn handle_cmd<SPI, NSS, RST, BSY, DIO1, RFSW, E, TX>(
             send_info(
                 &mut put,
                 radio,
+                *phy,
                 *freq,
                 *sf,
                 *bw,
@@ -1199,6 +2281,7 @@ fn handle_cmd<SPI, NSS, RST, BSY, DIO1, RFSW, E, TX>(
             send_info(
                 &mut put,
                 radio,
+                *phy,
                 *freq,
                 *sf,
                 *bw,
@@ -1225,18 +2308,167 @@ fn handle_cmd<SPI, NSS, RST, BSY, DIO1, RFSW, E, TX>(
         CMD_READ_CLOCK => {
             send_frame(&mut put, EVT_CLOCK, &micros64().to_be_bytes());
         }
-        // 7E-A5 v2 §P4: this firmware has NO scheduled-TX engine. The SX1262 can be armed from a
-        // DIO/timeout but nothing here implements a delayed key-up, and the MCU has no TX timer, so
-        // there is no honest way to serve a `delay_us`. Answer explicitly rather than falling through
-        // the catch-all, so the reason is NO_HARDWARE (a real capability statement) and not
-        // UNKNOWN_OPCODE (which would suggest a firmware too old to know the opcode). EVT_CAP's
-        // cmd_bitmap bit 24 is clear and sched_gran_ns is 0 for the same reason.
-        CMD_TX_AT => {
-            send_frame(&mut put, EVT_UNSUPPORTED, &[CMD_TX_AT, UNSUP_NO_HARDWARE]);
+        // 7E-A5 v2 §P4: **scheduled TX**. `payload = [delay_us u32 BE][frame]`; the frame airs
+        // `delay_us` after this command is decoded, on the `micros64()` timebase — the same counter
+        // EVT_RX stamps with and CMD_READ_CLOCK returns. `delay_us = 0` means now. The reply is a
+        // single EVT_TXDONE emitted when the frame actually goes (see `sched_service`), never here:
+        // answering at arm time would report a transmission that has not happened.
+        //
+        // `len >= 5` = 4 delay bytes and at least one frame byte; a shorter payload falls through to
+        // the catch-all and is answered BAD_LENGTH, because bit 24 of CMD_BITMAP is now set.
+        CMD_TX_AT if len >= 5 => {
+            if sched.pending() {
+                // One slot, and the frame already in it was committed first. Refusing keeps the
+                // 1-reply-per-command contract (ok = 0 is exactly true: this frame did not air)
+                // without silently displacing something the host is already waiting on.
+                send_frame(&mut put, EVT_TXDONE, &[0, 0]);
+                return;
+            }
+            let delay_us = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
+            if delay_us > SCHED_MAX_DELAY_US {
+                // Bounded, not clamped — see SCHED_MAX_DELAY_US. An unbounded u32 of microseconds
+                // could occupy the one-deep slot for over an hour, refusing every later
+                // CMD_TX_AT with no way to clear it.
+                send_frame(&mut put, EVT_UNSUPPORTED, &[CMD_TX_AT, UNSUP_OUT_OF_RANGE]);
+                return;
+            }
+            let n = (len - 4).min(SCHED_FRAME_MAX);
+            sched.buf[..n].copy_from_slice(&buf[4..4 + n]);
+            sched.len = n;
+            // Airtime is computed HERE, where the live modulation parameters are in scope, and
+            // announced later from the staging point in `sched_service`.
+            sched.air_ms = airtime_ms_for(*phy, *sf, *bw, *cr, n as u8, csma.preamble)
+                .min(u16::MAX as u32) as u16;
+            sched.deadline = micros64().saturating_add(delay_us as u64);
+            sched.state = SchedState::Armed;
         }
-        // 7E-A5 v2 §P1: the one place this node describes itself.
+        // 7E-A5 v3 §B2: **scheduled TX against an ABSOLUTE instant**.
+        // `payload = [target_ticks u64 BE][frame]`, on the `micros64()` timebase — the same counter
+        // EVT_RX stamps with and CMD_READ_CLOCK returns at full width. The reply is a single
+        // EVT_TXDONE when the frame actually goes, exactly as for CMD_TX_AT.
+        //
+        // **Why this opcode exists.** CMD_TX_AT's delay starts counting when the FIRMWARE decodes
+        // the arm, so everything between the host's intent and that moment — serial transmission,
+        // ring drain, whatever command ran before it — lands inside the placement. That was measured
+        // on the LR2021 as a 553 µs jitter sd against a 50 µs declared granularity, matching that
+        // node's 550 µs command round-trip spread rather than its release mechanism. An absolute
+        // target removes the term: the host names an instant on the node's own clock, and how long
+        // the request took to arrive stops mattering. See [`SCHED_REL_PLACEMENT_BOUND_NS`].
+        //
+        // `len >= 9` = 8 target bytes and at least one frame byte; shorter falls through to the
+        // catch-all and is answered BAD_LENGTH, because bit 31 of CMD_BITMAP is set.
+        CMD_TX_AT_ABS if len >= 9 => {
+            if sched.pending() {
+                // Same one-deep contract as CMD_TX_AT: refuse rather than displace a frame the host
+                // is already waiting on. `ok = 0` is exactly true — this frame did not air.
+                send_frame(&mut put, EVT_TXDONE, &[0, 0]);
+                return;
+            }
+            let target = u64::from_be_bytes([
+                buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
+            ]);
+            let now = micros64();
+            // "Absurd" is bounded SYMMETRICALLY at SCHED_MAX_DELAY_US (60 s). Far in the future is
+            // the same hazard CMD_TX_AT guards against — a one-deep slot occupied for an hour. Far
+            // in the PAST is the new one, and it is the more informative failure: the only way to be
+            // a minute behind a monotonic counter the host just read is to be converting from a
+            // different timebase, and firing immediately would hide that behind a frame that looks
+            // like it worked. A target merely *slightly* past is not an error at all — it is a
+            // deadline that slipped, and it fires at once with `late_us` reporting by how much,
+            // which is also what `delay_us = 0` means on the relative opcode.
+            let skew = if target > now { target - now } else { now - target };
+            if skew > SCHED_MAX_DELAY_US as u64 {
+                send_frame(
+                    &mut put,
+                    EVT_UNSUPPORTED,
+                    &[CMD_TX_AT_ABS, UNSUP_OUT_OF_RANGE],
+                );
+                return;
+            }
+            let n = (len - 8).min(SCHED_ABS_FRAME_MAX);
+            sched.buf[..n].copy_from_slice(&buf[8..8 + n]);
+            sched.len = n;
+            sched.air_ms = airtime_ms_for(*phy, *sf, *bw, *cr, n as u8, csma.preamble)
+                .min(u16::MAX as u32) as u16;
+            sched.deadline = target;
+            sched.state = SchedState::Armed;
+        }
+        // 7E-A5 v3 §B1: **the PHY is a knob.** `[packet_type]` in the LR20xx WIRE numbering, which
+        // is not the SX126x's — `wire_to_chip_phy` is the only place the two meet and the mapping is
+        // asserted at build time.
+        //
+        // The reply is the WHOLE new EVT_CAP, because `max_payload`, the SF span and the usable
+        // command set are all properties of the mode rather than of the node: the host replaces its
+        // profile instead of patching fields.
+        CMD_SET_PHY if len >= 1 => {
+            let want = buf[0];
+            // Only PHYs this node actually brings up. LR-FHSS is the interesting refusal: the
+            // SX1262 silicon has it, but transmit-only and with its own internal hop sequence, so it
+            // is not something a bidirectional bearer can advertise.
+            if want >= 32 || (PHY_BITMAP >> want) & 1 == 0 {
+                send_frame(
+                    &mut put,
+                    EVT_UNSUPPORTED,
+                    &[CMD_SET_PHY, UNSUP_OUT_OF_RANGE],
+                );
+                return;
+            }
+            // A queued scheduled frame was accepted under the OLD medium — its airtime was computed
+            // there and the host is holding a re-based deadline from it. Rather than air it on a
+            // modulation nobody asked for, cancel it and close its contract the same way a second
+            // CMD_TX_AT is closed: EVT_TXDONE[0, 0], where `ok = 0` is exactly true.
+            if sched.pending() {
+                sched.state = SchedState::Idle;
+                send_frame(&mut put, EVT_TXDONE, &[0, 0]);
+            }
+            let prev = *phy;
+            let status = radio.apply_phy(
+                wire_to_chip_phy(want),
+                *freq,
+                *sf,
+                *bw,
+                *cr,
+                *pwr,
+            );
+            if !sx1262::cmd_status_ok(status) {
+                // The node advertised this PHY and the silicon declined it. Put the radio back where
+                // it was and report the chip's LITERAL status byte — a firmware opinion about what
+                // went wrong would be worth less than the byte itself.
+                radio.apply_phy(wire_to_chip_phy(prev), *freq, *sf, *bw, *cr, *pwr);
+                radio.start_rx();
+                send_frame(&mut put, EVT_PHY_ERR, &[want, status]);
+                return;
+            }
+            *phy = want;
+            radio.start_rx();
+            let g = sched.gran_ns();
+            send_cap(&mut put, g, *phy);
+            sched.note_cap_published(g, micros64());
+        }
+        // 7E-A5 v3 §B4: **an explicit refusal, not a fall-through.**
+        //
+        // `CMD_SET_HOP` installs an intra-packet frequency-hopping table. The SX126x has no such
+        // engine: unlike the SX127x — which has `RegHopPeriod` and an `FhssChangeChannel` interrupt
+        // that steps a host-supplied table mid-frame — the SX126x's only hopping is inside the
+        // LR-FHSS packet type, which is transmit-only and builds its own sequence rather than taking
+        // one. So this node is STRUCTURALLY excluded from the hopping pair, and that exclusion is
+        // written here as its own arm with `NO_HARDWARE` so it reads as a decision rather than as an
+        // opcode nobody got round to. (`CMD_DATAPLANE`'s `hop_*` fields are a different mechanism
+        // entirely — a name-keyed choice of which channel to sit on BETWEEN frames, which needs no
+        // hardware sequencer.)
+        //
+        // Bit 30 of CMD_BITMAP stays CLEAR: the bitmap means "implemented and will act", and this
+        // will not. `REFUSED_OPCODES` asserts the two cannot drift.
+        CMD_SET_HOP => {
+            send_frame(&mut put, EVT_UNSUPPORTED, &[CMD_SET_HOP, UNSUP_NO_HARDWARE]);
+        }
+        // 7E-A5 v2 §P1 / v3 §B1: the one place this node describes itself — for the PHY it is in.
         CMD_GET_CAP => {
-            send_cap(&mut put);
+            let g = sched.gran_ns();
+            send_cap(&mut put, g, *phy);
+            // Remember what the host now holds, so the unsolicited re-publish (B3) measures a
+            // refined granularity against the figure actually delivered.
+            sched.note_cap_published(g, micros64());
         }
         // 7E-A5 v2 §P3: channel occupancy, reusing state that already exists — `cad_busy` is the
         // free-running CAD-busy counter the LBT loop increments, and the RSSI is the same
@@ -1247,7 +2479,9 @@ fn handle_cmd<SPI, NSS, RST, BSY, DIO1, RFSW, E, TX>(
             // would return the same value forever on a node that is not transmitting, and the
             // difference would say "channel free" no matter how busy the air was.
             radio.standby();
-            radio.set_cad_params(csma.cad_sym, csma.cad_peak, csma.cad_min);
+            if radio.supports_cad() {
+                radio.set_cad_params(csma.cad_sym, csma.cad_peak, csma.cad_min);
+            }
             sense_busy(radio, csma);
             radio.start_rx();
             // RSSI after RX is re-armed: `rssi_inst` outside an RX mode is not a channel measurement.
@@ -1257,9 +2491,22 @@ fn handle_cmd<SPI, NSS, RST, BSY, DIO1, RFSW, E, TX>(
             p[2..4].copy_from_slice(&r.to_be_bytes());
             send_frame(&mut put, EVT_SENSE, &p);
         }
-        // Waveshare-local (P6): pick the LNA gain. 1/default = boosted (this firmware's default,
-        // ~+3 dB sensitivity), 0 = the chip's power-saving power-on default.
+        // Waveshare-local (P6): pick the LNA gain. `[0]` = the chip's power-saving power-on default,
+        // `[1]` = boosted (this firmware's default, ~+3 dB sensitivity for ~+2 mA in RX).
+        //
+        // **Payload shape, for the two firmwares mirroring this opcode:** exactly one byte, and only
+        // 0 or 1 are defined. Anything else is OUT_OF_RANGE rather than folded into "boosted" — a
+        // host that sends 2 meaning something has been misunderstood, and a knob that quietly
+        // reinterprets its argument is how a capability statement stops being true.
         CMD_SET_RX_GAIN if len >= 1 => {
+            if buf[0] > 1 {
+                send_frame(
+                    &mut put,
+                    EVT_UNSUPPORTED,
+                    &[CMD_SET_RX_GAIN, UNSUP_OUT_OF_RANGE],
+                );
+                return;
+            }
             radio.standby();
             radio.set_rx_gain(if buf[0] == 0 {
                 sx1262::RX_GAIN_POWER_SAVING
@@ -1270,6 +2517,7 @@ fn handle_cmd<SPI, NSS, RST, BSY, DIO1, RFSW, E, TX>(
             send_info(
                 &mut put,
                 radio,
+                *phy,
                 *freq,
                 *sf,
                 *bw,
@@ -1299,14 +2547,24 @@ fn handle_cmd<SPI, NSS, RST, BSY, DIO1, RFSW, E, TX>(
     }
 }
 
-/// **EVT_CAP — the one place this node describes itself** (7E-A5 v2). 29 bytes, every multi-byte
-/// field big-endian. Every value below comes from a source constant or a verified property of this
-/// firmware; where nothing is known the field is 0 and says so, because a fabricated number is worse
-/// than 0 — the host believes it.
+/// **EVT_CAP — the one place this node describes itself** (7E-A5 **v3**). 34 bytes, every
+/// multi-byte field big-endian. Every value below comes from a source constant or a verified
+/// property of this firmware; where nothing is known the field is 0 and says so, because a
+/// fabricated number is worse than 0 — the host believes it.
+///
+/// ★ **This record describes the CURRENT PHY, not the node.** `max_payload`, `sf_min`/`sf_max` and
+/// `cmd_bitmap` all move with `phy_current` — the same SX1262 in GFSK has no spreading factor, no
+/// CAD and a different airtime model. So `CMD_SET_PHY` replies with the WHOLE record and the host
+/// replaces its profile; nothing here is safe to patch field-by-field.
+///
+/// **Two v2 fields changed meaning, both compatibly.** `proto_ver` is 3, and `radio_kind` now names
+/// the PART (0 = SX1262, 1 = SX1276, 2 = LR2021) rather than a part-and-mode pair — for this node
+/// the byte is unchanged at 0, so a v2 host reading a v3 SX1262 still gets the right answer, reads
+/// the 29 bytes it knows and ignores the 5-byte tail.
 ///
 /// ```text
-///  [0]      proto_ver     = 2
-///  [1]      radio_kind    = 0 (SX1262)
+///  [0]      proto_ver     = 3
+///  [1]      radio_kind    = 0 (the PART: SX1262)
 ///  [2..6]   freq_min_hz   = 902_000_000   } the band this firmware image-calibrates for; NOT the
 ///  [6..10]  freq_max_hz   = 928_000_000   } SX1262's 150-960 MHz silicon range (sx1262::FREQ_*_HZ)
 ///  [10]     pwr_min_dbm   = -9            } real dBm, the SetTxParams range `set_power` clamps to
@@ -1314,31 +2572,65 @@ fn handle_cmd<SPI, NSS, RST, BSY, DIO1, RFSW, E, TX>(
 ///  [12..16] stamp_hz      = 1_000_000     MICROseconds; see STAMP_HZ / `micros64`
 ///  [16]     stamp_kind    = 2 (software counter — the MCU reads its own clock when it notices
 ///                              RxDone in the poll loop; there is NO hardware capture on this radio)
-///  [17..19] max_payload   = 247           RX_MAX — the binding serial-framing limit, below the
-///                                         255 B CMD_TX accept and the 255 B LoRa PDU
-///  [19..23] cmd_bitmap    = CMD_BITMAP
-///  [23]     sf_min        = 7             } sx1262::SF_MIN/SF_MAX — the SFs this firmware operates
-///  [24]     sf_max        = 12            } and CMD_SF_SCAN sweeps
-///  [25..29] sched_gran_ns = 0             this firmware exposes NO scheduled-TX engine (see
-///                                         CMD_TX_AT above); 0 is the truth, not a placeholder
+///  [17..19] max_payload   = 247           PER-PHY. Both PHYs land on RX_MAX because the binding
+///                                         limit is the serial framing in both; the radio caps
+///                                         (255 B LoRa PDU, 255 B GFSK PDU) are larger
+///  [19..23] cmd_bitmap    PER-PHY         CMD_BITMAP in LoRa; in GFSK the four LoRa-modem opcodes
+///                                         (SET_MOD/CAD/SET_CAD_CFG/SF_SCAN) are cleared
+///  [23]     sf_min        PER-PHY         LoRa 7 / GFSK 0 } sx1262::SF_MIN/SF_MAX in LoRa — the SFs
+///  [24]     sf_max        PER-PHY         LoRa 12 / GFSK 0} this firmware operates and SF_SCAN
+///                                         sweeps. 0/0 in GFSK is "this PHY has no such knob"
+///  [25..29] sched_gran_ns = 400_000       Both CMD_TX_AT_ABS (0x1F) and CMD_TX_AT (0x18) are
+///                                         implemented: the MCU timer releases the key-up. The
+///                                         figure is derived term by term in [`SCHED_GRAN_NS`],
+///                                         describes the ABSOLUTE path (see
+///                                         [`SCHED_REL_PLACEMENT_BOUND_NS`] for what the relative
+///                                         one adds), and is RAISED to the measured key-up once this
+///                                         node has released a scheduled frame ([`Sched::gran_ns`])
+///  [29..33] phy_bitmap    = 0x0000_0005   v3 tail: bit N ⇔ wire SetPacketType value N is usable.
+///                                         Bit 0 LoRa + bit 2 FSK ([`PHY_BITMAP`])
+///  [33]     phy_current                   v3 tail: the wire SetPacketType value in effect now
 /// ```
-fn send_cap<F: FnMut(u8)>(put: F) {
-    let mut c = [0u8; 29];
-    c[0] = 2; // proto_ver
-    c[1] = 0; // radio_kind: SX1262
+fn send_cap<F: FnMut(u8)>(put: F, sched_gran_ns: u32, phy: u8) {
+    let caps = phy_caps(phy);
+    let mut c = [0u8; CAP_LEN];
+    c[0] = 3; // proto_ver
+    c[1] = 0; // radio_kind: the PART — SX1262
     c[2..6].copy_from_slice(&sx1262::FREQ_MIN_HZ.to_be_bytes());
     c[6..10].copy_from_slice(&sx1262::FREQ_MAX_HZ.to_be_bytes());
     c[10] = sx1262::PWR_MIN_DBM as u8;
     c[11] = sx1262::PWR_MAX_DBM as u8;
     c[12..16].copy_from_slice(&STAMP_HZ.to_be_bytes());
     c[16] = 2; // stamp_kind: software counter
-    c[17..19].copy_from_slice(&(RX_MAX as u16).to_be_bytes());
-    c[19..23].copy_from_slice(&CMD_BITMAP.to_be_bytes());
-    c[23] = sx1262::SF_MIN;
-    c[24] = sx1262::SF_MAX;
-    c[25..29].copy_from_slice(&0u32.to_be_bytes()); // sched_gran_ns: none
+    c[17..19].copy_from_slice(&caps.max_payload.to_be_bytes());
+    c[19..23].copy_from_slice(&caps.cmd_bitmap.to_be_bytes());
+    c[23] = caps.sf_min;
+    c[24] = caps.sf_max;
+    c[25..29].copy_from_slice(&sched_gran_ns.to_be_bytes());
+    // --- v3 tail ---
+    c[CAP_PHY_BITMAP_OFF..CAP_PHY_BITMAP_OFF + 4].copy_from_slice(&PHY_BITMAP.to_be_bytes());
+    c[CAP_PHY_CURRENT_OFF] = phy;
     send_frame(put, EVT_CAP, &c);
 }
+
+/// EVT_CAP layout constants. The record is fixed-width and the host slices fields by offset, so the
+/// offsets are named once, indexed with by the emitter above, and transcribed by the README's table.
+///
+/// v2's 29 bytes are unchanged in position and (except `proto_ver` and `radio_kind`'s *meaning*) in
+/// value, so a v2 host reads a v3 node correctly and ignores the tail. That back-compat is the
+/// reason the new fields are appended rather than interleaved.
+const CAP_LEN_V2: usize = 29;
+const CAP_SCHED_GRAN_OFF: usize = 25;
+const CAP_PHY_BITMAP_OFF: usize = 29;
+const CAP_PHY_CURRENT_OFF: usize = 33;
+const CAP_LEN: usize = 34;
+const _: () = assert!(CAP_SCHED_GRAN_OFF + 4 == CAP_LEN_V2);
+const _: () = assert!(CAP_PHY_BITMAP_OFF == CAP_LEN_V2);
+const _: () = assert!(CAP_PHY_CURRENT_OFF == CAP_PHY_BITMAP_OFF + 4);
+const _: () = assert!(CAP_LEN == CAP_PHY_CURRENT_OFF + 1);
+const _: () = assert!(CAP_LEN == 34);
+// The whole record must still fit the framing's one-byte `len`, with room for the sync/type/crc.
+const _: () = assert!(CAP_LEN <= 255);
 
 /// Reset-surviving handshake between CMD_ENTER_BOOTLOADER and [`maybe_enter_bootloader`]. The slot is
 /// the top 4 bytes of SRAM, carved out of the linker's RAM region in `memory.x` (so nothing else uses
@@ -1369,9 +2661,16 @@ unsafe fn maybe_enter_bootloader() {
 }
 
 /// Emit an INFO event snapshotting chip status + the current knobs.
+///
+/// **The `sf`/`bw`/`cr` bytes are PHY-dependent and report 0 in GFSK**, matching the `sf_min`/
+/// `sf_max` of 0 that EVT_CAP advertises there. The caller's mirrors keep their LoRa values so a
+/// switch back restores them; what would be wrong is putting `sf = 7` on the wire while the radio is
+/// running a modem that has no spreading factor at all. The record stays 19 bytes — it is frozen,
+/// the host reads `cad_busy`/`defer` as the last four — so `phy` is reported by EVT_CAP, not here.
 fn send_info<SPI, NSS, RST, BSY, DIO1, RFSW, E, F>(
     put: F,
     radio: &mut Sx1262<SPI, NSS, RST, BSY, DIO1, RFSW>,
+    phy: u8,
     freq: u32,
     sf: u8,
     bw: u8,
@@ -1391,9 +2690,13 @@ fn send_info<SPI, NSS, RST, BSY, DIO1, RFSW, E, F>(
     F: FnMut(u8),
 {
     let status = radio.get_status();
+    // Read back from whichever register file the CURRENT PHY uses (LoRa 0x0740 / GFSK 0x06C0), so
+    // this stays a genuine read-back rather than a read of the other modem's leftovers.
     let sync = radio.read_sync();
     let errors = radio.get_device_errors();
     let f = freq.to_be_bytes();
+    let lora = phy == wire_phy::LORA;
+    let (sf, bw, cr) = if lora { (sf, bw, cr) } else { (0, 0, 0) };
     let payload = [
         status,
         (sync >> 8) as u8,

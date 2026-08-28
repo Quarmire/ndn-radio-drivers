@@ -27,16 +27,28 @@
 //     cargo test --target <host-triple> --lib
 //
 // builds just these four modules and runs their tests.
+pub mod airtime;
 pub mod board;
 pub mod gcs;
+pub mod phy;
 pub mod serial;
 pub mod tier0;
 
 // ── The embedded half: embassy-nrf + the LR2021 driver, device target only ───────────────────────
+//
+// One module per PHY, plus the dispatcher. The split is the same one `airtime`/`flrc_link` already
+// makes for a different reason: everything that is a *wire contract* or a *per-PHY number* lives in
+// `phy` where it can be tested, and everything that programs registers lives here.
 #[cfg(target_os = "none")]
 pub mod flrc_link;
 #[cfg(target_os = "none")]
 pub mod hw;
+#[cfg(target_os = "none")]
+pub mod lora_link;
+#[cfg(target_os = "none")]
+pub mod lrfhss_link;
+#[cfg(target_os = "none")]
+pub mod phy_link;
 #[cfg(target_os = "none")]
 pub mod timing;
 

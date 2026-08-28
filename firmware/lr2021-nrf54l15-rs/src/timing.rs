@@ -78,7 +78,17 @@ pub const MAC_CLOCK: Frequency = Frequency::F16MHz;
 pub const TICKS_PER_US: u32 = 16;
 
 /// Nanoseconds per tick at [`MAC_CLOCK`] — the true resolution of every [`HwStamp`].
+///
+/// Truncating (62, not 62.5) is fine for a resolution figure and **wrong for a scheduling
+/// granularity**, which must round the other way; that one lives in
+/// [`crate::airtime::SCHED_TICK_NS`].
 pub const TICK_NS: u32 = 1000 / TICKS_PER_US;
+
+// `crate::airtime` has to mirror [`TICKS_PER_US`] because it is a host-testable module and this one
+// is device-only. Mirrored constants drift; this one cannot, because raising the timer frequency
+// here without raising it there fails the build rather than silently halving the `sched_gran_ns`
+// this node advertises.
+const _: () = assert!(crate::airtime::MAC_TICKS_PER_US == TICKS_PER_US);
 
 /// A hardware-captured instant on the MAC clock: the raw tick count latched by
 /// `TIMER.CC[n].CAPTURE` at a DPPI-routed event edge.

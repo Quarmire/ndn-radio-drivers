@@ -19,7 +19,7 @@ use lr2021_nrf54l15_rs::{flrc_link, hw};
 
 #[embassy_executor::main]
 async fn main(_spawner: Spawner) {
-    let p = embassy_nrf::init(Default::default());
+    let p = hw::init_peripherals();
     let (mut radio, _t, _u) = hw::init(p);
 
     radio.reset().await.unwrap();

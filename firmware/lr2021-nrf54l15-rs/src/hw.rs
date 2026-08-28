@@ -69,9 +69,13 @@ pub struct UartParts {
 /// so no absolute-time or common-view claim survives without this. The XIAO is a BLE part, so an
 /// HFXO is fitted.
 ///
-/// The M3–M5 milestone binaries still call `embassy_nrf::init(Default::default())`; their timing
-/// numbers were taken on the RC source and should be re-taken through this before being quoted as
-/// accuracy rather than resolution.
+/// **Every binary that brings up peripherals now boots through here** (2026-08-28) — the one
+/// exception is `m1_bare`, which deliberately initialises nothing. `m6_bridge` was the only one that
+/// did; the other 21 were still on the RC source, and that is the clock every M3–M5 number in
+/// the README was taken on. Those are **resolution** figures and stay true — a 62.5 ns ruler is a
+/// 62.5 ns ruler whichever oscillator drives it — but they are not **accuracy** figures and must be
+/// re-taken through this path before being quoted as such. `grep 'embassy_nrf::init('` outside this
+/// function should find nothing.
 pub fn init_peripherals() -> Peripherals {
     let mut cfg = embassy_nrf::config::Config::default();
     cfg.hfclk_source = embassy_nrf::config::HfclkSource::ExternalXtal;

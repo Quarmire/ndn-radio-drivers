@@ -92,22 +92,29 @@ pub const COVERAGE: &[Row] = &[
         // read off the rig. An empty list is the honest entry — a plausible-looking PID here would
         // silently claim a device the dispatch never matches.
         pids: &[],
-        // Not in the pre-registered campaign set. The link is live and MEASURED (o5p-0 -> o5p-1,
-        // 100/100 at 915 MHz FLRC), but no campaign run has driven this node through `FrameIo` end
-        // to end. Admit it when a run has, not on the strength of a working link.
+        // Not in the pre-registered campaign set. The link is live and MEASURED — 100/100 at
+        // 915 MHz FLRC, and in **LoRa** mode this node now reaches the SX1262 and SX1276 nodes too
+        // (modulation is a runtime knob as of v3) — but no campaign run has driven it through
+        // `FrameIo` end to end. Admit it when a run has, not on the strength of a working link.
         campaign: false,
         frame_io: Provided,
         knobs: Provided,
         // ★ The only node in this fleet whose clock cell means what the Realtek ones mean: a
         // free-running per-frame HARDWARE stamp (16 MHz DPPI capture, 62.5 ns), so
         // `FaceTimeProfile::can_common_view` is true here and false on every other sub-GHz node.
+        // MEASURED on that clock: with the host naming an absolute instant (`CMD_TX_AT_ABS`),
+        // scheduled TX places a frame to sd 0.7 µs / p2p 3.4 µs over 45 slots.
         time: Provided,
         profile: Provided,
     },
     Row {
         backend: "LoraSerialBackend (Heltec LoRa32 V2, SX1276)",
         pids: &[], // CP2102 bridge; ids not read off the rig (see the LR2021 row)
-        campaign: false, // flashed and self-describing, but no campaign run has driven it
+        // Flashed and MEASURED on air: interoperates with both SX1262 dongles and with the LR2021
+        // in LoRa mode, and its intra-packet hopping actuates (a receiver parked on the frequency a
+        // packet STARTS on hears nothing). Still not campaign — no run has driven it through
+        // `FrameIo`, and SX1276<->LR2021 hopping does not yet interoperate.
+        campaign: false,
         frame_io: Provided,
         knobs: Provided,
         time: Provided,

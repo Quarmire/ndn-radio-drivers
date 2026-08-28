@@ -485,7 +485,9 @@ mod tests {
     const KEY2: [u8; 16] = *b"ndr/tier0-vec-02";
 
     fn unhex(s: &str) -> Vec<u8> {
-        (0..s.len() / 2).map(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).unwrap()).collect()
+        (0..s.len() / 2)
+            .map(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).unwrap())
+            .collect()
     }
 
     /// `params version=2 k=4 m=126 max_depth=8 fill_cap=64 hash=siphash24 key_len=16
@@ -508,8 +510,20 @@ mod tests {
     #[test]
     fn golden_base_rows() {
         for (label, key, name, wire, popcount) in [
-            ("depth2", &KEY1, "/ndn/alarm", "83080804010000820040040090000010", 12),
-            ("depth8", &KEY1, "/c0/c1/c2/c3/c4/c5/c6/c7", "332819522211a01084010e60c4006218", 33),
+            (
+                "depth2",
+                &KEY1,
+                "/ndn/alarm",
+                "83080804010000820040040090000010",
+                12,
+            ),
+            (
+                "depth8",
+                &KEY1,
+                "/c0/c1/c2/c3/c4/c5/c6/c7",
+                "332819522211a01084010e60c4006218",
+                33,
+            ),
             // Past the depth cap: the filter stops inserting, so it is a *different* (sparser)
             // filter than the depth-8 row — 30 bits, not 33. That divergence is the cap working.
             (
@@ -521,11 +535,21 @@ mod tests {
             ),
             // Same name, different group key: an observer without the key cannot recompute the
             // filter, which is the unlinkability property the addressing doctrine assigns to it.
-            ("wrongkey", &KEY2, "/ndn/alarm", "83000100010082100804084080100000", 12),
+            (
+                "wrongkey",
+                &KEY2,
+                "/ndn/alarm",
+                "83000100010082100804084080100000",
+                12,
+            ),
         ] {
             let mut f = PrefixFilter::new();
             f.insert_name(key, name.as_bytes());
-            assert_eq!(f.to_wire().to_vec(), unhex(wire), "golden row {label}: wire bytes");
+            assert_eq!(
+                f.to_wire().to_vec(),
+                unhex(wire),
+                "golden row {label}: wire bytes"
+            );
             assert_eq!(f.popcount(), popcount, "golden row {label}: popcount");
         }
     }
@@ -542,7 +566,10 @@ mod tests {
         all.extend_from_slice(&w.addr2);
         all.extend_from_slice(&w.addr3);
         all.extend_from_slice(&w.addr4);
-        assert_eq!(all, unhex("87000800c10308820040040080000011370041a14230d880"));
+        assert_eq!(
+            all,
+            unhex("87000800c10308820040040080000011370041a14230d880")
+        );
         assert_eq!(w.htc.to_vec(), unhex("1486e901"));
         assert_eq!(name_fingerprint(&KEY1, name), 0x00e9_8614);
 
@@ -641,7 +668,10 @@ mod tests {
             f.insert_name(&key, name.as_bytes());
             let pc = f.popcount();
             // K bits per prefix, depth+1 prefixes, minus collisions — so never above the product.
-            assert!(pc <= K * (depth as u32 + 1), "depth {depth}: popcount {pc} exceeds K*(d+1)");
+            assert!(
+                pc <= K * (depth as u32 + 1),
+                "depth {depth}: popcount {pc} exceeds K*(d+1)"
+            );
             assert!(pc > 0);
             deepest = pc;
         }

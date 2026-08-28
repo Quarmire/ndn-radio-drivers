@@ -711,14 +711,25 @@ pub trait RadioKnobs: Send + Sync {
     fn set_channel(&self, channel: u8, bw: Bandwidth) -> Result<(), FaceError>;
 
     /// Set the TXAGC reference index (a back-off below the regulatory ceiling;
-    /// never used to exceed it). Default: no-op (radio runs at its init power).
+    /// never used to exceed it).
     ///
     /// This is an **opaque, chip-specific, nonlinear** scale: index N on one part
     /// is not index N on another, and equal index steps are not equal dB steps.
     /// Prefer [`set_tx_power_dbm`](Self::set_tx_power_dbm) when the radio
     /// advertises a [`RadioCapability::tx_power_dbm`] range.
+    ///
+    /// ★ **Default: `Unsupported`, not `Ok(())`.** It used to be a silent success, which made this
+    /// the single most misleading seam in the crate: the MT7612U and MT7921AU have **no power
+    /// actuator at all**, yet accepted every back-off cognition asked for. `apply_knobs` then
+    /// recorded the request as applied, the contextual bandit's footprint term was rewarded for a
+    /// spatial reuse that never physically happened, and nothing upstream could tell. A knob that
+    /// cannot act must say so — that is the whole point of a capability seam. See
+    /// [`RadioCapability::power_actuated`] for the declarative half of the same fact.
     fn set_tx_power(&self, _idx: u32) -> Result<(), FaceError> {
-        Ok(())
+        Err(FaceError::Io(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "radio exposes no TX-power control",
+        )))
     }
 
     /// Set TX power on the **absolute dBm scale**, returning the power actually
@@ -772,6 +783,45 @@ pub trait RadioKnobs: Send + Sync {
         Ok(None)
     }
 
+    /// **How hard this radio should fight for the medium** — the contention window, as a posture
+    /// rather than a register value.
+    ///
+    /// ★ Contention is a *knob*, and on a slotted named-data MAC it is the actuator for the slot
+    /// decision. The claimable name-slot ([[token-concept-named-radio]]) makes a node the grant
+    /// holder for `(name, t mod N)`; inside a slot it owns, CSMA backoff buys nothing — the
+    /// schedule already provides collision freedom — and every microsecond of it is pure
+    /// overhead. Outside its slot, or in an open slot being contested by demand, the node should
+    /// back off normally so the election works. One knob, driven by the scheduler.
+    ///
+    /// MEASURED on the MT7921AU (ch36, VHT MCS9 2SS/80 MHz/SGI, 9000 B): moving `cw_min` from the
+    /// firmware default (exponent 5, CW = 31 slots, ~140 µs average backoff) to exponent 2
+    /// (CW = 3) took offered throughput from **382 to 416 Mbit/s**. On a medium the node has
+    /// been granted, that ~140 µs is the single largest per-frame cost there is.
+    ///
+    /// ⚠ **This is not "turn contention off".** Zeroing the window is measured *harmful*: on the
+    /// MT7612U, writing CW exponent 0 into the EDCA registers dropped throughput 5.7× and left
+    /// the MAC unable to transmit at all, beyond software recovery. [`Owned`](ContentionPosture::Owned)
+    /// therefore means *minimal sane* backoff, not none, and implementors must clamp.
+    ///
+    /// ★ **Read [`ContentionApplied::slot_us`], do not assume 9 µs.** Every term of the budget is
+    /// counted in slots and the slot is a per-part fact: MEASURED, the MT7612U boots at **20 µs**
+    /// while the MT7610U, MT7921AU and the Realtek parts run 9. The same window exponent is
+    /// therefore 67 µs of average backoff on one radio and 150 µs on another.
+    ///
+    /// MEASURED on the RTL8812AU (ch36, contended, 200 B frames): `Shared` → `Owned` moved the
+    /// per-frame period 779 → 706 µs, a **73 µs** saving against the **72 µs**
+    /// [`ContentionApplied::medium_access_us`] predicts. The budget is an accurate account of this
+    /// knob, not an approximation of it — but it is a *fixed* cost, so it is +10 % on short frames
+    /// and under 1 % on a full-size VHT80 PPDU. Weigh it against frame length.
+    ///
+    /// Default: `Unsupported`, so a radio without an EDCA surface says so rather than pretending.
+    fn set_contention(&self, _posture: ContentionPosture) -> Result<ContentionApplied, FaceError> {
+        Err(FaceError::Io(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "radio exposes no contention-window control",
+        )))
+    }
+
     /// **Hold or release transmissions at the MAC**, if the radio can. Default: no-op.
     ///
     /// The hardware side of a slot MAC. A software gate can only stop *us calling inject*; frames
@@ -801,10 +851,101 @@ pub trait RadioKnobs: Send + Sync {
         Ok(())
     }
 
+    /// **The clear-channel threshold, in true dBm** — above `l2h` the medium counts as busy, below
+    /// `h2l` it counts as idle again (the hysteresis pair).
+    ///
+    /// ★ This is the *other* half of spatial reuse and the only RX-side knob in the fleet that is
+    /// already denominated in dBm rather than in chip units. Cognition should move it **together
+    /// with** the power decision: backing off power without raising the defer threshold shrinks who
+    /// hears this node while leaving it just as deferential to everyone else, and the concurrency
+    /// never appears. A node that trims 10 dB of transmit power and raises its floor by the same
+    /// 10 dB has actually claimed reuse; one that only does the first has just reduced its own
+    /// reach.
+    ///
+    /// Default: `Unsupported`. A radio that cannot express a threshold in dBm must say so rather
+    /// than accept a number it will silently reinterpret.
+    fn set_edcca_threshold_dbm(&self, _l2h: i8, _h2l: i8) -> Result<(), FaceError> {
+        Err(FaceError::Io(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "radio exposes no dBm clear-channel threshold",
+        )))
+    }
+
     /// Ignore EDCCA / listen-before-talk so TX proceeds under channel contention. Default: no-op.
     /// (A LoRa radio maps this to its LBT toggle.)
     fn set_edcca_ignore(&self, _on: bool) -> Result<(), FaceError> {
         Ok(())
+    }
+
+    /// **Switch the radio's modulation**, returning the mode actually in effect.
+    ///
+    /// ★ The capability this whole trait was missing. Modulation is a runtime command
+    /// (`SetPacketType` on an LR20xx; `RegOpMode` on an SX127x), so it is a *knob* cognition
+    /// actuates — the same shape as MCS or spreading factor — and not a property of the node. A
+    /// backend that hard-codes one modulation at bring-up and reports it as its identity has
+    /// converted a dial into a fact.
+    ///
+    /// **Believe the return, not the request**, exactly as with
+    /// [`set_tx_power_dbm`](Self::set_tx_power_dbm): the chip may refuse a mode the radio
+    /// advertises (a band/PA combination it cannot serve, a mode its calibration was not built
+    /// for), and the honest answer is the mode it is running now.
+    ///
+    /// ⚠ **A successful switch invalidates the radio's whole [`RadioCapability`].** Payload cap,
+    /// rate model, spreading-factor span, scheduling granularity and even the band are per-PHY, so
+    /// a caller must re-read [`RadioProfile::capability`] afterwards and replace what it held —
+    /// never patch the field it thinks changed. It must also re-assert its intended
+    /// channel/rate/power: none of them survives a modulation change.
+    ///
+    /// Default: `Unsupported`, so a single-modulation radio refuses rather than pretending.
+    fn set_phy(&self, _mode: PhyMode) -> Result<PhyMode, FaceError> {
+        Err(FaceError::Io(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "radio exposes no runtime modulation control",
+        )))
+    }
+
+    /// **Install an autonomous frequency-hopping plan**: the carrier list (Hz), how long to dwell
+    /// on each (`period`, counted in [`HopCapability::period_unit`]), and whether to arm it.
+    ///
+    /// Distinct from [`set_channel`](Self::set_channel) + a software schedule, and distinct from
+    /// [`RadioCapability::retune_us`]: this hands the *radio* a list it walks by itself — on the
+    /// LR20xx and the SX1276, within a single packet, at a dwell no host command could reach. A
+    /// caller checks [`RadioCapability::hop`] first: `None` means the radio has no sequencer, and
+    /// [`HopCapability::max_list_len`] bounds `freqs_hz`.
+    ///
+    /// Default: `Unsupported`. A radio with no sequencer must refuse, because a silent success
+    /// would leave a planner believing its frames are spread across a band they never left.
+    fn set_hop_plan(
+        &self,
+        _ctrl: HopControl,
+        _period: u16,
+        _freqs_hz: &[u32],
+    ) -> Result<(), FaceError> {
+        Err(FaceError::Io(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "radio exposes no autonomous frequency-hopping plan",
+        )))
+    }
+
+    /// **Set the receive front end's sensitivity posture** — [`RxGain::Auto`] (the part's own
+    /// default/AGC) or [`RxGain::Boosted`] (its highest manual gain).
+    ///
+    /// A posture rather than a number **because the wire already is one**: every firmware in the
+    /// 7E-A5 fleet defines `CMD_SET_RX_GAIN` as a single boolean byte, and the LR2021 firmware
+    /// records why it refuses to expose its chip's 0..13 manual ladder through that byte — `1`
+    /// would mean "boosted" on one node and the *lowest* manual step on another, an inversion this
+    /// rig has already paid for once on a TX-power knob. There is consequently no scale to
+    /// reconcile between parts, only the two positions below, and those do mean the same thing
+    /// everywhere.
+    ///
+    /// ⚠ It is **not** a link-budget knob: see [`RxGain::Boosted`]. Reason in postures, not dB.
+    ///
+    /// Default: `Unsupported`.
+    fn set_rx_gain(&self, _gain: RxGain) -> Result<(), FaceError> {
+        Err(FaceError::Io(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "radio exposes no receive-gain control",
+        )))
     }
 
     /// Set the LoRa **spreading factor** (7–12) — the sub-GHz reach/rate dial, the direct analogue
@@ -867,6 +1008,85 @@ pub trait RadioKnobs: Send + Sync {
         Ok(())
     }
 }
+
+/// How hard a radio should compete for the medium — the input to
+/// [`RadioKnobs::set_contention`].
+///
+/// Stated as a posture rather than a contention-window exponent because the mapping is
+/// chip-specific (a firmware command on connac2, two different register blocks on mt76x02) and
+/// because the *scheduler* knows the situation while only the driver knows the safe range.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ContentionPosture {
+    /// **This node holds the transmit grant for the current slot.** Back off as little as the
+    /// hardware safely allows: collision freedom is coming from the schedule, so CSMA backoff is
+    /// pure overhead. MEASURED worth ~9% throughput on the MT7921AU and far more on a busy
+    /// channel, where the default window is most of the per-frame cost.
+    ///
+    /// ⚠ Never "no backoff" — see the warning on [`RadioKnobs::set_contention`].
+    Owned,
+    /// **Ordinary contention**: the standards-default window. The right posture in an open or
+    /// claimable slot where several names may have data and the CCLF election needs collisions to
+    /// resolve, and the only honest posture on a channel shared with other networks.
+    #[default]
+    Shared,
+    /// **Deliberately yield**: a larger window than default, so other transmitters win the medium.
+    /// For coexistence, for letting a starving neighbour through (the anti-starvation case the
+    /// slot MAC exists to fix), and for politeness on a band shared with a co-banded bearer.
+    Yielding,
+}
+
+/// What a radio actually applied for a [`ContentionPosture`] — believe this, not the request.
+///
+/// The posture is advisory: a driver clamps to what its silicon tolerates, and the caller needs
+/// the real numbers to reason about airtime. `cw_min`/`cw_max` are **exponents** (CW = 2^n − 1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ContentionApplied {
+    /// Contention-window minimum exponent actually programmed.
+    pub cw_min: u8,
+    /// Contention-window maximum exponent actually programmed.
+    pub cw_max: u8,
+    /// Arbitration inter-frame spacing, in slots.
+    pub aifs: u8,
+    /// TXOP limit in 32 µs units; 0 = one PPDU per medium acquisition.
+    pub txop: u16,
+    /// The slot time the MAC is actually counting backoff in, in microseconds.
+    ///
+    /// ★ Not a constant. MEASURED 2026-08-28: the MT7612U boots with a **20 µs** slot
+    /// (`MT_BKOFF_SLOT_CFG` = 0x114) while the MT7610U ships 9 (0x209) and the MT7921AU programs
+    /// 9. Backoff, AIFS and the whole DCF budget scale linearly in this number, so a window
+    /// exponent alone does not say what a posture costs — an exponent of 4 is 67 µs of average
+    /// backoff on one part and 150 µs on another. Every airtime budget must read this field
+    /// rather than assume the 802.11a short slot.
+    pub slot_us: u8,
+    /// The average backoff this window implies, in microseconds, at [`Self::slot_us`] — the number
+    /// the scheduler actually cares about, precomputed so every caller does not re-derive it.
+    pub avg_backoff_us: u32,
+}
+
+impl ContentionApplied {
+    /// Average backoff for a `cw_min` exponent at a given slot: `((2^n − 1) / 2) × slot_us`.
+    pub const fn avg_backoff_us_at(cw_min: u8, slot_us: u8) -> u32 {
+        let cw = (1u32 << cw_min) - 1;
+        cw * slot_us as u32 / 2
+    }
+
+    /// Average backoff at the 802.11a short slot. Prefer [`Self::avg_backoff_us_at`] with the
+    /// slot the part actually reports — this shorthand is only correct on a 9 µs part.
+    pub const fn avg_backoff_us_for(cw_min: u8) -> u32 {
+        Self::avg_backoff_us_at(cw_min, 9)
+    }
+
+    /// The full DCF budget one medium acquisition costs: `SIFS + AIFSN×slot + E[backoff]`.
+    /// This is the quantity a slot/token scheduler must reserve per transmission, and the one
+    /// that MEASURED at 225 µs of the ~248 µs fixed per-PPDU cost on the MT7612U.
+    pub const fn medium_access_us(&self) -> u32 {
+        SIFS_US + (self.aifs as u32) * (self.slot_us as u32) + self.avg_backoff_us
+    }
+}
+
+/// Short inter-frame space for OFDM PHYs, in microseconds. The one genuinely fixed term in the
+/// DCF budget — slot time and contention window are both knobs, this is not.
+pub const SIFS_US: u32 = 16;
 
 /// What the transmit path can *promise* about when a frame leaves the antenna — a named-time
 /// Cut-2 capability the protocol reads, never a chipset register. A beacon slot or the URLLC lane
@@ -1076,6 +1296,304 @@ pub enum CsiSupport {
     PerSubcarrier,
 }
 
+// ---------------------------------------------------------------------------
+// Modulation as a runtime capability (7E-A5 v3).
+// ---------------------------------------------------------------------------
+
+/// **The modulation a radio is running — a knob, not an identity.**
+///
+/// ★ This exists to undo a design error. The LR2021 runs FLRC because its bring-up calls
+/// `set_packet_type(PacketType::Flrc)` **once**, and that one-time choice was encoded as *what the
+/// node is* ("radio kind 2 = LR2021-FLRC", with "LR2021-LoRa" as a separate kind). It is not an
+/// identity: `SetPacketType` is a runtime command, and the same silicon is a LoRa modem, a BLE
+/// modem, a Z-Wave modem or a Wi-SUN modem depending on one byte. Modulation is therefore something
+/// cognition **actuates**, exactly like MCS or spreading factor — and it is fleet-wide, not an
+/// LR2021 special case: the SX1262 does LoRa + GFSK, the SX1276 does LoRa + FSK + OOK.
+///
+/// ## The numbering is the LR20xx `SetPacketType` numbering, deliberately
+///
+/// A portable enum needs *some* code space, and inventing a fresh one would mean two translations
+/// (host↔wire and wire↔chip) where one is needed. This is the LR20xx table (datasheet Table 8-1),
+/// which is also what the vendored driver's `PacketType` uses
+/// (`firmware/lr2021-nrf54l15-rs/vendor/lr2021/src/cmd/cmd_common.rs`), so on the part with the
+/// most modes the mapping is the identity. **Other chips map at their own boundary**: an SX1276
+/// backend translates `Fsk`/`Ook` into its `RegOpMode` bits, and nothing about this enum claims
+/// every part can reach every code — that is what [`PhyModeSet`] is for.
+///
+/// The vendor crate's names for the codes that differ from the datasheet's: `1 = FskGeneric`,
+/// `2 = FskLegacy`, `4 = Ranging`, `13 = Zigbee`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PhyMode {
+    /// `0x0` — LoRa chirp spread spectrum. The only mode in this table with a spreading factor.
+    Lora,
+    /// `0x1` — the generic (fully parameterised) FSK packet engine.
+    FskGeneric,
+    /// `0x2` — the legacy/compatibility FSK packet engine (the datasheet's plain "FSK").
+    Fsk,
+    /// `0x3` — Bluetooth Low Energy.
+    Ble,
+    /// `0x4` — round-trip-time-of-flight ranging (the vendor crate's `Ranging`).
+    RtToF,
+    /// `0x5` — FLRC: a fixed-rate, non-LoRa modulation. No spreading factor, and its coding-rate
+    /// code space is its own (`0 = 1/2, 1 = 3/4, 2 = off, 3 = 2/3`), not LoRa's.
+    Flrc,
+    /// `0x6` — BPSK (transmit-only on the LR20xx: a Sigfox-class uplink modulation).
+    Bpsk,
+    /// `0x7` — LR-FHSS: long-range frequency-hopping spread spectrum.
+    LrFhss,
+    /// `0x8` — wireless M-Bus.
+    WMBus,
+    /// `0x9` — Wi-SUN.
+    WiSun,
+    /// `0xA` — on-off keying.
+    Ook,
+    /// `0xB` — raw/unframed PHY access (the vendor crate's `Raw`).
+    Raw,
+    /// `0xC` — Z-Wave.
+    ZWave,
+    /// `0xD` — O-QPSK / IEEE 802.15.4 (the vendor crate's `Zigbee`).
+    OQpsk154,
+    /// A code this host does not know. Carried rather than collapsed, so a node running a mode
+    /// added after this build still reports *something true* instead of being read as LoRa.
+    Unknown(u8),
+}
+
+impl PhyMode {
+    /// Decode a `SetPacketType` value.
+    pub fn from_code(c: u8) -> Self {
+        match c {
+            0 => PhyMode::Lora,
+            1 => PhyMode::FskGeneric,
+            2 => PhyMode::Fsk,
+            3 => PhyMode::Ble,
+            4 => PhyMode::RtToF,
+            5 => PhyMode::Flrc,
+            6 => PhyMode::Bpsk,
+            7 => PhyMode::LrFhss,
+            8 => PhyMode::WMBus,
+            9 => PhyMode::WiSun,
+            10 => PhyMode::Ook,
+            11 => PhyMode::Raw,
+            12 => PhyMode::ZWave,
+            13 => PhyMode::OQpsk154,
+            other => PhyMode::Unknown(other),
+        }
+    }
+
+    /// The `SetPacketType` value.
+    pub fn code(self) -> u8 {
+        match self {
+            PhyMode::Lora => 0,
+            PhyMode::FskGeneric => 1,
+            PhyMode::Fsk => 2,
+            PhyMode::Ble => 3,
+            PhyMode::RtToF => 4,
+            PhyMode::Flrc => 5,
+            PhyMode::Bpsk => 6,
+            PhyMode::LrFhss => 7,
+            PhyMode::WMBus => 8,
+            PhyMode::WiSun => 9,
+            PhyMode::Ook => 10,
+            PhyMode::Raw => 11,
+            PhyMode::ZWave => 12,
+            PhyMode::OQpsk154 => 13,
+            PhyMode::Unknown(c) => c,
+        }
+    }
+
+    /// The [`PhyModeSet`] bit for this mode, or `0` for a code that does not fit a `u32` bitmap.
+    /// Every code in the LR20xx table is < 32, so only a wild [`Unknown`](Self::Unknown) can miss.
+    pub fn bit(self) -> u32 {
+        let c = self.code();
+        if c < 32 { 1u32 << c } else { 0 }
+    }
+
+    /// **Does "spreading factor" mean anything in this mode?** True only for [`Lora`](Self::Lora).
+    ///
+    /// The distinction is load-bearing rather than cosmetic: on a fixed-rate mode the fleet's
+    /// `[sf, bw, cr]` byte positions are re-keyed to that modulation's own code space, so composing
+    /// them from a LoRa-shaped plan silently re-modulates the link. LR-FHSS is deliberately `false`
+    /// — it is a hopping GMSK mode with a coding rate and no SF.
+    pub fn has_spreading_factor(self) -> bool {
+        matches!(self, PhyMode::Lora)
+    }
+
+    /// **This host KNOWS this mode has no spreading factor** — true for every named mode except
+    /// [`Lora`](Self::Lora), and deliberately **false** for [`Unknown`](Self::Unknown).
+    ///
+    /// The asymmetry is the point. It is used to *override* a radio that declares an SF span in a
+    /// mode that cannot have one (a firmware that forgot to zero its span across a PHY switch would
+    /// otherwise let a host push a LoRa `[sf, bw, cr]` triple into a fixed-rate packet engine, whose
+    /// byte positions mean something else entirely). Overriding needs certainty, and about a mode
+    /// this build has never heard of there is none — there the radio's own declaration is the only
+    /// information available, so it stands.
+    pub fn known_without_spreading_factor(self) -> bool {
+        !matches!(self, PhyMode::Lora | PhyMode::Unknown(_))
+    }
+}
+
+/// **The set of modulations one radio can be commanded into**, as a bitmap over
+/// [`PhyMode::code`] — `bit N set == SetPacketType value N is usable on this radio`.
+///
+/// A set rather than a list because that is exactly what the wire carries (`EVT_CAP.phy_bitmap`,
+/// a `u32`), and because the question a planner asks is membership: *can this radio be a BLE
+/// modem?* A radio that has never described its modes reports [`empty`](Self::empty), which is the
+/// honest "I cannot say" — never a fabricated single entry.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct PhyModeSet(u32);
+
+impl PhyModeSet {
+    /// No modes described.
+    pub const fn empty() -> Self {
+        Self(0)
+    }
+
+    /// From the raw wire bitmap.
+    pub const fn from_bits(bits: u32) -> Self {
+        Self(bits)
+    }
+
+    /// The raw wire bitmap.
+    pub const fn bits(self) -> u32 {
+        self.0
+    }
+
+    /// The one-entry set for a radio that runs exactly one modulation — what a node predating the
+    /// capability reports, and the *only* honest synthesis for one.
+    pub fn single(mode: PhyMode) -> Self {
+        Self(mode.bit())
+    }
+
+    /// Add a mode.
+    pub fn with(self, mode: PhyMode) -> Self {
+        Self(self.0 | mode.bit())
+    }
+
+    /// Is `mode` reachable on this radio?
+    pub fn contains(self, mode: PhyMode) -> bool {
+        let b = mode.bit();
+        b != 0 && self.0 & b != 0
+    }
+
+    /// How many modes are in the set.
+    pub fn len(self) -> u32 {
+        self.0.count_ones()
+    }
+
+    /// Is the set empty (the radio has not described its modulations)?
+    pub fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    /// **More than one modulation is reachable** — i.e. modulation is genuinely a knob on this
+    /// radio and not a fact about it. The predicate a caller uses before planning a PHY switch.
+    pub fn is_agile(self) -> bool {
+        self.0.count_ones() > 1
+    }
+
+    /// The modes in the set, ascending by code.
+    pub fn iter(self) -> impl Iterator<Item = PhyMode> {
+        (0u8..32)
+            .filter(move |b| self.0 & (1u32 << b) != 0)
+            .map(PhyMode::from_code)
+    }
+}
+
+/// What a hop plan's period is counted in — see [`HopCapability`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum HopPeriodUnit {
+    /// **LoRa symbols.** The SX127x counts FHSS dwell in symbols (`RegHopPeriod`), and so does the
+    /// LR20xx LoRa hop counter, so on a LoRa-modulation radio a period is a symbol count — which
+    /// means its wall-clock value moves with SF and bandwidth and cannot be cached as a duration.
+    LoraSymbols,
+    /// Microseconds on the radio's own clock.
+    Microseconds,
+    /// The radio implements a hop plan and this host has not established what its period counts.
+    /// A caller must not convert this into a dwell.
+    Unspecified,
+}
+
+/// **Can this radio hop by itself, and how far can a plan go?** — deliberately NOT
+/// [`RadioCapability::retune_us`].
+///
+/// The two answer different questions and conflating them is how a planner ends up believing a
+/// radio cannot hop when it hops better than any of them:
+///
+/// * `retune_us` is *"what does a **host-commanded** `SetRfFrequency` cost"* — MEASURED on the
+///   7E-A5 fleet at 5.6 ms (Heltec SX1276), 52.8 ms (LR2021) and 161 ms (Waveshare SX1262, a full
+///   image calibration). It is a host↔device round trip and it bounds hopping *between* packets.
+/// * This is *"does the radio walk a frequency list **autonomously**, inside a packet"* — which the
+///   LR20xx and the SX1276 both do, at a dwell no host command could ever reach. There is no value
+///   of `retune_us` that expresses it, which is why it is a separate capability rather than a
+///   smaller number in the same field.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct HopCapability {
+    /// The radio hops **within a single packet**, driven by its own sequencer, with no host command
+    /// per hop. `false` means a hop plan exists but is applied per packet.
+    pub intra_packet: bool,
+    /// Longest frequency list the radio will accept. `40` on the 7E-A5 fleet — the bound the wire
+    /// contract pins for `CMD_SET_HOP`.
+    pub max_list_len: u8,
+    /// What [`RadioKnobs::set_hop_plan`]'s `period` is counted in.
+    pub period_unit: HopPeriodUnit,
+}
+
+/// Whether a hop plan is armed — the `hop_ctrl` byte of a hop-plan command.
+///
+/// Two states only, and both are actuated: the code space is not a place to park intentions. A
+/// *per-packet* hop schedule needs no wire state at all — that is [`RadioKnobs::set_channel`] plus
+/// a schedule — so the only thing an autonomous hop plan adds is the in-packet sequencer.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum HopControl {
+    /// Disarm hopping; the radio stays on its tuned carrier. The list is still installed.
+    #[default]
+    Off = 0,
+    /// Walk the installed list autonomously, advancing every `period`.
+    On = 1,
+}
+
+/// **Receive front-end sensitivity, as a posture** — the input to [`RadioKnobs::set_rx_gain`].
+///
+/// A posture and not a number, for the same reason [`ContentionPosture`] is: the *scales* are
+/// per-chip (the SX126x has two LNA register values, the LR20xx a 0..13 manual ladder, the SX127x
+/// a 3-bit `RegLna` field) and there is no common unit between them. What IS common — and what all
+/// three of our firmwares already implement, as one boolean byte — is the two-position choice
+/// below. That is the portable statement.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum RxGain {
+    /// Hand the front end back to the part's own default: AGC on the LR20xx, the power-saving LNA
+    /// setting on the SX126x. Lower sensitivity, lower current, and no chance of desensing on a
+    /// strong nearby transmitter.
+    #[default]
+    Auto,
+    /// Pin the front end at the highest gain the part offers. Buys sensitivity on a marginal link
+    /// and costs current; on a loud channel it can make things worse, not better.
+    ///
+    /// ⚠ **This is not a dB knob.** The delta is a per-part fact and only one of ours has a
+    /// figure at all (the SX126x's boosted LNA is a datasheet ~+3 dB); the SX127x and the LR20xx
+    /// deltas are unmeasured here. Do not convert this into link budget.
+    Boosted,
+    /// ★ **Deliberately desensitised, for spatial reuse** — raise the detection floor so this node
+    /// stops deferring to transmitters it has no interest in.
+    ///
+    /// This variant exists because the set above could only ever say "hear the same" or "hear
+    /// more": every position was at or above the part's default, so **no node in this fleet could
+    /// be told to hear less.** That made spatial reuse structurally impossible, because it has two
+    /// halves and we only had one. Backing TX power off shrinks who *hears you*; raising the
+    /// detection floor shrinks who *you defer to*. With only the first, a node in a dense cell
+    /// still yields to every distant transmitter it can hear, and the concurrency the back-off was
+    /// supposed to buy never materialises.
+    ///
+    /// Bounded and reversible: the driver owns the floor and clamps (the Realtek IGI ceiling is the
+    /// vendor's `IGI_MAX = 0x3e`), and [`RxGain::Auto`] must always restore.
+    ///
+    /// ⚠ Not a dB knob either — the per-part dB delta must be measured before any policy converts
+    /// it into link budget. Where a radio has a *genuinely* dBm-denominated defer threshold, use
+    /// [`RadioKnobs::set_edcca_threshold_dbm`] instead; the two are complementary, not
+    /// alternatives, and the a81a has both.
+    Reduced,
+}
+
 /// Per-radio capability descriptor — the single switch between homogeneous
 /// (NDNPIPES: identical capabilities → channel assignment + spatial reuse) and
 /// heterogeneous (NDN-CRAHNs: divergent capabilities → object→radio mapping by
@@ -1132,6 +1650,31 @@ pub struct RadioCapability {
     /// Opaque and nonlinear — see [`tx_power_dbm`](Self::tx_power_dbm) for the
     /// portable alternative, which is preferred whenever the radio offers it.
     pub max_tx_power: u8,
+    /// **The lowest index that is still monotone.** `None` = the scale is usable to 0.
+    ///
+    /// ★ Not a formality. MEASURED on the a81a: below index 20 the part *inverts* — commanded
+    /// power rises again, peaking ~11 dB ABOVE the calibrated maximum. The ESP32-C5 showed the
+    /// same class of fault. A back-off that walks past this floor does the opposite of what the
+    /// policy decided, loudly, into the channel it was trying to protect.
+    pub min_tx_power: Option<u8>,
+    /// **dB per index step on this part's scale.** `None` = unmeasured, or measured non-linear.
+    ///
+    /// ★ This replaces a single global constant (`DB_PER_POWER_IDX = 0.5`) that **no radio in the
+    /// fleet obeyed**: MEASURED 0.22 dB/step on the a81a and 0.111–0.155 on the RTL8733BU, so a
+    /// decided 18 dB back-off was rendered as 1.5–5 dB of actual back-off, silently, and
+    /// differently per part. A policy that reasons in dB must convert with the part's own number
+    /// or not convert at all — hence `Option`, and hence [`RadioPolicy`] declining to guess when
+    /// it is `None` rather than substituting a plausible one.
+    pub db_per_power_idx: Option<f32>,
+    /// **Does the power knob reach silicon?** `false` = the radio reports a power range it cannot
+    /// actually act on.
+    ///
+    /// ★ MEASURED true of the MT7612U and MT7921AU, which have no power actuator whatsoever. They
+    /// carry a `max_tx_power` because the capability struct demands one, and before this field
+    /// existed there was no way to say "that number is decorative". Consumers that reward a
+    /// *decision* — notably the contextual bandit's interference-footprint term — must gate on
+    /// this, or they learn from an outcome the hardware never produced.
+    pub power_actuated: bool,
     /// Absolute TX-power control range in dBm, when the radio exposes one
     /// ([`RadioKnobs::set_tx_power_dbm`]). `None` = index-only control via
     /// [`max_tx_power`](Self::max_tx_power).
@@ -1184,6 +1727,26 @@ pub struct RadioCapability {
     pub half_duplex: bool,
     /// Whether this radio exports channel-state information to the host (assessed per port).
     pub csi: CsiSupport,
+    /// **The modulations this radio can be commanded into** — see [`PhyMode`]. Empty
+    /// ([`PhyModeSet::empty`]) means the radio has never described its modes, which is a different
+    /// statement from "one mode": a planner must read it as "I cannot say", never as a set of one.
+    ///
+    /// Read [`PhyModeSet::is_agile`] before planning a switch, and drive it with
+    /// [`RadioKnobs::set_phy`].
+    pub phy_modes: PhyModeSet,
+    /// **The modulation in effect right now**, or `None` for a radio that does not report one.
+    ///
+    /// ★ Every other field of this struct is read *in the context of this one*. `max_payload`, the
+    /// `rate` model (including whether a spreading factor exists at all), `bands` and the timing
+    /// granularity are all **per-PHY**: an LR2021 in FLRC carries 47 bytes and has no SF, while the
+    /// same silicon in LoRa carries far more and spans SF7..SF12. So a PHY switch does not patch
+    /// fields — it replaces the whole capability.
+    pub phy_current: Option<PhyMode>,
+    /// **Autonomous frequency hopping**, if the radio has a sequencer of its own — explicitly not
+    /// [`retune_us`](Self::retune_us), which prices a *host-commanded* retune. See [`HopCapability`]
+    /// for why the two cannot be one field. `None` = the radio does not hop by itself (or has never
+    /// said).
+    pub hop: Option<HopCapability>,
 }
 
 /// The span of absolute TX powers a radio can actually be commanded to, in dBm.
@@ -1234,6 +1797,31 @@ impl RadioCapability {
     /// driver knob, an nl80211 query), not a table compiled into a capability
     /// preset. The presets therefore leave it `None` and the layer that discovers
     /// the knob attaches the range it actually observed.
+    /// Declare the modulations this radio can run and which one is in effect.
+    ///
+    /// A builder for the same reason [`with_tx_power_dbm`](Self::with_tx_power_dbm) is: the honest
+    /// source is whatever *asked the radio* at runtime (the 7E-A5 fleet reads both out of the
+    /// node's own `EVT_CAP`), never a table keyed on a part number. A preset that has not asked
+    /// leaves the set empty and says "I cannot say".
+    pub fn with_phy(mut self, modes: PhyModeSet, current: PhyMode) -> Self {
+        self.phy_modes = modes.with(current);
+        self.phy_current = Some(current);
+        self
+    }
+
+    /// Declare an autonomous hop sequencer. See [`HopCapability`] — this is not `retune_us`.
+    pub fn with_hop(mut self, hop: HopCapability) -> Self {
+        self.hop = Some(hop);
+        self
+    }
+
+    /// **Does this radio hop on its own inside a packet?** `false` for a radio with no sequencer
+    /// *and* for one that has never said — the two are distinguished by [`hop`](Self::hop) being
+    /// `None`, and neither may be reported as a capability.
+    pub fn hops_intra_packet(&self) -> bool {
+        self.hop.is_some_and(|h| h.intra_packet)
+    }
+
     pub fn with_tx_power_dbm(mut self, range: DbmRange) -> Self {
         self.tx_power_dbm = Some(range);
         self
@@ -1395,6 +1983,11 @@ impl RadioCapability {
             },
             channels,
             max_tx_power: 63,
+            // Unmeasured by default: a preset must not invent a power scale. Backends that have
+            // MEASURED theirs override these (see `RadioCapability::db_per_power_idx`).
+            min_tx_power: None,
+            db_per_power_idx: None,
+            power_actuated: true,
             tx_power_dbm: None,
             retune_us: Some(16_000), // measured: set_channel is a ~16 ms blocking call (#97)
             rx_only: false,
@@ -1402,6 +1995,9 @@ impl RadioCapability {
             max_payload: 1500,
             half_duplex: true,
             csi: CsiSupport::None,
+            phy_modes: PhyModeSet::empty(),
+            phy_current: None,
+            hop: None,
         }
     }
 
@@ -1421,6 +2017,11 @@ impl RadioCapability {
             },
             channels,
             max_tx_power: 63,
+            // Unmeasured by default: a preset must not invent a power scale. Backends that have
+            // MEASURED theirs override these (see `RadioCapability::db_per_power_idx`).
+            min_tx_power: None,
+            db_per_power_idx: None,
+            power_actuated: true,
             tx_power_dbm: None,
             retune_us: Some(16_000), // measured: set_channel is a ~16 ms blocking call (#97)
             rx_only: false,
@@ -1428,6 +2029,9 @@ impl RadioCapability {
             max_payload: 1500,
             half_duplex: true,
             csi: CsiSupport::None,
+            phy_modes: PhyModeSet::empty(),
+            phy_current: None,
+            hop: None,
         }
     }
 
@@ -1495,6 +2099,11 @@ impl RadioCapability {
             },
             channels,
             max_tx_power: 63,
+            // Unmeasured by default: a preset must not invent a power scale. Backends that have
+            // MEASURED theirs override these (see `RadioCapability::db_per_power_idx`).
+            min_tx_power: None,
+            db_per_power_idx: None,
+            power_actuated: true,
             tx_power_dbm: None,
             retune_us: None, // not measured on the MM6108/NRC7292
             rx_only: false,
@@ -1504,6 +2113,9 @@ impl RadioCapability {
             max_payload: 1500,
             half_duplex: true,
             csi: CsiSupport::None,
+            phy_modes: PhyModeSet::empty(),
+            phy_current: None,
+            hop: None,
         }
     }
 
@@ -1516,6 +2128,18 @@ impl RadioCapability {
     /// SX1262's, not the SX1276's or the LR2021's. It is kept **unchanged** because callers depend on
     /// its exact values, but a backend that knows its own node should build with
     /// [`lora_with`](Self::lora_with) instead of inheriting these.
+    ///
+    /// ★ **Deprecated as of this run, and the reason is that it has no real callers left.** Every
+    /// sub-GHz radio in the rig now describes itself over 7E-A5 `EVT_CAP` and is built through
+    /// [`lora_with`](Self::lora_with); what still calls this are `#[cfg(test)]` fixtures and one
+    /// simulated radio — none of them a radio, so none of them harmed by the three wrong numbers.
+    /// The values are **unchanged** precisely so those tests keep passing; the attribute exists to
+    /// stop the next backend from inheriting an ETSI duty cycle in an FCC band.
+    #[deprecated(
+        note = "a preset of one board's guesses: ETSI 0.01 duty in an FCC band, max_payload 256 \
+                above every real firmware, and an SX1262-only 10-22 dBm span. Use \
+                RadioCapability::lora_with and fill it from what the radio reports about itself."
+    )]
     pub fn lora(channels: Vec<u8>) -> Self {
         Self {
             kind: RadioKind::Lora,
@@ -1528,6 +2152,11 @@ impl RadioCapability {
             },
             channels,
             max_tx_power: 63,
+            // Unmeasured by default: a preset must not invent a power scale. Backends that have
+            // MEASURED theirs override these (see `RadioCapability::db_per_power_idx`).
+            min_tx_power: None,
+            db_per_power_idx: None,
+            power_actuated: true,
             // SX126x PA span (the backend clamps to this and sends CMD_SET_PWR): absolute dBm, so the
             // policy backs off from the ceiling for spatial reuse just like on the Wi-Fi path.
             tx_power_dbm: Some(DbmRange::new(10, 22)),
@@ -1539,6 +2168,9 @@ impl RadioCapability {
             max_payload: 256,
             half_duplex: true,
             csi: CsiSupport::None,
+            phy_modes: PhyModeSet::empty(),
+            phy_current: None,
+            hop: None,
         }
     }
 
@@ -1557,8 +2189,13 @@ impl RadioCapability {
     /// `tx_power_dbm` is deliberately absent: attach it with
     /// [`with_tx_power_dbm`](Self::with_tx_power_dbm) *only* when the radio reported a real range, so
     /// a node that has never declared one advertises `None` instead of inheriting another part's span.
-    /// `retune_us` stays `None` (never measured on these modules), which correctly makes
-    /// [`can_hop`](Self::can_hop) answer "I cannot say" rather than guess.
+    ///
+    /// `retune_us` is left `None` **by this constructor**, so a backend that has not timed its radio
+    /// makes [`can_hop`](Self::can_hop) answer "I cannot say" rather than guess. A backend that HAS
+    /// timed it assigns the field afterwards, per node — the 7E-A5 serial fleet does, and the three
+    /// nodes differ by 29× (5.6 ms on the Heltec SX1276, 52.8 ms on the LR2021, 161 ms on the
+    /// Waveshare SX1262, whose retune runs a full image calibration), which is exactly why this
+    /// constructor must not carry a family-wide number of its own.
     pub fn lora_with(
         kind: RadioKind,
         bands: Vec<Band>,
@@ -1574,6 +2211,11 @@ impl RadioCapability {
             rate,
             channels,
             max_tx_power: 63,
+            // Unmeasured by default: a preset must not invent a power scale. Backends that have
+            // MEASURED theirs override these (see `RadioCapability::db_per_power_idx`).
+            min_tx_power: None,
+            db_per_power_idx: None,
+            power_actuated: true,
             tx_power_dbm: None, // attach only from a real declared range
             retune_us: None,    // not measured on any module in the sub-GHz fleet
             rx_only: false,
@@ -1581,6 +2223,9 @@ impl RadioCapability {
             max_payload,
             half_duplex: true,
             csi: CsiSupport::None,
+            phy_modes: PhyModeSet::empty(),
+            phy_current: None,
+            hop: None,
         }
     }
 
@@ -1593,6 +2238,11 @@ impl RadioCapability {
             rate: RateCapability::None, // RX-only instrument — no transmit rate
             channels,
             max_tx_power: 0,
+            // Unmeasured by default: a preset must not invent a power scale. Backends that have
+            // MEASURED theirs override these (see `RadioCapability::db_per_power_idx`).
+            min_tx_power: None,
+            db_per_power_idx: None,
+            power_actuated: true,
             tx_power_dbm: None,
             retune_us: None, // not measured
             rx_only: true,
@@ -1601,6 +2251,9 @@ impl RadioCapability {
             max_payload: 0,
             half_duplex: false,
             csi: CsiSupport::PerSubcarrier,
+            phy_modes: PhyModeSet::empty(),
+            phy_current: None,
+            hop: None,
         }
     }
 }
@@ -1718,7 +2371,10 @@ mod ceiling_tests {
         );
 
         // Asking a LoRa radio for an MCS is a category error, not a number to guess at.
-        assert_eq!(RadioCapability::lora(vec![0]).mcs_for_rssi(-40), None);
+        // (The preset is deprecated; this test pins its behaviour, which is why it may still call it.)
+        #[allow(deprecated)]
+        let lora = RadioCapability::lora(vec![0]);
+        assert_eq!(lora.mcs_for_rssi(-40), None);
     }
 }
 
@@ -1741,5 +2397,158 @@ mod tx_hold_default {
         let b = Bare;
         assert!(b.set_tx_hold(true).is_ok());
         assert!(b.set_tx_hold(false).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod phy_capability {
+    use super::*;
+
+    /// **The code space is the LR20xx `SetPacketType` table**, and every code round-trips. Pinned
+    /// against the vendored driver's `PacketType`
+    /// (`firmware/lr2021-nrf54l15-rs/vendor/lr2021/src/cmd/cmd_common.rs`), whose names for the
+    /// three codes that differ from the datasheet's are `FskLegacy = 2`, `Ranging = 4`,
+    /// `Zigbee = 13`.
+    #[test]
+    fn phy_mode_codes_are_the_setpackettype_table() {
+        let table = [
+            (0u8, PhyMode::Lora),
+            (1, PhyMode::FskGeneric),
+            (2, PhyMode::Fsk),
+            (3, PhyMode::Ble),
+            (4, PhyMode::RtToF),
+            (5, PhyMode::Flrc),
+            (6, PhyMode::Bpsk),
+            (7, PhyMode::LrFhss),
+            (8, PhyMode::WMBus),
+            (9, PhyMode::WiSun),
+            (10, PhyMode::Ook),
+            (11, PhyMode::Raw),
+            (12, PhyMode::ZWave),
+            (13, PhyMode::OQpsk154),
+        ];
+        for (code, mode) in table {
+            assert_eq!(PhyMode::from_code(code), mode, "code {code}");
+            assert_eq!(mode.code(), code, "{mode:?}");
+            assert_eq!(mode.bit(), 1u32 << code);
+        }
+        // An unknown code is CARRIED, not collapsed into LoRa — a node running a mode added after
+        // this build still reports something true.
+        assert_eq!(PhyMode::from_code(30), PhyMode::Unknown(30));
+        assert_eq!(PhyMode::Unknown(30).code(), 30);
+        // Only LoRa has a spreading factor. LR-FHSS is hopping GMSK and deliberately does not.
+        assert!(PhyMode::Lora.has_spreading_factor());
+        for m in [PhyMode::Flrc, PhyMode::LrFhss, PhyMode::Ble, PhyMode::Fsk] {
+            assert!(!m.has_spreading_factor(), "{m:?}");
+            assert!(m.known_without_spreading_factor(), "{m:?}");
+        }
+        // The override predicate is asymmetric ON PURPOSE: it is used to contradict a radio that
+        // declares an SF span in a mode that cannot have one, and contradicting takes certainty.
+        assert!(!PhyMode::Lora.known_without_spreading_factor());
+        assert!(
+            !PhyMode::Unknown(20).known_without_spreading_factor(),
+            "about a mode this build has never seen, the radio's own declaration is all there is"
+        );
+    }
+
+    #[test]
+    fn a_phy_set_distinguishes_unknown_from_single_mode() {
+        // Empty is "I cannot say" — NOT a set of one, and it must not answer `contains`.
+        let unknown = PhyModeSet::empty();
+        assert!(unknown.is_empty() && !unknown.is_agile());
+        assert!(!unknown.contains(PhyMode::Lora));
+
+        // One mode: the radio is described and is NOT agile — a switch cannot be planned.
+        let fixed = PhyModeSet::single(PhyMode::Flrc);
+        assert!(!fixed.is_empty() && !fixed.is_agile());
+        assert!(fixed.contains(PhyMode::Flrc) && !fixed.contains(PhyMode::Lora));
+        assert_eq!(fixed.len(), 1);
+
+        // Two or more: modulation is genuinely a knob here.
+        let agile = fixed.with(PhyMode::Lora).with(PhyMode::Ble);
+        assert!(agile.is_agile() && agile.len() == 3);
+        assert_eq!(
+            agile.iter().collect::<Vec<_>>(),
+            vec![PhyMode::Lora, PhyMode::Ble, PhyMode::Flrc],
+            "ascending by code"
+        );
+        // The bitmap IS the wire field.
+        assert_eq!(agile.bits(), (1 << 0) | (1 << 3) | (1 << 5));
+        assert_eq!(PhyModeSet::from_bits(agile.bits()), agile);
+    }
+
+    /// A preset that has never asked the radio must not claim a modulation, and the builder must
+    /// make the current mode a member of the set even if the caller forgot it.
+    #[test]
+    fn capability_reports_no_phy_until_a_radio_describes_one() {
+        let bare = RadioCapability::wifi_monitor_5ghz(vec![36]);
+        assert!(bare.phy_modes.is_empty());
+        assert_eq!(bare.phy_current, None);
+        assert_eq!(bare.hop, None);
+        assert!(!bare.hops_intra_packet());
+
+        let described = bare
+            .clone()
+            .with_phy(PhyModeSet::single(PhyMode::Lora), PhyMode::Flrc);
+        assert_eq!(described.phy_current, Some(PhyMode::Flrc));
+        assert!(
+            described.phy_modes.contains(PhyMode::Flrc),
+            "the mode in effect is always a member of the set"
+        );
+        assert!(described.phy_modes.is_agile());
+    }
+
+    /// **A hop capability is not a retune cost.** A radio may hop inside a packet while its
+    /// host-commanded retune is 161 ms; the two fields answer different questions and neither
+    /// substitutes for the other.
+    #[test]
+    fn hop_capability_is_orthogonal_to_retune_cost() {
+        let mut cap = RadioCapability::wifi_monitor_5ghz(vec![36]);
+        cap.retune_us = Some(160_866); // a Waveshare-class host-commanded retune: hopeless
+        assert_eq!(cap.can_hop(100_000), Some(false));
+        assert!(
+            !cap.hops_intra_packet(),
+            "and it has no sequencer of its own"
+        );
+
+        let cap = cap.with_hop(HopCapability {
+            intra_packet: true,
+            max_list_len: 40,
+            period_unit: HopPeriodUnit::LoraSymbols,
+        });
+        assert!(cap.hops_intra_packet());
+        assert_eq!(
+            cap.can_hop(100_000),
+            Some(false),
+            "the host-commanded retune is unchanged by it — one does not imply the other"
+        );
+        assert_eq!(cap.hop.unwrap().max_list_len, 40);
+    }
+
+    struct Bare;
+    impl RadioKnobs for Bare {
+        fn set_channel(&self, _c: u8, _bw: Bandwidth) -> Result<(), FaceError> {
+            Ok(())
+        }
+    }
+
+    /// The three new knobs default to a REFUSAL, never a silent success: a radio with one
+    /// modulation, no hop sequencer and no gain control must say so, because a caller acts on the
+    /// answer (re-reading a capability, believing frames are spread across a band).
+    #[test]
+    fn the_new_knobs_refuse_rather_than_pretend() {
+        let b = Bare;
+        for e in [
+            b.set_phy(PhyMode::Lora).err(),
+            b.set_hop_plan(HopControl::On, 4, &[915_000_000]).err(),
+            b.set_rx_gain(RxGain::Boosted).err(),
+        ] {
+            match e {
+                Some(FaceError::Io(io)) => {
+                    assert_eq!(io.kind(), std::io::ErrorKind::Unsupported)
+                }
+                other => panic!("expected an Unsupported refusal, got {other:?}"),
+            }
+        }
     }
 }

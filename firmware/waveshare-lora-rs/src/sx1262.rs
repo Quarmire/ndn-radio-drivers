@@ -47,6 +47,7 @@ const OP_SET_REGULATOR: u8 = 0x96;
 const OP_SET_CAD_PARAMS: u8 = 0x88; // #52: Channel Activity Detection config
 const OP_SET_CAD: u8 = 0xC5; //        #52: run one CAD
 const OP_GET_RSSI_INST: u8 = 0x15; //  #52: instantaneous channel RSSI (must be in RX)
+
 // The chip's own packet counters (DS §13.5.5). Without these a CRC failure vanishes inside
 // `poll_rx` with nothing counting it, so RX loss is invisible to the host (bug P5).
 const OP_GET_STATS: u8 = 0x10; //      GetStats   -> [nbPktReceived(2), nbPktCrcError(2), nbPktHeaderErr(2)]
@@ -54,6 +55,13 @@ const OP_RESET_STATS: u8 = 0x00; //    ResetStats -> zero all three (takes six 0
 
 // --- Registers ---
 const REG_LORA_SYNC_MSB: u16 = 0x0740;
+// GFSK-mode registers. `SetPacketType` repurposes the register file, so these are only meaningful
+// while the chip is in [`SX126X_PKT_GFSK`] — which is why every one of them is (re)written by
+// `apply_phy` on entry to the mode rather than once at init.
+const REG_GFSK_WHITENING_MSB: u16 = 0x06B8; // [0] = seed bit 8; the rest of the byte is reserved
+const REG_GFSK_CRC_INIT_MSB: u16 = 0x06BC;
+const REG_GFSK_CRC_POLY_MSB: u16 = 0x06BE;
+const REG_GFSK_SYNC0: u16 = 0x06C0; //        8 sync bytes, MSB-first from here
 const REG_RANDOM_GEN: u16 = 0x0819; // #52: SX1262 hardware random-number registers (0x0819..0x081C)
 /// RX gain (DS §9.6). The power-on default is power-saving; on a bearer whose entire purpose is
 /// reach that is the wrong default, so this firmware writes BOOSTED at init and on every RX arm
@@ -72,6 +80,22 @@ pub const IRQ_CAD_DONE: u16 = 0x0080; //     #52: CAD finished
 pub const IRQ_CAD_DETECTED: u16 = 0x0100; // #52: CAD saw channel activity (busy)
 pub const IRQ_TIMEOUT: u16 = 0x0200;
 
+// --- `SetPacketType` (0x8A) argument values, in the SX126x's OWN numbering (DS Table 13-38) ---
+//
+// ⚠ These are NOT the 7E-A5 v3 wire values. The wire uses the LR20xx `SetPacketType` numbering
+// (0x0 LoRa, 0x2 FSK, ...), which disagrees with the SX126x's on BOTH modes this part implements —
+// LoRa is 0x0 on the wire and 0x01 here, FSK is 0x2 on the wire and 0x00 here. The translation
+// happens once, at the protocol boundary in `main.rs` (`wire_to_chip_phy`), and the mapping is
+// pinned by a compile-time table there so the two numberings cannot be confused silently.
+/// (G)FSK packet type — the SX1262's second modem (DS §6.1). Bring-up in [`Sx1262::apply_phy`].
+pub const SX126X_PKT_GFSK: u8 = 0x00;
+/// LoRa packet type — this firmware's default and the mode every fleet peer speaks.
+pub const SX126X_PKT_LORA: u8 = 0x01;
+// Not implemented here, and therefore never advertised: LR-FHSS (0x03 on the SX1262) is
+// TRANSMIT-ONLY and builds its own hop sequence inside the packet, so it can neither receive nor
+// take a host hop table. Claiming it would be exactly the "plausible invention" the capability
+// rules forbid.
+
 // --- LoRa modulation codes ---
 pub const BW_125: u8 = 0x04;
 pub const BW_250: u8 = 0x05;
@@ -81,8 +105,77 @@ pub const CR_4_6: u8 = 0x02;
 pub const CR_4_7: u8 = 0x03;
 pub const CR_4_8: u8 = 0x04;
 
+// --- (G)FSK profile: ONE fixed operating point, and every number here is a source constant -------
+//
+// The SX1262's GFSK modem has its own modulation/packet/CRC/whitening configuration, none of which
+// is shared with LoRa — which is precisely why `SetPacketType` is a PHY *switch* and not a flag.
+// This firmware brings up a single well-known profile rather than inventing a knob surface: 50 kbps
+// / ±25 kHz deviation / 117.3 kHz RX bandwidth / BT 0.5 Gaussian shaping, the LoRaWAN FSK profile
+// (RP002 "FSK modulation, 50 kbps, BT 0.5, Fdev 25 kHz"). A bitrate/deviation knob would need a
+// fleet-wide opcode assignment; `CMD_SET_MOD` carries `[sf, bw, cr]`, which GFSK has none of, so
+// this node REFUSES it in GFSK rather than reinterpreting three bytes into a different meaning.
+/// Crystal reference the SX126x's frequency and bitrate registers are scaled against (DS §13.4.1).
+const XTAL_HZ: u64 = 32_000_000;
+/// GFSK bitrate. Also the divisor in [`gfsk_airtime_ms`].
+pub const GFSK_BITRATE_BPS: u32 = 50_000;
+/// GFSK frequency deviation (single-sided).
+pub const GFSK_FDEV_HZ: u32 = 25_000;
+/// `SetModulationParams` bitrate register: `br = 32 * F_XTAL / bitrate` (DS §13.4.5.1).
+/// 32 x 32 MHz / 50 kbps = 20 480 = 0x005000.
+const GFSK_BR_REG: u32 = ((32 * XTAL_HZ) / GFSK_BITRATE_BPS as u64) as u32;
+const _: () = assert!(GFSK_BR_REG == 0x00_5000);
+/// `SetModulationParams` deviation register: `fdev = Fdev * 2^25 / F_XTAL` — the same scaling as
+/// `SetRfFrequency`. 25 kHz -> 26 214.
+const GFSK_FDEV_REG: u32 = (((GFSK_FDEV_HZ as u64) << 25) / XTAL_HZ) as u32;
+const _: () = assert!(GFSK_FDEV_REG == 26_214);
+/// Gaussian filter BT 0.5 (DS `SetModulationParams` pulse-shape table).
+const GFSK_PULSE_SHAPE: u8 = 0x09;
+/// RX bandwidth code 0x0B = **117.3 kHz** double-sided (DS Table 13-38 GFSK RX-bandwidth table).
+const GFSK_RX_BW: u8 = 0x0B;
+/// The bandwidth that code means, kept beside it so the Carson-rule check below is real arithmetic
+/// and not a comment.
+pub const GFSK_RX_BW_HZ: u32 = 117_300;
+// Carson: the occupied bandwidth is 2*(Fdev + BR/2). The receiver must be at least that wide, or
+// the profile is mis-specified in a way no runtime check would ever catch.
+const _: () = assert!(2 * (GFSK_FDEV_HZ + GFSK_BITRATE_BPS / 2) <= GFSK_RX_BW_HZ);
+/// Preamble-detector length code 0x05 = 16 bits (DS GFSK `SetPacketParams`).
+const GFSK_PREAMBLE_DET: u8 = 0x05;
+/// Sync-word length **in bits**. 24 bits = the 3-byte sync word below.
+pub const GFSK_SYNC_BITS: u8 = 24;
+/// Default GFSK sync word: `C1 94 C1`, the SX127x/LoRaWAN FSK convention. Byte 0 is the one an
+/// SX127x peer's `RegSyncValue1` holds, which is what `CMD_SET_SYNC`'s single host byte replaces.
+const GFSK_SYNC_DEFAULT: [u8; 3] = [0xC1, 0x94, 0xC1];
+/// GFSK CRC type 0x06 = 2 bytes, inverted (DS GFSK `SetPacketParams` CRC table) — the LoRaWAN FSK
+/// convention, paired with the poly/seed below. (In GFSK the CRC codes are NOT the LoRa on/off
+/// 0x00/0x01: 0x01 means CRC *off* there, which is an easy and silent way to disable it.)
+const GFSK_CRC_2_BYTE_INV: u8 = 0x06;
+const GFSK_CRC_INIT: u16 = 0x1D0F;
+const GFSK_CRC_POLY: u16 = 0x1021;
+/// Whitening LFSR seed. Whitening is ON: a GFSK payload of repeated bytes otherwise puts a tone in
+/// the middle of the channel and the DC/AGC loops fight it.
+const GFSK_WHITENING_SEED: u16 = 0x01FF;
+/// Largest GFSK payload the variable-length header can describe (its length field is one byte).
+/// Reported nowhere as `max_payload`, because the 7E-A5 serial framing binds first at 247 — but
+/// kept here so the comparison is visible rather than assumed.
+pub const GFSK_PDU_MAX: u16 = 255;
+
 // TCXO control voltage codes.
 const TCXO_1_7V: u8 = 0x01;
+/// DIO3 TCXO startup timeout, in the SX126x's 15.625 us units (DS SetDIO3AsTcxoCtrl).
+/// **5000 x 15.625 us = 78 125 us = 78.125 ms**, and that number is the single largest cost in this
+/// firmware's command latency: every transition from STDBY_RC into a mode that needs the crystal
+/// (RX, TX, CalibrateImage) stalls for it. See [`TCXO_STARTUP_US`] and `set_frequency`.
+const TCXO_TIMEOUT_UNITS: u32 = 5000;
+/// The same figure in microseconds. Kept as a constant because the scheduled-TX path is designed
+/// around AVOIDING it (`stage_tx` uses STDBY_XOSC, which never stops the crystal) and the retune
+/// path around not paying it twice (`set_frequency` skips a redundant image calibration).
+pub const TCXO_STARTUP_US: u32 = TCXO_TIMEOUT_UNITS * 15_625 / 1000; // 78_125
+
+/// `SetTxParams` ramp-time code this firmware uses, and its value in microseconds (DS SetTxParams
+/// ramp table: 0x04 = SET_RAMP_200U). It is a component of `sched_gran_ns` in main.rs, so the code
+/// and the number it implies live together.
+pub const TX_RAMP_CODE: u8 = 0x04;
+pub const TX_RAMP_US: u32 = 200;
 
 // --- Capability constants (the source of truth EVT_CAP reports; see main.rs `send_cap`) ---
 /// Carrier range THIS firmware constrains itself to. Not the SX1262's silicon range (150-960 MHz):
@@ -95,6 +188,13 @@ pub const FREQ_MAX_HZ: u32 = 928_000_000;
 /// range the host can actually obtain — the value it reports back in EVT_INFO.
 pub const PWR_MIN_DBM: i8 = -9;
 pub const PWR_MAX_DBM: i8 = 22;
+/// `CalibrateImage` band code for 902-928 MHz (DS SetCalibrateImage frequency-band table), the ONLY
+/// band this firmware operates: `CMD_SET_FREQ` refuses everything outside [`FREQ_MIN_HZ`]..=
+/// [`FREQ_MAX_HZ`]. Because the argument is a BAND and not a point, one calibration covers every
+/// frequency the host can legally ask for — which is what lets `set_frequency` skip it. See the
+/// `Sx1262::cal_band` memo.
+pub const CAL_BAND_902_928: (u8, u8) = (0xE1, 0xE9);
+
 /// Spreading factors this firmware operates and `CMD_SF_SCAN` sweeps. The chip also supports SF5/SF6,
 /// but those need a different sync-word handling and do not interop with the SX127x peers in this
 /// fleet, so they are outside the advertised range.
@@ -109,6 +209,11 @@ pub struct Diagnostics {
     pub sync_readback: u16, // LoRa sync-word registers read back (should equal what we set)
     pub device_errors: u16, // GetDeviceErrors op-error bitfield (0 = clean)
     pub busy_ok: bool,      // BUSY settled low within the timeout after reset
+    /// GetStatus taken immediately after the boot `SetPacketType`, i.e. the chip's verdict on the
+    /// initial PHY bring-up — the same byte `EVT_PHY_ERR` would carry, judged by
+    /// [`cmd_status_ok`]. Reported in the boot EVT_LOG so a node that came up in a PHY the silicon
+    /// declined says so at boot instead of at the first failed transmission.
+    pub phy_status: u8,
 }
 
 pub struct RxPacket {
@@ -133,10 +238,29 @@ pub struct Sx1262<SPI, NSS, RST, BSY, DIO1, RFSW> {
     busy: BSY,
     dio1: DIO1,
     rfsw: RFSW,
-    /// LoRa preamble length in symbols (runtime-tunable, #52). Longer = more reliable CAD by peers.
+    /// Preamble length. **The unit is per-PHY**: LoRa symbols, or GFSK *bytes* (the register wants
+    /// bits, so the GFSK path multiplies by 8). Runtime-tunable (#52); longer = more reliable CAD /
+    /// preamble detection by peers.
     preamble: u16,
+    /// The `SetPacketType` value currently loaded, in the CHIP's numbering ([`SX126X_PKT_LORA`] /
+    /// [`SX126X_PKT_GFSK`]). Every packet-shaped operation below branches on it, because the chip's
+    /// two modems share opcodes but not parameter layouts: `SetModulationParams` is 4 bytes in LoRa
+    /// and 8 in GFSK, `SetPacketParams` 6 and 9, `GetPacketStatus` decodes differently, and CAD does
+    /// not exist in GFSK at all. Getting this wrong is silent — the chip accepts the bytes.
+    pkt_type: u8,
+    /// LoRa sync word in the SX127x single-byte convention, remembered so a PHY switch can restore
+    /// it (the sync registers move from 0x0740 to 0x06C0 between the two modems).
+    lora_sync: u8,
+    /// GFSK sync word (24 bits). Byte 0 is what `CMD_SET_SYNC` writes.
+    gfsk_sync: [u8; 3],
     /// LNA gain written to [`REG_RX_GAIN`] on every RX arm. Defaults to [`RX_GAIN_BOOSTED`].
     rx_gain: u8,
+    /// **Image-calibration memo** — the (f1, f2) band pair currently loaded in the chip, or (0, 0)
+    /// if none. `CalibrateImage` takes a BAND, so re-running it for a hop that stays inside the
+    /// band it already calibrated is pure cost; this remembers what is loaded so `set_frequency`
+    /// can skip it. Calibration results live in chip registers that survive standby, so the memo is
+    /// only invalidated by a hard reset — which is exactly when `init` reloads it.
+    cal_band: (u8, u8),
 }
 
 impl<SPI, NSS, RST, BSY, DIO1, RFSW, E> Sx1262<SPI, NSS, RST, BSY, DIO1, RFSW>
@@ -157,7 +281,11 @@ where
             dio1,
             rfsw,
             preamble: 8,
+            pkt_type: SX126X_PKT_LORA,
+            lora_sync: 0x12,
+            gfsk_sync: GFSK_SYNC_DEFAULT,
             rx_gain: RX_GAIN_BOOSTED,
+            cal_band: (0, 0), // nothing calibrated until `init` runs
         };
         let _ = s.nss.set_high();
         s
@@ -285,8 +413,96 @@ where
     fn calibrate_image(&mut self, f1: u8, f2: u8) {
         self.cmd(OP_CALIBRATE_IMAGE, &[f1, f2]);
     }
-    fn set_packet_type_lora(&mut self) {
-        self.cmd(OP_SET_PACKET_TYPE, &[0x01]);
+    /// `SetPacketType` — **the PHY switch**, in the chip's own numbering. Per DS §13.4.2 it must be
+    /// the FIRST command of a configuration sequence, because it re-maps the register file and the
+    /// parameter layout of `SetModulationParams`/`SetPacketParams`; everything the new mode needs is
+    /// therefore (re)written after it by [`Self::apply_phy`].
+    fn set_packet_type(&mut self, chip_pkt: u8) {
+        self.cmd(OP_SET_PACKET_TYPE, &[chip_pkt]);
+    }
+
+    /// GFSK `SetModulationParams` — 8 parameters, against LoRa's 4 (DS §13.4.5).
+    fn set_gfsk_mod_params(&mut self) {
+        let br = GFSK_BR_REG;
+        let fd = GFSK_FDEV_REG;
+        self.cmd(
+            OP_SET_MOD_PARAMS,
+            &[
+                (br >> 16) as u8,
+                (br >> 8) as u8,
+                br as u8,
+                GFSK_PULSE_SHAPE,
+                GFSK_RX_BW,
+                (fd >> 16) as u8,
+                (fd >> 8) as u8,
+                fd as u8,
+            ],
+        );
+    }
+
+    /// GFSK `SetPacketParams` — 9 parameters, against LoRa's 6 (DS §13.4.6). Variable-length
+    /// packets, so the one-byte length field goes on air and the receiver does not need to be told
+    /// the size in advance (that byte is charged for in [`gfsk_airtime_ms`]).
+    ///
+    /// `preamble` is in BITS here; the firmware's host-facing preamble knob is in bytes for this
+    /// PHY, so it is multiplied by 8 and saturated at the register's 16-bit ceiling.
+    fn set_gfsk_pkt_params(&mut self, len: u8) {
+        let bits = (self.preamble as u32).saturating_mul(8).min(0xFFFF) as u16;
+        self.cmd(
+            OP_SET_PKT_PARAMS,
+            &[
+                (bits >> 8) as u8,
+                bits as u8,
+                GFSK_PREAMBLE_DET,
+                GFSK_SYNC_BITS,
+                0x00, // address filtering off — this is a broadcast bearer with no host identity
+                0x01, // variable length (explicit 1-byte length on air)
+                len,
+                GFSK_CRC_2_BYTE_INV,
+                0x01, // whitening on
+            ],
+        );
+    }
+
+    /// Write the 24-bit GFSK sync word (registers 0x06C0.., MSB first).
+    fn set_gfsk_sync_regs(&mut self, sync: [u8; 3]) {
+        self.write_regs(REG_GFSK_SYNC0, &sync);
+    }
+
+    /// GFSK CRC seed + polynomial. These have sane reset defaults, but they are written explicitly
+    /// so the on-air CRC is a property of this file rather than of whatever last touched the chip.
+    fn set_gfsk_crc(&mut self) {
+        self.write_regs(REG_GFSK_CRC_INIT_MSB, &GFSK_CRC_INIT.to_be_bytes());
+        self.write_regs(REG_GFSK_CRC_POLY_MSB, &GFSK_CRC_POLY.to_be_bytes());
+    }
+
+    /// GFSK whitening seed. Read-modify-write on the MSB register: only bit 0 of it is the seed's
+    /// bit 8 and the rest is reserved, so writing the whole byte would clobber reserved state.
+    fn set_gfsk_whitening(&mut self) {
+        let mut msb = [0u8; 1];
+        self.read_regs(REG_GFSK_WHITENING_MSB, &mut msb);
+        let hi = (msb[0] & 0xFE) | ((GFSK_WHITENING_SEED >> 8) as u8 & 0x01);
+        self.write_regs(REG_GFSK_WHITENING_MSB, &[hi, GFSK_WHITENING_SEED as u8]);
+    }
+
+    /// Packet parameters for a TRANSMIT of `len` bytes, in whichever PHY is loaded.
+    fn set_tx_pkt_params(&mut self, len: u8) {
+        if self.pkt_type == SX126X_PKT_LORA {
+            let pre = self.preamble;
+            self.set_pkt_params(pre, 0x00, len, 0x01, 0x00);
+        } else {
+            self.set_gfsk_pkt_params(len);
+        }
+    }
+
+    /// Packet parameters for RECEIVE (max length), in whichever PHY is loaded.
+    fn set_rx_pkt_params(&mut self) {
+        if self.pkt_type == SX126X_PKT_LORA {
+            let pre = self.preamble;
+            self.set_pkt_params(pre, 0x00, 0xFF, 0x01, 0x00);
+        } else {
+            self.set_gfsk_pkt_params(0xFF);
+        }
     }
     fn set_rf_freq(&mut self, hz: u32) {
         // freq_reg = hz * 2^25 / 32e6
@@ -381,32 +597,26 @@ where
         self.set_standby(0x00); // STDBY_RC
         self.set_regulator(0x00); // LDO
         self.set_dio2_rfsw(false); // MCU drives the RF switch
-        self.set_dio3_tcxo(TCXO_1_7V, 5000); // 5000 * 15.625 us = ~78 ms TCXO startup
+        self.set_dio3_tcxo(TCXO_1_7V, TCXO_TIMEOUT_UNITS); // 78.125 ms; see TCXO_STARTUP_US
         self.calibrate(0x7F); // recalibrate all blocks with the TCXO running
         Self::delay_ms(5);
         self.wait_busy();
         self.clear_device_errors();
 
-        self.set_packet_type_lora();
-        self.calibrate_image(0xE1, 0xE9); // 902-928 MHz band
-        self.set_rf_freq(freq_hz);
-        self.set_pa_config(0x04, 0x07); // +22 dBm SX1262 PA config
-        self.set_tx_params(22, 0x04); // 22 dBm, 200 us ramp
-        self.set_buffer_base(0, 0);
-
-        // For SF7/BW125 the symbol time is 1.024 ms (< 16 ms) so low-data-rate optimize stays off.
-        let ldro = if sf >= 11 && bw == BW_125 { 1 } else { 0 };
-        self.set_mod_params(sf, bw, cr, ldro);
-        self.set_sync_word(0x12);
-        // Boosted LNA (P6). Previously never written, so the receiver ran at the chip's power-saving
-        // power-on default on a bearer that exists for reach.
-        let g = self.rx_gain;
-        self.write_regs(REG_RX_GAIN, &[g]);
-        // No ResetStats here: `init` begins with a hard RESET-pin reset, which already zeroes the
+        // The ONE image calibration this firmware needs: it covers 902-928 MHz, and `CMD_SET_FREQ`
+        // refuses anything outside that, so every legal retune afterwards reuses it (see the
+        // `cal_band` memo and `set_frequency`). `CalibrateImage` takes a BAND and is independent of
+        // the packet type, so it is not repeated per PHY switch.
+        self.calibrate_image(CAL_BAND_902_928.0, CAL_BAND_902_928.1);
+        self.cal_band = CAL_BAND_902_928;
+        // Everything that is per-PHY — packet type, modulation, sync, packet params, RX gain, IRQ
+        // routing — goes through the SAME path a runtime `CMD_SET_PHY` takes, so a node that has
+        // switched PHYs and back is in exactly the state a freshly-booted one is. There is no
+        // second, init-only configuration sequence to drift.
+        //
+        // No ResetStats either: `init` begins with a hard RESET-pin reset, which already zeroes the
         // chip's packet counters. Issuing the extra command would only add a way for init to fail.
-        self.set_pkt_params(8, 0x00, 0xFF, 0x01, 0x00);
-        self.set_dio_irq(0xFFFF, IRQ_TX_DONE | IRQ_RX_DONE | IRQ_TIMEOUT);
-        self.clear_irq(0xFFFF);
+        let phy_status = self.apply_phy(SX126X_PKT_LORA, freq_hz, sf, bw, cr, 22);
 
         let mut sync = [0u8; 2];
         self.read_regs(REG_LORA_SYNC_MSB, &mut sync);
@@ -415,17 +625,126 @@ where
             sync_readback: ((sync[0] as u16) << 8) | sync[1] as u16,
             device_errors: self.get_device_errors(),
             busy_ok,
+            phy_status,
         }
     }
 
-    /// Transmit one LoRa frame, blocking until TxDone or a bounded timeout. Returns true on TxDone.
+    /// **Enter a PHY**, in the chip's numbering, and reconfigure everything that mode needs.
+    /// Returns the chip's own `GetStatus` byte taken immediately after `SetPacketType` — the literal
+    /// byte `EVT_PHY_ERR` carries, so a refusal is reported as the chip stated it rather than as a
+    /// firmware opinion about it.
+    ///
+    /// This is the only place the packet type changes, and it rewrites the whole per-PHY
+    /// configuration, because `SetPacketType` re-maps the register file: the modulation and packet
+    /// parameter layouts differ, the sync word lives at a different address (0x0740 vs 0x06C0), and
+    /// GFSK additionally needs CRC seed/polynomial and a whitening seed that LoRa has no concept of.
+    /// Anything left over from the previous mode would be accepted by the chip and wrong on air.
+    ///
+    /// Leaves the chip in STDBY_RC; the caller re-arms RX.
+    pub fn apply_phy(&mut self, chip_pkt: u8, freq_hz: u32, sf: u8, bw: u8, cr: u8, pwr_dbm: i8) -> u8 {
+        self.set_standby(0x00);
+        self.set_packet_type(chip_pkt);
+        // Read the verdict HERE, while `cmdStatus` still refers to `SetPacketType` — after the
+        // reconfiguration below it would describe whichever command ran last.
+        let status = self.get_status();
+        self.pkt_type = chip_pkt;
+        self.set_rf_freq(freq_hz);
+        self.set_power(pwr_dbm); // PA config + SetTxParams; identical in both modems
+        self.set_buffer_base(0, 0);
+        if chip_pkt == SX126X_PKT_LORA {
+            self.set_modulation(sf, bw, cr);
+            let sy = self.lora_sync;
+            self.set_sync_word(sy);
+        } else {
+            self.set_gfsk_mod_params();
+            let sy = self.gfsk_sync;
+            self.set_gfsk_sync_regs(sy);
+            self.set_gfsk_crc();
+            self.set_gfsk_whitening();
+        }
+        self.set_rx_pkt_params();
+        // Boosted LNA (P6): the register is not retained across a warm start, and a packet-type
+        // change is exactly such a transition, so it is re-written here as well as on every RX arm.
+        let g = self.rx_gain;
+        self.write_regs(REG_RX_GAIN, &[g]);
+        self.set_dio_irq(0xFFFF, IRQ_TX_DONE | IRQ_RX_DONE | IRQ_TIMEOUT);
+        self.clear_irq(0xFFFF);
+        status
+    }
+
+    /// The `SetPacketType` value currently loaded, in the CHIP's numbering.
+    pub fn packet_type(&self) -> u8 {
+        self.pkt_type
+    }
+
+    /// **Is Channel Activity Detection available in the current PHY?** `SetCad` (0xC5) is a LoRa
+    /// modem function: it correlates against a LoRa preamble, and there is nothing to correlate in
+    /// GFSK. Issuing it in GFSK is not harmless — the chip answers with a command error and the
+    /// caller would read the resulting "not busy" as a clear channel. Every sensing path asks this
+    /// first and falls back to the energy detector, which works in both modes.
+    pub fn supports_cad(&self) -> bool {
+        self.pkt_type == SX126X_PKT_LORA
+    }
+
+    /// Transmit one frame in the current PHY, blocking until TxDone or a bounded timeout. Returns
+    /// true on TxDone.
     pub fn transmit(&mut self, payload: &[u8]) -> bool {
         self.rf_tx();
-        let pre = self.preamble;
-        self.set_pkt_params(pre, 0x00, payload.len() as u8, 0x01, 0x00);
+        self.set_tx_pkt_params(payload.len() as u8);
         self.write_buffer(0, payload);
         self.clear_irq(0xFFFF);
         self.set_tx(0); // no timeout: transmit until done
+        self.wait_txdone()
+    }
+
+    // --- Scheduled TX (CMD_TX_AT). The SX1262 has no delayed key-up engine, so the MCU's timer is
+    //     the transmit queue: `stage_tx` does every slow step AHEAD of the deadline, `tx_issue` is
+    //     the single SPI transaction left to perform at it, and `wait_txdone` collects the result.
+    //     Splitting `transmit` into those three is the whole mechanism. ---
+
+    /// **Stage a frame for a key-up that has not happened yet.** Everything expensive — leaving RX,
+    /// programming the packet length, pushing up to 251 payload bytes over a 1 MHz SPI, clearing the
+    /// IRQ latch — happens here, before the deadline. Returns true once BUSY has settled low, i.e.
+    /// the chip is idle and the only step remaining is [`Self::tx_issue`].
+    ///
+    /// ⚠ **STDBY_XOSC (0x01), not STDBY_RC (0x00).** STDBY_RC powers the crystal down, so the
+    /// `SetTx` at the deadline would have to restart the TCXO and wait the DIO3 startup timeout —
+    /// [`TCXO_STARTUP_US`] = 78.125 ms — which is the exact quantum measured in the knob latencies
+    /// (see `set_frequency`). Entering STDBY_XOSC straight out of RX, where the crystal is already
+    /// running, is what keeps the key-up in the hundreds of microseconds instead of tens of
+    /// milliseconds. The caller does not have to trust that: `tx_issue` is timed against BUSY, and
+    /// main.rs reports the measured key-up in EVT_TXDONE and folds it into EVT_CAP's
+    /// `sched_gran_ns`, so if this assumption is ever wrong the node says so instead of lying.
+    pub fn stage_tx(&mut self, payload: &[u8]) -> bool {
+        self.set_standby(0x01); // STDBY_XOSC — keep the TCXO alive
+        self.rf_tx();
+        self.set_tx_pkt_params(payload.len() as u8);
+        self.write_buffer(0, payload);
+        self.clear_irq(0xFFFF);
+        self.wait_busy()
+    }
+
+    /// **The key-up.** One NSS window, four bytes, nothing else: `SetTx(timeout = 0)`. Deliberately
+    /// does NOT call `wait_busy` first — [`Self::stage_tx`] already waited BUSY low, and a poll loop
+    /// between the timer event and NSS going low would add jitter to the one instant that matters.
+    /// It also writes the opcode and its three parameter bytes as a single SPI transfer rather than
+    /// the two `cmd()` issues, saving one call boundary inside the window.
+    pub fn tx_issue(&mut self) {
+        let _ = self.nss.set_low();
+        let _ = self.spi.write(&[OP_SET_TX, 0x00, 0x00, 0x00]);
+        let _ = self.nss.set_high();
+    }
+
+    /// Raw BUSY-pin state. After [`Self::tx_issue`] this is the chip's own key-up indicator: it goes
+    /// high while `SetTx` is processed and drops once the transmitter is running, so the interval is
+    /// a direct measurement of SPI + command processing + (if the crystal was stopped) TCXO restart.
+    pub fn busy_high(&self) -> bool {
+        matches!(self.busy.is_high(), Ok(true))
+    }
+
+    /// Block until TxDone (or the bounded timeout), clear the IRQ latch, report whether it fired.
+    /// The 2000 x 1 ms ceiling covers the longest LoRa frame this firmware can emit (SF12/BW125).
+    pub fn wait_txdone(&mut self) -> bool {
         let mut ok = false;
         for _ in 0..2000 {
             let irq = self.get_irq();
@@ -449,10 +768,50 @@ where
         self.set_standby(0x00);
     }
 
-    /// Retune the carrier (Hz). Re-runs image calibration for the 902-928 US band.
-    pub fn set_frequency(&mut self, hz: u32) {
-        self.calibrate_image(0xE1, 0xE9);
+    /// Retune the carrier (Hz). Returns **true if an image calibration was needed** (and run).
+    ///
+    /// **Why this is not just `calibrate_image(); set_rf_freq()` any more (measured, 2026-08-28).**
+    /// `CMD_SET_FREQ` cost 160.87 ms on o5p-0 and 160.15 ms on mds-05 while `CMD_SET_PWR` cost
+    /// 82.68 ms and `CMD_SET_MOD` 82.78 ms, with a `CMD_GET_INFO` floor of 4.76 ms. Subtract:
+    ///
+    /// ```text
+    ///   SET_PWR  - GET_INFO floor = 82.68 - 4.76 = 77.92 ms   <- one TCXO startup
+    ///   SET_MOD  - GET_INFO floor = 82.78 - 4.76 = 78.02 ms   <- one TCXO startup
+    ///   SET_FREQ - SET_PWR        = 160.87 - 82.68 = 78.19 ms <- a SECOND one
+    ///   TCXO_STARTUP_US                                = 78.125 ms  (5000 x 15.625 us)
+    /// ```
+    ///
+    /// Three independent subtractions land on the same 78.125 ms quantum to within 0.3 %. So the
+    /// "~80 ms of extra retune cost" is **not** the image calibration's own compute time (the
+    /// residual left for that is ~60 us); it is a second **TCXO startup**, forced because
+    /// `CalibrateImage` needs the crystal and `standby()` had just stopped it by entering STDBY_RC.
+    ///
+    /// `CalibrateImage` takes a frequency **band**, not a point, and this firmware refuses every
+    /// frequency outside 902-928 MHz — so the calibration `init` already ran covers every retune the
+    /// host can legally request, and re-running it buys nothing while costing a full TCXO restart.
+    /// The [`Self::cal_band`] memo makes that skip conditional rather than assumed: if the operating
+    /// band ever widens, a target outside the loaded band still recalibrates.
+    ///
+    /// Expected cost after this change: a retune becomes the same shape as `SET_PWR`/`SET_MOD` —
+    /// standby, one register write, re-arm RX — i.e. **~83 ms**, one remaining TCXO startup plus the
+    /// serial floor. That is a PREDICTION from the arithmetic above and must be re-measured before
+    /// the host's `retune_us` is changed away from 161 ms.
+    pub fn set_frequency(&mut self, hz: u32) -> bool {
+        let in_band = (FREQ_MIN_HZ..=FREQ_MAX_HZ).contains(&hz);
+        // Outside the band there is no calibration this firmware knows to be correct, so it loads
+        // none and says so; `CMD_SET_FREQ` rejects such a request before ever reaching here.
+        let recalibrated = in_band && self.cal_band != CAL_BAND_902_928;
+        if recalibrated {
+            self.calibrate_image(CAL_BAND_902_928.0, CAL_BAND_902_928.1);
+            self.cal_band = CAL_BAND_902_928;
+        }
         self.set_rf_freq(hz);
+        recalibrated
+    }
+
+    /// The image-calibration band currently loaded, or `(0, 0)` if none.
+    pub fn cal_band(&self) -> (u8, u8) {
+        self.cal_band
     }
 
     /// Set LoRa modulation: spreading factor (5-12), bandwidth code, coding-rate code.
@@ -477,7 +836,7 @@ where
             _ => (0x02, 0x02),            // +14 dBm optimal
         };
         self.set_pa_config(duty, hp);
-        self.set_tx_params(dbm, 0x04);
+        self.set_tx_params(dbm, TX_RAMP_CODE);
         dbm
     }
 
@@ -493,15 +852,35 @@ where
         r > thresh_dbm
     }
 
-    /// Set the LoRa sync word using the SX127x single-byte convention (0x12 private / 0x34 public).
+    /// Set the network sync word from the host's single byte, in whichever PHY is loaded.
+    ///
+    /// * **LoRa** — the SX127x single-byte convention (0x12 private / 0x34 public), expanded into
+    ///   the SX126x's two-register form.
+    /// * **GFSK** — the byte replaces sync byte 0, the one an SX127x FSK peer holds in
+    ///   `RegSyncValue1`; bytes 1..3 keep the `C1 94 C1` convention's tail. One host byte maps to
+    ///   exactly one on-air byte, so nothing about the mapping has to be guessed at either end.
     pub fn set_sync(&mut self, sx127x_sync: u8) {
-        self.set_sync_word(sx127x_sync);
+        if self.pkt_type == SX126X_PKT_LORA {
+            self.lora_sync = sx127x_sync;
+            self.set_sync_word(sx127x_sync);
+        } else {
+            self.gfsk_sync[0] = sx127x_sync;
+            let sy = self.gfsk_sync;
+            self.set_gfsk_sync_regs(sy);
+        }
     }
 
-    /// Read the current LoRa sync-word registers (0x1424 == SX127x 0x12).
+    /// Read back the first two sync-word register bytes of the current PHY — a genuine read-back in
+    /// both modes, from the address that mode uses (LoRa 0x0740, GFSK 0x06C0). LoRa 0x12 reads back
+    /// as 0x1424; GFSK's default reads back as 0xC194.
     pub fn read_sync(&mut self) -> u16 {
+        let addr = if self.pkt_type == SX126X_PKT_LORA {
+            REG_LORA_SYNC_MSB
+        } else {
+            REG_GFSK_SYNC0
+        };
         let mut b = [0u8; 2];
-        self.read_regs(REG_LORA_SYNC_MSB, &mut b);
+        self.read_regs(addr, &mut b);
         ((b[0] as u16) << 8) | b[1] as u16
     }
 
@@ -512,8 +891,7 @@ where
         // SPI write, negligible against the SetPacketParams/ClearIrq/SetRx that follow.
         let g = self.rx_gain;
         self.write_regs(REG_RX_GAIN, &[g]);
-        let pre = self.preamble;
-        self.set_pkt_params(pre, 0x00, 0xFF, 0x01, 0x00);
+        self.set_rx_pkt_params();
         self.clear_irq(0xFFFF);
         self.set_rx(0xFFFFFF); // continuous
     }
@@ -545,9 +923,18 @@ where
 
         let mut ps = [0u8; 3];
         self.read_cmd(OP_GET_PKT_STATUS, &mut ps);
-        // LoRa: rssiPkt = -rssi/2 dBm, snrPkt = (i8)snr / 4 dB.
-        let rssi_dbm = -(ps[0] as i16) / 2;
-        let snr_db = (ps[1] as i8) as i16 / 4;
+        // `GetPacketStatus` returns three bytes in both modes and means something different by them
+        // (DS §13.5.3):
+        //   LoRa: [rssiPkt, snrPkt, signalRssiPkt]  -> rssi = -rssiPkt/2 dBm, snr = (i8)snr/4 dB
+        //   GFSK: [rxStatus, rssiSync, rssiAvg]     -> rssi = -rssiSync/2 dBm, and there is NO SNR
+        // Decoding a GFSK reply with the LoRa formula would report the rxStatus BITFIELD as an RSSI.
+        let (rssi_dbm, snr_db) = if self.pkt_type == SX126X_PKT_LORA {
+            (-(ps[0] as i16) / 2, (ps[1] as i8) as i16 / 4)
+        } else {
+            // The GFSK modem measures no signal-to-noise ratio. The field is 0 — an explicit "not
+            // measured", never a number derived from something else and presented as an SNR.
+            (-(ps[1] as i16) / 2, 0)
+        };
         Some(RxPacket {
             len,
             rssi_dbm,
@@ -648,9 +1035,48 @@ where
     }
 }
 
+/// **Did the chip refuse the last command?** `GetStatus` (DS §13.5.1) packs the chip mode in bits
+/// [6:4] and the command status in bits [3:1]; 0x3/0x4/0x5 are "command timeout", "command
+/// processing error" and "failure to execute command". Everything else — including 0x2 (data
+/// available) and 0x6 (command TX done) — is a normal outcome.
+///
+/// This is the oracle behind `EVT_PHY_ERR`: the node advertises the PHYs it brings up, and if the
+/// silicon ever declines one at runtime the host is told so, with the chip's own byte attached,
+/// instead of being left to infer it from frames that never arrive.
+pub const fn cmd_status_ok(status: u8) -> bool {
+    !matches!((status >> 1) & 0x07, 0x03 | 0x04 | 0x05)
+}
+
+/// GFSK time-on-air in whole milliseconds (rounded up), for the one profile this firmware brings up.
+///
+/// GFSK has no symbol/spreading arithmetic — it is a fixed-rate bit pipe, so the airtime is just the
+/// framing's bit count over the bitrate. Every term is a field this driver actually programs in
+/// [`Sx1262::set_gfsk_pkt_params`]:
+///
+/// ```text
+///   preamble   preamble_bytes x 8   (the host knob is bytes in this PHY)
+///   sync       GFSK_SYNC_BITS = 24
+///   length     8                    variable-length packets put the length byte on air
+///   payload    payload_len x 8
+///   CRC        16                   GFSK_CRC_2_BYTE_INV
+/// ```
+///
+/// At 50 kbps a 32-byte frame is 368 bits = 7.4 ms, against ~60 ms for the same frame at
+/// SF7/BW125 — which is the whole reason the PHY is worth having as a knob.
+pub const fn gfsk_airtime_ms(payload_len: u8, preamble_bytes: u16) -> u32 {
+    // Saturated at the GFSK preamble register's 16-bit ceiling, matching what
+    // `set_gfsk_pkt_params` actually programs — written as an `if` rather than `.min()` because
+    // `Ord::min` is not const-callable, and this function is asserted at build time in `main.rs`.
+    let raw = (preamble_bytes as u64).saturating_mul(8);
+    let preamble_bits = if raw > 0xFFFF { 0xFFFF } else { raw };
+    let bits = preamble_bits + GFSK_SYNC_BITS as u64 + 8 + (payload_len as u64) * 8 + 16;
+    let us = bits * 1_000_000 / GFSK_BITRATE_BPS as u64;
+    (us / 1000 + 1) as u32
+}
+
 /// LoRa time-on-air in whole milliseconds (rounded up). Standard Semtech formula, explicit header +
 /// CRC on. Used to tell the host the real airtime so a fixed command timeout does not blow at high SF.
-pub fn airtime_ms(sf: u8, bw_code: u8, cr: u8, payload_len: u8, preamble: u16) -> u32 {
+pub const fn airtime_ms(sf: u8, bw_code: u8, cr: u8, payload_len: u8, preamble: u16) -> u32 {
     let bw_hz: u64 = match bw_code {
         BW_250 => 250_000,
         BW_500 => 500_000,

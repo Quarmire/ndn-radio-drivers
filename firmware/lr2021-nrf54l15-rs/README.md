@@ -19,6 +19,36 @@ This is not just another LoRa node. It is the only hardware in the rig that can 
 
 ## Status
 
+**★ 7E-A5 v3 — modulation is a KNOB, not an identity (2026-08-28).** `SetPacketType` is a runtime
+command with 14 modes and this firmware called it once at bring-up, then encoded that one-time choice
+as identity: `EVT_CAP.radio_kind = 2` meant "LR2021-FLRC" and `3` was reserved for "LR2021-LoRa", as
+though a node that changed modulation became a different part. That is undone. `CMD_SET_PHY` now
+moves the node between **LoRa**, **FLRC** and **LR-FHSS** at runtime and replies with a whole new
+`EVT_CAP`, because `max_payload`, `sf_min`/`sf_max`, the airtime model and `sched_gran_ns` are all
+per-PHY. Also new: `CMD_SET_HOP` (intra-packet frequency hopping, table written by the host) and
+`CMD_TX_AT_ABS` (schedule against an instant on the node's own clock). See
+"7E-A5 v3" below.
+
+**★ HFXO in every binary (2026-08-28) — and every M3–M5 timing number predates it.** `embassy-nrf`'s
+`Config::default()` selects the **internal RC** as the high-frequency source, and 21 of the 22
+binaries that bring up peripherals used it; only `m6_bridge` called `hw::init_peripherals()`
+(`m1_bare` initialises nothing by design). Measured against a precise
+host cadence the RC source runs **+2002 ppm**; on the crystal the same node measures **+16.7 ppm**.
+Every binary now boots through `hw::init_peripherals()`.
+
+**What that does and does not invalidate.** The M4 62.5 ns floor and the M5 58.9 µs guard band are
+**resolution** figures — a ruler's ticks do not move when the oscillator driving it drifts — and they
+stand. They are **not accuracy** figures, and were never taken on a disciplined clock, so nothing
+absolute, drift-derived or common-view may be quoted from them: **re-take M4 and M5 through the
+crystal before citing either as accuracy.** The +16.7 ppm figure is what a two-node common view has
+to work against.
+
+**7E-A5 parity closed (2026-08-28): `CMD_TX_AT` is real, and six more opcodes landed.** Scheduled TX
+is CPU-mediated rather than DPPI — the trigger pin is the RX stamp's capture source and the stamp
+wins — and `EVT_CAP.sched_gran_ns` says **50 µs** rather than pretending to the timer's 62.5 ns. Plus
+`EVT_TX_STARTED` on every transmit path, `SET_BEACON`, `SET_CAD_CFG`, `SET_PREAMBLE`, `SET_DEBUG`,
+`SET_RX_GAIN`. See "M6 result" below.
+
 **M7a done — the Tier-0 prefix-set filter is built and its false-positive curve is MEASURED on
 hardware, correcting #91's sizing: k=4, not 6.** Zero false negatives everywhere. See "M7a" below.
 
@@ -59,9 +89,9 @@ handler `0x479`. The memory map in `memory.x` is therefore consistent with the p
 | **M1** | ✅ RTT on both boards | yes | flash + run + debug I/O, and the GRTC time driver |
 | **M2** | ✅ SPI up, `get_version()` = fw 1.24 | yes | the `board` pin map, SPI mode and wiring |
 | **M3** | ✅ FLRC link, 125/126 delivered | yes | an on-air link at a usable rate |
-| **M4** | ✅ DPPI+TIMER RX capture, jitter measured | yes | the RX-timestamp floor: **≤62.5 ns**, below instrument resolution |
-| **M5** | ✅ scheduled TX, 1100/1100 slots | yes | guard-band floor **58.9 µs** (vs 100.9 µs software) ⇒ sub-ms base slots for #93 |
-| **M6** | ✅ 7E-A5 bridge on `/dev/ttyACM0` | yes | parity with the Waveshare/Heltec nodes — all five are one fleet |
+| **M4** | ✅ DPPI+TIMER RX capture, jitter measured | yes | the RX-timestamp floor: **≤62.5 ns**, below instrument resolution (⚠ taken on the RC clock — resolution, not accuracy) |
+| **M5** | ✅ scheduled TX, 1100/1100 slots | yes | guard-band floor **58.9 µs** (vs 100.9 µs software) ⇒ sub-ms base slots for #93 (⚠ same caveat) |
+| **M6** | ✅ 7E-A5 bridge on `/dev/ttyACM0` | yes | parity with the Waveshare/Heltec nodes — all five are one fleet; v2 gaps closed 2026-08-28 |
 | **M7a** | ✅ Tier-0 filter built + FP curve measured | yes | #91's filter works; **k=4 measured, not the predicted 6–7** |
 | **M7b** | run it on the FLPR RISC-V coprocessor | yes | NDN-NIC's "NIC microcontroller" in real silicon — feasible, see below |
 
@@ -277,18 +307,220 @@ Why parity matters: the rig's five nodes (2 LR2021 + 2 Waveshare + 1 Heltec) bec
 fleet, which is what the N≥3 MAC experiments need — the claimable-slot and hidden-terminal tests
 (#94/#95) cannot run on a two-node link.
 
+### Closing the v2 gaps (2026-08-28)
+
+`cmd_bitmap` went from `0x0C9F_CB5E` to **`0x1DBF_DFDE`** and `sched_gran_ns` from 0 to **50 000**.
+(v3 took it to `0xFDBF_DFDE` — see "7E-A5 v3" above.)
+
+| opcode | what it does here | why not the obvious thing |
+|---|---|---|
+| `0x18 TX_AT` | wait on the **same free-running counter** the RX stamp uses, then `SetTx` over SPI | the DPPI trigger needs DIO8 as an *input*, and DIO8 is the RX stamp's capture source. The stamp is the fleet's only hardware timestamp, so the schedule moved to the CPU rather than the pin changing hands. **v3 note:** its delay is counted from the firmware's arm, so the serial round trip is inside the placement — `CMD_TX_AT_ABS` is the one that reaches `sched_gran_ns` |
+| `0x88 TX_STARTED` | emitted on `TX`, `TX_LBT` **and** `TX_AT`, between staging and key-up | airtime is computed from the live link (`LinkState::airtime_us`), not hardcoded — the rung ladder spans 10×. Rounded **up**, floor 1 ms: an FLRC frame is sub-millisecond and the fleet's field cannot say so |
+| `0x07 SET_BEACON` | periodic self-transmit, **default OFF** | a node that beacons on power-up transmits into a neighbour's measurement; this bench runs several in one band |
+| `0x0A SET_CAD_CFG` | `sym` scales the CCA window 1/2/4/8/16×; `det_peak`/`det_min` **must be 0** | reinterpreting a correlator ratio as a dBm threshold would read a saturated channel as idle. **v3 gap:** in LoRa mode the part *does* have a real correlator (`SetLoraCadParams`), so those two fields have a genuine analogue there; wiring it needs the host to key `CMD_CAD`'s meaning on `phy_current` first, and refusing is the safe direction until then |
+| `0x0C SET_PREAMBLE` | value taken as FLRC preamble **bits**, rounded up to the 4-bit step, 4..32 only | FLRC has no symbols. Outside the register's reach it is refused, not clamped — LoRa's 8 *symbols* and 8 *bits* are different requests. **In v3's LoRa mode the field finally means symbols**, and needs no reinterpretation at all; in LR-FHSS there is no preamble knob and it is refused |
+| `0x15 SET_DEBUG` | toggles `EVT_LOG`, off by default | `EVT_LOG` was declared and never emitted; this gives it a purpose without letting diagnostics compete with `EVT_RX` for a 115200 link |
+| `0x1C SET_RX_GAIN` | `0` → AGC auto, `1` → max manual gain | the LR2021 has a 0..13 ladder, but the fleet's byte is two-valued; exposing the ladder would make `1` mean "boosted" on one node and the **lowest** gain on another |
+
+Still refused, all `REASON_NO_HARDWARE` — understood, and unreachable from firmware:
+**`0x05 SET_SYNC`** (the wire carries one byte, FLRC's syncword is 32 bits — and two nodes that
+disagree about a syncword do not error, they go silent, which is indistinguishable from a dead
+radio), **`0x0D SF_SCAN`** (no spreading factor to scan for in FLRC, and no multi-SF scan implemented
+in LoRa), **`0x16 ENTER_BOOTLOADER`** (the XIAO reflashes over its own CMSIS-DAP probe; there is no
+ROM loader to jump to).
+
+The 50 µs is **derived, not measured**: `SCHED_TICK_NS` 63 + `SCHED_SPI_NS` 5 000 + `SCHED_RAMP_NS`
+2 000 + `SCHED_MCU_NS` 30 900 (M4's measured executor-wake path) = 37 963 ns, declared as 50 000 with
+the balance as margin. Over-stating a granularity is safe; under-stating it tells a slot scheduler it
+can pack slots this node cannot hit. Measuring it properly is an M5-shaped run: a `CMD_TX_AT` train at
+a fixed period, read as a consecutive-pair spread off the receiver's hardware stamp.
+
 Two deliberate differences from the Waveshare node, both documented in `src/serial.rs`:
 
-- **`EVT_RX.ts_us` carries the M4 hardware capture** (DPPI-latched at the DIO edge, 62.5 ns), not a
+- **`EVT_RX.ts` carries the M4 hardware capture** (DPPI-latched at the DIO edge, 62.5 ns), not a
   software millisecond counter. Same field, far better number — stamp precision is a per-node
   property the host should read rather than assume.
-- **LoRa-only commands are answered with `EVT_UNSUPPORTED`, not ignored.** A host that assumes a
-  spreading-factor knob gets an error instead of silence: a diagnosable bug rather than a mystery.
+- **Commands this PHY has no analogue for are answered with `EVT_UNSUPPORTED`, not ignored.** A host
+  that assumes a spreading-factor knob in FLRC gets an error instead of silence: a diagnosable bug
+  rather than a mystery. In v3 the honest answer to several of those is now "switch PHY first".
 
 The on-device NDN data plane is **shared by path** with `waveshare-lora-rs` (`#[path]` to its
 `ndn.rs`), not copied. Filter/dedup/relay semantics must be byte-identical across nodes that
 interoperate; two implementations agreeing today would drift, and the failure mode — one node
 silently dropping traffic its neighbour forwards — is indistinguishable from a link problem.
+
+## 7E-A5 v3 — modulation as a knob (2026-08-28)
+
+`cmd_bitmap` went from `0x1DBF_DFDE` to **`0xFDBF_DFDE`**, `EVT_CAP` from 29 bytes to **34**, and
+`proto_ver` from 2 to **3**.
+
+`cmd_bitmap` is now **per-PHY**, like everything else in `EVT_CAP`: the figure above is the surface
+in LoRa and LR-FHSS, and in **FLRC it is `0xBDBF_DFDE`** — `CMD_SET_HOP` (bit 30) drops, because
+this part has no FLRC hopping command and `check_hop` refuses every call there. The bitmap means
+"implemented and *will act*", and the host builds a whole `HopCapability` out of that bit.
+
+### The design error this fixes
+
+FLRC ran because `flrc_link::configure()` called `set_packet_type(PacketType::Flrc)` **once**. That
+one-time choice then travelled on the wire as the node's *kind*. It is not a kind: `SetPacketType`
+(datasheet Table 8-1) is a runtime command with fourteen modes — `0x0` LoRa, `0x2` FSK, `0x3` BLE,
+`0x4` RTToF, `0x5` FLRC, `0x6` BPSK, `0x7` LR-FHSS, `0x8` WM-Bus, `0x9` Wi-SUN, `0xA` OOK, `0xC`
+Z-Wave, `0xD` O-QPSK — and the vendored crate exposes every one. **Modulation is a knob cognition
+actuates, exactly like MCS or spreading factor.** It is fleet-wide too: the SX1262 does LoRa + GFSK,
+the SX1276 does LoRa + FSK + OOK.
+
+### What changed on the wire
+
+| | |
+|---|---|
+| `CMD_SET_PHY 0x1D` | `[packet_type u8]` → **the full new `EVT_CAP`** |
+| `CMD_SET_HOP 0x1E` | `[hop_ctrl][period u16][n][freq_hz u32]*n`, n ≤ 40 → `EVT_INFO` |
+| `CMD_TX_AT_ABS 0x1F` | `[target_ticks u64][frame]` → `EVT_TXDONE` |
+| `EVT_PHY_ERR 0x8D` | `[requested_phy, chip_status]` — an advertised PHY the **chip** refused |
+| `EVT_CAP[1]` | `radio_kind` now names the **part**: 0 SX1262, 1 SX1276, 2 LR2021. v2's `3` is retired |
+| `EVT_CAP[29..33]` | `phy_bitmap u32` — bit N set ⇒ `SetPacketType` value N is usable here |
+| `EVT_CAP[33]` | `phy_current u8` |
+
+`phy_bitmap` on the default LF build is **`0x0000_00A1`** = LoRa | FLRC | LR-FHSS. On an HF
+(`PHY_HF=1`) build LR-FHSS is dropped: its grids (25.39 / 3.91 kHz) and bandwidths (up to 1523.4 kHz)
+are the LoRa Alliance's sub-GHz channel plans. A set bit is a promise, so an untested mode is simply
+not advertised.
+
+**`EVT_CAP` describes the CURRENT PHY**, which is why `CMD_SET_PHY` replies with a whole body and the
+host must replace its profile rather than patch fields:
+
+| | LoRa | FLRC | LR-FHSS |
+|---|---|---|---|
+| `max_payload` | 247 | 47 | 247 |
+| `sf_min`/`sf_max` | 7 / 12 | 0 / 0 | 0 / 0 |
+| airtime, 48 B | ~100 ms @ SF7/125k | 230 µs @ 2.6 Mbit/s | ~3.4 s @ CR 1/3 |
+| framing | explicit header, payload as-is | fixed PDU, in-frame length byte, software whitening | `LrFhssBuildFrame` |
+| `CMD_SET_MOD` | `[sf, bw, cr]` — the fleet's own meaning | `[rung, 0, FlrcCr]` | `[0, LrfhssBw, LrfhssCr]` |
+| intra-packet hopping | yes | **no** (refused, never ignored) | yes |
+| `sched_gran_ns` | 50 000 | 50 000 | 50 000 |
+
+The granularity is the same on all three **by derivation**: its four terms (timer tick, `SetTx` over
+SPI, PA ramp, MCU reaction) are PHY-independent, because the frame is *staged* before the deadline
+and only one five-byte `SetTx` happens after it. It is still exposed as a function of the PHY so a
+future mode with a different fire path cannot silently inherit the wrong number.
+
+LoRa reports **SF7..SF12**, not the part's SF5..SF12: SF5 does not exist on an SX127x at all, and SF6
+needs `comp_sx127x_sf6_sw` plus implicit-header framing — a different packet format, not a different
+number. That is also exactly the span the Waveshare node advertises, which is what makes a fleet-wide
+`CMD_SET_MOD` sweep mean the same thing everywhere.
+
+### `CMD_TX_AT_ABS` — and why the relative opcode could never hit 50 µs
+
+Scheduled TX works; the **relative** opcode caps its placement. An absolute-boundary slot train
+measured on this node:
+
+```
+  45/45 fired
+  accuracy   mean gap 2,399,818 ticks vs 2,400,000 nominal   ->  11 µs over 44 slots
+  jitter     sd 553 µs, p2p 1875 µs                          ->  vs 50 µs declared
+  the same node's CMD_GET_INFO round trip: p2p 550 µs
+```
+
+Those two 550 µs figures are the same number. `CMD_TX_AT`'s `delay_us` is counted from when the
+**firmware** processes the arm, so the host→device serial latency lands inside the placement — as
+exercised it is *worse* than the software path (sd 553 µs vs 155 µs) because it pays an extra round
+trip for nothing.
+
+`CMD_TX_AT_ABS` names an instant on the same free-running TIMER20 that `CMD_READ_CLOCK` reports and
+`EVT_RX.ts` is latched from, so that latency is spent *before* the deadline where it is free. The
+declared `sched_gran_ns` = **50 µs** describes this path and only this path:
+
+```
+  timer tick, ceil(1e9 / 16 MHz)     63 ns
+  SetTx over SPI, 5 B @ 8 MHz     5 000 ns
+  PA ramp, RampTime::Ramp2u       2 000 ns
+  MCU reaction (M4-measured)     30 900 ns
+                                 --------
+                                 37 963 ns  ->  declared 50 000
+```
+
+The 32/64-bit arithmetic is explicit: the counter is 32 bits and wraps every ~268 s, the target is
+64-bit on the firmware-extended clock, a target already past **fires immediately** (never a wait for
+the wrap), and a target more than 1 s ahead is `OUT_OF_RANGE`. Inside that bound the low 32 bits are
+unambiguous, which is what makes the cast safe — `m5_tx` measured the alternative: 74 transmits and
+then silence until the counter came round. `CMD_TX_AT` stays, because it is still the right primitive
+for a delay the *firmware* computes, where no serial hop exists.
+
+### Intra-packet hopping (`CMD_SET_HOP`)
+
+The carrier moves **inside one frame**, on a table the host writes in Hz — up to 40 entries, the chip
+depth for both mechanisms. Not to be confused with `CMD_DATAPLANE`'s name-keyed inter-frame hopping,
+which still has no channel-index convention on this bearer and is still refused.
+
+⚠ **§9.8: the LR20xx and SX127x hop INCOMPATIBLY by default** — "the internal timing, frequency
+switching mechanisms, and control logic evolved between the chip generations, making them unable to
+properly synchronize their hopping sequences". There is an explicit SX1276 compatibility mode (one
+bit of `lora_modem_main_tx_cfg1` at `0xF30A24`, wrapped as `comp_sx127x_hopping`) and it is enabled
+**whenever hopping is on**, because the Heltec SX1276 is the intended peer and a hop sequence only
+one end can follow fails mid-frame — which reads as a marginal channel rather than as a
+misconfiguration.
+
+Asking for hopping in FLRC is refused with a reason. There is no FLRC hopping command on this part,
+and silently accepting the table would leave a host believing its frames were spread when they were
+sitting on one carrier.
+
+★ **Two vendor-crate defects found and worked around** (in our code, not by forking the driver):
+
+- `set_lora_hopping` has an **off-by-one**: it fills `buffer[0..4 + 4n]` and transmits `3 + 4n`,
+  truncating the last frequency's low byte. With `n = 0` the length is right by accident, so the
+  disable path would have looked fine.
+- `set_lrfhss_hopping` is **uncallable from outside the crate**: it takes `&[LrfhssHop]`, and
+  `LrfhssHop`'s two fields are private with no constructor.
+
+### LR-FHSS — reachable, and the chip gets to settle the contradiction
+
+The datasheet disagrees with itself:
+
+- **§17.1**: "In the LR20xx, LR-FHSS is implemented as a transmit-only mode."
+- **§17.2.2**: `LrFhssSetSyncword` "configures the synchronization word utilized for LR-FHSS
+  **detection on the receiver side**, and for building the Tx frame on the transmitter side."
+
+There *is* a plausible mechanism for a real transmit-only limit: LR-FHSS modulates at **488.28125
+bit/s** (exactly 2048 µs/bit) and Table 11-2 gives the generic (G)FSK modem a bitrate minimum of
+**500 bps** — 2.4% above it.
+
+That is a hypothesis and the firmware does not act on it. `CMD_SET_PHY 0x07` brings the mode up,
+issues a real `SetRxContinuous`, and forwards **the chip's literal status byte** as `EVT_PHY_ERR
+[0x07, chip_status]` if it is refused. Crucially, a refusal to *arm RX* does **not** revert the PHY:
+LR-FHSS transmits perfectly well, and reverting would make it unreachable — the opposite of the
+point. The host gets `EVT_PHY_ERR` *and* the new `EVT_CAP`.
+
+⚠ **Not measured here.** This agent does not touch hardware. The mechanism to answer the question is
+in place; the answer comes from a node on the bench. And **arming is not receiving** — a `CMD_OK`
+from `SetRxContinuous` would not be evidence that LR-FHSS demodulates anything.
+
+`ReadLrFhssHoppingTable` (0x58) and `WriteLrFhssHoppingTable` (0x59) are both exposed, and a
+`CMD_SET_HOP` in LR-FHSS with `CMD_SET_DEBUG` on performs a write/read-back round trip and reports
+the first echoed frequency as `EVT_LOG`. That is what turns "the hop sequence is ours to write" from
+a claim into something checkable without a reflash. The `pkt_length` and `nb_hopping_blocks`
+arguments are **inferred** from the frame structure, not sourced — which is precisely why the
+read-back exists.
+
+The LR-FHSS airtime model's frame-structure constants (114-bit sync header, 48-bit fragments, 2-bit
+block preambles) come from Semtech's `lr_fhss_mac.c` and are **not verified against this chip**. They
+are used anyway because the alternative is worse: the TxDone watchdog was a flat 20 ms, which is
+*shorter than a single LR-FHSS frame at any setting*, so every transmit would have been reported as
+failed after airing perfectly. The watchdog is now `2 × airtime + 20 ms` on every PHY, so a model
+wrong by up to 2× degrades into a longer wait rather than a truncated transmit.
+
+### Where the code lives now
+
+| file | what |
+|---|---|
+| `src/phy.rs` | pure logic, **host-tested**: the `Phy` enum, per-PHY payload/SF/granularity, the band and PA range, hop validation, the LoRa bandwidth code spaces, `PHY_BITMAP` |
+| `src/phy_link.rs` | the shared front-end sequence, `PhyState`, the dispatch, per-PHY TX staging and RX read |
+| `src/flrc_link.rs` | FLRC's parameters, modem block and framing — and re-exports of what moved, so twenty binaries keep compiling |
+| `src/lora_link.rs` | LoRa's parameters, modem block, hopping |
+| `src/lrfhss_link.rs` | LR-FHSS's parameters, frame build, hopping table read/write, the RX arm |
+
+The generalisation is of `flrc_link`'s `LinkState`/`apply` split, **not a copy of it per PHY** — the
+one copy of the Semtech-ordered sequence has a hole in the middle where the modulation goes. Three
+copies would drift, which is exactly what had already happened once between `configure` and `retune`.
 
 ### The bug this reproduced, and it was already in the tracker
 
@@ -316,6 +548,11 @@ TX node trades its IRQ pin for the trigger — acceptable, because completion ti
 transmit *instant*, and the receiver keeps its IRQ pin and does the timestamping.
 
 **Reliability: 1100 armed slots, 1100 transmits, 0 errors.**
+
+> ⚠ **Taken on the internal RC clock** (see Status). The spread below is a resolution/precision
+> figure and stands; it is not an accuracy figure, and the two nodes' relative drift term inside it
+> was measured against a source since shown to be ~2000 ppm off. Re-take it through
+> `hw::init_peripherals()` before quoting it as anything but a guard-band bound.
 
 **The number**, measured end to end by the M4 receiver over consecutive-slot pairs:
 
@@ -370,6 +607,10 @@ makes "consecutive sequence numbers" and "consecutive slots" the same statement 
 a skipped slot can never masquerade as transmit jitter.
 
 ## M4 result — the RX-timestamp floor
+
+> ⚠ **Taken on the internal RC clock** (see Status). 62.5 ns is the *ruler's* smallest division and
+> stays true on any oscillator; what does not survive is any absolute-time or common-view claim built
+> on it. Re-take through `hw::init_peripherals()` before quoting accuracy.
 
 Every frame is stamped twice from **one** timer: `CC[0]` by DPPI at the DIO8 edge (no CPU), `CC[1]`
 by the CPU when the async task wakes. `CC[1] − CC[0]` is therefore the whole software path, and one

@@ -84,10 +84,15 @@ pub use serial_radio::{Esp32SerialBackend, SERIAL_RADIO_BAUD, SerialRadioBackend
 // (see src/lora_serial.rs).
 #[cfg(feature = "lora")]
 mod lora_serial;
+//
+// v3 of that protocol adds the **modulation** axis: a node reports which PHYs it can run and which
+// one it is in, and `RadioKnobs::set_phy` switches it — so `LoraRadioKind` names the PART again
+// rather than the part-plus-mode it happened to boot in. The `PhyMode`/`PhyModeSet`/`HopCapability`
+// types live in `ndn-radio-hal`, because none of them is LoRa-specific.
 #[cfg(feature = "lora")]
 pub use lora_serial::{
-    LORA_BAUD, LoraParams, LoraRadioKind, LoraSerialBackend, MAX_LORA_PAYLOAD, NdnStats,
-    NodeProfile, PROTO_VER, RadioKindHint, StampKind, lora_clock_domain, name_hash,
+    HOP_LIST_MAX, LORA_BAUD, LoraParams, LoraRadioKind, LoraSerialBackend, MAX_LORA_PAYLOAD,
+    NdnStats, NodeProfile, PROTO_VER, RadioKindHint, StampKind, lora_clock_domain, name_hash,
 };
 
 /// The canonical named-data-over-802.11 EtherType — the LLC/SNAP protocol id every backend uses so a

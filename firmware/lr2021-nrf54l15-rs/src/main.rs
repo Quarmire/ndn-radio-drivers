@@ -53,7 +53,7 @@ use lr2021_nrf54l15_rs::hw;
 /// A frozen counter means the clock/time-driver feature is wrong, not the radio.
 #[embassy_executor::main]
 async fn main(_spawner: Spawner) {
-    let p = embassy_nrf::init(Default::default());
+    let p = hw::init_peripherals();
 
     defmt::info!("lr2021-nrf54l15-rs M1: target alive, RTT up, embassy time driver running");
 

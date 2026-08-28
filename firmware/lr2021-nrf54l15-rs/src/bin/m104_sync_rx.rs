@@ -44,7 +44,7 @@ const HF_TICKS_PER_TIMER_TICK: u32 = 2;
 
 #[embassy_executor::main]
 async fn main(_spawner: Spawner) {
-    let p = embassy_nrf::init(Default::default());
+    let p = hw::init_peripherals();
     let (mut radio, timing, _u) = hw::init(p);
 
     radio.reset().await.unwrap();

@@ -18,6 +18,7 @@ use embassy_executor::Spawner;
 use embassy_time::{Duration, Timer};
 use panic_probe as _;
 
+use lr2021_nrf54l15_rs::hw;
 use lr2021_nrf54l15_rs::tier0::{self, PrefixFilter};
 
 /// Runtime-k variants of the filter, so K can be *measured* rather than assumed.
@@ -125,7 +126,7 @@ fn make_name(buf: &mut [u8], depth: usize, salt: u32) -> usize {
 
 #[embassy_executor::main]
 async fn main(_spawner: Spawner) {
-    let _p = embassy_nrf::init(Default::default());
+    let _p = hw::init_peripherals();
     Timer::after(Duration::from_millis(200)).await;
 
     defmt::info!(

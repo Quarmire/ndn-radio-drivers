@@ -107,6 +107,7 @@ length, `0x04` out of range.
 | 0x1D | SET_PHY | `[packet_type u8]` | **yes (C2)** → the **whole new `EVT_CAP`**, because every capability field is per-PHY. `phy_bitmap` on this node is `0x0000_0001`: LoRa only. A `packet_type` outside the bitmap → `EVT_UNSUPPORTED`/OUT_OF_RANGE (the host asked for something never claimed); one **inside** it that the chip does not corroborate → `EVT_PHY_ERR` (0x8D) `[phy, RegOpMode]`. Selecting the PHY already running is a *verify* (read `RegOpMode`, check bit 7 `LongRangeMode`), not a re-init — `LongRangeMode` is writable only in SLEEP, so a real transition costs a sleep + full re-init |
 | 0x1E | SET_HOP | `[hop_ctrl][hop_period u16 BE][n][freq_hz u32 BE]*n`, n ≤ 40 | **yes (C1)** → `EVT_INFO`. Real SX1276 **intra-packet** frequency hopping — see the section below |
 | 0x1F | TX_AT_ABS | `[target_ticks u64 BE][frame]` | **yes (C3)** → `EVT_TX_STARTED` at the staging point, then `EVT_TXDONE`. Same one-deep slot and same stage/fire machine as 0x18, with the deadline read off the wire instead of derived from `Instant::now()` at command-processing time. Target on the counter `CMD_READ_CLOCK` returns, at full 64-bit width. **Target in the past → fires now**, unclamped, so `report_sched_error` states the real lateness on the wire; further than 60 s ahead → `EVT_UNSUPPORTED`/OUT_OF_RANGE (the same bound as 0x18, so the answer to "how far ahead can I schedule?" does not depend on which opcode you reach for) |
+| **0x20** | **GET_HOPTRACE** | *(empty)* | **yes (H2)** → `EVT_HOPTRACE` (0x8E). This node's own hop timeline: up to 32 free-running `(idx, t_ticks)` entries, most recent last, on the counter `CMD_READ_CLOCK` returns. Reading does **not** clear it. See the section below. ⚠ 0x20 is opcode **32** and `EVT_CAP.cmd_bitmap` is a u32 that is full at 0x1F, so this opcode is **not** advertised there — discover it by sending it (`EVT_HOPTRACE` vs `EVT_UNSUPPORTED`), or read `bitmap_ext` from the `CMD_SET_DEBUG` dump |
 
 ### Firmware → host
 
@@ -115,7 +116,9 @@ per-packet `RegPktRssiValue`/`RegPktSnrValue`; `ts` in `EVT_CAP.stamp_hz` units)
 `EVT_TXDONE` 0x82 `[ok, attempts]` · `EVT_INFO` 0x83 (19 B, fixed) · `EVT_LOG` 0x84 ·
 `EVT_CAD` 0x85 · `EVT_RSSI` 0x86 · `EVT_SF_DETECTED` 0x87 · `EVT_TX_STARTED` 0x88 ·
 `EVT_STATS` 0x89 (24 B) · `EVT_CLOCK` 0x8A · `EVT_CAP` 0x8B (**34 B in v3**) · `EVT_SENSE` 0x8C ·
-`EVT_PHY_ERR` 0x8D `[requested_phy, chip_status]` · `EVT_UNSUPPORTED` 0x8F.
+`EVT_PHY_ERR` 0x8D `[requested_phy, chip_status]` ·
+**`EVT_HOPTRACE` 0x8E** `[stamp_hz u32 BE][n u8][idx u8, t_ticks u32 BE]*n` (H2 — ≤ 165 B) ·
+`EVT_UNSUPPORTED` 0x8F.
 
 ### Bandwidth codes — the canonical space, pinned
 
@@ -157,7 +160,7 @@ reading a v3 Heltec still gets a sane kind.
 | 12..16 | stamp_hz | 1 000 000 | `embassy_time::TICK_HZ`, a compile-time constant of the driver actually linked (esp-rtos selects `tick-hz-1_000_000`) — verified against this build, not assumed |
 | 16 | stamp_kind | 2 | **software counter**: the MCU reads its own monotonic clock when the DIO0 interrupt wakes it. The SX1276 has no RX-time capture register, so a hardware stamp is impossible on this radio |
 | 17..19 | max_payload | 247 | the REAL end-to-end cap, set by the serial framing, not the radio: an event's `len` is one byte, so an `EVT_RX` payload is ≤ 255 B of which 8 are the rssi/snr/ts header. The FIFO (256 B), the LoRa PDU (255 B) and `CMD_TX`'s accept (255 B) are all larger, so 247 binds. A frame larger than this is **counted and dropped**, never truncated into something that looks complete |
-| 19..23 | cmd_bitmap | 0xFDBF_FFFE | bit N set ⇔ opcode N is implemented. It is also the dispatcher's own "known opcode?" oracle, so the bitmap and the command handler cannot drift apart |
+| 19..23 | cmd_bitmap | 0xFDBF_FFFE | bit N set ⇔ opcode N is implemented. It is also the dispatcher's own "known opcode?" oracle, so the bitmap and the command handler cannot drift apart. ☠ **This word is full at opcode 0x1F.** `CMD_GET_HOPTRACE` is 0x20 = bit 32 and cannot be represented in a u32, and the 34-byte v3 layout was **not** widened to make room: that would be a fleet-wide wire change desynchronising this node from the LR2021 — the very node the hop trace exists to be compared with. Opcodes 32..63 live in `CMD_BITMAP_EXT`, emitted in the `CMD_SET_DEBUG` dump as `bitmap_ext=`; the primary discovery path is the one the 7E-A5 rule set already guarantees — send the opcode and read the answer |
 | 23 | sf_min | 7 | SF6 needs an implicit header and would break fleet interop |
 | 24 | sf_max | 12 | |
 | 25..29 | sched_gran_ns | 99 000 | P1. A **sum of source constants**, not an estimate: 1 000 ns of `embassy-time` tick quantisation (`TICK_HZ` = 1 MHz, and `Timer::at` fires on the first tick at or after the target) + 8 000 ns for the 2-byte key-up write at the 2 MHz SPI rate `main` configures + 40 000 ns of PA ramp (`lora-phy` programs `RegPaRamp` = `RampTime::Ramp40Us` for a TX prep) + 50 000 ns of budget for the executor wake and NSS framing, which are **not measured on this board** and are therefore given at least as much room as everything that is. One-sided: the node never keys up early. The firmware measures its own error against the same counter `EVT_RX` stamps with and emits an `EVT_LOG` (`sched err=…us`) on every miss, whether or not debug is on — so the number is falsifiable from the wire. ★ v3: this is the **firmware-side** granularity and it is the same on `CMD_TX_AT` and `CMD_TX_AT_ABS` — both leave `fire_tx` the same single write. What the absolute opcode removes is the host→node serial transit, which the relative one adds to the *host's* placement and which no field here can express (see **Scheduled TX** below) |
@@ -341,6 +344,184 @@ a second at ~32 µs of SPI each: nothing. At `hop_period = 1` with SF7/500 kHz (
 ~3 900 a second, ~16% of the SPI budget, on a node that has other work. The firmware does not forbid
 it; it is the host's dial, and this is the bill.
 
+## ★ Hop-event timestamping — `CMD_GET_HOPTRACE` (0x20) / `EVT_HOPTRACE` (0x8E)
+
+```
+CMD_GET_HOPTRACE  []                                                   ->  EVT_HOPTRACE
+EVT_HOPTRACE      [stamp_hz u32 BE][n u8][ idx u8, t_ticks u32 BE ]*n       (n <= 32, <= 165 B)
+```
+
+### The question this instrument exists to answer
+
+An LR2021 and this SX1276 both do LoRa **intra-packet frequency hopping**, each interoperates with
+its own kind, and they cannot hop with each other. Measured on hardware:
+
+| TX (hopping) | RX | RX hop | result |
+|---|---|---|---|
+| Heltec n=1 | Waveshare (no hop support) | off | **4/4** |
+| LR2021 n=1 | Waveshare | off | **4/4** |
+| Heltec n=1 | LR2021, hop **off** | off | **4/4** |
+| Heltec n=1 | LR2021, hop **on** | on | **0/4** |
+| LR2021 n=1 | Heltec, hop **on** | on | **1/20** |
+| LR2021 n=1 | Heltec, hop **off** | off | **20/20** |
+| LR2021 n=4 | LR2021, hop on | on | 4/4 |
+
+**`n = 1` is a one-entry hop list: the hop machinery runs but the carrier can never move.** So it is
+not the frequency sequence or the phase (n=1 still fails); not the frame format (a plain receiver
+decodes either part's hop-mode TX perfectly); and not structural (1/20 is not 0/20 — a format
+mismatch would be absolute). What is left is that **the two disagree about WHEN a hop boundary
+falls**, which is what SX127x/LR2021 §9.8 says in as many words. A period sweep is already ruled
+out: with this node's RX period fixed at 8 symbols, sweeping the LR2021's TX period over 2/4/8/16
+gave 0–1 of 10 at **every** setting, so no parameter search over the exposed knobs will find it.
+
+★ **Each node timestamps its OWN hop events.** No cross-vendor reception is required to compare the
+two timelines — which is the only reason this is measurable at all, because the link that would
+carry the comparison is the very thing that is broken.
+
+At **SF7 / BW 125 kHz** one symbol is 2⁷/125000 = **1.024 ms**, so a nominal 8-symbol hop period is
+**8.192 ms** and both parts should show that interval. Whatever differs — the interval itself, the
+instant of the first hop relative to the start of a frame, or whether hops continue between frames —
+is the answer.
+
+### The encoding
+
+| Field | Bytes | Meaning |
+|---|---|---|
+| `stamp_hz` | 4, BE | **this node's own tick rate**: 1 000 000 here, `embassy_time::TICK_HZ`, identical to `EVT_CAP.stamp_hz` and to the units of `EVT_RX.ts` and `EVT_CLOCK`. On the wire, and **not** converted to microseconds in firmware — the host divides, so a 16 MHz node does not have to throw away resolution to match this 1 MHz one |
+| `n` | 1 | entries returned, 0…32, **most recent last** |
+| `idx` | 1 | bits **5:0** = `RegHopChannel`'s `FhssPresentChannel`, **verbatim** (not `% n`); bit **7** = the hop was taken while **transmitting** (H4); bit 6 spare |
+| `t_ticks` | 4, BE | `Instant::now()` sampled at the top of `service_hop`, low 32 bits, in `stamp_hz` units — the same counter and the same truncation as `EVT_RX.ts`, so the two wrap together (~71 min at 1 MHz) |
+
+`idx` carries the chip's **raw** 6-bit counter rather than the list index the retune used, because
+the experiment above runs on a **one-entry** list: `field % 1` is 0 forever and would hide the
+modem's hop counter entirely, while the raw field still counts 0, 1, 2, … and wraps at 64.
+
+☠ **`idx` is the one field that is NOT the same quantity on the LR2021**, though the byte, the mask
+and the flag bit are identical. Here it is the *chip's* counter, read out of `RegHopChannel`; there
+it is a *firmware* count of recorded hop interrupts, because the LR2021 exposes no hop-index
+register at all (`SetLoraHopping` is commented out of its command spec and there is no
+`GetLoraHopStatus`). Only this node's `idx` can reveal a hop that was swallowed (it jumps by more
+than 1) or a per-packet reset of the modem's counter. ★ **Compare `t_ticks` across the two nodes;
+compare `idx` only within one.**
+
+The ring is **free-running and wraps**, and **reading does not clear it** — the `EVT_SENSE.activity`
+contract. Neither does `CMD_SET_HOP 0`: reading the trace *after* a run is the use case, and
+clearing on disable would delete the measurement at the moment it was taken. `n = 0` is a real
+answer meaning *this node has serviced no hop since boot*, since only `service_hop` ever writes the
+ring. At `hop_period = 8` / SF7 / BW125 the ring turns over in 262 ms, so a stale entry from an
+earlier run cannot survive into a new one; if one did, its timestamp would say so.
+
+★ **The LR2021 node implements the same rule** (`hoptrace::HopTrace::arm`): arming a plan clears the
+ring, disarming does not. That agreement is load-bearing rather than tidy. If one node cleared on
+`CMD_SET_HOP 0` and the other did not, a harness that stopped the hopping before pulling the
+timeline would get a full trace from one part and `n = 0` from the other — and at the host, `n = 0`
+from a part that hops is indistinguishable from **"this part does not signal its hops at all"**,
+which is a conclusion the measurement protocol explicitly draws.
+
+This node **never** answers `EVT_UNSUPPORTED [0x20, NO_HARDWARE]`: it can stamp its hops, on the
+same counter it stamps everything else with. That reply is reserved for a part that genuinely
+cannot — the rule being *never a fabricated timeline*, which is also why `n = 0` is returned plainly
+rather than padded into something that looks like data.
+
+### ⚠ Where the stamp is taken, and what is still between it and the RF boundary
+
+The stamp is `Instant::now()` as the **first statement of `Radio::service_hop`**, before that
+function's four SPI transactions — those are ~32 µs of byte time at 2 MHz and would otherwise sit
+inside the measurement. Nothing may be inserted above that line.
+
+The SX1276 offers nothing closer: it has **no RX-time capture register and no hop-time capture
+register**, which is the same reason `EVT_CAP.stamp_kind` is 2 (software counter). So the MCU-side
+stamp is the best this part allows, and what matters is stating what remains:
+
+| Term | Value | Measured? |
+|---|---|---|
+| RF hop boundary → DIO1 asserts | unknown | **no** — no datasheet figure, no register to read it from |
+| DIO1 high → GPIO interrupt → esp-hal waker → embassy executor → task resumes | unknown | **no** — never timed on this board |
+| task resumes → `Instant::now()` | ≤ 1 tick = 1 µs | derived (`STAMP_HZ` = 1 MHz, and the counter has 1 µs resolution) |
+| main task busy elsewhere when DIO1 asserts | 0 … milliseconds | **no** |
+
+The last row is the one that can dominate: the hop branch is a `select` arm of a single-threaded
+loop, so a hop landing while that task is inside a bare SPI or UART statement waits for it. The
+known worst cases in this firmware are `stage_tx`'s ~30-transaction register burst (≈ 1.5–2.7 ms,
+budgeted at `STAGE_FIXED_US`) and `write_all` draining a full 128-byte UART TX FIFO at 115200
+(≈ 11 ms). Neither has been timed against a hop. ⚠ The 11 ms case **exceeds one 8.192 ms hop
+period**, so it is not only jitter: it can put two hops on the wrong side of one stamp. Do not poll
+`CMD_GET_HOPTRACE` (a 170-byte reply, ≈ 14 ms of UART) during the window being measured.
+
+### ☠ A fifth term that is a LOSS, not a latency
+
+**A hop that coincides with RxDone, TxDone or HeaderValid produces no entry at all.** `lora-phy`'s
+`process_irq_event` clears `RegIrqFlags` with `0xFF`, hop flag included (see "One hop can be
+swallowed" above), so when the DIO0 branch of the `select` wins that round nothing reaches
+`service_hop` to be stamped. It is pre-existing behaviour of the C1 hop path, not something the
+trace added — but it lands on the trace, and a reader differencing across the gap would read
+**2 × the hop period and believe it**.
+
+★ This is the case that pays for carrying the chip's raw counter in `idx`: the modem kept counting,
+so the entry after a swallowed hop arrives **2 higher, not 1**. The host's rule is therefore not
+"difference consecutive stamps" but *"difference consecutive stamps and divide by the `idx` step"*,
+and any interval whose `idx` step is not 1 is a gap rather than a measurement.
+
+⚠ The loss is **correlated with frames**, not random — it happens exactly at a packet-boundary
+interrupt, which is the region of the timeline the hop question is about — and its rate has never
+been counted. The LR2021 fails differently in the same situation: it records the entry but may stamp
+it with the frame's instant instead of the hop's, and counts how often (`HopTrace::coalesced`). So
+**prefer to take each timeline on a node that is hopping but not carrying traffic.**
+
+**No guessed offset is folded into a stamp**, and no interpolation to a symbol boundary is
+attempted. A trace whose own offset is unknown cannot answer a timing question, so the offset is
+declared unknown rather than invented.
+
+★ **The trace makes its own offset falsifiable, which is why it is still worth taking.** Every
+*constant* term above cancels in the **difference** of two stamps, so consecutive entries measure
+the hop **interval** with only the variable part left in — and the spread of those intervals over a
+quiet run is a direct upper bound on the jitter of the whole wake path. Read the interval first;
+trust an absolute offset only once it has been measured.
+
+A tighter stamp is possible in principle — a custom GPIO ISR sampling the counter before the
+executor runs — and is deliberately not done here: esp-hal's `Input::wait_for_high` owns that pin's
+interrupt to drive the async waker, so installing a handler on it would replace the mechanism the
+cancel-safe hop path is built on. If the interval jitter turns out to matter, that is the next step
+and a pass of its own.
+
+### H4 — a hop taken while transmitting vs one taken while listening
+
+In FHSS the receiver hops too, so the interrupt fires every `hop_period` symbols **forever**, not
+only during a transmission: a trace read after a frame otherwise mixes the frame's own hops with the
+idle-RX hops that surround it. That is exactly the confusion that made the raw `hops` counter
+misleading, so one bit resolves it.
+
+`HOPTRACE_TX_FLAG` (bit 7 of `idx`) is set **iff** the event was serviced from `Radio::fire_tx` —
+the chip in TX with a frame in flight. Clear means *not transmitting*: the main loop serviced it,
+which is idle RX or a reception in progress. The call site is the authority and no extra register is
+read for it, and the two sites are exhaustive because `fire_tx` does not return until TxDone, a
+timeout or an error, so the main loop cannot run during a transmission.
+
+This is also what makes *"the instant of the first hop relative to the start of a frame"* readable
+off the trace: the first TX-flagged entry after a run of unflagged ones **is** the frame's first
+intra-packet hop.
+
+### Cancel safety (H3) is untouched
+
+`service_hop` gains exactly two things — `Instant::now()`, a counter read on the MCU, and
+`HopTrace::push`, arithmetic on a fixed RAM array. **Neither is an `await`**, so the set of points
+at which that future can suspend is byte-for-byte what it was, and it remains awaited as a **bare
+statement** at both call sites (`Wake::Hop` in the main loop, `FireWake::Hop` inside `fire_tx`),
+never as a `select` branch. The `select`s still race only GPIO level waits and timers. Nothing about
+`CMD_GET_HOPTRACE` touches the radio at all: it reads a RAM array in the command path and emits one
+frame, so it adds no SPI transaction anywhere and cannot interleave with a hop it is reporting (the
+firmware is single-threaded and `send_hoptrace` snapshots the ring into a stack buffer before the
+first UART byte goes out).
+
+### Cost
+
+Per hop: one `Instant::now()` and ~10 words of RAM stores — **no SPI transaction is added**, because
+the `idx` comes from the `RegHopChannel` read `service_hop` already performs. Static cost: 32 × 5
+bytes of ring plus two indices, ≈ 176 B of RAM, allocated inside `Hop` whether or not hopping is on.
+`CMD_GET_HOPTRACE` costs one 165-byte UART frame (≈ 14 ms at 115200 — worth knowing, because that
+write occupies the same task the hop branch lives in, so **do not poll the trace during the window
+you are measuring**).
+
 ## PHY selection — `CMD_SET_PHY` (0x1D)
 
 **Modulation is a knob cognition actuates, like MCS or spreading factor — not a property of the
@@ -401,6 +582,16 @@ firmware's own reply work). **No p99, sd or peak-to-peak is claimed here** — b
 the same slot-train harness that produced the LR2021's sd 553 µs, and it has not been run on the
 Heltec.
 
+## The 2026-08-28 H pass (H1–H5) — hop-event timestamping
+
+| | Before | After |
+|---|---|---|
+| **H1** | a hop advanced `Hop::hops` and nothing else; **when** it happened was unrecoverable | `Instant::now()` as the **first statement of `service_hop`**, ahead of that function's ~32 µs of SPI byte time, on the same counter `EVT_RX.ts` and `CMD_READ_CLOCK` use. What is still between it and the RF boundary is written down term by term and marked measured / not measured — see the section above; **nothing unmeasured is folded into the stamp** |
+| **H2** | — | **`CMD_GET_HOPTRACE` 0x20 → `EVT_HOPTRACE` 0x8E.** 32-entry free-running ring, most recent last, reading does not clear it, ticks on the wire with `stamp_hz` beside them so the host — not the firmware — does the unit conversion |
+| **H3** | `service_hop` awaited as a bare statement at both call sites, never a `select` branch | **unchanged, structurally.** The two additions (`Instant::now()`, `HopTrace::push`) contain no `await`, so the future's suspension points are byte-for-byte what they were |
+| **H4** | `hops` mixed a frame's own intra-packet hops with the idle-RX hops around it, because in FHSS the receiver hops too | bit 7 of `idx` = **taken while transmitting**, set from the call site (`fire_tx` vs the main loop), no extra register read. The first TX-flagged entry after a run of unflagged ones is a frame's first intra-packet hop |
+| **H5** | `CMD_BITMAP` was the whole self-description | the u32 is **full at 0x1F** and 0x20 is bit 32, so `CMD_BITMAP_EXT` carries opcodes 32..63 and `EVT_CAP`'s frozen 34-byte layout is **not** widened (that would desynchronise this node from the LR2021 it exists to be compared with). The dispatcher's catch-all oracle now spans both words; a sixth compile-time table pins the wire arithmetic, the 165-byte payload bound and the flag/index bit split |
+
 ## The 2026-08-28 v3 pass (tasks C1–C5)
 
 ⚠ Two label sets share the letter C in this directory: the **bug** labels C1–C7 in the section below
@@ -413,7 +604,7 @@ discipline" it means the *bug* C3 — the cancel-safe restructuring.
 | **C2** | modulation was an identity: `EVT_CAP.radio_kind` encoded "LR2021-FLRC" and "LR2021-LoRa" as different *kinds* | **`CMD_SET_PHY` 0x1D + `phy_bitmap`.** `radio_kind` now names the PART; `EVT_CAP` describes the CURRENT PHY and is replaced wholesale on a switch. This node advertises **LoRa only** — one honest bit — with FSK/OOK's real cost written down beside it, and gains `EVT_PHY_ERR` 0x8D |
 | **C3** | `CMD_TX_AT`'s delay is counted from when the **firmware** processes the arm, so the host's serial latency lands in the placement — MEASURED sd 553 µs / p2p 1875 µs against a declared 50 µs on the LR2021 | **`CMD_TX_AT_ABS` 0x1F**, a target on this node's own clock at full 64-bit width. Past → fires now, unclamped, so the real lateness is reported; > 60 s ahead → OUT_OF_RANGE |
 | **C4** | — | **the 5 597 µs retune is unchanged.** Everything C1–C3 adds is gated on hopping being enabled: with it off, **zero** extra SPI transactions and **zero** extra UART bytes reach `CMD_SET_FREQ`, and the only addition is one predicated branch. With hopping **on**, the cost is three SPI transactions (6 bytes ≈ 24 µs of byte time at 2 MHz, ~30 µs allowing NSS framing at the firmware's own 5 µs/byte slack rate) — and they are not in the `CMD_SET_FREQ` handler at all but in the `arm_rx` that follows, which was already programming the carrier. ≈ 0.5% of 5 597 µs, and derived, not measured |
-| **C5** | `CMD_BITMAP` = 0x1DBF_FFFE; three compile-time tables | `CMD_BITMAP` = **0xFDBF_FFFE** (0x1D/0x1E/0x1F set), and **five** compile-time tables: bandwidth, the command bitmap + scheduling arithmetic, the PHY surface, the hop table (`main.rs`), and the detector/LNA + FHSS register encodings (`regs.rs`). `#[cfg(test)]` still cannot run on this `no_std`/`no_main` xtensa target |
+| **C5** | `CMD_BITMAP` = 0x1DBF_FFFE; three compile-time tables | `CMD_BITMAP` = **0xFDBF_FFFE** (0x1D/0x1E/0x1F set), and (with the H pass below) **six** compile-time tables: bandwidth, the command bitmap + scheduling arithmetic, the PHY surface, the hop table, the hop-trace table (`main.rs`), and the detector/LNA + FHSS register encodings (`regs.rs`). `#[cfg(test)]` still cannot run on this `no_std`/`no_main` xtensa target |
 
 ## The 2026-08-28 correctness pass (bugs C1–C7)
 
@@ -493,6 +684,16 @@ node, but **not** confirmed on air on this board:
   ⚠ `(RegHopChannel & 0x3F)` is used as the list index because that is the **Semtech reference
   driver's own pattern**, not because it has been measured here. If the pair walks the list out of
   step, that mapping is the first suspect.
+* **★ `EVT_HOPTRACE`'s offset from the true RF hop instant.** The stamp is taken as early as this
+  part allows (first statement of `service_hop`, before any SPI), but **two terms of the path are
+  unmeasured and are declared unknown rather than budgeted**: the SX1276's RF-boundary → DIO1 delay,
+  and the DIO1 edge → GPIO interrupt → esp-hal waker → embassy executor → task-resume path. A third,
+  the main task being busy in a bare SPI/UART statement when DIO1 asserts, is variable and can reach
+  milliseconds. Nothing is folded into the timestamp to cover any of them. The constant terms cancel
+  in a difference, so the **interval** between consecutive entries is the number to read first, and
+  the spread of those intervals over a quiet run is itself the bound on the variable term — that is
+  the first measurement to take with this instrument, before any absolute claim. Expected at
+  SF7/BW125 with `hop_period = 8`: **8 192 ticks** between entries.
 * **`SERIAL_RTT_MEAN_US` as a spread bound.** The 10 733 µs is a measured **mean**; the spread was
   not measured on this node, and none is claimed. Run the slot-train harness against `CMD_TX_AT_ABS`
   and `CMD_TX_AT` back to back — that comparison is the whole point of C3 and it is exactly the

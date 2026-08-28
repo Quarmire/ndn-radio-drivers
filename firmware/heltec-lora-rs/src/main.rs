@@ -5,6 +5,36 @@
 //! air side is plain standard LoRa — no proprietary header — so it interoperates with any
 //! SX127x/SX126x peer.
 //!
+//! # ★ What changed in the 2026-08-28 H pass (H1..H5): hop-event timestamping
+//!
+//! An LR2021 and this SX1276 both do LoRa intra-packet frequency hopping and **cannot hop with each
+//! other**, and the failure survives a ONE-ENTRY hop list — the machinery runs but the carrier never
+//! moves — so it is not the sequence, not the phase and not the frame format. The two disagree
+//! about *when a hop boundary falls*, and a period sweep over 2/4/8/16 has already been ruled out on
+//! air. ★ The way to see it is that **each node timestamps its OWN hop events**: no cross-vendor
+//! reception is needed to compare the two timelines, which matters because the link that would
+//! carry the comparison is the very thing that is broken. Full argument at [`HopTrace`].
+//!
+//! * **H1 — the stamp.** `Instant::now()` as the FIRST statement of [`Radio::service_hop`], ahead of
+//!   that function's four SPI transactions (~32 µs of byte time), on the same `embassy-time` counter
+//!   `EVT_RX.ts` is filled from and `CMD_READ_CLOCK` returns. ⚠ What remains between it and the true
+//!   RF hop instant is stated term by term at [`HopTrace`] and is **NOT MEASURED**; nothing is
+//!   folded into the stamp to cover it.
+//! * **H2 — [`CMD_GET_HOPTRACE`] (0x20) / [`EVT_HOPTRACE`] (0x8E).** A 32-entry free-running ring,
+//!   most recent last, that reading does not clear; ticks and `stamp_hz` both on the wire so the
+//!   HOST does the unit conversion and a 16 MHz node need not lose resolution to match this 1 MHz
+//!   one.
+//! * **H3 — cancel safety is structurally unchanged.** Neither addition to `service_hop` is an
+//!   `await`, so its suspension points are byte-for-byte what they were and it is still awaited as a
+//!   bare statement at both call sites, never as a `select` branch.
+//! * **H4 — TX vs listening.** In FHSS the receiver hops too, so a trace read after a frame would
+//!   otherwise mix the frame's own hops with the idle-RX hops around it. Bit 7 of `idx`
+//!   ([`HOPTRACE_TX_FLAG`]) is set from the CALL SITE — `fire_tx` vs the main loop — with no extra
+//!   register read.
+//! * **H5 — the self-description.** `CMD_BITMAP` is a u32 and is FULL at 0x1F, and 0x20 is bit 32;
+//!   [`CMD_BITMAP_EXT`] carries opcodes 32..63 rather than widening `EVT_CAP`'s frozen 34-byte
+//!   layout, which would desynchronise this node from the LR2021 it exists to be compared with.
+//!
 //! # What changed in the 2026-08-28 v3 pass (C1..C5)
 //!
 //! v3's premise is that **a modulation is a knob, not an identity**. `EVT_CAP` therefore describes
@@ -178,6 +208,11 @@ const CMD_SET_HOP: u8 = 0x1E; //   payload = [hop_ctrl, hop_period u16 BE, n, fr
 //                                 n <= HOP_MAX                                   -> EVT_INFO (C1)
 const CMD_TX_AT_ABS: u8 = 0x1F; // payload = [target_ticks u64 BE][frame]         -> EVT_TXDONE (C3)
 
+// --- 7E-A5 v3, H-pass (2026-08-28): hop-event timestamping. Fleet-wide numbering; the LR2021 node
+// implements the SAME two opcodes with the SAME encoding, which is the entire point — see
+// [`HopTrace`] for what question this exists to answer.
+const CMD_GET_HOPTRACE: u8 = 0x20; // payload = []                              -> EVT_HOPTRACE (H2)
+
 // --- Firmware -> host ---
 const EVT_RX: u8 = 0x81; //    [rssi i16 BE, snr i16 BE, ts u32 BE, LoRa bytes]; ts unit = CAP.stamp_hz
 const EVT_TXDONE: u8 = 0x82; // [ok, attempts]  (attempts = 0 for a plain CMD_TX)
@@ -200,6 +235,15 @@ const EVT_PHY_ERR: u8 = 0x8D; //     [requested_phy, chip_status] — v3. A PHY 
 //                                   chip's literal status byte (RegOpMode here). A PHY that is NOT
 //                                   in the bitmap is a different answer and gets the fleet's
 //                                   existing one: EVT_UNSUPPORTED [0x1D, OUT_OF_RANGE].
+const EVT_HOPTRACE: u8 = 0x8E; //     [stamp_hz u32 BE][n u8][ (idx u8, t_ticks u32 BE) ]*n — H2.
+//                                   `stamp_hz` is THIS node's own tick rate (== EVT_CAP.stamp_hz),
+//                                   never converted to microseconds in firmware: the host divides,
+//                                   so a 16 MHz node does not have to throw away resolution to
+//                                   match a 1 MHz one. `n` most-recent-LAST, capped at
+//                                   HOPTRACE_MAX = 32 => 4 + 1 + 32*5 = 165 B, one frame.
+//                                   `idx` bits 5:0 = the hop index the event moved TO (this node:
+//                                   RegHopChannel bits 5:0, verbatim); bit 7 = HOPTRACE_TX_FLAG,
+//                                   set iff the hop was taken while TRANSMITTING (H4).
 const EVT_UNSUPPORTED: u8 = 0x8F; // [cmd, reason] — never silence, never a fake success
 
 // EVT_UNSUPPORTED reason codes (shared with the Waveshare node).
@@ -227,7 +271,37 @@ const UNSUP_OUT_OF_RANGE: u8 = 0x04;
 /// ```
 /// bits 1-21 = 0x003F_FFFE, bits 23-24 = 0x0180_0000, bits 26-31 = 0xFC00_0000
 ///   =>  0xFDBF_FFFE.
+///
+/// ☠ **This word is FULL at opcode 0x1F, and `CMD_GET_HOPTRACE` is 0x20 = 32.** It cannot be
+/// advertised here and is not: `EVT_CAP.cmd_bitmap` is a u32 in a layout frozen at 34 bytes, so
+/// widening it would be a fleet-wide wire change, not a firmware change, and it is not one this
+/// pass is entitled to make. See [`CMD_BITMAP_EXT`] for where bit 32 actually lives and how a host
+/// discovers 0x20.
 const CMD_BITMAP: u32 = 0xFDBF_FFFE;
+
+/// **Opcodes 32..63**, bit `(op - 32)`. The continuation of [`CMD_BITMAP`] past the u32 that
+/// `EVT_CAP` can carry.
+///
+/// It exists because the 32-bit self-description ran out exactly one opcode before this pass needed
+/// it, and the three ways out are not equal:
+///
+/// * **Widen `EVT_CAP`.** Its v3 layout is 34 bytes and every node in the fleet plus the host
+///   parser agree on it. Changing it here alone would desynchronise this node from the LR2021 —
+///   the very node this trace exists to be COMPARED with. Refused.
+/// * **Renumber `CMD_GET_HOPTRACE` into a gap** (0x19 is free). Refused for a different reason: the
+///   opcode number is part of the contract stated for BOTH nodes, and a node that answered a
+///   different opcode than its counterpart would make the comparison harness node-specific.
+/// * **Say the true thing in a place that has room.** This word is emitted in the `CMD_SET_DEBUG`
+///   dump (a free-form `EVT_LOG`, no frozen layout), and the primary discovery path is the one the
+///   7E-A5 rule set already guarantees: *send it and read the answer.* A node that does not
+///   implement 0x20 replies `EVT_UNSUPPORTED [0x20, UNKNOWN_OPCODE]`; one that implements it but
+///   cannot stamp its hops replies `EVT_UNSUPPORTED [0x20, NO_HARDWARE]`; this node replies
+///   `EVT_HOPTRACE`. Three distinguishable answers, no silence, nothing fabricated.
+///
+/// ⚠ The dispatcher's catch-all oracle still reads [`CMD_BITMAP`] only, guarded by `f.typ < 32`.
+/// That guard is load-bearing in Rust (`1u32 << 32` panics in debug and is UB-adjacent in release),
+/// and it is also why 0x20 MUST have an explicit `match` arm above the catch-all — which it has.
+const CMD_BITMAP_EXT: u32 = 1 << (CMD_GET_HOPTRACE as u32 - 32);
 
 /// `1 << opcode`, so the compile-time bitmap checks below read as opcodes rather than as hex.
 const fn cmd_bit(op: u8) -> u32 {
@@ -264,9 +338,19 @@ const _: () = {
     assert!(CMD_BITMAP & cmd_bit(CMD_SENSE) != 0);
     // The literal and the opcode list are two statements of the same fact; make them agree.
     assert!(CMD_BITMAP == 0x003F_FFFE | 0x0180_0000 | 0xFC00_0000);
-    // The catch-all in `handle_cmd` reads the bitmap with `CMD_BITMAP >> f.typ`, so the highest
-    // opcode this node claims must still be inside a u32.
+    // The catch-all in `handle_cmd` reads the bitmap with `CMD_BITMAP >> f.typ` behind an
+    // `f.typ < 32` guard, so every opcode the u32 bitmap claims must be inside it.
     assert!(CMD_TX_AT_ABS < 32);
+    // ★ H5 — the bitmap really is full at 0x1F, and 0x20 really is the first opcode past its end.
+    // These two assertions are what stop a later pass from "just setting the bit" (there is none)
+    // or from renumbering 0x20 into the 0x19 gap without noticing the contract it shares with the
+    // LR2021 node.
+    assert!(CMD_BITMAP & cmd_bit(0x1F) != 0); // the top bit of the u32 is taken
+    assert!(CMD_GET_HOPTRACE == 32); // ...so this one cannot be represented in it at all
+    // The continuation word says the same thing the dispatcher does: 0x20 is implemented here.
+    assert!(CMD_BITMAP_EXT & (1 << (CMD_GET_HOPTRACE as u32 - 32)) != 0);
+    // Nothing above 0x20 is claimed yet; a stray bit would advertise an opcode with no handler.
+    assert!(CMD_BITMAP_EXT == 0x0000_0001);
     // ★ The host's `NodeProfile::schedules_tx()` requires BOTH the bit and a non-zero granularity,
     // and treats one without the other as an inconsistent node. Fail the build instead.
     assert!((CMD_BITMAP & cmd_bit(CMD_TX_AT) != 0) == (SCHED_GRAN_NS > 0));
@@ -517,6 +601,233 @@ const _: () = {
     assert!(HOP_PERIOD_MAX == 255); // == the width of RegHopPeriod
     assert!(HOP_OFF != HOP_ON);
 };
+
+// =================================================================================================
+// ★ H1-H4 — hop-event timestamping (`CMD_GET_HOPTRACE` / `EVT_HOPTRACE`)
+// =================================================================================================
+
+/// Ring depth, from the H2 contract. 32 events at `hop_period = 8` / SF7 / BW125 (T_sym 1.024 ms,
+/// one hop per 8.192 ms) is **262 ms** of timeline — several whole frames — and 32 * 5 + 5 = 165 B,
+/// which fits the single 255-byte serial payload the event is defined to be.
+const HOPTRACE_MAX: usize = 32;
+
+/// H4 — bit 7 of the `idx` byte: **this hop was taken while the chip was TRANSMITTING.**
+///
+/// Without it a trace read after a frame is useless, because in FHSS the RECEIVER hops too: the
+/// interrupt fires every `hop_period` symbols forever, so a frame's own hops arrive embedded in an
+/// unbroken run of idle-RX hops and nothing in a raw count separates them. That is exactly the
+/// confusion that made `Hop::hops` misleading.
+///
+/// Set iff the event was serviced from [`Radio::fire_tx`] — i.e. the chip was in TX with a frame in
+/// flight and `RegOpMode` had been written to TX by `do_tx`. Clear means **not transmitting**: the
+/// main loop serviced it, which is idle RX or a reception in progress. It is deliberately a
+/// two-valued fact and not a mode enumeration, because "was the carrier ours?" is the only
+/// distinction the timing question needs and it is the only one the firmware can state without
+/// reading another register.
+///
+/// Bits 6 and 5:0: `RegHopChannel`'s `FhssPresentChannel` field is 6 bits, so bit 6 is spare and
+/// bit 7 cannot collide with a legitimate index.
+const HOPTRACE_TX_FLAG: u8 = 0x80;
+
+/// Bytes per entry on the wire: `idx u8` + `t_ticks u32 BE`.
+const HOPTRACE_ENTRY_BYTES: usize = 5;
+
+/// **The hop-trace table test** (H5). The wire arithmetic and the flag layout, pinned at compile
+/// time — `#[cfg(test)]` cannot run on this `no_std`/`no_main` xtensa target.
+const _: () = {
+    assert!(HOPTRACE_MAX == 32); // the H2 contract
+    assert!(HOPTRACE_ENTRY_BYTES == 5); // idx u8 + t_ticks u32 BE
+    // The whole event must fit ONE 255-byte serial payload: [stamp_hz u32][n u8] + n entries.
+    assert!(4 + 1 + HOPTRACE_MAX * HOPTRACE_ENTRY_BYTES == 165);
+    assert!(4 + 1 + HOPTRACE_MAX * HOPTRACE_ENTRY_BYTES <= 255);
+    // H4's flag must not collide with an index. RegHopChannel's channel field is 6 bits wide, and
+    // `regs::HOP_CHANNEL_MASK` is the authority on that, so derive the check from it rather than
+    // from 0x3F written twice.
+    assert!(HOPTRACE_TX_FLAG & regs::HOP_CHANNEL_MASK == 0);
+    assert!(HOPTRACE_TX_FLAG == 0x80);
+    // The trace is stamped from the SAME counter EVT_RX.ts and CMD_READ_CLOCK use, and EVT_HOPTRACE
+    // declares that counter's rate in its own first field. Both are u32 on the wire, so they wrap
+    // together and a host can compare them without a unit conversion. (STAMP_HZ itself is pinned to
+    // 1 000 000 by the scheduling table above; this pins that the trace shares it.)
+    assert!(STAMP_HZ == embassy_time::TICK_HZ as u32);
+};
+
+/// **H1/H2 — the hop-event ring.** 32 free-running entries, oldest overwritten, and reading does
+/// NOT clear it (the `EVT_SENSE.activity` contract).
+///
+/// # What this instrument is for
+///
+/// An LR2021 and this SX1276 both do LoRa intra-packet frequency hopping and cannot hop with each
+/// other, and the failure survives a **one-entry** hop list — the hop machinery runs but the carrier
+/// never moves — so it is not the sequence, not the phase, and not the frame format (a plain
+/// non-hopping receiver decodes either part's hop-mode TX perfectly). What is left is that the two
+/// disagree about **when a hop boundary falls**. A period sweep over 2/4/8/16 has already been ruled
+/// out on air.
+///
+/// ★ The thing that makes it measurable at all: **each node timestamps its OWN hop events.** No
+/// cross-vendor reception is needed to compare the two timelines, which matters because the link
+/// that would have carried the comparison is the very thing that is broken.
+///
+/// At SF7 / BW 125 kHz a symbol is 2^7/125000 = 1.024 ms, so a nominal 8-symbol hop period is
+/// **8.192 ms** and both parts should show that interval. Whatever differs — the interval, the
+/// instant of the first hop relative to the start of a frame, or whether hops continue between
+/// frames — is the answer.
+///
+/// # Where the stamp is taken, and what sits between it and the RF boundary (H1)
+///
+/// The stamp is `Instant::now()` as the **first statement of [`Radio::service_hop`]**, before any
+/// of that function's four SPI transactions — those are ~32 µs of byte time at 2 MHz and would
+/// otherwise sit between the RF boundary and the timestamp. It is the same `embassy-time` counter
+/// `EVT_RX.ts` is filled from and `CMD_READ_CLOCK` returns, so a hop and a frame arrival on this
+/// node share one timebase with no conversion.
+///
+/// **⚠ The offset from the true RF hop instant is NOT MEASURED.** Stating it is the whole point of
+/// the instrument, so here is the path, term by term, and which terms are which:
+///
+/// | term | value | measured? |
+/// |---|---|---|
+/// | SX1276 RF hop boundary → DIO1 asserts | unknown | **no** — the datasheet gives no figure and there is no register to read it from |
+/// | DIO1 high → GPIO interrupt → esp-hal waker → embassy executor → this task resumes | unknown | **no** — never timed on this board |
+/// | task resumes → `Instant::now()` | ≤ 1 tick = 1 µs | derived (`STAMP_HZ`) |
+/// | main task busy elsewhere when DIO1 asserts | 0 … milliseconds | **no** — see below |
+///
+/// The last row is the one that can dominate and it is not bounded by anything small: the hop
+/// branch is a `select` arm of a single-threaded loop, so if DIO1 asserts while that task is inside
+/// a bare SPI or UART statement, the stamp waits for it. The known worst cases in this firmware are
+/// `stage_tx`'s ~30-transaction register burst (≈ 1.5-2.7 ms, budgeted at [`STAGE_FIXED_US`]) and
+/// `write_all` draining a full 128-byte UART TX FIFO at 115200 (≈ 11 ms). Neither is timed against
+/// a hop.
+///
+/// ★ **The trace makes its own offset falsifiable, which is why it is still worth taking.** Every
+/// constant part of that path cancels in a DIFFERENCE of two stamps, so consecutive entries measure
+/// the hop INTERVAL with only the variable part left in, and the spread of those intervals over a
+/// quiet run is a direct upper bound on the jitter of everything above. Read the interval first;
+/// trust an absolute offset only after it has been measured.
+///
+/// # ☠ A term that is a LOSS, not a latency: a hop can be missing from this ring entirely
+///
+/// The four rows above are all delays. There is a fifth term and it is different in kind, so it is
+/// stated separately rather than folded into the table: **a hop that coincides with RxDone, TxDone
+/// or HeaderValid produces no entry at all.** `lora-phy`'s `process_irq_event` is called with
+/// `clear_interrupts = true` on the RX and TX paths and clears `RegIrqFlags` with `0xFF`, hop flag
+/// included, so when the DIO0 branch of the `select` wins that round the hop's retune is skipped and
+/// nothing reaches `service_hop` to be stamped. It is a pre-existing property of the C1 hop path
+/// (documented in the README as "one hop can be swallowed"), not something this instrument added —
+/// but it lands on the instrument, and a reader differencing consecutive stamps across the gap would
+/// read **2 × the hop period and believe it**.
+///
+/// ★ **`idx` is what makes it detectable, and this is the case that pays for carrying the chip's raw
+/// counter instead of a software one:** the modem kept counting through the swallowed hop, so the
+/// next entry's `FhssPresentChannel` arrives **2 higher, not 1**. The host's rule is therefore not
+/// "difference consecutive stamps" but *"difference consecutive stamps and divide by the `idx`
+/// step"* — and any interval whose `idx` step is not 1 is a gap, not a measurement.
+///
+/// ⚠ The loss is **correlated with frames**, not random: it happens exactly when the modem raises a
+/// packet-boundary interrupt, which is the region of the timeline the hop question is about. Its
+/// rate has never been counted. The LR2021 node fails differently in the same situation — it records
+/// the entry but may stamp it with the frame's instant instead of the hop's, and counts how often
+/// (`hoptrace::HopTrace::coalesced`) — so **neither node's trace should be taken while it is also
+/// carrying traffic if the timeline can be taken on an idle-hopping node instead.**
+///
+/// A tighter stamp is possible in principle — a custom GPIO ISR that samples the counter before the
+/// executor runs — and is deliberately NOT done here: esp-hal's `Input::wait_for_high` owns that
+/// pin's interrupt to drive the async waker, so installing a handler on it would replace the
+/// mechanism the cancel-safe hop path (H3) is built on. If the interval jitter above turns out to
+/// matter, that is the next step, and it is a pass of its own.
+///
+/// # What is NOT folded in
+///
+/// Nothing. No guessed constant offset is added to a stamp, and no interpolation to a symbol
+/// boundary is attempted. The event carries the node's own raw counter value and its own tick rate,
+/// and the host does the arithmetic — which is also why `stamp_hz` is on the wire instead of a
+/// firmware-side conversion to microseconds, which would throw away resolution on a 16 MHz node to
+/// match this 1 MHz one.
+struct HopTrace {
+    /// `Instant::now().as_ticks() as u32` at the top of `service_hop`, in `STAMP_HZ` units. The low
+    /// 32 bits, exactly like `EVT_RX.ts`, so the two wrap together (~71 min at 1 MHz).
+    t: [u32; HOPTRACE_MAX],
+    /// `RegHopChannel` bits 5:0 verbatim, OR'd with [`HOPTRACE_TX_FLAG`] when the hop was taken
+    /// while transmitting.
+    ///
+    /// ☠ **This byte is NOT the same quantity as the LR2021's, though the layout, the mask and the
+    /// flag bit are identical.** Here it is the CHIP's own counter, read out of `RegHopChannel`;
+    /// there it is a FIRMWARE count of recorded hop interrupts, because the LR2021 exposes no
+    /// hop-index register at all (`SetLoraHopping` is commented out of its command spec and there
+    /// is no `GetLoraHopStatus`). Two consequences the host must hold on to:
+    ///
+    /// * only THIS node's `idx` can reveal a hop the MCU coalesced (the field jumps by more than 1)
+    ///   or a per-packet reset of the modem's counter — the other node's advances once per
+    ///   *recorded* event by construction and can show neither;
+    /// * therefore ★ **compare `t_ticks` across the two nodes; compare `idx` only within one.** A
+    ///   difference in the first `idx` value between the parts is a fact about the LR2021
+    ///   firmware's counter, not about its silicon.
+    idx: [u8; HOPTRACE_MAX],
+    /// Next slot to write.
+    head: usize,
+    /// Entries held, saturating at [`HOPTRACE_MAX`]. Not a count of hops ever taken — that is
+    /// `Hop::hops`, which the host differences.
+    len: usize,
+}
+
+impl HopTrace {
+    const fn new() -> Self {
+        Self { t: [0; HOPTRACE_MAX], idx: [0; HOPTRACE_MAX], head: 0, len: 0 }
+    }
+
+    /// Record one hop event. **Pure arithmetic on RAM — no SPI, no await, no allocation** — which
+    /// is what lets it be called from inside `service_hop` without adding a suspension point to a
+    /// future that must run to completion (H3).
+    ///
+    /// `chan` is `RegHopChannel & HOP_CHANNEL_MASK` as read by the caller; this function does not
+    /// re-read it and does not mask it again beyond dropping the flag bit's room, so the value
+    /// stored is the chip's, not a derived one.
+    fn push(&mut self, t: Instant, chan: u8, tx_active: bool) {
+        let mut b = chan & regs::HOP_CHANNEL_MASK;
+        if tx_active {
+            b |= HOPTRACE_TX_FLAG;
+        }
+        self.t[self.head] = t.as_ticks() as u32;
+        self.idx[self.head] = b;
+        self.head = (self.head + 1) % HOPTRACE_MAX;
+        if self.len < HOPTRACE_MAX {
+            self.len += 1;
+        }
+    }
+
+    /// Serialise into an `EVT_HOPTRACE` payload: `[stamp_hz u32 BE][n u8][idx u8, t u32 BE]*n`,
+    /// **most recent LAST**. Returns the used length of `out`.
+    ///
+    /// Reading does not disturb the ring — no head reset, no length reset, no clear — so two reads
+    /// with hops in between overlap, and the host differences or de-duplicates on the stamps. That
+    /// is the `EVT_SENSE.activity` contract, and it is what makes a read safe to repeat while a
+    /// measurement is running.
+    fn encode(&self, out: &mut [u8; 4 + 1 + HOPTRACE_MAX * HOPTRACE_ENTRY_BYTES]) -> usize {
+        out[0..4].copy_from_slice(&STAMP_HZ.to_be_bytes());
+        out[4] = self.len as u8;
+        // Oldest first: with a full ring the oldest entry is the one `head` is about to overwrite.
+        let start = (self.head + HOPTRACE_MAX - self.len) % HOPTRACE_MAX;
+        for k in 0..self.len {
+            let i = (start + k) % HOPTRACE_MAX;
+            let o = 5 + k * HOPTRACE_ENTRY_BYTES;
+            out[o] = self.idx[i];
+            out[o + 1..o + 5].copy_from_slice(&self.t[i].to_be_bytes());
+        }
+        5 + self.len * HOPTRACE_ENTRY_BYTES
+    }
+
+    /// How many of the entries held were taken while TRANSMITTING (H4). Reported in the
+    /// `CMD_SET_DEBUG` dump so the TX/idle-RX split is visible without pulling the whole trace.
+    fn tx_flagged(&self) -> usize {
+        let start = (self.head + HOPTRACE_MAX - self.len) % HOPTRACE_MAX;
+        let mut c = 0;
+        for k in 0..self.len {
+            if self.idx[(start + k) % HOPTRACE_MAX] & HOPTRACE_TX_FLAG != 0 {
+                c += 1;
+            }
+        }
+        c
+    }
+}
 
 /// SX1276 LoRa spreading factors this firmware operates. SF6 is excluded: it requires an implicit
 /// header, which would break interop with the fleet's explicit-header frames.
@@ -932,6 +1243,9 @@ struct Hop {
     pll_timeouts: u32,
     /// The last list index actually programmed, for the debug dump.
     last_idx: u8,
+    /// ★ H1/H2 — the timestamped hop-event ring. See [`HopTrace`], which carries the whole
+    /// argument for why it exists and where in the path the stamp is taken.
+    trace: HopTrace,
     /// ☠ **The carrier to go back to when hopping is switched off.**
     ///
     /// Enabling overwrites `st.p.freq_hz` with `hz[0]`, because hop channel 0 is where a packet
@@ -955,6 +1269,7 @@ impl Hop {
             hops: 0,
             pll_timeouts: 0,
             last_idx: 0,
+            trace: HopTrace::new(),
             base_hz: 0,
         }
     }
@@ -1188,11 +1503,60 @@ impl Radio {
     /// we were servicing the hop survives to be consumed by `lora-phy`'s `process_irq_event`.
     /// Clearing first is also what drops DIO1 before we return, so the level wait cannot re-fire on
     /// the hop we just handled.
-    async fn service_hop(&mut self) -> Result<(), esp_hal::spi::Error> {
+    ///
+    /// # ★ H1 — where the timestamp is taken, and what is still between it and the RF boundary
+    ///
+    /// `Instant::now()` is the **first statement of this function**, before the flag-clear write.
+    /// That is as early as this function can be: the four SPI transactions below are ~32 µs of byte
+    /// time at 2 MHz and would otherwise sit inside the measurement. It is the same `embassy-time`
+    /// counter `EVT_RX.ts` is filled from and `CMD_READ_CLOCK` returns, so hops and frame arrivals
+    /// on this node share one timebase and `EVT_HOPTRACE.stamp_hz` describes both.
+    ///
+    /// ⚠ What remains between the true RF hop instant and this stamp is **NOT MEASURED**: the
+    /// SX1276's own RF-boundary → DIO1 delay (no datasheet figure, no register to read it from),
+    /// and the DIO1 edge → GPIO interrupt → esp-hal waker → embassy executor → task-resume path
+    /// (never timed on this board). Both are stated as unknown rather than budgeted, because a
+    /// guessed offset folded into a stamp is exactly what would make this trace unable to answer a
+    /// timing question. On top of them sits a variable term that can dominate: this is a `select`
+    /// arm of a single-threaded loop, so a hop that lands while the task is inside a bare SPI or
+    /// UART statement waits for it (worst known: ~11 ms for `write_all` draining a full UART TX
+    /// FIFO). The constant terms cancel in the DIFFERENCE of two stamps, so the hop INTERVAL — the
+    /// number the SX1276-vs-LR2021 comparison actually turns on — carries only the variable part,
+    /// and its spread over a quiet run bounds that part directly. Full accounting at [`HopTrace`].
+    ///
+    /// # ★ H4 — `tx_active`
+    ///
+    /// `true` iff the caller is [`Radio::fire_tx`], i.e. the chip is in TX with a frame in flight;
+    /// `false` from the main loop, which is idle RX or a reception in progress. It is recorded in
+    /// bit 7 of the trace's `idx` byte ([`HOPTRACE_TX_FLAG`]) because in FHSS the receiver hops too,
+    /// so a frame's own hops arrive embedded in an unbroken run of idle-RX hops and nothing in a
+    /// raw count separates them. The caller is the authority on this and no register is read for it.
+    ///
+    /// # ★ H3 — this still cannot cancel an SPI future mid-flow
+    ///
+    /// Nothing added here is an `await`. `Instant::now()` is a register read on the MCU and
+    /// [`HopTrace::push`] is arithmetic on RAM; neither introduces a suspension point, so the set
+    /// of places this future can be suspended is byte-for-byte what it was, and it is still awaited
+    /// as a bare statement in both call sites — never as a `select` branch.
+    async fn service_hop(&mut self, tx_active: bool) -> Result<(), esp_hal::spi::Error> {
+        // ★ H1: THE STAMP. Nothing may be inserted above this line.
+        let t = Instant::now();
         self.raw
             .write_reg(regs::REG_IRQ_FLAGS, regs::IRQ_FHSS_CHANGE_CHANNEL)
             .await?;
         let hc = self.raw.read_reg(regs::REG_HOP_CHANNEL).await?;
+        // H2: recorded from the read the service path already performs — no second SPI transaction
+        // is added for the trace — and recorded HERE, before the retune, so a `write_frf` that then
+        // fails on the bus loses the retune but not the evidence that the boundary happened.
+        //
+        // The value stored is `RegHopChannel`'s own 6-bit FhssPresentChannel field, NOT
+        // `field % n`. That matters for the experiment this instrument exists for: with a
+        // ONE-ENTRY hop list — where the machinery runs but the carrier can never move — the
+        // modulo'd list index is 0 forever and would hide the chip's hop counter entirely, while
+        // the raw field still counts 0,1,2,… and wraps at 64. It is also literally what the H2
+        // contract asks for ("what RegHopChannel reports on the SX1276"). The retune below keeps
+        // using `% n`, which is the Semtech reference driver's pattern and unchanged.
+        self.hop.trace.push(t, hc & regs::HOP_CHANNEL_MASK, tx_active);
         if hc & regs::HOP_CHANNEL_PLL_TIMEOUT != 0 {
             // The modem itself says the synthesiser did not lock in time for this hop. Counted
             // rather than inferred, and surfaced in the CMD_SET_DEBUG dump.
@@ -1200,7 +1564,8 @@ impl Radio {
         }
         // An empty list can only be reached by a stale latched flag (hopping was just turned off
         // while one was pending). Clearing it was the whole job; writing RegFrf from `frf[0] == 0`
-        // would command a 0 Hz carrier.
+        // would command a 0 Hz carrier. The event is still in the trace above — it did happen, and
+        // silently dropping it would put a gap in a timeline whose gaps are the measurement.
         if self.hop.n == 0 {
             return Ok(());
         }
@@ -1360,7 +1725,10 @@ impl Radio {
                 // Retune to the next hop and go straight back to waiting for TxDone. The chip stays
                 // in TX throughout; only the carrier moves.
                 FireWake::Hop => {
-                    if self.service_hop().await.is_err() {
+                    // H4: `true` — the chip is in TX with this frame in flight, so every hop
+                    // serviced here is an INTRA-PACKET hop of ours and is flagged as such in the
+                    // trace. This is the only call site that can say that.
+                    if self.service_hop(true).await.is_err() {
                         // Cannot keep hopping if the bus will not carry the retune, and cannot keep
                         // racing a pin we can no longer clear. Give up hopping, not the frame.
                         self.hop.enabled = false;
@@ -1904,7 +2272,10 @@ async fn main(spawner: Spawner) {
             // a packet in flight is the entire point, the modem stays in RXCONTINUOUS, and
             // re-arming would abort the very reception the hop exists to follow.
             Wake::Hop => {
-                if radio.service_hop().await.is_err() {
+                // H4: `false` — the main loop only runs while no transmission is in flight
+                // (`fire_tx` does not return until TxDone, a timeout or an error), so a hop
+                // serviced here was taken while LISTENING: idle RX, or a reception in progress.
+                if radio.service_hop(false).await.is_err() {
                     st.radio_errors = st.radio_errors.saturating_add(1);
                     // A hop we could not service leaves DIO1 latched high, and the branch above
                     // would then spin the loop. Turning hopping off removes the branch, which is
@@ -2371,6 +2742,48 @@ async fn send_cap(tx: &mut UartTx<'static, Async>) {
     send_frame(tx, EVT_CAP, &c).await;
 }
 
+/// **★ H2 — `EVT_HOPTRACE` (0x8E): this node's own hop timeline.**
+///
+/// ```text
+///  [0..4]  stamp_hz  = STAMP_HZ, THIS node's tick rate (== EVT_CAP.stamp_hz, == EVT_RX.ts units)
+///  [4]     n         = entries returned, 0..=HOPTRACE_MAX (32), MOST RECENT LAST
+///  then n * {
+///    [0]     idx     = bits 5:0 RegHopChannel's FhssPresentChannel, verbatim;
+///                      bit 7 HOPTRACE_TX_FLAG = the hop was taken while TRANSMITTING (H4)
+///    [1..5]  t_ticks = Instant::now() at the top of `service_hop`, low 32 bits, in stamp_hz units
+///  }
+/// ```
+///
+/// `stamp_hz` is on the wire, and the ticks are NOT converted to microseconds in firmware, for a
+/// reason that is the whole design: the host divides. A firmware-side conversion would force a
+/// 16 MHz node to throw away resolution to match this 1 MHz one, and the comparison between the two
+/// nodes is the measurement.
+///
+/// **`n = 0` is a real answer, not a failure**: it means this node has not serviced a hop since
+/// boot — the ring is only ever written by [`Radio::service_hop`]. Reading does not clear it and
+/// neither does `CMD_SET_HOP 0`: a trace read after a run is precisely the use case, and the
+/// alternative would delete the measurement at the moment it was taken. (At `hop_period = 8` /
+/// SF7 / BW125 the 32-entry ring turns over in 262 ms, so a stale entry from an earlier run cannot
+/// survive into a new one anyway — and if one did, its timestamp would say so.)
+///
+/// ★ **The LR2021 node implements the same rule** (`hoptrace::HopTrace::arm`): arming a plan clears
+/// the ring, disarming does not. That agreement is load-bearing, not tidiness. If one node cleared
+/// on `CMD_SET_HOP 0` and the other did not, a harness that stopped the hopping before pulling the
+/// timeline would get a full trace from one part and `n = 0` from the other — and `n = 0` from a
+/// part that hops is indistinguishable, at the host, from **"this part does not signal its hops at
+/// all"**, which is a conclusion the measurement protocol explicitly draws. The one difference
+/// that survives is `idx`, and it is called out below.
+///
+/// This node never answers `EVT_UNSUPPORTED [0x20, NO_HARDWARE]`: it can stamp its hops, on the
+/// same counter it stamps everything else with. That reply is reserved for a node that genuinely
+/// cannot, and the rule it enforces — never a fabricated timeline — is why `n = 0` is returned
+/// plainly instead of being padded into something that looks like data.
+async fn send_hoptrace(tx: &mut UartTx<'static, Async>, hop: &Hop) {
+    let mut p = [0u8; 4 + 1 + HOPTRACE_MAX * HOPTRACE_ENTRY_BYTES];
+    let n = hop.trace.encode(&mut p);
+    send_frame(tx, EVT_HOPTRACE, &p[..n]).await;
+}
+
 /// `EVT_PHY_ERR` — a PHY this node ADVERTISES that the chip then refused, carrying the chip's own
 /// status byte (`RegOpMode` here: bit 7 LongRangeMode, bits 2:0 the mode). Never used for a PHY
 /// outside `phy_bitmap` — that is a host asking for something never claimed, and it gets the
@@ -2760,6 +3173,20 @@ async fn handle_cmd(
                     "phy cur={PHY_CURRENT} bitmap=0x{PHY_BITMAP:08X} rtt_mean={SERIAL_RTT_MEAN_US}us"
                 );
                 send_frame(tx, EVT_LOG, lg4.as_slice()).await;
+                // ★ H2/H5 — the hop trace's own state, and the one self-description word EVT_CAP
+                // has no room for. `trace` is how many of the 32 ring slots are filled (NOT a hop
+                // count — that is `hops` on the line above, which the host differences); `txf` is
+                // how many of them were taken while transmitting, which is the H4 split visible
+                // without pulling the whole trace. `bitmap_ext` advertises opcodes 32..63, i.e.
+                // 0x20 CMD_GET_HOPTRACE — see CMD_BITMAP_EXT for why it cannot live in EVT_CAP.
+                let txf = radio.hop.trace.tx_flagged();
+                let mut lg5 = BufWriter::new();
+                let _ = write!(
+                    lg5,
+                    "hoptrace n={}/{HOPTRACE_MAX} txf={txf} stamp_hz={STAMP_HZ} bitmap_ext=0x{CMD_BITMAP_EXT:08X}",
+                    radio.hop.trace.len
+                );
+                send_frame(tx, EVT_LOG, lg5.as_slice()).await;
             }
             send_info(tx, radio, st).await;
         }
@@ -3049,6 +3476,25 @@ async fn handle_cmd(
         }
 
         CMD_GET_CAP => send_cap(tx).await,
+
+        // ---- ★ H2 — `CMD_GET_HOPTRACE` (0x20) -> `EVT_HOPTRACE` (0x8E) ----
+        //
+        // Read this node's own hop timeline. The point of the opcode is that it needs NO
+        // cross-vendor reception: the SX1276 and the LR2021 cannot hop with each other, so the
+        // link that would have carried a comparison is the very thing under test — but each node
+        // can state its own hop instants on its own clock, and the host puts the two side by side.
+        //
+        // Free-running, wrapping, and reading does NOT clear it (the `EVT_SENSE.activity`
+        // contract), so a read is safe to repeat while a measurement is running: two reads with
+        // hops in between simply overlap and the host de-duplicates on the stamps.
+        //
+        // ⚠ 0x20 is opcode 32 and `EVT_CAP.cmd_bitmap` is a u32 that is FULL at 0x1F, so this arm
+        // must sit above the catch-all — the catch-all's oracle is that bitmap, guarded by
+        // `f.typ < 32`, and would answer UNKNOWN_OPCODE for an opcode that is in fact implemented
+        // here. See [`CMD_BITMAP_EXT`] for why the bitmap was not widened and how a host discovers
+        // this opcode instead.
+        CMD_GET_HOPTRACE => send_hoptrace(tx, &radio.hop).await,
+
         // Channel occupancy. `activity` is the free-running, wrapping CAD-busy counter — the host
         // differences two reads over a window, never reads it as an absolute. This node advances it
         // from every channel-busy observation it makes: the CADs inside the LBT loop, CMD_CAD, and
@@ -3089,8 +3535,21 @@ async fn handle_cmd(
         //   * the opcode is in the bitmap => we implement it, so we only got here because a length
         //     guard above rejected the payload -> BAD_LENGTH;
         //   * it is not                     -> UNKNOWN_OPCODE.
+        //
+        // ★ H5: the oracle now spans BOTH self-description words. `CMD_BITMAP` covers opcodes
+        // 0..31 and `CMD_BITMAP_EXT` covers 32..63; the `< 32` / `< 64` guards are load-bearing,
+        // because `1u32 << 32` is not 0 in Rust — it panics in debug and is a compile error as a
+        // constant. Splitting the shift this way is what keeps the property the original comment
+        // claims: the dispatcher and the advertised bitmaps cannot drift apart, now including the
+        // opcodes that no longer fit in the one word `EVT_CAP` can carry.
         _ => {
-            let known = f.typ < 32 && (CMD_BITMAP >> f.typ) & 1 != 0;
+            let known = if f.typ < 32 {
+                (CMD_BITMAP >> f.typ) & 1 != 0
+            } else if f.typ < 64 {
+                (CMD_BITMAP_EXT >> (f.typ - 32)) & 1 != 0
+            } else {
+                false
+            };
             let reason = if known { UNSUP_BAD_LENGTH } else { UNSUP_UNKNOWN_OPCODE };
             send_unsupported(tx, f.typ, reason).await;
         }

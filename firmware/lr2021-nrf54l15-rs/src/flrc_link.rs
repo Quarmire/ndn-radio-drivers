@@ -734,6 +734,12 @@ where
     // a silent zero-sample result that looks exactly like "hardware timestamping does not work"
     // rather than "the interrupt was never routed to the pin". Configured here, in the shared setup,
     // so no binary can forget it.
+    //
+    // `new_txrx()` (RxDone | TxDone | Timeout) is the **boot** mask, and it is deliberately not the
+    // only one: with a hop plan live the bridge widens it to carry the intra-packet hop interrupt
+    // too, so the hop timeline (`CMD_GET_HOPTRACE`) is latched by the same DPPI capture as the RX
+    // stamp. That variant lives in `m6_bridge::dio_irq_mask`, which is the single place the mask is
+    // decided at runtime; here hopping is by construction off, so the two agree.
     radio.set_dio_irq(DioNum::Dio8, Intr::new_txrx()).await?;
 
     Ok(())

@@ -354,6 +354,14 @@ silently dropping traffic its neighbour forwards — is indistinguishable from a
 `cmd_bitmap` went from `0x1DBF_DFDE` to **`0xFDBF_DFDE`**, `EVT_CAP` from 29 bytes to **34**, and
 `proto_ver` from 2 to **3**.
 
+⚠ **`0xFDBF_DFDE` is now a full field.** `CMD_GET_HOPTRACE` is opcode **0x20 = 32**, one past the end
+of the four-byte `cmd_bitmap`, so it is the first command in this protocol that cannot be advertised
+and has to be **probed** for (send it; get `EVT_HOPTRACE` or `EVT_UNSUPPORTED`). Widening the field
+would break four firmwares and two host crates at once to advertise one diagnostic opcode, so it is
+not widened — `serial::CMD_BITMAP_FULL` carries the bit for firmware-side reasoning and the wire
+field is its low 32 bits **by construction**, with a test pinning the boundary rather than leaving it
+to be rediscovered when a 33rd opcode silently vanishes.
+
 `cmd_bitmap` is now **per-PHY**, like everything else in `EVT_CAP`: the figure above is the surface
 in LoRa and LR-FHSS, and in **FLRC it is `0xBDBF_DFDE`** — `CMD_SET_HOP` (bit 30) drops, because
 this part has no FLRC hopping command and `check_hop` refuses every call there. The bitmap means
@@ -376,7 +384,9 @@ the SX1276 does LoRa + FSK + OOK.
 | `CMD_SET_PHY 0x1D` | `[packet_type u8]` → **the full new `EVT_CAP`** |
 | `CMD_SET_HOP 0x1E` | `[hop_ctrl][period u16][n][freq_hz u32]*n`, n ≤ 40 → `EVT_INFO` |
 | `CMD_TX_AT_ABS 0x1F` | `[target_ticks u64][frame]` → `EVT_TXDONE` |
+| `CMD_GET_HOPTRACE 0x20` | `[]` → `EVT_HOPTRACE`. ⚠ **opcode 32 — past the end of the 32-bit `cmd_bitmap`**, so it is probed for, not advertised |
 | `EVT_PHY_ERR 0x8D` | `[requested_phy, chip_status]` — an advertised PHY the **chip** refused |
+| `EVT_HOPTRACE 0x8E` | `[stamp_hz u32][n u8][(idx u8, t_ticks u32)]*n`, n ≤ 32 — this node's own hop timeline |
 | `EVT_CAP[1]` | `radio_kind` now names the **part**: 0 SX1262, 1 SX1276, 2 LR2021. v2's `3` is retired |
 | `EVT_CAP[29..33]` | `phy_bitmap u32` — bit N set ⇒ `SetPacketType` value N is usable here |
 | `EVT_CAP[33]` | `phy_current u8` |
@@ -472,6 +482,129 @@ sitting on one carrier.
 - `set_lrfhss_hopping` is **uncallable from outside the crate**: it takes `&[LrfhssHop]`, and
   `LrfhssHop`'s two fields are private with no constructor.
 
+### `CMD_GET_HOPTRACE` — each node timestamps its OWN hop events
+
+**The question.** An LR2021 and a Heltec (SX1276) both do LoRa intra-packet hopping, each
+interoperates with its own kind, and they cannot hop with each other. Everything cheap is measured:
+
+| TX (hopping) | RX | RX hop | result |
+|---|---|---|---|
+| Heltec n=1 | Waveshare (no hop support) | off | **4/4** |
+| LR2021 n=1 | Waveshare | off | **4/4** |
+| Heltec n=1 | LR2021, hop **off** | off | **4/4** |
+| Heltec n=1 | LR2021, hop **on** | on | **0/4** |
+| LR2021 n=1 | Heltec, hop **on** | on | **1/20** |
+| LR2021 n=1 | Heltec, hop **off** | off | **20/20** |
+| LR2021 n=4 | LR2021, hop on | on | 4/4 |
+
+`n = 1` is a **one-entry hop list**: the machinery runs and the carrier can never move. So it is not
+the frequency sequence or its phase, not the frame format (a plain receiver decodes both parts'
+hopping transmissions perfectly), and not structural (1/20 is not 0/20 — a format mismatch would be
+absolute). What is left is that the two disagree about **when** a hop boundary falls, which is what
+§9.8 says in as many words. A period sweep is already ruled out: with the Heltec's RX period fixed at
+8 symbols, sweeping the LR2021's TX period over 2/4/8/16 gave 0–1 of 10 at **every** setting, so no
+search over the exposed knobs will find it.
+
+★ **The measurement needs no cross-vendor decode**, which is what makes it possible at all: each node
+stamps its **own** hop events on its **own** clock and the host compares two timelines. At SF7/BW125
+one symbol is 2^7/125000 = **1.024 ms**, so a nominal 8-symbol period is **8.192 ms** = 131,072 ticks
+here. Whatever differs — the interval, the phase of the first hop relative to the start of a frame,
+or whether hops continue between frames — is the answer.
+
+**Does this part signal each hop at all? Yes — two interrupts, from source.** `vendor/lr2021/src/status.rs`:
+
+| bit | constant | accessor | the crate's own wording |
+|---|---|---|---|
+| `0x0000_1000` | `IRQ_MASK_LORA_TX_RX_HOP` (:203) | `Intr::lora_tx_rx_hop()` (:361) | "IRq for LoRa intra-packet hopping" |
+| `0x0200_0000` | `IRQ_MASK_FHSS` (:231) | `Intr::fhss()` (:413) | "IRQ after each ramp-up for intra-packet hopping" |
+
+Both are enabled and neither is presumed: which one the silicon actually raises — or whether both
+fire, at two different instants — is a measurement, not a reading of two doc strings.
+`hoptrace::HopTrace` folds them into **one event per IRQ poll**, so enabling both cannot double-count.
+
+They reach the MCU on **DIO8**, the only LR2021 DIO the shield routes to the XIAO (→ D0 → P1.04).
+`set_dio_irq` takes a per-DIO mask, so the hop bits are added to the line **only while a hop plan is
+live**.
+
+**Where the stamp is taken.** `TIMER20.CC[0]`, latched by **DPPI in silicon** at the DIO8 rising
+edge — the same capture register, the same free-running 16 MHz counter and the same GPIOTE/DPPI route
+`RxCapture` already uses for `EVT_RX.ts`. Sharing the timebase is the point: a hop instant and a
+frame arrival on one node subtract directly.
+
+Between the RF hop boundary and that tick:
+
+| term | size |
+|---|---|
+| carrier transition → IRQ assertion inside the LR2021 | **NOT MEASURED.** `IRQ_MASK_FHSS` fires "after each ramp-up", i.e. deliberately after the PLL/PA settle — a positive offset of unknown size. `IRQ_MASK_LORA_TX_RX_HOP` states no phase at all |
+| DIO8 pad + shield trace → P1.04 | ns, below one 62.5 ns tick |
+| GPIOTE edge detect → DPPI → `CC[0].CAPTURE` | a few 16 MHz cycles, fixed — the same silicon path M4 measured |
+| CPU wake, SPI status read, `CC[0]` read | lands **after** the latch and cannot contaminate it |
+
+The first term is **not folded in and not guessed at**. It does not have to be: the quantities being
+compared (a hop *interval*, and the *phase* of the first hop against a frame) are differences, and a
+constant offset cancels in both.
+
+**The one DIO8 cost, stated rather than hidden.** DIO8 carries every enabled interrupt and stays high
+until the status is cleared over SPI, so a second event while it is already high raises no new edge —
+`CC[0]` always holds the **first** edge since the last clear. Consequence: if a hop and an `RxDone`
+fall in one poll window they share the one capture, and `CC[0]` is **whichever came first — not
+necessarily the hop.** Inside a packet the hop does come first; but after an `RxDone` the modem stays
+in RX and keeps hopping, so a hop landing in the ≤1 ms before the next poll is stamped with the
+*frame's* instant. At a ~1 ms poll and an 8.192 ms period that is ~12 % of receptions — **derived from
+those two numbers, not measured.** Such an entry is *ambiguous*, and a host must **drop** it rather
+than correct it. It is never silent: the case is **counted** (`EVT_LOG` under `CMD_SET_DEBUG`) and
+the offending `EVT_RX.ts` appears verbatim as a `t_ticks` in the ring. ★ The clean avoidance is a run
+discipline, not firmware — **take the timeline on a node that is hopping but not receiving.**
+
+It is also gated: with hopping off, which is every measurement taken on this board to date, the DIO8
+mask and the RX stamp path are bit-identical to before. The capture path is **not** taken away from
+`RxCapture`, which keeps `GPIOTE20_CH0`, `PPI20_CH0` and `CC[0]`; a separate line is simply not
+available, because the shield routes exactly one radio DIO to the MCU.
+
+**⚠ A second sharing cost: the poll rate bounds which hops are SEPARATED.** The main loop reads the
+status roughly every 1 ms (the UART read timeout plus the SPI work), which is ~8× finer than an
+8.192 ms period — but only roughly, and `wait_tx_done` polls at a firm 200 µs while the node is
+transmitting. Anything that keeps the main loop away for longer than a hop period collapses every hop
+in that gap into **one** entry stamped at the first of them; a 170-byte `EVT_HOPTRACE` reply on the
+115200 UART is ~15 ms and is itself such a gap, so **do not poll the trace during the window you are
+measuring**. The failure is not silent at the host: the surviving intervals come out as integer
+MULTIPLES of the true period, which is the first thing a reader should check.
+
+**`idx` is a firmware counter, not a chip readback.** The SX1276 reports the live hop index in
+`RegHopChannel`; this part exposes no equivalent — `SetLoraHopping` (opcode 556) is commented out of
+the vendor command spec, there is no `GetLoraHopStatus`, and no documented address in
+`lr2021::constants` reads one back. So the index counts hop interrupts modulo the table depth, and it
+is deliberately **not** reset per frame — whether the chip restarts its sequence at entry 0 for each
+packet is one of the things the trace exists to find out. At `n = 1`, which is the configuration every
+row of the table above uses, every index is 0 either way.
+
+☠ **`idx` is therefore NOT the same quantity as the Heltec's `idx`**, though the byte, the mask and
+the flag bit are identical. There it is `RegHopChannel` verbatim — the *chip* counting — so it jumps
+when a hop is swallowed and would show a per-packet reset; here it advances once per *recorded* event
+and can show neither. ★ **Compare `t_ticks` across the two nodes; compare `idx` only within one.** A
+difference in the first `idx` value between the parts is a fact about this firmware's counter, not
+about the silicon.
+
+**Arming clears the ring; disarming does not.** `CMD_SET_HOP 1` starts a fresh timeline, so one plan's
+events can never be served under another. `CMD_SET_HOP 0` and `CMD_SET_PHY` stop the recording and
+**keep** what was recorded — the same rule `heltec-lora-rs` follows. The agreement matters: if one
+node cleared on disable and the other did not, a harness that stopped the hopping before pulling the
+timeline would get a full trace from one part and `n = 0` from the other, and at the host `n = 0` from
+a part that hops is indistinguishable from "this part does not signal its hops at all" — a conclusion
+the measurement protocol explicitly draws. So `n = 0` means exactly *nothing recorded since the last
+plan was armed*, on both nodes.
+
+**Where a transmit started.** Bit 7 of `idx` (`hoptrace::IDX_TX_KEYED`) marks a **TX key-up** entry
+rather than a hop; the table is 40 deep, so that bit cannot occur on a real index and the wire layout
+is unchanged. It costs **no SPI on the transmit hot path** — the index is the firmware counter and
+the instant is one MCU timer-register read, both taken in the gap before `SetTx` leaves the MCU. ⚠ It
+is the one entry whose stamp is a *software* read: between it and the RF key-up sit the `SetTx`
+transaction (≈5 µs at 8 MHz) and the chip's PLL/PA ramp, **neither measured**. There is no hardware
+key-up event to capture instead — `IRQ_MASK_TX_TIMESTAMP` marks the *end* of a transmitted packet.
+
+**⚠ Nothing here is measured on air.** This agent does not touch hardware; the instrument is built
+and the timeline comes from a node on the bench.
+
 ### LR-FHSS — reachable, and the chip gets to settle the contradiction
 
 The datasheet disagrees with itself:
@@ -516,6 +649,7 @@ wrong by up to 2× degrades into a longer wait rather than a truncated transmit.
 | `src/phy_link.rs` | the shared front-end sequence, `PhyState`, the dispatch, per-PHY TX staging and RX read |
 | `src/flrc_link.rs` | FLRC's parameters, modem block and framing — and re-exports of what moved, so twenty binaries keep compiling |
 | `src/lora_link.rs` | LoRa's parameters, modem block, hopping |
+| `src/hoptrace.rs` | pure logic, **host-tested**: the `EVT_HOPTRACE` ring and encoding, the DIO8-sharing rule, the symbol/tick arithmetic the trace is read against |
 | `src/lrfhss_link.rs` | LR-FHSS's parameters, frame build, hopping table read/write, the RX arm |
 
 The generalisation is of `flrc_link`'s `LinkState`/`apply` split, **not a copy of it per PHY** — the

@@ -30,6 +30,7 @@
 pub mod airtime;
 pub mod board;
 pub mod gcs;
+pub mod hoptrace;
 pub mod phy;
 pub mod serial;
 pub mod tier0;

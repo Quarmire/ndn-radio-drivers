@@ -90,6 +90,13 @@ pub const TICK_NS: u32 = 1000 / TICKS_PER_US;
 // this node advertises.
 const _: () = assert!(crate::airtime::MAC_TICKS_PER_US == TICKS_PER_US);
 
+// `crate::hoptrace` puts this same rate on the wire as `EVT_HOPTRACE.stamp_hz`, and it is
+// host-testable for the same reason `airtime` is. Pinned here so raising the timer frequency without
+// raising the advertised one fails the build — a hop trace that says 16 MHz while running at 32
+// would halve every interval a host computes, silently, and the whole instrument exists to measure
+// an interval.
+const _: () = assert!(crate::hoptrace::STAMP_HZ == TICKS_PER_US * 1_000_000);
+
 /// A hardware-captured instant on the MAC clock: the raw tick count latched by
 /// `TIMER.CC[n].CAPTURE` at a DPPI-routed event edge.
 ///
@@ -135,6 +142,26 @@ use crate::hw::TimingParts;
 /// silently disconnects the route, and a silently-disconnected capture returns a stale register
 /// value rather than an error. The result would be plausible-looking timestamps that are simply
 /// wrong, which is the worst failure mode a measurement instrument can have.
+///
+/// ## `CC[0]` holds the FIRST edge since the last IRQ clear — and what shares this line
+///
+/// DIO8 carries **every** enabled LR2021 interrupt and stays high until the status is cleared over
+/// SPI, so a second event while it is already high produces no new rising edge and no new capture.
+/// That makes `CC[0]` exactly "the instant of the first event since the last `get_and_clear_irq`",
+/// which is unambiguous as long as one event is enabled at a time — which is the case for
+/// `Intr::new_txrx()`.
+///
+/// [`crate::hoptrace`] adds the hop interrupt to that mask **while a hop plan is enabled**, to get a
+/// hardware-latched hop timeline on the same timebase as the RX stamp. It does not take the capture
+/// path away — this struct keeps `GPIOTE20_CH0`, `PPI20_CH0` and `CC[0]` — but while hopping is on,
+/// a hop and an `RxDone` falling in the same poll window share one capture, and the value is
+/// **whichever came first**: the hop inside a packet, but the frame when a hop follows an `RxDone`
+/// before the next poll. Both the hop entry and that frame's `ts` are then the same instant and one
+/// of them is wrong; the pair is bounded by one hop period, **counted** (`HopTrace::coalesced`) and
+/// identifiable on the wire (the `ts` reappears verbatim in the hop ring), rather than silent — and
+/// it is avoided outright by taking a hop timeline on a node that is not also receiving. With
+/// hopping off — every measurement taken on this board to date — nothing about this path changes at
+/// all.
 pub struct RxCapture {
     dio: InputChannel<'static>,
     timer: Timer<'static>,

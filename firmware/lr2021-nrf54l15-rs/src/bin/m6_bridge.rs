@@ -60,10 +60,11 @@ use panic_probe as _;
 use lr2021::flrc::{FlrcBitrate, FlrcCr};
 use lr2021::lrfhss::{LrfhssBw, LrfhssCr};
 use lr2021::radio::ExitMode;
-use lr2021::status::Intr;
+use lr2021::status::{Intr, IRQ_MASK_FHSS, IRQ_MASK_LORA_TX_RX_HOP};
 use lr2021::system::DioNum;
 use lr2021::system::ChipMode;
 
+use lr2021_nrf54l15_rs::hoptrace::{self as hoptrace_mod, HopTrace};
 use lr2021_nrf54l15_rs::phy::{self, Phy};
 use lr2021_nrf54l15_rs::phy_link::{self, dbm_of, PhyMode, PhyState};
 use lr2021_nrf54l15_rs::serial::{self, Parser};
@@ -275,6 +276,61 @@ async fn cca_busy(radio: &mut hw::Radio, s: &Sense) -> bool {
     }
 }
 
+/// **The DIO8 interrupt mask**, as a function of whether the hop trace is armed.
+///
+/// One helper rather than five literals, because DIO8 is not merely an interrupt line on this board
+/// — it is the capture source of the hardware RX timestamp, and every `SetPacketType` re-issues the
+/// routing. Five copies of a mask is how one of them ends up missing a bit after a PHY switch, and
+/// nothing says so: the stamps simply stop.
+///
+/// `Intr::new_txrx()` is `RxDone | TxDone | Timeout`, the baseline. When a hop plan is live the two
+/// interrupts the part documents for intra-packet hopping are added:
+///
+/// | bit | vendor crate | datasheet wording |
+/// |---|---|---|
+/// | `0x0000_1000` | `Intr::lora_tx_rx_hop()` | "IRq for LoRa intra-packet hopping" — no phase stated |
+/// | `0x0200_0000` | `Intr::fhss()` | "IRQ after each ramp-up for intra-packet hopping" |
+///
+/// **Both are enabled and neither is presumed.** Which one the silicon actually raises (or whether
+/// it raises both, at two different instants) is a measurement, not a reading of two doc strings —
+/// and `CMD_SET_DEBUG` reports the raw pair so one run settles it. Enabling both cannot double-count:
+/// [`hop_irq`] folds them into one event per IRQ poll.
+///
+/// ⚠ Added **only while hopping is enabled**. With hopping off — every measurement taken on this
+/// board to date — the mask is bit-identical to what it has always been, and so is the RX stamp.
+fn dio_irq_mask(hop_trace_armed: bool) -> Intr {
+    if hop_trace_armed {
+        Intr::new(Intr::new_txrx().value() | IRQ_MASK_LORA_TX_RX_HOP | IRQ_MASK_FHSS)
+    } else {
+        Intr::new_txrx()
+    }
+}
+
+/// Did this interrupt status carry a hop event? See [`dio_irq_mask`] for why both bits count as one.
+fn hop_irq(irq: &Intr) -> bool {
+    irq.lora_tx_rx_hop() || irq.fhss()
+}
+
+/// **Fold one `get_and_clear_irq` result into the hop trace**, given the capture register read that
+/// went with it.
+///
+/// `stamp` must be `cap.hw_stamp()` read **once** for this status word, because `CC[0]` holds the
+/// instant of the *first* DIO8 rising edge since the previous clear — see [`RxCapture`]. Reading it
+/// twice would not give two events; it would give the same value with a race in between.
+///
+/// The coalesced case is counted rather than hidden: when a hop and an `RxDone` land in one poll
+/// window they share the one capture, and `CC[0]` is **whichever came first** — the hop inside a
+/// packet, but the frame when a hop follows an `RxDone` before the next poll. Such an entry is
+/// AMBIGUOUS and the host must drop it; both halves of the detection are on the wire, because the
+/// count says how often it happened and the offending `EVT_RX.ts` reappears verbatim as a `t_ticks`
+/// in the ring. Bounded by one hop period (8.192 ms at SF7/8 symbols), and avoided entirely by
+/// taking the timeline on a node that is not also receiving.
+fn note_irq(tr: &mut HopTrace, irq: &Intr, stamp: u32) {
+    // The decision itself is host-tested in `HopTrace::note`; this function is only the translation
+    // from the chip's status word to the two booleans it takes.
+    tr.note(hop_irq(irq), irq.rx_done(), stamp);
+}
+
 /// Poll for TxDone. Returns whether the frame actually went out.
 ///
 /// `get_and_clear_irq` clears **every** interrupt, so a frame that arrived in the microseconds
@@ -293,10 +349,24 @@ async fn cca_busy(radio: &mut hw::Radio, s: &Sense) -> bool {
 /// some. The same is true of `CMD_TX_AT`'s wait and has been since v2 — it is bounded there by
 /// `MAX_SCHED_DELAY_US`, and here by the airtime the host was just told in `EVT_TX_STARTED`. A host
 /// that respects that deadline never hits it; one that pipelines into a slow PHY will.
-async fn wait_tx_done(radio: &mut hw::Radio, timeout_ms: u64) -> bool {
+///
+/// ★ It also **feeds the hop trace**, and that is not incidental: intra-packet hopping happens
+/// *during* this wait, so the transmitting node's own hop timeline exists only here. A version of
+/// this loop that swallowed the hop interrupts without recording them would leave the TX side of the
+/// comparison blank while looking perfectly correct. The 200 µs poll is 40× finer than an 8.192 ms
+/// hop period, and the stamp itself is the DPPI capture, so the poll rate bounds *which* events are
+/// separated, never the accuracy of the ones that are.
+async fn wait_tx_done(
+    radio: &mut hw::Radio,
+    cap: &RxCapture,
+    tr: &mut HopTrace,
+    timeout_ms: u64,
+) -> bool {
     let deadline = Instant::now() + Duration::from_millis(timeout_ms);
     while Instant::now() < deadline {
         if let Ok(irq) = radio.get_and_clear_irq().await {
+            // One capture read per status word — see `note_irq`.
+            note_irq(tr, &irq, cap.hw_stamp().ticks);
             if irq.tx_done() {
                 return true;
             }
@@ -315,8 +385,15 @@ async fn wait_tx_done(radio: &mut hw::Radio, timeout_ms: u64) -> bool {
 ///   transition-starved and the GMSK demodulator slips polarity mid-frame;
 /// * **`settle_before_tx`** — measured with a B210: going straight from standby to TX leaves the
 ///   PLL converging under the first 27 kHz of the payload.
-async fn tx_once(radio: &mut hw::Radio, st: &PhyState, payload: &[u8]) -> bool {
-    phy_link::tx_stage(radio, st, payload).await && tx_fire(radio, tx_timeout_ms(st, payload.len())).await
+async fn tx_once(
+    radio: &mut hw::Radio,
+    st: &PhyState,
+    cap: &RxCapture,
+    tr: &mut HopTrace,
+    payload: &[u8],
+) -> bool {
+    phy_link::tx_stage(radio, st, payload).await
+        && tx_fire(radio, cap, tr, tx_timeout_ms(st, payload.len())).await
 }
 
 /// Staging a transmit is per-PHY and lives in
@@ -329,11 +406,27 @@ async fn tx_once(radio: &mut hw::Radio, st: &PhyState, payload: &[u8]) -> bool {
 ///
 /// This one SPI command is the whole of `CMD_TX_AT_ABS`'s residual latency, and it is why
 /// `EVT_CAP.sched_gran_ns` is [`airtime::SCHED_GRAN_NS`] and not a timer tick.
-async fn tx_fire(radio: &mut hw::Radio, timeout_ms: u64) -> bool {
+///
+/// **The hop index at key-up is recorded here** (`EVT_HOPTRACE`, `idx | IDX_TX_KEYED`), so a host can
+/// tell where in the hop sequence a frame started. It costs **no SPI**: the index is a firmware
+/// counter and the instant is one MCU timer-register read, both taken in the gap before `SetTx`
+/// leaves the MCU. Nothing is added to the transmit hot path that could move the frame it is
+/// marking — which was the condition on recording it at all. The offset between this software stamp
+/// and the real RF key-up (the `SetTx` transaction, ≈5 µs at 8 MHz, plus the chip's PLL/PA ramp) is
+/// **not measured**, and is documented on `hoptrace::IDX_TX_KEYED` rather than folded in. The part
+/// offers no hardware key-up event to capture instead — `IRQ_MASK_TX_TIMESTAMP` marks the *end* of a
+/// transmitted packet.
+async fn tx_fire(
+    radio: &mut hw::Radio,
+    cap: &RxCapture,
+    tr: &mut HopTrace,
+    timeout_ms: u64,
+) -> bool {
+    tr.push_tx_keyed(cap.now().ticks);
     if radio.set_tx(0).await.is_err() {
         return false;
     }
-    wait_tx_done(radio, timeout_ms).await
+    wait_tx_done(radio, cap, tr, timeout_ms).await
 }
 
 /// **Re-program the link and go back to listening** — the one supported way to change frequency,
@@ -415,6 +508,8 @@ async fn lbt_tx<F, Fut>(
     radio: &mut hw::Radio,
     st: &PhyState,
     s: &mut Sense,
+    cap: &RxCapture,
+    tr: &mut HopTrace,
     payload: &[u8],
     announce: F,
 ) -> (bool, u8)
@@ -451,7 +546,7 @@ where
                 if let Some(a) = announce.take() {
                     a().await;
                 }
-                sent = tx_fire(radio, tx_timeout_ms(st, payload.len())).await;
+                sent = tx_fire(radio, cap, tr, tx_timeout_ms(st, payload.len())).await;
             }
             break;
         }
@@ -847,6 +942,12 @@ async fn main(_spawner: Spawner) {
         .expect("FLRC configure");
     let cap = RxCapture::new(timing);
 
+    // **The hop timeline this node takes of itself** (`CMD_GET_HOPTRACE`). Disarmed at boot, so it
+    // records nothing and the DIO8 interrupt mask is exactly what it has always been until a host
+    // enables hopping. See `lr2021_nrf54l15_rs::hoptrace` for the question it answers and for where
+    // in the path the stamp is taken.
+    let mut hoptrace = HopTrace::new();
+
     // Seed the backoff PRNG from two sources that differ between boards: the chip's hardware RNG and
     // the free-running MAC clock at the instant we get here. A deterministic seed would make both
     // nodes draw the SAME backoff sequence, which is not a backoff at all.
@@ -916,7 +1017,13 @@ async fn main(_spawner: Spawner) {
                         let ok = if phy_link::tx_stage(&mut radio, &state, pl).await {
                             let air = state.airtime_ms_be(pl.len());
                             send(&mut uart, &mut out, serial::EVT_TX_STARTED, &air).await;
-                            tx_fire(&mut radio, tx_timeout_ms(&state, pl.len())).await
+                            tx_fire(
+                                &mut radio,
+                                &cap,
+                                &mut hoptrace,
+                                tx_timeout_ms(&state, pl.len()),
+                            )
+                            .await
                         } else {
                             false
                         };
@@ -929,7 +1036,7 @@ async fn main(_spawner: Spawner) {
                     serial::CMD_TX_LBT => {
                         let air = state.airtime_ms_be(pl.len());
                         let (sent, attempts) =
-                            lbt_tx(&mut radio, &state, &mut sense, pl, || {
+                            lbt_tx(&mut radio, &state, &mut sense, &cap, &mut hoptrace, pl, || {
                                 send(&mut uart, &mut out, serial::EVT_TX_STARTED, &air)
                             })
                             .await;
@@ -1150,6 +1257,42 @@ async fn main(_spawner: Spawner) {
                         let body = info_body(&mut radio, &state, &sense).await;
                         send(&mut uart, &mut out, serial::EVT_INFO, &body).await;
                     }
+                    serial::CMD_GET_HOPTRACE => {
+                        // ★ **This node's own hop timeline** — the instrument for "when does a hop
+                        // boundary fall?", and the reason no cross-vendor link is needed to answer
+                        // it: each node stamps its OWN hops on its OWN clock, and the host compares
+                        // two timelines. The link that would otherwise have to carry the comparison
+                        // is the very thing under investigation.
+                        //
+                        // Free-running and wrapping; **reading does not clear it**, the same
+                        // contract as `EVT_SENSE.activity` — and neither does turning hopping off,
+                        // which is the contract the Heltec node implements too. `n = 0` therefore
+                        // means "nothing recorded since the last plan was ARMED", never "hopping is
+                        // off right now"; see `HopTrace::arm` for why that distinction is the one
+                        // this instrument must not blur. Nothing is ever fabricated: a node that
+                        // could not stamp its hops would answer
+                        // `EVT_UNSUPPORTED [0x20, NO_HARDWARE]` instead, and this node can.
+                        //
+                        // ⚠ **Do not poll this during the window you are measuring.** The reply is
+                        // up to 170 bytes on a 115200 UART ≈ 15 ms — longer than one 8.192 ms hop
+                        // period — and the loop is not polling the chip's interrupt status while it
+                        // writes, so hops landing inside that window coalesce into one entry.
+                        //
+                        // No argument is taken and none is rejected: an empty payload is the whole
+                        // command, so a host that sends stray bytes still gets its trace rather than
+                        // a `BAD_LENGTH` for a field that does not exist.
+                        let mut body = [0u8; hoptrace_mod::MAX_BODY_LEN];
+                        let k = hoptrace.encode(&mut body);
+                        send(&mut uart, &mut out, serial::EVT_HOPTRACE, &body[..k]).await;
+                        // The DIO8-sharing cost, reported rather than described: how many times a
+                        // hop and an RxDone shared one capture. Debug-gated like every other
+                        // diagnostic here, so a quiet link stays quiet.
+                        if debug {
+                            let mut m = [0u8; 40];
+                            let n = fmt_kv(&mut m, b"HOPTRACE coalesced=", hoptrace.coalesced);
+                            send(&mut uart, &mut out, serial::EVT_LOG, &m[..n]).await;
+                        }
+                    }
                     serial::CMD_SET_DEBUG if !pl.is_empty() => {
                         debug = pl[0] != 0;
                         let body = info_body(&mut radio, &state, &sense).await;
@@ -1334,7 +1477,13 @@ async fn main(_spawner: Spawner) {
                                 let air = state.airtime_ms_be(frame.len());
                                 send(&mut uart, &mut out, serial::EVT_TX_STARTED, &air).await;
                                 wait_until(&cap, target).await;
-                                tx_fire(&mut radio, tx_timeout_ms(&state, frame.len())).await
+                                tx_fire(
+                                    &mut radio,
+                                    &cap,
+                                    &mut hoptrace,
+                                    tx_timeout_ms(&state, frame.len()),
+                                )
+                                .await
                             } else {
                                 false
                             };
@@ -1410,7 +1559,13 @@ async fn main(_spawner: Spawner) {
                                 let air = state.airtime_ms_be(frame.len());
                                 send(&mut uart, &mut out, serial::EVT_TX_STARTED, &air).await;
                                 wait_until(&cap, target32).await;
-                                tx_fire(&mut radio, tx_timeout_ms(&state, frame.len())).await
+                                tx_fire(
+                                    &mut radio,
+                                    &cap,
+                                    &mut hoptrace,
+                                    tx_timeout_ms(&state, frame.len()),
+                                )
+                                .await
                             } else {
                                 false
                             };
@@ -1444,6 +1599,21 @@ async fn main(_spawner: Spawner) {
                             Some(p) if phy::advertised(p) => {
                                 let prev = state;
                                 state.set_phy(p);
+                                // `set_phy` drops the hop table (a table written for one modulation
+                                // silently re-arming under another is the stale-state bug that
+                                // whole path exists to remove), so the trace stops recording with
+                                // it and the hop interrupts come back off DIO8, which every
+                                // `set_dio_irq` below then re-issues correctly.
+                                //
+                                // It does NOT erase what was already recorded — the same rule
+                                // `CMD_SET_HOP 0` follows, and the same one the Heltec follows: the
+                                // stamps stay true across a PHY switch, and deleting a run because
+                                // the host reconfigured afterwards is how a measurement disappears
+                                // at the moment it was taken. What the host must not do is read the
+                                // *symbol period* out of a trace recorded under a different
+                                // modulation; the ticks are raw and the sf/bw is the host's to
+                                // track.
+                                hoptrace.arm(0);
                                 if phy_link::apply(&mut radio, &state).await.is_err() {
                                     // ── (2) the CHIP refused the mode ─────────────────────────
                                     // Its literal status byte, from the cached status of the command
@@ -1469,7 +1639,12 @@ async fn main(_spawner: Spawner) {
                                     if phy_link::apply(&mut radio, &state).await.is_err() {
                                         let _ = phy_link::reset_and_apply(&mut radio, &state).await;
                                         let _ =
-                                            radio.set_dio_irq(DioNum::Dio8, Intr::new_txrx()).await;
+                                            radio
+                                                .set_dio_irq(
+                                                    DioNum::Dio8,
+                                                    dio_irq_mask(hoptrace.armed()),
+                                                )
+                                                .await;
                                     }
                                     let _ = phy_link::arm_rx(&mut radio, &state).await;
                                     send(&mut uart, &mut out, serial::EVT_PHY_ERR, &[p.code(), chip])
@@ -1480,7 +1655,9 @@ async fn main(_spawner: Spawner) {
                                     // RX timestamp, the one capability this whole board exists for.
                                     // If `SetPacketType` clears the routing, the stamps stop and
                                     // nothing says so; one command makes that impossible.
-                                    let _ = radio.set_dio_irq(DioNum::Dio8, Intr::new_txrx()).await;
+                                    let _ = radio
+                                        .set_dio_irq(DioNum::Dio8, dio_irq_mask(hoptrace.armed()))
+                                        .await;
 
                                     // ★ **Arming RX is a SEPARATE question from entering the mode,
                                     // and LR-FHSS is why.** §17.1 calls it transmit-only; §17.2.2
@@ -1525,7 +1702,7 @@ async fn main(_spawner: Spawner) {
                                             let _ =
                                                 phy_link::reset_and_apply(&mut radio, &state).await;
                                             let _ = radio
-                                                .set_dio_irq(DioNum::Dio8, Intr::new_txrx())
+                                                .set_dio_irq(DioNum::Dio8, dio_irq_mask(hoptrace.armed()))
                                                 .await;
                                             Some(chip)
                                         }
@@ -1613,6 +1790,15 @@ async fn main(_spawner: Spawner) {
                             match phy::check_hop(state.phy(), ctrl, period, &freqs[..n]) {
                                 Ok(enable) => {
                                     state.hop.set(enable, period, &freqs[..n]);
+                                    // **Arm the hop timeline with the plan.** The table depth is
+                                    // what labels each event's index. ARMING clears the ring, so a
+                                    // timeline taken under one plan is never served under another;
+                                    // DISABLING does not, because reading the trace after a run is
+                                    // the use case and a host that stops the hopping first must not
+                                    // be handed `n = 0` — which the measurement protocol reads as
+                                    // "this part does not signal its hops". Same rule on the Heltec.
+                                    // See `hoptrace::HopTrace::arm`.
+                                    hoptrace.arm(if enable { n as u8 } else { 0 });
                                     // A full re-apply: `SetLoraHopping` is programmed inside the
                                     // LoRa modem block, after the modulation it depends on, and the
                                     // SX127x compatibility bit lives in a register a
@@ -1623,6 +1809,24 @@ async fn main(_spawner: Spawner) {
                                     // overwrite anything written before it) — so the re-apply below
                                     // stores the plan and the chip sees it at the next transmit.
                                     retune(&mut radio, &state).await;
+                                    // ⚠ **The interrupt routing has to be re-issued here**, because
+                                    // this is the one command that changes which interrupts DIO8
+                                    // carries: the hop event joins the line while a plan is live and
+                                    // leaves it again when the plan is dropped. `retune` re-applies
+                                    // the modem, not the DIO configuration — and a hop trace that
+                                    // silently recorded nothing because the interrupt never reached
+                                    // the pin is exactly the failure M4 already paid for once.
+                                    let _ = radio
+                                        .set_dio_irq(DioNum::Dio8, dio_irq_mask(hoptrace.armed()))
+                                        .await;
+                                    // Flush whatever the status word was already carrying, so the
+                                    // first entry of the fresh timeline is a real post-arm edge.
+                                    // The hop bits latch in the status whether or not they are
+                                    // routed to DIO8; a stale one surviving the arm would be paired
+                                    // with a stale `CC[0]` — an invented instant at the head of the
+                                    // trace, which is precisely the kind of plausible fiction this
+                                    // instrument must not produce.
+                                    let _ = radio.get_and_clear_irq().await;
                                     hop_probe(&mut radio, &mut uart, &mut out, &state, debug).await;
                                     let body = info_body(&mut radio, &state, &sense).await;
                                     send(&mut uart, &mut out, serial::EVT_INFO, &body).await;
@@ -1707,8 +1911,22 @@ async fn main(_spawner: Spawner) {
 
         // ── node → host: a captured frame, carrying the HARDWARE timestamp ─────────────────────
         if let Ok(irq) = radio.get_and_clear_irq().await {
+            // ONE capture read per status word. `CC[0]` holds the instant of the FIRST DIO8 rising
+            // edge since the previous clear (the line stays high until the IRQ is cleared over SPI,
+            // so a second event raises no new edge) — so reading it twice would not give two
+            // instants, it would give the same value with a race in between.
+            //
+            // ⚠ This loop polls at roughly 1 ms (the UART read timeout above plus the SPI work), so
+            // at an 8.192 ms hop period it separates hops with ~8x of margin — but only ROUGHLY.
+            // Anything that keeps the loop away for longer than a hop period (a large `send` on the
+            // 115200 UART is the realistic one: 170 B is ~15 ms) collapses every hop in that gap
+            // into a single entry stamped at the FIRST of them. That failure is not silent at the
+            // host: the surviving intervals come out as integer MULTIPLES of the true period, which
+            // is exactly what a reader should check for before trusting an interval. See `note_irq`
+            // for the other sharing case, a hop and an RxDone on one edge.
+            let ts = cap.hw_stamp().ticks;
+            note_irq(&mut hoptrace, &irq, ts);
             if irq.rx_done() {
-                let ts = cap.hw_stamp().ticks;
                 // Reading the frame is **per-PHY** — length, signal and framing all come from
                 // different places in each mode. See `phy_link::rx_read`, which also documents why
                 // FLRC deliberately does not use `get_rx_pkt_len()`.
@@ -1789,11 +2007,29 @@ async fn main(_spawner: Spawner) {
                         if serve_len > 0 {
                             // Content-Store hit: we answer the Interest ourselves, the host never wakes.
                             let _ =
-                                lbt_tx(&mut radio, &state, &mut sense, &serve[..serve_len], quiet).await;
+                                lbt_tx(
+                                    &mut radio,
+                                    &state,
+                                    &mut sense,
+                                    &cap,
+                                    &mut hoptrace,
+                                    &serve[..serve_len],
+                                    quiet,
+                                )
+                                .await;
                             left_rx = true;
                         }
                         if relay {
-                            let _ = lbt_tx(&mut radio, &state, &mut sense, payload, quiet).await;
+                            let _ = lbt_tx(
+                                &mut radio,
+                                &state,
+                                &mut sense,
+                                &cap,
+                                &mut hoptrace,
+                                payload,
+                                quiet,
+                            )
+                            .await;
                             left_rx = true;
                         }
                         if left_rx {
@@ -1846,7 +2082,7 @@ async fn main(_spawner: Spawner) {
             let mut msg = [0u8; 17];
             msg[..13].copy_from_slice(b"LR2021-BEACON");
             msg[13..].copy_from_slice(&beacon_seq.to_be_bytes());
-            let ok = tx_once(&mut radio, &state, &msg).await;
+            let ok = tx_once(&mut radio, &state, &cap, &mut hoptrace, &msg).await;
             // A transmit drops continuous RX; re-arm or the node goes deaf after its first beacon.
             let _ = phy_link::arm_rx(&mut radio, &state).await;
             n_tx = n_tx.wrapping_add(1);

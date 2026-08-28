@@ -62,6 +62,18 @@
 //! [`CMD_TX_AT_ABS`] (schedule against an absolute instant on the node's own clock, so host serial
 //! latency cannot move the frame).
 //!
+//! ## [`CMD_GET_HOPTRACE`] — a node timestamps its OWN hops
+//!
+//! The last addition, and the one whose shape is dictated by a broken link: an LR2021 and an SX1276
+//! both do intra-packet hopping, each interoperates with its own kind, and they cannot hop with each
+//! other — so the link that would carry a cross-vendor comparison is the very thing being measured.
+//! [`CMD_GET_HOPTRACE`]/[`EVT_HOPTRACE`] therefore has each node report **its own** hop events on
+//! **its own** clock, in its own units, and the host does the comparison. See [`crate::hoptrace`].
+//!
+//! ⚠ Its opcode is **0x20 = 32**, one past the end of the 32-bit [`CMD_BITMAP`] field, so it is the
+//! first command in this protocol that cannot be advertised and must be **probed** for. That is a
+//! property of the fleet's wire format rather than an oversight; see [`CMD_BITMAP_FULL`].
+//!
 //! ## Back-compatibility, in both directions
 //!
 //! A v2 node still parses here: [`Capabilities::from_bytes`] accepts the 29-byte body and
@@ -277,6 +289,27 @@ pub const CMD_SET_HOP: u8 = 0x1E;
 /// come round. A target further ahead than the node's scheduling bound is
 /// [`REASON_OUT_OF_RANGE`].
 pub const CMD_TX_AT_ABS: u8 = 0x1F;
+/// **v3.** payload = []; replies [`EVT_HOPTRACE`], or [`EVT_UNSUPPORTED`] `[0x20,
+/// REASON_NO_HARDWARE]` on a node that cannot timestamp its own hops.
+///
+/// ★ **The instrument for "when does a hop boundary fall?", and the reason it needs no cross-vendor
+/// link.** Each node timestamps its **own** hop events on its **own** clock, so an LR2021 and an
+/// SX1276 can be compared without either having to receive the other — which matters here because
+/// the link that would carry the comparison is the very thing that is broken. See
+/// [`crate::hoptrace`] for the measurement this settles and for the exact latency between the RF hop
+/// boundary and the stamp.
+///
+/// The ring is **free-running and wraps; reading does NOT clear it**, the same contract as
+/// [`EVT_SENSE`]`.activity` — so two reads can be differenced and a second reader cannot destroy the
+/// first's view. A node with hopping off answers `n = 0` and never a stale timeline.
+///
+/// ⚠ **This opcode is 0x20 = 32 and therefore CANNOT appear in [`CMD_BITMAP`]**, whose wire field is
+/// four bytes fleet-wide (`EVT_CAP[19..23]`) and covers opcodes 0..31 only. It is the first opcode
+/// past the end of that space. Widening the field would break every node and host in the fleet at
+/// once, so discovery is by **probe** instead: send it, and get either `EVT_HOPTRACE` or
+/// `EVT_UNSUPPORTED`. [`CMD_BITMAP_FULL`] carries the bit for firmware-side reasoning; the wire
+/// field is its low 32 bits by construction.
+pub const CMD_GET_HOPTRACE: u8 = 0x20;
 
 // ── Node → host ────────────────────────────────────────────────────────────────────────────────
 /// payload = `[rssi i16 BE dBm, snr i16 BE dB, ts u32 BE, frame bytes]`.
@@ -365,6 +398,25 @@ pub const EVT_SENSE: u8 = 0x8C;
 /// at all (§17.1 "transmit-only mode" vs §17.2.2's syncword "for detection on the receiver side"),
 /// so the node asks the chip and forwards the answer instead of pre-judging it.
 pub const EVT_PHY_ERR: u8 = 0x8D;
+/// **v3.** payload = `[stamp_hz u32 BE][n u8][ (idx u8, t_ticks u32 BE) ]*n`, `n <= 32` — this
+/// node's own hop timeline, encoded by [`crate::hoptrace::HopTrace::encode`].
+///
+/// `stamp_hz` is **this node's clock in its own units** — the same one [`CMD_READ_CLOCK`] returns
+/// and [`EVT_RX`]`.ts` uses (16 MHz here, 62.5 ns per tick). It is deliberately **not** converted to
+/// microseconds in firmware: the host divides, and converting here would throw away 16× of
+/// resolution on this part purely to match the Heltec's 1 MHz counter. Same reasoning as the `ts`
+/// field, and the same trap — a field documented in one unit and filled in another is a silent
+/// scale error in whichever host reads it first.
+///
+/// `idx` is the hop-list index the event moved **to**. On this node it is a **firmware counter**,
+/// not a chip readback (the SX1276's `RegHopChannel` has no LR2021 equivalent) — see
+/// [`crate::hoptrace::HopTrace::push_hop`]. Bit 7 ([`crate::hoptrace::IDX_TX_KEYED`]) marks a
+/// **transmit key-up** rather than a hop, which is how a host learns where in the sequence a frame
+/// started; the chip's table is 40 deep, so that bit cannot occur on a real index.
+///
+/// `n = 0` is the honest answer from a node whose hopping is off, and `stamp_hz` still travels so
+/// the units are learned either way.
+pub const EVT_HOPTRACE: u8 = 0x8E;
 /// payload = `[cmd, reason]` — see [`REASON_UNKNOWN_OPCODE`] and friends.
 pub const EVT_UNSUPPORTED: u8 = 0x8F;
 
@@ -498,11 +550,23 @@ pub mod stamp_kind {
     pub const HARDWARE_FREE_RUNNING: u8 = 3;
 }
 
-/// One bit per implemented opcode, `bit N == opcode N`. Every opcode is < 32 by construction.
+/// **Every opcode this firmware implements, one bit each — including the ones the wire field cannot
+/// carry.** `bit N == opcode N`, 64 bits wide.
 ///
 /// Derived from the constants above rather than written out, so the bitmap cannot drift from the
 /// dispatch table the way a hand-maintained list does. **Anything added here must be answered by
 /// the bridge**, and anything the bridge answers `EVT_UNSUPPORTED` must be absent.
+///
+/// ⚠ [`CMD_BITMAP`] — the value that actually reaches the host — is the **low 32 bits** of this, and
+/// [`CMD_GET_HOPTRACE`] (0x20 = 32) falls off the end. That is a property of the fleet's wire
+/// format, not an oversight: `EVT_CAP[19..23]` is four bytes on four firmwares and two host crates,
+/// and widening it would break all of them simultaneously to advertise one diagnostic opcode. The
+/// truncation is made explicit here, and pinned by a test, so it is a known boundary rather than a
+/// bit that silently vanished.
+pub const CMD_BITMAP_FULL: u64 = (CMD_BITMAP as u64) | (1u64 << CMD_GET_HOPTRACE);
+
+/// The `cmd_bitmap` field of [`EVT_CAP`] — opcodes 0..31 only. See [`CMD_BITMAP_FULL`] for what
+/// does not fit and why the field is not widened.
 pub const CMD_BITMAP: u32 = (1 << CMD_TX)
     | (1 << CMD_SET_FREQ)
     | (1 << CMD_SET_MOD)
@@ -536,6 +600,10 @@ pub const CMD_BITMAP: u32 = (1 << CMD_TX)
 //                              and a wrong syncword is silent, not loud
 //   0x0D CMD_SF_SCAN         — no spreading factor exists to scan for
 //   0x16 CMD_ENTER_BOOTLOADER— the XIAO reflashes over its own CMSIS-DAP probe, not a ROM loader
+// And one opcode is absent for a DIFFERENT reason — it is implemented and answered, it simply does
+// not fit:
+//   0x20 CMD_GET_HOPTRACE   — bit 32 of a 32-bit field. Discovered by probing, not by the bitmap;
+//                             see CMD_BITMAP_FULL.
 
 /// ★ **[`CMD_BITMAP`] for the PHY the node is running** — the command surface is per-PHY too.
 ///
@@ -572,7 +640,7 @@ pub const fn cmd_bitmap_for(has_intra_packet_hopping: bool) -> u32 {
 ///   [12..16] stamp_hz     u32    ticks/second of the EVT_RX ts field; 0 = no per-frame stamp
 ///   [16]     stamp_kind
 ///   [17..19] max_payload  u16    the REAL end-to-end cap
-///   [19..23] cmd_bitmap   u32
+///   [19..23] cmd_bitmap   u32    OPCODES 0..31 ONLY — see CMD_BITMAP_FULL
 ///   [23]     sf_min              0 when the node has no spreading factor
 ///   [24]     sf_max
 ///   [25..29] sched_gran_ns u32   0 = no hardware-scheduled TX
@@ -599,6 +667,9 @@ pub struct Capabilities {
     /// The **real** end-to-end cap: `min(TX accept, RX buffer, on-air PDU)`. A node that accepts
     /// 240 bytes on TX and truncates RX at 64 reports 64 — the smaller side, always.
     pub max_payload: u16,
+    /// One bit per implemented opcode, **and it can only ever describe opcodes 0..31** — the field
+    /// is four bytes across the whole fleet. [`CMD_GET_HOPTRACE`] (0x20) is the first opcode past
+    /// it and is discovered by probing instead; see [`CMD_BITMAP_FULL`].
     pub cmd_bitmap: u32,
     pub sf_min: u8,
     pub sf_max: u8,
@@ -833,6 +904,11 @@ mod tests {
         // The longest CMD_SET_HOP: 40 frequencies plus its 4-byte header.
         round_trip(CMD_SET_HOP, &[0xA5u8; 4 + 4 * crate::phy::MAX_HOPS]);
         round_trip(EVT_CLOCK, &[0, 0, 0, 0, 0xDE, 0xAD, 0xBE, 0xEF]);
+        round_trip(CMD_GET_HOPTRACE, &[]);
+        // The longest EVT_HOPTRACE: a full 32-entry ring.
+        round_trip(EVT_HOPTRACE, &[0x5Au8; crate::hoptrace::MAX_BODY_LEN]);
+        // …and the empty one a node with hopping off emits.
+        round_trip(EVT_HOPTRACE, &[0x00, 0xF4, 0x24, 0x00, 0x00]);
         round_trip(EVT_SENSE, &[0xFF, 0xFE, 0xFF, 0xA2]);
         // Payload containing the frame-start pair and a lone SYNC0.
         round_trip(EVT_RX, &[SYNC0, SYNC1, 0x00, SYNC0, 0x7E, 0x7E, 0xA5]);
@@ -1224,11 +1300,34 @@ mod tests {
                 EVT_CAP,
                 EVT_SENSE,
                 EVT_PHY_ERR,
+                EVT_HOPTRACE,
                 EVT_UNSUPPORTED
             ],
             [
-                0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88, 0x89, 0x8A, 0x8B, 0x8C, 0x8D, 0x8F
+                0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88, 0x89, 0x8A, 0x8B, 0x8C, 0x8D, 0x8E,
+                0x8F
             ]
         );
+    }
+
+    /// ★ **`CMD_GET_HOPTRACE` does not fit `cmd_bitmap`, and that is pinned rather than discovered
+    /// on the bench.**
+    ///
+    /// The field is four bytes on four firmwares and two host crates; opcode 0x20 is bit 32. Every
+    /// *other* opcode must stay inside the field, and the hop-trace opcode must stay out of it — so
+    /// this test fails the moment either a 33rd opcode is added without a plan or someone
+    /// "fixes" the bitmap by silently truncating a claim.
+    #[test]
+    fn the_hop_trace_opcode_is_past_the_end_of_the_bitmap_field() {
+        assert_eq!(CMD_GET_HOPTRACE, 0x20);
+        assert_eq!(CMD_GET_HOPTRACE as u32, 32);
+        // The wire field is exactly the low 32 bits of what the firmware implements.
+        assert_eq!(CMD_BITMAP, CMD_BITMAP_FULL as u32);
+        assert_ne!(CMD_BITMAP_FULL & (1u64 << CMD_GET_HOPTRACE), 0);
+        // Every opcode the bitmap *does* claim is inside the field, so nothing else is lost.
+        assert_eq!(CMD_BITMAP_FULL >> 33, 0, "an opcode above 0x20 would vanish unnoticed");
+        // And the per-PHY surface still moves on exactly one bit — the hop-trace opcode is not in
+        // it either way, because a bitmap cannot carry it at all.
+        assert_eq!(cmd_bitmap_for(true) ^ cmd_bitmap_for(false), 1 << CMD_SET_HOP);
     }
 }

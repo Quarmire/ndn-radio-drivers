@@ -574,6 +574,22 @@ pub trait FrameIo: Send + Sync + 'static {
         self.inject(frame).await
     }
 
+    /// **Does this backend actually place TX in time?** `false` (the default) means
+    /// [`inject_after`](Self::inject_after) / [`inject_at_clock`](Self::inject_at_clock) fall
+    /// through to plain [`inject`](Self::inject) — the frame goes out NOW and the delay is ignored.
+    ///
+    /// ⚠ This exists because a scheduler cannot safely infer the capability from
+    /// [`RadioKnobs::tx_discipline`]. A backend that declares `ScheduledAt` without implementing
+    /// the seam is worse than one that declares nothing: the caller hands it a delay, skips its own
+    /// software gate believing the hardware will place the frame, and the default implementation
+    /// transmits immediately — ungated, with no slot discipline at all.
+    ///
+    /// **Override this to `true` only in the same impl block that overrides `inject_after`.** The
+    /// two must move together; declaring the discipline is not enough.
+    fn schedules_tx(&self) -> bool {
+        false
+    }
+
     /// Await the next frame captured on the medium. A node never hears its own
     /// transmissions (half-duplex radio); the backend filters those.
     async fn recv_frame(&self) -> Result<CapturedFrame, FaceError>;

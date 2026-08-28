@@ -64,6 +64,7 @@ fn c5_clock_domain(path: &str) -> ClockDomainId {
     }
     ClockDomainId((h & 0x00ff_ffff) | 0x4335_0000) // "C5" tag in the top bytes
 }
+use ndn_radio_hal::DbmRange;
 use ndn_transport::FaceError;
 use tokio::sync::{Mutex as AsyncMutex, mpsc};
 
@@ -71,8 +72,8 @@ const SYNC0: u8 = 0x4E;
 const SYNC1: u8 = 0x44;
 const T_INJECT: u8 = 0x01;
 const T_CHANNEL: u8 = 0x02;
-const T_TXPOWER: u8 = 0x03; // wext "txpower patha=N" power index
-const T_RATE: u8 = 0x04; // wifi_set_tx_data_rate code
+const T_TXPOWER: u8 = 0x03; // RTL8720DN: TXAGC index for every rate (0xFF = restore driver defaults)
+const T_RATE: u8 = 0x04; // RTL8720DN: MGN rate code; ESP32-C5: wifi_phy_rate_t
 const T_BW40: u8 = 0x05; // wext_set_bw40_enable
 const T_INJECT_ATTR: u8 = 0x06; // poke pkt_attrib bytes, then inject
 const T_NAMEFILTER: u8 = 0x07; // load on-device Tier-0 masks: [enabled][n_masks][mask 16B]*
@@ -80,6 +81,18 @@ const T_INJECT_AT: u8 = 0x09; // scheduled TX: [delay_us_le32][802.11 frame] (ES
 const T_INJECT_ABS: u8 = 0x0A; // scheduled TX at an ABSOLUTE esp_timer µs: [target_us_le64][frame]
 const T_READCLOCK: u8 = 0x0B; // request the device's schedule clock; reply T_CLOCK [esp_timer_us_le64]
 const T_CLOCK: u8 = 0x85; // reply to T_READCLOCK: [esp_timer_us_le64]
+const T_POWER_PCT: u8 = 0x0D; // RTL8720DN coarse power: [idx] 0=100% 1=-1.5dB 2=-3dB 3=-6dB 4=-9dB
+const T_READPOWER: u8 = 0x0E; // request the live TXAGC indices; reply T_POWERIDX
+const T_POWERIDX: u8 = 0x89;
+const T_READSTATS: u8 = 0x10; // request the ESP32-C5's hardware receive counters
+const T_HWSTATS: u8 = 0x8B; // [rx_fcs_err][rx_abort][brx_err_agc][nrx_err_agcexit][nrx_err][rx_mpdu]
+// [rx_fifo_ovf][rx_cfo_hz] — all u16 LE; the receive-side loss a frame count cannot show // reply to T_READPOWER: [status_i8][20 TXAGC bytes]
+const T_LOG: u8 = 0x84; // device status text (the RTL8720DN's boot markers)
+const T_BLE_TXPOWER: u8 = 0x35; // BLE advertising TX power. Units are per-radio: the ESP32-C5 takes an
+// esp_power_level_t 0..15 (-24..+20 dBm, 3 dB/step, MEASURED 36.4 dB span); the RTL8720DN takes a
+// controller gain index (~0.5 dB/step, MEASURED 22.2 dB span).
+const T_BLE_PACE: u8 = 0x32; // RTL8720DN: [hold_ms_le16]([adv_int_min_ms][adv_int_max_ms]) — the BLE
+// bearer's packet-rate lever (how long each payload is held on air before the next replaces it)
 const T_TXTIME: u8 = 0x83; // scheduled-TX confirmation: [target_le64][actual_le64][tsf_le64]
 const T_RX: u8 = 0x81;
 const T_OCC: u8 = 0x86; // [activity_count_le32] — periodic free-running channel-activity counter
@@ -92,17 +105,40 @@ const T_COEX: u8 = 0x31; // host->device: [scan_window_le16][scan_itvl_le16] —
 const T_BLE_RX: u8 = 0x88; // device->host: [rssi_i8][addr6][payload] — a scanned advertisement
 // µs stamp + the ESP's per-frame PHY metadata (radiotap-equiv): RX rate/MCS + SNR
 
-/// BW16 fixed TX-rate codes for [`SerialRadioBackend::set_tx_rate`]
-/// (`wifi_set_tx_data_rate`). CCK 0x00–0x03, OFDM 0x04–0x0b, HT MCS0–7 0x0c–0x13,
-/// `0xFF` = auto rate adaptation.
+/// Realtek **MGN** rate codes — the units of `padapter[0x855]`, which is what the
+/// RTL8720DN's management-TX descriptor actually reads: `rtl8721d_update_txdesc`
+/// fills the descriptor's DATA_RATE from `MRateToHwRate(padapter[0x855])` and sets
+/// the use-fixed-rate bit, so hardware rate adaptation cannot override it.
+///
+/// These are NOT the `wifi_set_tx_data_rate` codes. That API writes the **data**
+/// path's fixed rate (`padapter[0x230c]`), which the management path — the one our
+/// raw inject uses — ignores unless a driver global we never set is nonzero. Driving
+/// it is why the rate knob previously actuated nothing on air, and why the earlier
+/// conclusion ("the mgmt path is legacy-rate-locked; a data-path rewrite is needed")
+/// was wrong: the mgmt path has a rate lever, just a different one.
+///
+/// For legacy rates an MGN code is the rate in 500 kb/s units (0x0C = 6 Mb/s,
+/// 0x6C = 54 Mb/s) — the same convention radiotap uses.
+///
+/// MEASURED on air, all 17 values, witnessed by an ESP32-C5's per-frame PHY
+/// metadata: every request produced exactly that rate and PHY format.
 pub mod rate {
-    pub const CCK_1M: u8 = 0x00;
-    pub const CCK_11M: u8 = 0x03;
-    pub const OFDM_6M: u8 = 0x04;
-    pub const OFDM_54M: u8 = 0x0b;
-    pub const HT_MCS0: u8 = 0x0c;
-    pub const HT_MCS7: u8 = 0x13;
-    pub const AUTO: u8 = 0xFF;
+    pub const CCK_1M: u8 = 0x02;
+    pub const CCK_2M: u8 = 0x04;
+    pub const CCK_5_5M: u8 = 0x0B;
+    pub const CCK_11M: u8 = 0x16;
+    pub const OFDM_6M: u8 = 0x0C;
+    pub const OFDM_24M: u8 = 0x30;
+    pub const OFDM_54M: u8 = 0x6C;
+    pub const HT_MCS0: u8 = 0x80;
+    pub const HT_MCS7: u8 = 0x87;
+    /// Hand the rate choice back to the driver.
+    pub const AUTO: u8 = 0x00;
+
+    /// The MGN code for a 1-stream HT MCS index. The RTL8720DN is 1x1 HT20, so 0–7.
+    pub fn ht_mcs(index: u8) -> u8 {
+        HT_MCS0 + index.min(7)
+    }
 }
 
 /// Baud the firmware opens `Serial` at — the RTL8720 LOG UART's native rate,
@@ -114,8 +150,8 @@ pub struct SerialRadioBackend {
     tx: Arc<Mutex<Box<dyn serialport::SerialPort>>>,
     format: FrameFormat,
     rx: AsyncMutex<mpsc::UnboundedReceiver<CapturedFrame>>,
-    /// Device schedule-clock replies (`T_CLOCK` → esp_timer µs), routed here by the reader for
-    /// [`read_schedule_clock`](Self::read_schedule_clock). Empty on the BW16 (never replies).
+    /// Device schedule-clock replies (`T_CLOCK` → device µs), routed here by the reader for
+    /// [`read_schedule_clock`](Self::read_schedule_clock). Both firmwares reply.
     clock_rx: AsyncMutex<mpsc::UnboundedReceiver<u64>>,
     /// Scheduled-TX confirmations (`T_TXTIME` → (target, actual) esp_timer µs) — the actual on-air
     /// instant of an [`inject_at_abs`](Self::inject_at_abs), for verifying slot placement.
@@ -127,6 +163,13 @@ pub struct SerialRadioBackend {
     /// bearer, routed here by the one reader so the SAME port connection also drives a BLE `AdvBackend`
     /// (see [`ble_next_scanned`](Self::ble_next_scanned)). Empty on the BW16 (Wi-Fi only, no BLE).
     ble_rx: AsyncMutex<mpsc::UnboundedReceiver<(i8, [u8; 6], Bytes)>>,
+    /// TX-power readback replies (`T_POWERIDX` → (status, the 20 live TXAGC indices)). The power
+    /// knob's own instrument: it reads the registers back out of the hardware, so a power change can
+    /// be proven to have landed before anything is claimed about the air. RTL8720DN only.
+    /// Device request/reply traffic, tagged by type: `T_POWERIDX` (TX-power readback, shape per radio)
+    /// and `T_HWSTATS` (the C5's hardware receive counters). One channel because both are rare,
+    /// synchronous request→reply exchanges; the type tag keeps them from being mistaken for each other.
+    reply_rx: AsyncMutex<mpsc::UnboundedReceiver<(u8, Vec<u8>)>>,
     /// Running count of scanned BLE advertisements — the BLE **demand** signal, incremented by the reader
     /// independently of the `ble_rx` channel so [`spawn_demand_coex`](Self::spawn_demand_coex) can measure
     /// BLE traffic without stealing frames from the face (mirrors `wifi_frames` = the Wi-Fi demand signal).
@@ -162,6 +205,12 @@ impl SerialRadioBackend {
         Self::open_inner(path, false, Some(domain))
     }
 
+    /// Like [`open`](Self::open) (with the RTL8720DN's DTR→CEN reset pulse) but stamping frames in the
+    /// given device clock `domain` — the RTL8720DN firmware's per-frame µs stamp.
+    pub fn open_clocked(path: &str, domain: ClockDomainId) -> Result<Self, FaceError> {
+        Self::open_inner(path, true, Some(domain))
+    }
+
     fn open_inner(
         path: &str,
         reset_pulse: bool,
@@ -191,6 +240,7 @@ impl SerialRadioBackend {
         let (clkch, clk_rxch) = mpsc::unbounded_channel();
         let (ttch, tt_rxch) = mpsc::unbounded_channel();
         let (blech, ble_rxch) = mpsc::unbounded_channel();
+        let (pwrch, pwr_rxch) = mpsc::unbounded_channel();
         let format = FrameFormat::default();
         let activity = Arc::new(std::sync::atomic::AtomicU32::new(u32::MAX));
         let ble_activity = Arc::new(std::sync::atomic::AtomicU32::new(0));
@@ -206,6 +256,7 @@ impl SerialRadioBackend {
                 clkch,
                 ttch,
                 blech,
+                pwrch,
                 act_reader,
                 ble_act_reader,
                 wifi_fr_reader,
@@ -220,6 +271,7 @@ impl SerialRadioBackend {
             txtime_rx: AsyncMutex::new(tt_rxch),
             activity,
             ble_rx: AsyncMutex::new(ble_rxch),
+            reply_rx: AsyncMutex::new(pwr_rxch),
             ble_activity,
             wifi_frames,
         })
@@ -245,8 +297,10 @@ impl SerialRadioBackend {
         self.send_framed(T_CHANNEL, &[channel])
     }
 
-    /// Pin the on-air TX rate (a [`rate`] code; `wifi_set_tx_data_rate`). Whether
-    /// it affects the raw-inject path is empirical — verify by capturing the MCS.
+    /// Pin the on-air TX rate. On the RTL8720DN this is a [`rate`] MGN code, re-asserted by the
+    /// firmware before every inject (a band or channel change resets the driver's copy, so a
+    /// set-once knob would silently revert the first time cognition retuned). On the ESP32-C5 it is
+    /// a `wifi_phy_rate_t`. Both were MEASURED on air against a witness's per-frame PHY metadata.
     pub fn set_tx_rate(&self, code: u8) -> Result<(), FaceError> {
         self.send_framed(T_RATE, &[code])
     }
@@ -291,6 +345,40 @@ impl SerialRadioBackend {
         let mut p = window.to_le_bytes().to_vec();
         p.extend_from_slice(&itvl.to_le_bytes());
         self.send_framed(T_COEX, &p)
+    }
+
+    /// **RTL8720DN only.** How long each BLE payload is held on air, and the advertising interval (ms).
+    ///
+    /// Advertising is a repeating broadcast, not a send: new data replaces whatever is on air. The hold
+    /// time is therefore the bearer's packet-rate lever, and its right value is a property of the *link*
+    /// — a receiver duty-cycling its scan needs a longer hold to catch the same payload than one
+    /// scanning continuously. MEASURED against a wide-open ESP32-C5 peer: 120 ms → 6.0 pkt/s at 30/30,
+    /// 40 ms → 16.5 pkt/s still at 30/30, 20 ms → 24.2 pkt/s but only 26/30. Default 60 ms.
+    ///
+    /// `interval_ms` is the advertising interval; GAP's floor is 20 ms. Pass `None` to leave it alone.
+    pub fn set_ble_pace(
+        &self,
+        hold_ms: u16,
+        interval_ms: Option<(u16, u16)>,
+    ) -> Result<(), FaceError> {
+        let mut p = hold_ms.to_le_bytes().to_vec();
+        if let Some((lo, hi)) = interval_ms {
+            p.extend_from_slice(&lo.to_le_bytes());
+            p.extend_from_slice(&hi.to_le_bytes());
+        }
+        self.send_framed(T_BLE_PACE, &p)
+    }
+
+    /// BLE **advertising** TX power — a reach lever for the broadcast bearer, independent of the
+    /// Wi-Fi power knob (different register path, one shared PA).
+    ///
+    /// The unit is the radio's own and they differ, so the caller picks by radio:
+    /// * ESP32-C5 — `esp_power_level_t` 0..15, i.e. −24 dBm to +20 dBm in 3 dB steps
+    ///   (MEASURED: 36.4 dB span, R² = 0.977; at level 0 the link starts dropping frames).
+    /// * RTL8720DN — a controller gain-table index, ~0.5 dB/step
+    ///   (MEASURED: 22.2 dB span, R² = 0.993; the vendor table anchors 0x06 ≈ −10 dBm, 0x1A ≈ 0 dBm).
+    pub fn set_ble_tx_power(&self, level: u8) -> Result<(), FaceError> {
+        self.send_framed(T_BLE_TXPOWER, &[level])
     }
 
     /// Running count of scanned BLE advertisements since open — the BLE demand signal (take deltas).
@@ -352,10 +440,90 @@ impl SerialRadioBackend {
         })
     }
 
-    /// Set the TX power index (wext `txpower patha=<idx>`). Only reachable on the
-    /// Rust firmware, which reimplements the SDK's `#if 0`-disabled wifi_set_txpower.
+    /// Set the TX power index.
+    ///
+    /// On the RTL8720DN this is the **TXAGC index** written to every rate's power register via
+    /// phydm (`config_phydm_write_txagc_8721d`). MEASURED on air: **0.274 dB per step** (the
+    /// driver's own arithmetic says 0.25), R² = 0.982 over a 31 dB span. `0xFF` restores the
+    /// driver's computed per-rate power.
+    ///
+    /// This replaced the `txpower patha=<idx>` wext command the firmware used to send, which was a
+    /// genuine no-op: that sub-command is registered under the private-ioctl **GET** family and its
+    /// handler only parses and echoes. Sweeping it moved a witness's RSSI by 0.6 dB — i.e. noise.
     pub fn set_txpower(&self, idx: u8) -> Result<(), FaceError> {
         self.send_framed(T_TXPOWER, &[idx])
+    }
+
+    /// Restore the RTL8720DN's driver-computed per-rate TX power, undoing [`set_txpower`](Self::set_txpower).
+    pub fn reset_txpower(&self, channel: u8) -> Result<(), FaceError> {
+        self.send_framed(T_TXPOWER, &[0xFF, channel])
+    }
+
+    /// Coarse RTL8720DN TX power: 0=100%, 1=−1.5 dB, 2=−3 dB, 3=−6 dB, 4=−9 dB.
+    ///
+    /// Worth having beside the fine knob because it is applied through the driver's own percentage
+    /// path, so the DM power-tracking watchdog will not silently reprogram it away — whereas direct
+    /// TXAGC writes are stomped unless tracking is disabled (which [`set_txpower`] does).
+    pub fn set_tx_power_pct(&self, idx: u8) -> Result<(), FaceError> {
+        self.send_framed(T_POWER_PCT, &[idx.min(4)])
+    }
+
+    /// Read the RTL8720DN's 20 live TXAGC indices straight back out of the hardware:
+    /// `[0..4]` CCK 1/2/5.5/11, `[4..12]` OFDM 6…54, `[12..20]` HT MCS0…7.
+    ///
+    /// The power knob's instrument. A TX-power claim that rests only on a witness's RSSI cannot
+    /// separate "the register moved" from "the air changed for another reason"; this can.
+    pub async fn read_txpower(&self) -> Option<(i8, [u8; 20])> {
+        let p = self.request_reply(T_READPOWER, &[], T_POWERIDX).await?;
+        if p.len() < 21 {
+            return None;
+        }
+        let mut idx = [0u8; 20];
+        idx.copy_from_slice(&p[1..21]);
+        Some((p[0] as i8, idx))
+    }
+
+    /// Send a request and await the device reply of type `want` (raw payload).
+    async fn request_reply(&self, ty: u8, payload: &[u8], want: u8) -> Option<Vec<u8>> {
+        let mut rx = self.reply_rx.lock().await;
+        while rx.try_recv().is_ok() {} // drop stale replies so we read OUR answer
+        self.send_framed(ty, payload).ok()?;
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(600);
+        loop {
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if left.is_zero() {
+                return None;
+            }
+            match tokio::time::timeout(left, rx.recv()).await {
+                Ok(Some((t, p))) if t == want => return Some(p),
+                Ok(Some(_)) => continue, // a reply of the other kind; keep waiting for ours
+                _ => return None,
+            }
+        }
+    }
+
+    /// **ESP32-C5.** The MAC/PHY receive counters the promiscuous callback cannot see: PPDUs whose
+    /// preamble the PHY locked onto and whose payload then failed, plus AGC-level receive failures.
+    /// Returns `(rx_mpdu, rx_fcs_err, brx_err_agc, rx_cfo_hz)`. Free-running and wrapping — difference
+    /// them over an interval, never read absolutes.
+    pub async fn read_hw_rx_stats(&self) -> Option<(u16, u16, u16, i16)> {
+        let p = self.request_reply(T_READSTATS, &[], T_HWSTATS).await?;
+        if p.len() < 16 {
+            return None;
+        }
+        let g = |k: usize| u16::from_le_bytes([p[2 * k], p[2 * k + 1]]);
+        Some((g(5), g(0), g(2), i16::from_le_bytes([p[14], p[15]])))
+    }
+
+    /// **ESP32-C5.** Set TX power on the absolute dBm scale and return what the radio actually
+    /// applied. The wire unit is `esp_wifi_set_max_tx_power`'s: 0.25 dBm, valid `[8,84]` = 2..20 dBm,
+    /// which the IDF then quantises to 11 steps — so the applied value is read back rather than
+    /// assumed. The firmware clamps into range; passing a value below 8 used to be *rejected*, leaving
+    /// the radio at full power (measured: a request of 1 dBm produced the same RSSI as 20 dBm).
+    pub async fn set_max_tx_power_dbm(&self, dbm: i8) -> Option<i8> {
+        let q = (dbm as i32 * 4).clamp(8, 84) as u8;
+        let p = self.request_reply(T_TXPOWER, &[q], T_POWERIDX).await?;
+        (p.len() >= 2).then(|| (p[1] as i8) / 4)
     }
 
     /// Load the on-device **Tier-0 name filter** (ESP32-C5 firmware only): up to 8 16-byte prefix-set
@@ -451,6 +619,7 @@ fn reader_loop(
     clk: mpsc::UnboundedSender<u64>,
     txtime: mpsc::UnboundedSender<(u64, u64)>,
     ble: mpsc::UnboundedSender<(i8, [u8; 6], Bytes)>,
+    reply: mpsc::UnboundedSender<(u8, Vec<u8>)>,
     activity: Arc<std::sync::atomic::AtomicU32>,
     ble_activity: Arc<std::sync::atomic::AtomicU32>,
     wifi_frames: Arc<std::sync::atomic::AtomicU32>,
@@ -463,7 +632,27 @@ fn reader_loop(
             Ok(n) if n > 0 => {
                 acc.extend_from_slice(&tmp[..n]);
                 while let Some((ty, payload, consumed)) = deframe(&acc) {
-                    // T_CLOCK [esp_timer_us_le64] — the device's schedule clock reply; route to read_schedule_clock.
+                    // T_LOG — device status text (boot markers, short-command warnings). Consume it
+                    // explicitly: it shares no code with T_RX_TS now, but leaving it to fall through
+                    // would let a status line be mistaken for a frame the moment its length reached 8.
+                    if ty == T_LOG {
+                        tracing::debug!(
+                            target: "serial_radio",
+                            msg = %String::from_utf8_lossy(&payload),
+                            "device log"
+                        );
+                        acc.drain(..consumed);
+                        continue;
+                    }
+                    // T_POWERIDX — a TX-power readback. The shape is per-radio: the RTL8720DN
+                    // answers `[status][20 TXAGC bytes]`, the ESP32-C5 `[requested_q][applied_q]`
+                    // in 0.25 dBm units. Forward the payload raw; each backend interprets its own.
+                    if (ty == T_POWERIDX || ty == T_HWSTATS) && !payload.is_empty() {
+                        let _ = reply.send((ty, payload.clone()));
+                        acc.drain(..consumed);
+                        continue;
+                    }
+                    // T_CLOCK [device_us_le64] — the device's schedule clock reply; route to read_schedule_clock.
                     if ty == T_CLOCK && payload.len() >= 8 {
                         let t = u64::from_le_bytes(payload[0..8].try_into().unwrap());
                         let _ = clk.send(t);
@@ -587,8 +776,10 @@ impl FrameIo for SerialRadioBackend {
     }
 }
 
-// Marker only: the Ameba board's management-TX path picks its own rate, so `set_rate`
-// (the FrameIo default no-op) and the derived `inject_at` both just inject.
+// `set_rate` is deliberately NOT implemented on the shared transport: the two firmwares take
+// different rate units on the same T_RATE byte (RTL8720DN = Realtek MGN, ESP32-C5 = wifi_phy_rate_t),
+// so a shared mapping would silently transmit at the wrong rate on one of them. Each newtype
+// (`Bw16SerialBackend`, `Esp32SerialBackend`) supplies its own.
 
 impl RadioKnobs for SerialRadioBackend {
     fn set_channel(&self, channel: u8, bw: Bandwidth) -> Result<(), FaceError> {
@@ -598,9 +789,10 @@ impl RadioKnobs for SerialRadioBackend {
         self.set_bw40(!matches!(bw, Bandwidth::Bw20))
     }
     fn set_tx_power(&self, idx: u32) -> Result<(), FaceError> {
-        // Reachable on the Rust firmware (reimplemented txpower). Index is clamped
-        // into a byte for the wext command.
-        self.set_txpower(idx.min(u8::MAX as u32) as u8)
+        // RTL8720DN: the phydm TXAGC index, ~0.25 dB/step (measured 0.274). Clamp to 0..=126 so a
+        // large cognition index cannot land on 0xFF, which the firmware reads as "restore defaults"
+        // — i.e. asking for maximum power would instead give up control of it.
+        self.set_txpower(idx.min(126) as u8)
     }
     fn configure_name_filter(
         &self,
@@ -613,8 +805,8 @@ impl RadioKnobs for SerialRadioBackend {
         SerialRadioBackend::configure_name_filter(self, enabled, masks)
     }
     fn read_channel_activity(&self) -> Result<Option<u16>, FaceError> {
-        // The C5 emits its free-running frame counter as T_OCC ~5×/s; the reader caches the latest.
-        // u32::MAX = no report yet (the BW16 firmware never emits) → honestly None.
+        // Both firmwares emit their free-running frame counter as T_OCC ~5×/s; the reader caches the
+        // latest. u32::MAX = no report yet (an older firmware, or one still booting) → honestly None.
         let v = self.activity.load(std::sync::atomic::Ordering::Relaxed);
         Ok((v != u32::MAX).then_some(v as u16))
     }
@@ -635,8 +827,214 @@ impl RadioTime for SerialRadioBackend {
 
 impl RadioProfile for SerialRadioBackend {
     fn capability(&self) -> RadioCapability {
-        // RTL8720DN (BW16): single-chain 2.4 GHz 11n over the serial bridge.
+        // The conservative profile for "some serial radio": single-chain 2.4 GHz 11n. Both real
+        // devices are dual-band and override this — open through [`Bw16SerialBackend`] or
+        // [`Esp32SerialBackend`] to get the measured profile, or the planner will never pick 5 GHz.
         RadioCapability::wifi_monitor_2ghz_1ss(vec![1, 6, 11])
+    }
+}
+
+/// A stable per-device clock domain for an RTL8720DN, derived from its port path (as
+/// [`c5_clock_domain`] does for the C5) so two boards on one host never share a timeline.
+pub fn bw16_clock_domain(path: &str) -> ClockDomainId {
+    let mut h: u32 = 0x811c_9dc5;
+    for b in path.bytes() {
+        h ^= b as u32;
+        h = h.wrapping_mul(0x0100_0193);
+    }
+    ClockDomainId((h & 0x00ff_ffff) | 0x4257_0000) // "BW" tag in the top bytes
+}
+
+/// **BW16 / RTL8720DN serial-bridge backend** — the RTL8720DN's own identity, the sibling of
+/// [`Esp32SerialBackend`].
+///
+/// [`SerialRadioBackend`] is the shared transport (framing, reader, demux). This newtype carries what
+/// is specific to the RTL8720DN and would be wrong on the C5:
+///
+/// * **Dual-band.** The RTL8720DN is a 2.4 + 5 GHz part, and both bands were verified on air in both
+///   directions (ch36 and ch149, TX and RX). The shared profile is 2.4-only, so cognition driving a
+///   BW16 through it would never choose a 5 GHz channel.
+/// * **Rate units.** `T_RATE` carries a Realtek **MGN** code here, not the C5's `wifi_phy_rate_t`.
+/// * **A device clock.** The firmware stamps every frame from a monotonic µs timeline and answers
+///   `T_READCLOCK`, so frames carry a device stamp rather than a host-receive time.
+/// * **Scheduled TX.** `T_INJECT_AT`/`T_INJECT_ABS` place a frame at a named instant.
+pub struct Bw16SerialBackend {
+    inner: Arc<SerialRadioBackend>,
+    capability: RadioCapability,
+    clock_domain: ClockDomainId,
+}
+
+impl Bw16SerialBackend {
+    /// Open a BW16 running the `firmware/bw16-rs` bridge. Pulses DTR→CEN so a freshly-flashed board
+    /// boots our firmware without a manual reset, and stamps frames in this device's clock domain.
+    pub fn open(path: &str) -> Result<Self, FaceError> {
+        let clock_domain = bw16_clock_domain(path);
+        Ok(Self {
+            inner: Arc::new(SerialRadioBackend::open_clocked(path, clock_domain)?),
+            // MEASURED on air, both directions: 2.4 GHz ch6 and 5 GHz ch36/ch149. The RTL8720DN is
+            // 1x1 HT20 — it tops out at HT MCS7 (65 Mb/s), with no VHT and no HE, so no `.with_he()`:
+            // claiming the HE reach levers here would make cognition escalate to a modulation this
+            // PHY cannot emit.
+            capability: RadioCapability::wifi_monitor_dual_1ss(vec![
+                1, 6, 11, 36, 40, 44, 48, 149, 153, 157, 161,
+            ]),
+            clock_domain,
+        })
+    }
+
+    /// Open the BW16 and bundle it as an [`OpenRadio`] — io + knobs + time + profile backed by one
+    /// instance, so the measured dual-band profile survives into the engine.
+    pub fn open_radio(path: &str) -> Result<OpenRadio, FaceError> {
+        let dev = Arc::new(Self::open(path)?);
+        let io: Arc<dyn FrameIo> = dev.clone();
+        let knobs: Arc<dyn RadioKnobs> = dev.clone();
+        let time: Arc<dyn RadioTime> = dev.clone();
+        let profile: Arc<dyn RadioProfile> = dev;
+        Ok(OpenRadio {
+            io,
+            knobs: Some(knobs),
+            time: Some(time),
+            profile: Some(profile),
+        })
+    }
+
+    /// The shared transport behind this view (for the wire-level helpers: `read_txpower`,
+    /// `set_tx_power_pct`, `inject_at_abs`, `read_schedule_clock`, `recv_tx_confirm`, …).
+    pub fn inner(&self) -> &Arc<SerialRadioBackend> {
+        &self.inner
+    }
+
+    // Inherent delegates for the wire-level knobs. Spelled out rather than reached through a
+    // `Deref` to the transport: `RadioKnobs` is also implemented here, and its `set_channel` takes
+    // a bandwidth, so a deref-based single-argument `set_channel` would resolve to the trait method
+    // and fail on arity. Inherent methods win resolution, which is exactly what a caller holding a
+    // `Bw16SerialBackend` means.
+
+    /// Retune the radio (2.4 or 5 GHz channel), leaving the bandwidth alone.
+    pub fn set_channel(&self, channel: u8) -> Result<(), FaceError> {
+        self.inner.set_channel(channel)
+    }
+    /// Pin the management-TX rate to a [`rate`] MGN code (`rate::AUTO` gives it back to the driver).
+    pub fn set_tx_rate(&self, code: u8) -> Result<(), FaceError> {
+        self.inner.set_tx_rate(code)
+    }
+    /// Set the TXAGC index for every rate (~0.25 dB/step); `0xFF` restores driver defaults.
+    pub fn set_txpower(&self, idx: u8) -> Result<(), FaceError> {
+        self.inner.set_txpower(idx)
+    }
+    /// Read the 20 live TXAGC indices back out of the hardware.
+    pub async fn read_txpower(&self) -> Option<(i8, [u8; 20])> {
+        self.inner.read_txpower().await
+    }
+    /// Enable/disable 40 MHz channel bandwidth.
+    pub fn set_bw40(&self, enable: bool) -> Result<(), FaceError> {
+        self.inner.set_bw40(enable)
+    }
+    /// Poke `pkt_attrib` bytes before injecting — the driver-RE probe harness.
+    pub fn inject_attr(&self, frame: &[u8], pairs: &[(u8, u8)]) -> Result<(), FaceError> {
+        self.inner.inject_attr(frame, pairs)
+    }
+
+    /// Open with an explicit on-air frame format (default `RawNdn`). Taken at open rather than as a
+    /// `with_format` builder because the transport is already behind an `Arc` by then — and the
+    /// format must be fixed before the reader thread starts parsing with it.
+    pub fn open_with_format(path: &str, format: FrameFormat) -> Result<Self, FaceError> {
+        let clock_domain = bw16_clock_domain(path);
+        let inner = SerialRadioBackend::open_clocked(path, clock_domain)?.with_format(format);
+        Ok(Self {
+            inner: Arc::new(inner),
+            capability: RadioCapability::wifi_monitor_dual_1ss(vec![
+                1, 6, 11, 36, 40, 44, 48, 149, 153, 157, 161,
+            ]),
+            clock_domain,
+        })
+    }
+}
+
+#[async_trait]
+impl FrameIo for Bw16SerialBackend {
+    async fn inject(&self, frame_in: InjectFrame) -> Result<(), FaceError> {
+        self.inner.inject(frame_in).await
+    }
+
+    async fn recv_frame(&self) -> Result<CapturedFrame, FaceError> {
+        self.inner.recv_frame().await
+    }
+
+    /// Actuate cognition's rate lever.
+    ///
+    /// The RTL8720DN is 1x1 HT20, so an `McsDescriptor` index maps to the HT MGN code
+    /// `MGN_MCS0 (0x80) + index`, clamped to MCS7. MEASURED on air across every rate the chip has.
+    /// The `he`/`dcm`/`er_su` reach flags are ignored on purpose — this is an 802.11n PHY and
+    /// silently substituting an HT rate for a requested HE one is the honest behaviour, since the
+    /// capability never advertises `he_cap` for cognition to escalate into.
+    fn set_rate(&self, mcs: McsDescriptor) -> Result<(), FaceError> {
+        self.inner.set_tx_rate(rate::ht_mcs(mcs.index))
+    }
+
+    /// Real scheduled placement: this backend implements `inject_after`, so the caller may
+    /// skip its software gate and hand us the delay. Moves with that implementation.
+    fn schedules_tx(&self) -> bool {
+        true
+    }
+
+    async fn inject_after(&self, frame_in: InjectFrame, delay_us: u64) -> Result<(), FaceError> {
+        // T_INJECT_AT carries a u32 µs delay, and the firmware refuses anything past its
+        // busy-wait cap anyway — saturate rather than wrap, so an over-long delay is rejected
+        // by the device instead of silently becoming a near-immediate transmission.
+        self.inner
+            .inject_at(frame_in, delay_us.min(u32::MAX as u64) as u32)
+    }
+}
+
+impl RadioKnobs for Bw16SerialBackend {
+    fn set_channel(&self, channel: u8, bw: Bandwidth) -> Result<(), FaceError> {
+        RadioKnobs::set_channel(self.inner.as_ref(), channel, bw)
+    }
+    fn set_tx_power(&self, idx: u32) -> Result<(), FaceError> {
+        RadioKnobs::set_tx_power(self.inner.as_ref(), idx)
+    }
+    fn tx_discipline(&self) -> TxDiscipline {
+        // The firmware spins on its µs timeline to the target instant, then injects. MEASURED
+        // submit error: a constant 10 µs across 15 frames (the read-back overhead), so declare a
+        // conservative 20 µs granularity. Tighter than the C5's 200 µs — the busy-wait is exact;
+        // what it cannot control is CSMA backoff between submission and the air.
+        TxDiscipline::ScheduledAt {
+            granularity_ns: 20_000,
+        }
+    }
+    fn configure_name_filter(
+        &self,
+        enabled: bool,
+        key: &[u8; 16],
+        masks: &[[u8; 16]],
+    ) -> Result<(), FaceError> {
+        RadioKnobs::configure_name_filter(self.inner.as_ref(), enabled, key, masks)
+    }
+    fn read_channel_activity(&self) -> Result<Option<u16>, FaceError> {
+        RadioKnobs::read_channel_activity(self.inner.as_ref())
+    }
+}
+
+impl RadioTime for Bw16SerialBackend {
+    fn time_sources(&self) -> Vec<RadioTimeSource> {
+        // Stamped in the promiscuous callback from the SDK's µs ticker — earlier than any host
+        // timestamp, but taken in the driver's RX path rather than latched by the MAC, so it carries
+        // the driver's delivery jitter. Declared at 1 µs resolution, which is the clock's; the
+        // *accuracy* is bounded by that jitter and is not claimed here. (The MAC's own RXTSFL does
+        // sit in the RX descriptor, but the blob discards it before our callback ever runs.)
+        vec![RadioTimeSource::free_run_rx_stamp(self.clock_domain, 1_000)]
+    }
+    fn read_clock(&self, _domain: ClockDomainId) -> Result<Option<u64>, FaceError> {
+        // Latch-only, as on the C5: `T_READCLOCK` exists and answers, but a serial round-trip is a
+        // worse estimate of "now" than the per-frame latch it shares a domain with.
+        Ok(None)
+    }
+}
+
+impl RadioProfile for Bw16SerialBackend {
+    fn capability(&self) -> RadioCapability {
+        self.capability.clone()
     }
 }
 
@@ -670,7 +1068,11 @@ impl Esp32SerialBackend {
             // .with_he(): the C5 is Wi-Fi 6 — it transmits real HE (verified on air, RX cur_bb_format=HE_SU),
             // so it advertises the HE reach levers (ER-SU + DCM) that for_intent(MostRobust) and set_rate use.
             capability: RadioCapability::wifi_monitor_dual_1ss(vec![1, 6, 11, 36, 40, 44, 48])
-                .with_he(),
+                .with_he()
+                // The C5's power really is an absolute scale (esp_wifi_set_max_tx_power, 2..20 dBm),
+                // so advertise it: that is what lets cognition reason in dBm across bearers instead
+                // of in per-chip indices.
+                .with_tx_power_dbm(DbmRange::new(2, 20)),
             clock_domain,
         })
     }
@@ -750,6 +1152,12 @@ impl FrameIo for Esp32SerialBackend {
     }
     /// Relative hardware scheduling (T_INJECT_AT): the C5 fires the frame `delay_us` after it receives the
     /// command, on its own esp_timer — so the scheduler's slot_wait drives it with no clock reconcile.
+    /// Real scheduled placement: this backend implements `inject_after`, so the caller may
+    /// skip its software gate and hand us the delay. Moves with that implementation.
+    fn schedules_tx(&self) -> bool {
+        true
+    }
+
     async fn inject_after(&self, frame: InjectFrame, delay_us: u64) -> Result<(), FaceError> {
         if delay_us == 0 {
             self.inner.inject(frame).await
@@ -787,9 +1195,36 @@ impl RadioKnobs for Esp32SerialBackend {
         // FQ call: SerialRadioBackend has an inherent 1-arg `set_channel` that would shadow this.
         RadioKnobs::set_channel(self.inner.as_ref(), channel, bw)
     }
+    /// The C5's power unit is **0.25 dBm** (`esp_wifi_set_max_tx_power`), valid `[8,84]` = 2..20 dBm —
+    /// NOT the RTL8720DN's TXAGC index, so this must not inherit the shared implementation. `idx` is
+    /// taken as that quarter-dBm value and clamped into range.
+    ///
+    /// Prefer [`set_tx_power_dbm`](RadioKnobs::set_tx_power_dbm): this radio's power really is an
+    /// absolute scale, and the index form throws that away.
     fn set_tx_power(&self, idx: u32) -> Result<(), FaceError> {
-        RadioKnobs::set_tx_power(self.inner.as_ref(), idx)
+        self.inner.set_txpower(idx.clamp(8, 84) as u8)
     }
+
+    /// The portable absolute-power knob, returning the power the radio actually applied — which the
+    /// firmware reads back with `esp_wifi_get_max_tx_power`, because the IDF quantises a request to 11
+    /// discrete steps and the applied value routinely differs from the requested one (21 dBm applies as
+    /// 20). MEASURED across the full range: monotonic, 22.6 dB span, R² = 0.974.
+    fn set_tx_power_dbm(&self, dbm: i8) -> Result<i8, FaceError> {
+        // The readback is a wire round-trip and this trait method is sync. Inside a runtime, use
+        // block_in_place so blocking on it cannot panic with "cannot start a runtime from within a
+        // runtime"; outside one, set without the readback and report the clamped request.
+        let inner = self.inner.clone();
+        match tokio::runtime::Handle::try_current() {
+            Ok(h) => tokio::task::block_in_place(|| h.block_on(inner.set_max_tx_power_dbm(dbm)))
+                .ok_or_else(|| io_err("no TX-power readback from the device".into())),
+            Err(_) => {
+                let q = (dbm as i32 * 4).clamp(8, 84) as u8;
+                self.inner.set_txpower(q)?;
+                Ok((q / 4) as i8)
+            }
+        }
+    }
+
     fn tx_discipline(&self) -> TxDiscipline {
         // The C5 firmware places T_INJECT_AT frames at a scheduled instant via its monotonic timer.
         // Measured error ≤ ~190 µs (dominated by the esp_wifi_80211_tx submission latency), so declare
@@ -808,6 +1243,22 @@ impl RadioKnobs for Esp32SerialBackend {
     }
     fn read_channel_activity(&self) -> Result<Option<u16>, FaceError> {
         RadioKnobs::read_channel_activity(self.inner.as_ref())
+    }
+
+    /// `(ok, err)` PPDU counters from the C5's hardware MAC/PHY registers.
+    ///
+    /// `ok` is `rx_mpdu`; `err` is `rx_fcs_err + brx_err_agc` — PPDUs the PHY began to demodulate and
+    /// failed. That is precisely the half of channel activity the promiscuous callback cannot see: it
+    /// only ever reports clean receptions, so an occupancy built from it structurally under-reports a
+    /// busy or contended channel. MEASURED on an idle bench: 760 FCS errors and 125 AGC failures
+    /// against 14227 good MPDUs, none of which reached the callback.
+    fn read_ofdm_counters(&self) -> Result<Option<(u16, u16)>, FaceError> {
+        let inner = self.inner.clone();
+        let got = match tokio::runtime::Handle::try_current() {
+            Ok(h) => tokio::task::block_in_place(|| h.block_on(inner.read_hw_rx_stats())),
+            Err(_) => return Ok(None), // no runtime to do the round-trip on
+        };
+        Ok(got.map(|(mpdu, fcs_err, agc_err, _cfo)| (mpdu, fcs_err.saturating_add(agc_err))))
     }
 }
 

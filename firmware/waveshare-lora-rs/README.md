@@ -16,7 +16,7 @@ with `CMD_SET_PHY` — see [PHY selection](#phy-selection-cmd_set_phy).
 | SX1262 SPI | SPI2 — NSS PB12, SCK PB13, MISO PB14, MOSI PB15 | NSS driven by hand (BUSY handshake) |
 | SX1262 RESET | PA4 | |
 | SX1262 BUSY | PB1 | |
-| SX1262 DIO1 | PB0 | RxDone/TxDone (polled) |
+| SX1262 DIO1 | PB0 | RxDone/TxDone. The IRQ status is read over SPI; the **edge** is captured in hardware by TIM3_CH3, whose default (un-remapped) input is this exact pin — see [Hardware RX timestamp](#hardware-rx-timestamp). No pin reconfiguration was needed: on STM32F1/GD32F1 an alternate-function *input* is just a plain input |
 | RF switch | PB4 | **HIGH = RX, LOW = TX**; PB4 is JNTRST → JTAG disabled (SWD kept) |
 | TCXO | DIO3, 1.7 V | non-`-B` variant; recalibrated after enable |
 | LEDs | PA6 (RXD) / PA7 (TXD) | |
@@ -75,7 +75,7 @@ not satisfy the opcode's arguments · `0x04` argument outside the range CAP adve
 
 | Type | Name | Payload |
 |------|------|---------|
-| 0x81 | RX | `[rssi i16 BE, snr i16 BE, ts_us u32 BE, frame bytes]` — **`ts_us` is MICROseconds** (see CAP `stamp_hz`); up to 247 frame bytes. **`snr` is 0 in GFSK**: that modem measures no signal-to-noise ratio, and 0 is the explicit "not measured" rather than a number derived from something else |
+| 0x81 | RX | `[rssi i16 BE, snr i16 BE, ts_us u32 BE, frame bytes]` — **`ts_us` is MICROseconds** (see CAP `stamp_hz`) and is the TIM3_CH3 capture latched at the SX1262's DIO1 edge; up to 247 frame bytes. **`snr` is 0 in GFSK**: that modem measures no signal-to-noise ratio, and 0 is the explicit "not measured" rather than a number derived from something else |
 | 0x82 | TXDONE | `[ok, attempts]` (attempts = 0 for a plain TX). A **CMD_TX_AT** / **CMD_TX_AT_ABS** reply appends 8 more bytes: `[late_us u32 BE, keyup_us u32 BE]` — see [Scheduled TX](#scheduled-tx-cmd_tx_at-0x18-and-cmd_tx_at_abs-0x1f). Read byte 0 (and 1) and ignore the rest if you do not want it |
 | 0x83 | INFO | `[status, sync(2), errors(2), freq(4), sf, bw, cr, pwr, lost(2), cad_busy(2), defer(2)]` — **19 B, frozen**: the host reads cad_busy/defer as the last 4 bytes, so nothing may be appended |
 | 0x84 | LOG | ascii |
@@ -83,24 +83,36 @@ not satisfy the opcode's arguments · `0x04` argument outside the range CAP adve
 | 0x86 | RSSI | `[rssi i16 BE]` |
 | 0x87 | SF_DETECTED | `[sf | 0 = none]` |
 | 0x88 | TX_STARTED | `[airtime_ms u16 BE]` — emitted just before key-up |
-| 0x89 | STATS | 32 B, see [STATS](#stats-0x89--32-bytes) |
+| 0x89 | STATS | 44 B, see [STATS](#stats-0x89--44-bytes) |
 | 0x8A | CLOCK | `[ticks u64 BE]` — the same counter EVT_RX stamps with, at full width |
 | 0x8B | CAP | **34 B**, see below. Also arrives **unsolicited** when the measured `sched_gran_ns` moves — see [Re-published capabilities](#re-published-capabilities) |
 | 0x8C | SENSE | `[activity u16 BE, rssi i16 BE]` |
 | 0x8D | PHY_ERR | `[requested_phy, chip_status]` — a PHY this node **advertises** that the chip refused at runtime, carrying the SX126x's literal `GetStatus` byte (chip mode in bits [6:4], command status in [3:1]) |
 | 0x8F | UNSUPPORTED | `[cmd, reason]` |
+| 0x90 | RX_STAMP | `[frame_stamp_kind, reason]` — emitted **immediately before** an `EVT_RX` whose `ts` disagrees with the `stamp_kind` this node advertises, and emitted **only** then. Byte 0 is the `stamp_kind` of that one frame in the same vocabulary as `CAP[16]` (so it reads `2`, software counter); byte 1 is why: `1` no edge captured, `2` overcapture — an edge was **lost**, `3` more than one edge in the window, so the capture may belong to a later frame, `4` timer-ISR latency past half a wrap, `6` **coalesced** — the chip completed a number of packets in this window other than exactly one, so the edge and the payload need not be the same frame. Reason `5` (no capture path) exists in the firmware's verdict but cannot reach the wire: a node whose self-test failed advertises `2`, so its frames *agree* with its capability and there is nothing to qualify. See [Hardware RX timestamp](#hardware-rx-timestamp) |
 
-### STATS (0x89) — 32 bytes
+> ☠ **This event was 0x8E and had to move.** 0x8E is the fleet's `EVT_HOPTRACE` on the LR2021 and
+> the Heltec. Nothing decoded the collision: `tools/hoptrace.py` discovers hop support by sending
+> `CMD_GET_HOPTRACE` (0x20, too high for `cmd_bitmap`) and accepting the first `0x8E` **or** `0x8F`
+> it sees within 3 s — so a single degraded frame arriving in that window would have made this node,
+> which structurally cannot hop (`CMD_SET_HOP` → `NO_HARDWARE`), answer with a "hop timeline". 0x90
+> is past the end of the v3 event space and is now pinned in the fleet's event-number registry
+> (`fleet_event_numbering`, `lr2021-nrf54l15-rs/src/serial.rs`), which previously listed only that
+> one node's constants and so could not fail on a collision introduced anywhere else.
 
-`CMD_GET_STATS` (0x13) always replies with **exactly 32 payload bytes**. Every field is **unsigned
+### STATS (0x89) — 44 bytes
+
+`CMD_GET_STATS` (0x13) always replies with **exactly 44 payload bytes**. Every field is **unsigned
 and big-endian**; the offsets below are half-open byte ranges into the payload (the byte after the
 framing's `len`, i.e. payload byte 0 is wire byte 4). They are transcribed from the `stats` module in
 `src/main.rs`, which the emitter indexes with and whose contiguity is asserted at compile time — the
 table and the wire cannot drift.
 
-Bytes `[0..24]` are byte-identical to the v1 layout, and the existing host parser length-checks
-`< 24` rather than `!= 24`, so a v1 host reads exactly the 24 bytes it always did and ignores the
-tail.
+Bytes `[0..24]` are byte-identical to the v1 layout and `[0..32]` to the v2 one. The host parser
+length-checks `< 24` rather than `!= 24`, reads the v2 tail only at `>= 32`, and explicitly accepts a
+**longer** reply while ignoring the excess — so v1, v2 and v3 hosts all read a v3 node correctly and
+each sees exactly the fields it knows. That is why every generation of this record appends rather
+than interleaves.
 
 | Offset | Width | Field | Meaning | Cleared by `RESET_STATS` (0x14) |
 |--------|-------|-------|---------|------------------------------|
@@ -116,8 +128,33 @@ tail.
 | `[26..28]` | u16 BE | `chip_crc_err` | SX126x `GetStats` `nbPktCrcError` — **the only place a failed decode is visible**: `poll_rx` drops a CRC failure and returns nothing, so without this a quiet channel and a channel we are failing to decode look identical | yes (″) |
 | `[28..30]` | u16 BE | `chip_hdr_err` | SX126x `GetStats` third counter — `nbPktHeaderErr` in LoRa, **`nbPktLengthError` in GFSK** (same register, different meaning per PHY) | yes (″) |
 | `[30..32]` | u16 BE | `rx_trunc`     | frames whose on-air length exceeded `max_payload` (247) and were therefore truncated. **Should stay 0**; non-zero means a peer is transmitting past our advertised cap | yes |
+| *— end of the v2 payload; a v2 host stops here —* | | | | |
+| `[32..34]` | u16 BE | `hw_stamped`   | frames whose `ts` is the hardware capture | yes |
+| `[34..36]` | u16 BE | `hw_stamp_sw`  | frames that fell back to the software read. Each one *delivered to the host* was also announced individually by an `EVT_RX_STAMP` (0x90) immediately before its `EVT_RX` | yes |
+| `[36..38]` | u16 BE | `hw_stamp_ambig` | of those, the ones discarded for **mis-attribution**: either the window held more than one DIO1 edge (the capture register holds the *latest* edge on this timer, so the stamp may belong to a later frame) **or** the chip's completed-packet count did not advance by exactly one across the window (a frame arrived while DIO1 was already high, so the payload is a later frame's than the edge). Both are the same failure and both are discarded. **Should stay 0 on a quiet link**; on a flooded or relayed channel it is the honest cost of refusing to guess | yes |
+| `[38..40]` | u16 BE | `hw_stamp_over` | timer overcaptures (`CC3OF`) — **an edge was LOST**, which is worse than a stamp being imprecise. **Should stay 0** | **no** — `rxstamp::take` reads it as a difference against each window's baseline, and moving one side of a difference under the reader is how a counter starts lying |
+| `[40..42]` | u16 BE | `hw_stamp_lat_us` | worst timer-ISR entry latency in µs, saturating. **This is the measurement that says whether the hardware path was worth building**: it is how wrong a software stamp taken *in the ISR* would have been, and the stamp it replaced was taken later still, out in the poll loop after the SPI readback | yes (re-baselined) |
+| `[42..44]` | u16 BE | `clock_skew_ms` | \|`micros64()/1000 − millis()`\| — the TIM3 microsecond clock against the SysTick millisecond clock. ⚠ Vacuous (structurally 0) on a node whose boot rate check moved the clock to SysTick, since both sides are then the same counter; the boot log's `clk=` says which | n/a (an instantaneous read, not a counter) |
 
 Notes for a reader:
+
+* `hw_stamped + hw_stamp_sw` is every frame `poll_rx` delivered — counted **before** the on-device
+  data plane classifies it, so a frame the name filter drops still lands here (which is why the sum
+  can exceed the number of `EVT_RX` events). Difference it against `chip_rx` above and the remainder
+  is frames the SX126x saw and the firmware never got;
+* coalescing — two packets inside one `RxDone` window — is now caught **per frame**, not inferred
+  from that aggregate. `poll_rx` reads the chip's own completed-packet count at both ends of the
+  capture window and discards any stamp whose window did not hold exactly one completion, so the
+  frame lands in `hw_stamp_sw` + `hw_stamp_ambig` and carries reason `6` in its `EVT_RX_STAMP`. The
+  aggregate is still worth watching (it also counts frames the firmware never saw at all), but it is
+  a post-hoc statistic and was never a per-frame verdict. `hw_stamp_over` is *not* a coalescing
+  detector either and must not be read as one: a frame arriving while DIO1 is still high produces no
+  edge at all, so the overcapture flag is blind to it;
+* both clocks are divided from the same 8 MHz HSI, so `clock_skew_ms` measures neither oscillator.
+  What it catches is a **lost TIM3 overflow**, whose signature is unmistakable: the value jumps by
+  65 (one 65.536 ms wrap) and never comes back. A steady 0 or 1 is expected — the two counters start
+  a few hundred µs apart at boot. It is the one failure mode the 16-bit microsecond clock has that
+  SysTick's 1 ms quantum did not, so it is instrumented rather than argued away;
 
 * the three `chip_*` fields are the SX126x's own 16-bit counters, so they are narrower than the
   firmware counters above them and are also zeroed by any hard reset of the chip;
@@ -133,6 +170,13 @@ field is `0`.
 `cmd_bitmap` all move with `phy_current` — the same SX1262 in GFSK has no spreading factor and no
 CAD. That is why `SET_PHY` answers with the *whole* record and a host **replaces its profile
 wholesale**; nothing here is safe to patch field by field.
+
+⚠ **The two hex dumps below are STALE at byte 16.** They were captured off a dongle running the
+software-stamp firmware, so `stamp_kind` reads `02` in both and the trailing XOR CRC is that
+record's. They are left as captured rather than hand-edited: this is a *wire fixture*, and a
+hand-patched byte with a hand-patched checksum is a claim about what the node emits rather than a
+record of it. Re-capture them from a reflashed dongle (`CMD_GET_CAP` → `EVT_CAP`) and replace both
+blocks whole. Everything else in them is unchanged.
 
 Freshly booted (LoRa, before the first scheduled transmission refines `sched_gran_ns`):
 
@@ -156,8 +200,8 @@ and after `SET_PHY [0x02]` (GFSK) — note `cmd_bitmap`, `sf_min`, `sf_max` and 
 | 6..10 | freq_max_hz | 928 000 000 | ″ | ″ |
 | 10 | pwr_min_dbm | −9 (0xF7) | ″ | real dBm — the SetTxParams range `set_power` clamps to; the PA is not per-PHY |
 | 11 | pwr_max_dbm | +22 (0x16) | ″ | ″ |
-| 12..16 | stamp_hz | 1 000 000 | ″ | **microseconds** — `micros()` adds SysTick sub-ms cycles (RELOAD 7999 @ 8 MHz) to `ms×1000` |
-| 16 | stamp_kind | 2 | ″ | software counter — the MCU reads its own clock on noticing RxDone in the poll loop; there is no hardware capture |
+| 12..16 | stamp_hz | 1 000 000 | ″ | **microseconds** — one TIM3 tick at PSC 7 off the 8 MHz APB1 timer clock. The same unit as `EVT_CLOCK`, `TX_AT_ABS`'s deadline and TIM2's scheduler tick, deliberately: they are all the same counter |
+| 16 | stamp_kind | **3** | ″ | hardware free-running — TIM3_CH3 latches the counter **in silicon at the SX1262's DIO1 edge**. See [Hardware RX timestamp](#hardware-rx-timestamp). **Reads `2` instead if the boot self-test did not pass**, and the boot `EVT_LOG` says which |
 | 17..19 | max_payload | 247 | 247 | **the same number for the same reason in both**: the binding limit is the *serial framing* (EVT_RX = 8 header bytes + frame ≤ 255), not the radio. Both radio caps are larger (LoRa PDU 255, GFSK PDU 255) and therefore not binding |
 | 19..23 | cmd_bitmap | 0xBDFF_FFFE | 0xBDFF_DAF6 | 29 opcodes in LoRa; GFSK clears the four LoRa-modem ones — `SET_MOD` (0x03), `CAD` (0x08), `SET_CAD_CFG` (0x0A), `SF_SCAN` (0x0D). Clear in both: bit 0 (no opcode 0), bit 25 (0x19 unassigned), bit 30 (0x1E `SET_HOP`, understood and refused). The build asserts the LoRa bitmap equals the OR of every opcode `handle_cmd` dispatches, so the bitmap **is** the dispatcher rather than a claim about it |
 | 23 | sf_min | 7 | **0** | SF5/6 are chip-supported but do not interop with the fleet's SX127x peers. 0/0 in GFSK is "this PHY has no such knob", not "unknown" |
@@ -170,6 +214,163 @@ and after `SET_PHY [0x02]` (GFSK) — note `cmd_bitmap`, `sf_min`, `sf_max` and 
 node `radio_kind` keeps its v2 *value* too (0 = SX1262 was already the part) — so a v2 host reads a
 v3 node correctly and ignores the 5-byte tail. A v3 host reading a v2 node (29 bytes, `proto_ver` 2)
 should synthesise a single-entry `phy_bitmap` from the v2 `radio_kind` and set `phy_current` to it.
+
+## Hardware RX timestamp
+
+`EVT_RX.ts` is latched **in silicon at the DIO1 edge** by a TIM3_CH3 input capture on PB0, not read
+by the MCU when it notices `RxDone`. The unit does not change — 1 µs before and after — and neither
+does the EVT_RX layout. What changes is accuracy.
+
+**The term this removes.** The old stamp was `micros()` taken *after* `poll_rx` returned, i.e. after
+`GetIrqStatus`, `ClearIrqStatus`, `GetRxBufferStatus`, the whole buffer readback and
+`GetPacketStatus`. At SCK = 1 MHz that is `(19 + n) × 8 µs` of SPI: ~280 µs for a 16-byte frame,
+~2.1 ms for a 247-byte one, before poll-loop phase or any blocking command handler is counted. Note
+the shape — it is not jitter around a constant, it is a **bias that grows with frame length**, and a
+length-coupled bias is exactly the term that cannot cancel in a two-way exchange. (Those figures are
+arithmetic from `poll_rx`'s transaction sizes, not measurements; they are a floor, since real
+per-byte HAL overhead only adds.)
+
+**One counter, not two.** TIM3 also replaced SysTick as the microsecond clock, so `EVT_RX.ts`,
+`EVT_CLOCK`, `CMD_TX_AT_ABS`'s deadline and the capture register are one free-running counter with
+one epoch. This is not about accuracy — SysTick and TIM3 are the same 8 MHz HSI divided twice, so
+there is no drift between them at all — it is about **identity**: the host declares one
+`ClockDomainId` per serial port and then differences a received stamp against a `CMD_READ_CLOCK`
+read and schedules against the result. Two "1 MHz" counters would satisfy every unit check on the
+wire and put an arbitrary offset into every one of those subtractions. SysTick stays, as `millis()`
+only — **and as the fallback described below**, which is what makes the rate measurement an actuator
+rather than a diagnostic.
+
+The cost of a 16-bit timer is stated rather than glossed: the clock now depends on an overflow
+interrupt 15.26 times a second, and a lost overflow costs 65.536 ms where a lost SysTick tick cost
+1 ms. The probability is far lower (you would need 65 ms of masked interrupts against 1 ms, and this
+firmware has no critical sections anywhere) but the quantum is 65× larger — so it is instrumented,
+as `clock_skew_ms` in STATS.
+
+**Attribution — the rule, and what happens when it fails.** On an STM32/GD32 input capture the
+register holds the **latest** edge (an overcapture *overwrites* it), which is the opposite of the
+LR2021's DPPI capture. So:
+
+> The capture supplies the INSTANT. The chip's IRQ status word supplies the REASON. The chip's
+> buffer and packet status supply the IDENTITY. They describe the same event only if all three are
+> read in the same IRQ-clear cycle — **and only if exactly one packet completed inside it.**
+
+Enforced structurally, not by discipline. `Sx1262::clear_irq` opens a fresh capture window at every
+one of the eleven sites that close one, so the timer's window *is* the chip's IRQ window; and
+`poll_rx` reads the capture, the buffer status and the packet status **between** `GetIrqStatus` and
+`ClearIrqStatus`. Reading any of them at the old `let ts = micros()` site would have been too late:
+after the clear, `poll_rx` spends ~2 ms reading the buffer, and a frame arriving in that stretch
+takes its own capture and updates `rxStartBufferPointer`, `payloadLengthRx` and the packet status —
+attaching one frame's instant to another frame's payload, silently.
+
+☠ **The count of edges is not sufficient, and believing it was is how this feature shipped worse
+than what it replaced.** DIO1 is *level*-latched: it stays high from an `RxDone` until the
+`ClearIrqStatus` goes out. So during the ~22 ms an `EVT_RX` push occupies the USART, frame **B**
+raises the line and is captured, and frame **C** arriving while it is still high raises **nothing at
+all** — while the chip's buffer and packet status advance to describe C. The next `poll_rx` sees one
+edge, no overcapture, a small latency, and reads C's payload: a *plausible* timestamp on the *wrong*
+frame, wrong by up to a whole poll gap (~22 ms here, ~78 ms after any `SET_*` TCXO restart, seconds
+behind an SF12 relay), published under a byte claiming 1 µs. Two frames inside one poll gap is not
+exotic — it is the ordinary case on the flooded or relayed channel the on-device data plane exists
+for.
+
+The second half of the rule closes it: `poll_rx` reads the chip's own completed-packet count
+(`GetStats`, summed over `nbPktReceived + nbPktCrcError`) at both ends of the window and requires the
+delta to be **exactly one**. Anything else degrades the frame to the software read with reason `6`.
+Three details are deliberate. The baseline is snapshotted *before* the `ClearIrqStatus`, so the count
+can only ever run one **high** (which costs a good stamp) and never one low (which would admit a bad
+one). `nbPktHeaderErr` is excluded, because a header error aborts before `RxDone` and so raises no
+edge and cannot mis-attribute anything. And the other two are **summed** rather than read
+individually, because the datasheet does not say whether `nbPktReceived` counts CRC-failed
+receptions — the same thing the host discloses about `phy_counters` — and the sum is correct under
+either reading, over-counting a bad packet at worst.
+
+One more property of those counters is **not measured**: whether they wrap or saturate at `0xFFFF`.
+The arithmetic assumes wrapping, which is what the host's `NdnStats` documents. If they saturate the
+detector fails **closed** — the delta pins at 0 after the 65 536th reception and every frame degrades
+to the software stamp, which shows up at once in `hw_stamped`/`hw_stamp_ambig` and is cleared by a
+`CMD_RESET_STATS` (which zeroes the chip's counters and this baseline together). Failing closed costs
+coverage; the other direction would cost correctness.
+
+**And DIO1 now carries `RX_DONE` alone.** It used to carry `TX_DONE | RX_DONE | TIMEOUT`, which made
+an edge not self-identifying and left one hole open: `start_rx` clears the latch ~40 µs before it
+issues `SetRx`, so a `TxDone` landing in that gap (reachable once `wait_txdone`'s 2000 × 1 ms ceiling
+expires — SF12/BW125 at 247 B is ~8.9 s of airtime) leaves DIO1 high with the receiver armed, the
+next frame's `RxDone` raises no edge, and the stale TX edge reads as `edges == 1` with no
+overcapture. Narrowing the mask deletes the class instead of arguing about it, and costs nothing:
+no code reads the DIO1 *pin* (`wait_txdone`, `poll_rx` and `do_cad` all poll `GetIrqStatus` over
+SPI), and the full IRQ **status** word is untouched.
+
+A capture that fails any check is **discarded**, never reported as approximate, and the frame falls
+back to the software read — the same TIM3 counter, read microseconds-to-milliseconds later. That is
+visible two ways: an `EVT_RX_STAMP` (0x90) immediately before that frame's `EVT_RX`, saying
+`stamp_kind = 2` and why; and the `hw_stamp_*` counters in STATS. The per-frame note is an event
+rather than a header byte because `8 + RX_MAX == 255` exactly — a ninth EVT_RX header byte would cost
+`max_payload` 247 → 246, which is a number peers size their frames against, and it would be 0 on
+every frame in normal operation.
+
+**The `3` is gated on a measurement.** `stamp_kind = 3` is what makes the host publish
+`LatchPoint::RadioCapture`, a 1 µs `stamp_precision_ns` in place of the 1 ms host-receive floor, and
+`can_common_view = true` — a 1000× tightening of a number the timekeeper acts on. So `rxstamp::init`
+proves on the silicon in front of it, at boot, that a capture raises `CC3IF`, that reading `CCR3`
+clears it, that a second capture raises `CC3OF`, that a write clears that, and that the counter
+advances at the declared rate — using the timer's own `EGR.CC3G` software capture event, so no radio
+and no bench instrument are involved. GD32 is not STM32 and this repo has already been bitten once by
+a divergence between them (the in-app jump to the ROM bootloader), so the two behaviours the design
+depends on are tested rather than assumed. A failed self-test leaves the node advertising `2`, and
+the boot `EVT_LOG` line `rxstamp psc=… st=0x… tps=… kind=… clk=…` says exactly which check failed
+(`st = 0x1F` is a clean pass; `tps` is TIM3 ticks across exactly one SysTick period and should read
+1000 — `0` means SysTick, the reference, never moved).
+
+**★ A detected rate fault moves the CLOCK, not just the capability byte.** The five checks are not
+one verdict, and folding them into one is how a *detected* fault still shipped a wrong number. The
+four flag checks decide the **capture**: if an edge cannot be latched and read back, the counter is
+still a perfectly good clock. The rate check decides the **clock**: if TIM3 is not ticking at
+1 MHz — a prescaler or clock-tree divergence, which is a factor of 2 or 8 — then `EVT_CLOCK`,
+`EVT_RX.ts`, `CMD_TX_AT`'s delay, `CMD_TX_AT_ABS`'s deadline, `late_us`, `keyup_us` and the
+re-published `sched_gran_ns` are *all* wrong by that factor, and lowering `stamp_kind` to `2` says
+nothing about any of them. So:
+
+| boot measurement | `micros64()` reads | `stamp_kind` | `stamp_hz` |
+|---|---|---|---|
+| flags pass, rate in band | TIM3 | `3` | 1 000 000 — the measured rate |
+| flags fail, rate in band | TIM3 | `2` | 1 000 000 — the measured rate |
+| rate out of band (SysTick alive) | **SysTick** (`ms × 1000 + (RELOAD − CVR)/8`) | `2` | 1 000 000 — µs by construction |
+| `tps = 0` (SysTick dead) | TIM3 | `2` | 1 000 000, **unverified** — nothing could measure it |
+
+The third row restores exactly the behaviour that preceded this feature, when `micros64()` was
+SysTick-derived and structurally immune to an APB1 timer-tree fault. The fourth is the one case that
+cannot fall back — falling back to a dead reference would *freeze* the clock, which is worse than an
+unverified rate — so it keeps the only counter still running, refuses the hardware stamp, and says
+`clk=tim3` with bit 4 of `st` clear. In every row `stamp_hz` describes the counter the node is
+actually reading, which is the property that broke when the rate check reached nothing but one byte.
+Publishing the *measured* rate instead would not have been enough: `CMD_TX_AT`'s `delay_us` is
+microseconds by definition, so a mis-rated counter still airs the frame at the wrong time.
+
+### ☠ What is NOT measured
+
+The capture is honest about *when the DIO1 edge happened*. Between a frame arriving in the air and
+that edge sit terms this timer cannot see, and none of them is folded into the number:
+
+| term | status |
+|---|---|
+| propagation, TX antenna → RX antenna | 3.34 ns/m; below one tick at bench range |
+| antenna → RF switch → LNA → mixer → IF filter group delay | **NOT MEASURED.** Positive, and not constant across bandwidth — IF group delay scales roughly as 1/BW, so it *moves* on any `SET_MOD` that changes BW. Any calibration would be per-(SF,BW) and void after a mode change |
+| demodulation | `RxDone` marks the **end** of the packet — after the last symbol and the CRC check — not the first on-air symbol. Recovering a start-of-frame instant needs the time-on-air subtracted; `airtime_ms_for` computes one, in whole ms and from the reported length. That is a derivation and is deliberately not folded in |
+| packet-done → DIO1 assertion inside the SX1262 | **NOT MEASURED**, and not specified by Semtech. Believed sub-symbol, bounded by nothing |
+| DIO1 pad → PB0 trace | ns; below one tick |
+| GPIO synchroniser + the `IC3F` input filter (N = 2 at 8 MHz) | 125–250 ns, fixed by construction. A bias, not jitter |
+| quantisation | one TIM3 tick = 1 µs |
+| **tick-rate accuracy** | ★ the MCU runs on the **8 MHz HSI RC oscillator** (`rcc.cfgr.freeze()` with no HSE), which clocks both SysTick and TIM3. Every figure here is in *nominal* microseconds; the rate itself is untrimmed, ~1%. The SX1262's 32 MHz TCXO clocks the RADIO, not this counter. For a cross-node common view this term dominates all the others put together, and it is **NOT MEASURED** |
+
+If the demodulate-and-flag offset is constant it cancels in a two-way exchange and calibrates out in
+a one-way one; if it varies it is a floor this timer cannot lift. Measuring it is a separate job from
+building the capture — the same milestone the LR2021 calls M4 — and nothing here is a substitute for
+it. **No number in this section has been checked on hardware**: the firmware builds and its pure
+logic is unit-tested, and the first dongle to run it should be read for `st=0x1F`, `tps=1000`,
+`clk=tim3`, `hw_stamp_over = 0` and a `hw_stamp_lat_us` in the low tens before any of it is believed.
+`hw_stamp_ambig` should be 0 on a quiet bench link; on a busy one it is the coalescing detector doing
+its job, and the figure to watch is then the *coverage* — `hw_stamped / (hw_stamped + hw_stamp_sw)` —
+rather than a zero.
 
 ## PHY selection (`CMD_SET_PHY`)
 
@@ -324,8 +525,8 @@ derived from an unmeasured latency is a bias dressed as precision.
 
 | Term | µs | Where it comes from |
 |------|----|---------------------|
-| TIM2 tick | 1 | timer runs at 1 MHz (PSC = `pclk1_tim`/1 MHz − 1 = 7 at the 8 MHz HSI clock; the prescaler actually programmed is printed in the boot `EVT_LOG` as `tim2psc=`) |
-| deadline quantization | 1 | `micros64()` reports whole microseconds (SysTick CVR ÷ 8) |
+| TIM2 tick | 1 | timer runs at 1 MHz (PSC = `pclk1_tim`/1 MHz − 1 = 7 at the 8 MHz HSI clock; the prescaler actually programmed is printed in the boot `EVT_LOG` as `psc=` on the `ws-lora v3` line — TIM3's is on the `rxstamp` line beside it) |
+| deadline quantization | 1 | `micros64()` reports whole microseconds (one TIM3 tick). TIM2 and TIM3 share the APB1 timer clock, so the deadline and the gate quantise identically rather than merely commensurately |
 | UIF poll loop | 2 | read TIM2.SR + test + branch ≈ 12 cycles at 8 MHz = 1.5 µs, rounded up |
 | `SetTx` SPI transaction | 50 | 4 bytes at SCK = 1 MHz = 8 µs/byte = 32 µs, plus the two NSS edges and the call boundary, rounded up |
 | `SetTx` → transmitter | 100 | BUSY-high while the chip processes the command out of STDBY_XOSC. Not stated crisply in the datasheet for a TCXO part, so rounded **up** generously — and it is the one term measured at runtime |

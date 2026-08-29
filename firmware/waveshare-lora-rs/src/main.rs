@@ -66,6 +66,45 @@
 //!  * **`CMD_SET_HOP` (0x1E) → `EVT_UNSUPPORTED[0x1E, NO_HARDWARE]`**, from an explicit arm: the
 //!    SX126x has no intra-packet FHSS engine, so this node is structurally outside the hopping pair.
 //!
+//! ## Hardware RX timestamping (2026-08-28) — `stamp_kind` 2 → 3
+//!
+//! The `EVT_RX` timestamp is now latched **in silicon at the DIO1 edge** by a TIM3_CH3 input
+//! capture, instead of being read by the MCU in the poll loop after `poll_rx` had finished its SPI
+//! work. The unit is unchanged (1 µs, [`STAMP_HZ`]); what changes is accuracy. The old stamp landed
+//! `(19 + n) × 8 µs` of SPI after `RxDone` — ~280 µs for a 16-byte frame, ~2.1 ms for a 247-byte
+//! one — which is not jitter around a constant but a **bias that grows with frame length**, and a
+//! length-coupled bias is exactly the term that cannot cancel in a two-way exchange.
+//!
+//! Three things make that claim safe to put on the wire:
+//!
+//!  * **One counter, and only when it has earned it.** TIM3 replaces SysTick as the microsecond
+//!    clock, so `EVT_RX.ts`, `EVT_CLOCK`, `CMD_TX_AT_ABS`'s deadline and the capture register are
+//!    all the same free-running counter with the same epoch. The host declares ONE clock domain per
+//!    port and then differences a received stamp against a `CMD_READ_CLOCK` read; two "1 MHz"
+//!    counters would satisfy every unit check on the wire and put an arbitrary offset into that
+//!    subtraction. ★ But the boot rate measurement is now an ACTUATOR, not a diagnostic: if TIM3 is
+//!    not ticking at [`STAMP_HZ`], `micros64()` goes back to being SysTick-derived and the node
+//!    refuses the hardware stamp, so `stamp_hz` always describes the counter the node is really
+//!    reading. See [`capture::choose_timebase`]. SysTick keeps `millis()` either way.
+//!  * **An attribution rule with TWO halves, not a hope.** The timer's half — the capture is read
+//!    inside `poll_rx` between `GetIrqStatus` and `ClearIrqStatus`, in a window `Sx1262::clear_irq`
+//!    opens — counts edges and overcaptures ([`capture::classify`]). It is not sufficient: DIO1 is
+//!    level-latched, so a frame arriving while the line is already high raises **no edge** while the
+//!    chip's buffer and packet status advance to describe it, and the timer then sees one clean edge
+//!    belonging to an earlier frame. The chip's own completed-packet count, differenced across the
+//!    window, is the second half ([`capture::attribute`]). A capture that fails either is DISCARDED,
+//!    never reported as approximate, and the frame falls back to the software read with an
+//!    `EVT_RX_STAMP` saying so *for that frame*.
+//!  * **A boot self-test.** `stamp_kind = 3` is what makes the host publish `LatchPoint::
+//!    RadioCapture` and set `can_common_view`, so the byte is gated on `rxstamp::init` proving the
+//!    two GD32 flag behaviours the design depends on, plus the tick rate — not on the code
+//!    compiling. A failed self-test leaves the node advertising 2, honestly.
+//!
+//! What is **not** measured, and is not folded into any number, is the offset between the frame
+//! arriving in the air and the DIO1 edge: RF front-end group delay (which moves with bandwidth),
+//! the SX1262's own demodulate-and-flag latency, and above all the untrimmed 8 MHz HSI RC
+//! oscillator that clocks this counter. See [`capture`]'s table.
+//!
 //! A retune also stopped costing 161 ms: three independent latency subtractions showed the extra
 //! ~80 ms was a second **TCXO startup** forced by a redundant `CalibrateImage`, not the calibration
 //! itself — `sx1262::set_frequency` now skips it while the target stays inside the calibrated band.
@@ -75,7 +114,14 @@
 #![allow(dead_code)]
 
 mod ndn;
+mod rxstamp;
 mod sx1262;
+
+/// The pure half of the RX-timestamp contract, re-exported so the device modules can say
+/// `crate::capture`. It lives in `src/lib.rs`'s tree rather than here because a `no_main` binary
+/// cannot be built for a hosted target and therefore cannot be tested; see [`mod@capture`] and
+/// `lib.rs` for the split.
+pub use waveshare_lora_rs::capture;
 
 use core::cell::UnsafeCell;
 use core::fmt::Write as FmtWrite;
@@ -168,15 +214,30 @@ static RING: Ring = Ring::new();
 /// Reading DR *after* SR is also what clears an overrun (ORE). That matters: a latched ORE stops the
 /// peripheral delivering anything further, so missing this would take the host link down for good
 /// rather than costing a single byte.
-/// 1 kHz SysTick → the free-running millisecond clock behind `millis()`/`micros()` (EVT_RX
-/// timestamps). Also carries the ms counter's own wrap into `MILLIS_HI`, which is what lets
-/// `micros64` (CMD_READ_CLOCK) be a genuine 64-bit monotonic µs clock instead of a u32 that silently
-/// restarts every ~71 minutes.
+/// 1 kHz SysTick → the free-running millisecond clock behind [`millis`].
+///
+/// **It is normally not behind `micros()` any more.** The microsecond clock is TIM3 (see
+/// [`rxstamp::ticks64`]), because the RX timestamp is a TIM3 capture register and putting the
+/// capture and the clock on two different counters would give the host one declared clock domain
+/// containing two epochs — an error no unit check on the wire could catch.
+///
+/// ★ **"Normally" is load-bearing.** [`systick_micros64`] is still built and still exact, because a
+/// boot measurement that finds TIM3 ticking at the wrong rate must be able to *act*: the node moves
+/// its clock back here rather than publishing microseconds that are not microseconds. So this ISR
+/// keeps carrying the millisecond counter's own wrap into `MILLIS_HI`, which is what makes that
+/// fallback a genuine 64-bit monotonic µs clock instead of a u32 that restarts every ~71 minutes.
 #[exception]
 fn SysTick() {
     if MILLIS.fetch_add(1, Ordering::Relaxed) == u32::MAX {
         MILLIS_HI.fetch_add(1, Ordering::Relaxed);
     }
+}
+
+/// TIM3: the microsecond clock's 16-bit overflow, and the DIO1 input capture that stamps a received
+/// frame. Both live in [`rxstamp::on_tim3_irq`]; this is only the vector.
+#[interrupt]
+fn TIM3() {
+    rxstamp::on_tim3_irq();
 }
 
 #[interrupt]
@@ -243,8 +304,13 @@ const CMD_SET_HOP: u8 = 0x1E; //     [hop_ctrl u8][hop_period u16 BE][n u8][freq
 const CMD_TX_AT_ABS: u8 = 0x1F; //   payload = [target_ticks u64 BE][frame] → EVT_TXDONE when it airs
 // Firmware -> host events.
 const EVT_RX: u8 = 0x81; //    payload = [rssi i16 BE, snr i16 BE, ts_us u32 BE, LoRa bytes]
-//                             ts_us is MICROseconds (`micros()`), not ms — the field was mislabelled
-//                             `ts_ms` here and on the host. EVT_CAP.stamp_hz states the true rate.
+//                             ts_us is MICROseconds, not ms — the field was mislabelled `ts_ms` here
+//                             and on the host. EVT_CAP.stamp_hz states the true rate.
+//                             The value is the TIM3_CH3 capture latched at the SX1262's DIO1 edge
+//                             (EVT_CAP.stamp_kind = 3). When a capture cannot be attributed to THIS
+//                             frame it is discarded and `ts` is the software read instead — in which
+//                             case an EVT_RX_STAMP says so, for that frame, immediately before this
+//                             event. The layout is unchanged either way.
 const EVT_TXDONE: u8 = 0x82; //payload = [ok, attempts]  (attempts=0 for a plain CMD_TX)
 //                             + an 8-byte Waveshare-local tail ONLY for a CMD_TX_AT reply:
 //                             [late_us u32 BE, keyup_us u32 BE] — how far past the requested instant
@@ -258,7 +324,7 @@ const EVT_CAD: u8 = 0x85; //   payload = [busy(0/1)]
 const EVT_RSSI: u8 = 0x86; //  payload = [rssi i16 BE]
 const EVT_SF_DETECTED: u8 = 0x87; // payload = [sf | 0 = none]
 const EVT_TX_STARTED: u8 = 0x88; //  payload = [airtime_ms u16 BE] — emitted just before key-up
-const EVT_STATS: u8 = 0x89; //       payload = 32 B; the offsets are named in [`stats`], which the
+const EVT_STATS: u8 = 0x89; //       payload = 44 B in v3 (32 in v2); the offsets are named in [`stats`], which the
 //                                   emitter indexes with and the README's table transcribes, so the
 //                                   wire and the documentation cannot drift.
 const EVT_CLOCK: u8 = 0x8A; //       payload = [ticks u64 BE] (µs; see EVT_CAP.stamp_hz)
@@ -269,18 +335,41 @@ const EVT_PHY_ERR: u8 = 0x8D; //     payload = [requested_phy u8, chip_status u8
 //                                   ADVERTISES that the chip refused at runtime, with the SX126x's
 //                                   literal GetStatus byte (see `sx1262::cmd_status_ok`)
 const EVT_UNSUPPORTED: u8 = 0x8F; // payload = [cmd, reason] — never silence, never a fake success
+const EVT_RX_STAMP: u8 = 0x90; //    payload = [frame_stamp_kind u8, reason u8] — emitted
+//                                   IMMEDIATELY BEFORE the EVT_RX it qualifies, and ONLY when that
+//                                   frame's `ts` is NOT the hardware capture EVT_CAP advertises.
+//                                   See [`send_rx_stamp_note`] for why the degradation has to be
+//                                   per-frame and why it could not go in the EVT_RX header.
+//                                   ☠ **0x8E is TAKEN** — it is the fleet's EVT_HOPTRACE on the
+//                                   LR2021 and the Heltec, and this event sat on it. The collision
+//                                   was silent in exactly the way the fleet's event-number registry
+//                                   (`fleet_event_numbering` in lr2021-nrf54l15-rs/src/serial.rs)
+//                                   exists to prevent, because that test listed only that node's own
+//                                   constants: `tools/hoptrace.py` probes for hop support by sending
+//                                   CMD_GET_HOPTRACE and accepting the first 0x8E or 0x8F, so one
+//                                   degraded frame inside its 3 s window would have made a Waveshare
+//                                   — which structurally cannot hop — answer "yes, and here is a
+//                                   2-byte hop timeline". 0x90 is past the end of the v3 event space
+//                                   and is now listed in that registry so the next collision fails a
+//                                   build instead of a bench run.
 
-/// **EVT_STATS (0x89) v2 — the byte offsets, named once.**
+/// **EVT_STATS (0x89) v3 — the byte offsets, named once.**
 ///
 /// Every field is BIG-ENDIAN and unsigned. `CMD_GET_STATS` indexes the payload with these constants
 /// and the README's STATS table is a transcription of this block, so a host reader written against
 /// the documentation is written against the emitter.
 ///
-/// Bytes `0..V1_LEN` are byte-identical to the v1 layout, and the existing host parser length-checks
-/// `< 24` rather than `!= 24`, so a v1 host reads the same 24 bytes it always did and ignores the
-/// tail. The tail exists because RX loss was otherwise invisible: `poll_rx` drops a CRC failure and
+/// Bytes `0..V1_LEN` are byte-identical to the v1 layout and `0..V2_LEN` to the v2 one. The host
+/// parser length-checks `< 24` rather than `!= 24`, reads the v2 tail only when the reply is at
+/// least 32 bytes, and explicitly accepts a LONGER reply and ignores the excess — so v1, v2 and v3
+/// hosts all read a v3 node correctly and each sees exactly the fields it knows. That is why every
+/// generation of this record appends rather than interleaves.
+///
+/// The v2 tail exists because RX loss was otherwise invisible: `poll_rx` drops a CRC failure and
 /// returns `None`, so without the chip's own counters a quiet channel and a channel we are failing
-/// to decode look identical from the host.
+/// to decode look identical from the host. The v3 tail exists for the same class of reason one
+/// layer up — `stamp_kind = 3` claims a hardware RX timestamp, and without these counters a stamp
+/// that quietly fell back to software would look exactly like one that did not.
 ///
 /// Reset semantics differ per field and matter to anyone differencing them:
 ///   * `RX`..`RELAYED` and `DEFER` are firmware counters zeroed by `CMD_RESET_STATS` (0x14);
@@ -289,7 +378,12 @@ const EVT_UNSUPPORTED: u8 = 0x8F; // payload = [cmd, reason] — never silence, 
 ///     two never disagree about direction;
 ///   * `CHIP_RX`/`CHIP_CRC_ERR`/`CHIP_HDR_ERR` are the SX126x's own 16-bit `GetStats` registers,
 ///     zeroed on the chip by `CMD_RESET_STATS` (which issues `ResetStats`) and by any hard reset;
-///   * `RX_TRUNC` is a firmware counter, also zeroed by `CMD_RESET_STATS`.
+///   * `RX_TRUNC`, `HW_STAMPED`, `HW_STAMP_SW` and `HW_STAMP_AMBIG` are firmware counters, also
+///     zeroed by `CMD_RESET_STATS`;
+///   * `HW_STAMP_LAT_US` is a WATERMARK (worst case since the last reset), re-baselined by
+///     `CMD_RESET_STATS`;
+///   * `HW_STAMP_OVER` is free-running and is NOT reset — see its own note;
+///   * `CLOCK_SKEW_MS` is an instantaneous read, not a counter, and reset means nothing to it.
 mod stats {
     /// `rx` u32 — frames the on-device data plane classified.
     pub const RX: usize = 0;
@@ -315,11 +409,65 @@ mod stats {
     pub const CHIP_HDR_ERR: usize = 28;
     /// `rx_trunc` u16 — frames whose on-air length exceeded `RX_MAX`. Should stay 0.
     pub const RX_TRUNC: usize = 30;
-    /// Total v2 payload length.
-    pub const LEN: usize = 32;
+    /// End of the v2 payload.
+    pub const V2_LEN: usize = 32;
+
+    // ---- v3 tail: is the hardware RX stamp actually working? ------------------------------------
+    //
+    // `stamp_kind` in EVT_CAP is a claim about the NODE. These five are the evidence for it, and
+    // they are here because the alternative was for a degraded stamp to be indistinguishable from a
+    // good one on the wire. `HW_STAMPED` and `HW_STAMP_SW` partition every frame `poll_rx`
+    // delivered — counted before the data plane classifies it, so a frame the on-device filter
+    // drops still lands here. Difference their sum against `CHIP_RX` above and the result is frames
+    // the SX126x saw and the firmware never got.
+    //
+    // ★ That aggregate is no longer the ONLY detector for two packets coalescing into one `RxDone`,
+    // and it never was a per-frame one. `poll_rx` now differences the chip's own completed-packet
+    // count across each capture window and discards a stamp whose window did not hold exactly one
+    // (`capture::attribute`), so a coalesced frame lands in `HW_STAMP_SW` and `HW_STAMP_AMBIG` at
+    // the instant it happens. The overcapture counter is still NOT that detector and must not be
+    // read as one: a frame arriving while DIO1 is still high produces no edge at all.
+
+    /// `hw_stamped` u16 — frames whose `ts` is the hardware capture.
+    pub const HW_STAMPED: usize = 32;
+    /// `hw_stamp_sw` u16 — frames that fell back to the software read. Each one that was delivered
+    /// to the host was also announced individually by an `EVT_RX_STAMP` immediately before its
+    /// `EVT_RX`.
+    pub const HW_STAMP_SW: usize = 34;
+    /// `hw_stamp_ambig` u16 — of those, the ones discarded for MIS-ATTRIBUTION: the window held
+    /// more than one DIO1 edge (the capture register holds the LATEST edge on this part, so the
+    /// stamp may belong to a later frame), or the chip's completed-packet count did not advance by
+    /// exactly one (a frame arrived while DIO1 was already high, so the payload is a later frame's
+    /// than the edge). Both are the same failure — a plausible timestamp on the wrong frame — and
+    /// both are discarded rather than reported. **This counter's meaning widened when the coalescing
+    /// case became detectable per frame**; it used to count only the multi-edge case.
+    pub const HW_STAMP_AMBIG: usize = 36;
+    /// `hw_stamp_over` u16 — timer overcaptures (`CC3OF`). **An edge was LOST**, which is worse
+    /// than a stamp being imprecise. Should stay 0. Free-running: `CMD_RESET_STATS` does not touch
+    /// it, because `rxstamp::take` reads it as a difference against the window's baseline and
+    /// moving one side of a difference under the reader is how a counter starts lying.
+    pub const HW_STAMP_OVER: usize = 38;
+    /// `hw_stamp_lat_us` u16 — worst timer-ISR entry latency in µs, saturating. **This is the
+    /// measurement that says whether the hardware path was worth building**: it is how wrong a
+    /// software stamp taken in the ISR would have been, and the stamp it replaced was taken later
+    /// still, out in the poll loop after the SPI readback.
+    pub const HW_STAMP_LAT_US: usize = 40;
+    /// `clock_skew_ms` u16 — `|micros64()/1000 − millis()|`, the disagreement between the TIM3
+    /// microsecond clock and the SysTick millisecond clock.
+    ///
+    /// They are divided from the same 8 MHz HSI, so this checks neither oscillator; what it catches
+    /// is a **lost TIM3 overflow**, whose signature is unmistakable — the value jumps by 65 (one
+    /// 65.536 ms wrap) and stays there. ⚠ On a node whose boot rate check moved the clock to
+    /// [`systick_micros64`], the two sides are the same counter and this is structurally 0 — it is
+    /// then vacuous rather than reassuring, and the boot log's `clk=` says which node you have. That is the one failure the 16-bit clock has that SysTick's
+    /// 1 ms quantum does not, so it is instrumented rather than argued away. A steady 0 or 1 is
+    /// expected: the two counters start a few hundred µs apart at boot.
+    pub const CLOCK_SKEW_MS: usize = 42;
+    /// Total v3 payload length.
+    pub const LEN: usize = 44;
 }
 
-// The layout is contiguous, in order, and exactly 32 bytes — asserted rather than trusted, because
+// The layout is contiguous, in order, and exactly 44 bytes — asserted rather than trusted, because
 // the README's byte offsets are being read by another agent as the contract.
 const _: () = assert!(stats::FILTERED == stats::RX + 4);
 const _: () = assert!(stats::DEDUPED == stats::FILTERED + 4);
@@ -332,8 +480,17 @@ const _: () = assert!(stats::CHIP_RX == stats::V1_LEN);
 const _: () = assert!(stats::CHIP_CRC_ERR == stats::CHIP_RX + 2);
 const _: () = assert!(stats::CHIP_HDR_ERR == stats::CHIP_CRC_ERR + 2);
 const _: () = assert!(stats::RX_TRUNC == stats::CHIP_HDR_ERR + 2);
-const _: () = assert!(stats::LEN == stats::RX_TRUNC + 2);
-const _: () = assert!(stats::LEN == 32 && stats::V1_LEN == 24);
+const _: () = assert!(stats::V2_LEN == stats::RX_TRUNC + 2);
+const _: () = assert!(stats::HW_STAMPED == stats::V2_LEN);
+const _: () = assert!(stats::HW_STAMP_SW == stats::HW_STAMPED + 2);
+const _: () = assert!(stats::HW_STAMP_AMBIG == stats::HW_STAMP_SW + 2);
+const _: () = assert!(stats::HW_STAMP_OVER == stats::HW_STAMP_AMBIG + 2);
+const _: () = assert!(stats::HW_STAMP_LAT_US == stats::HW_STAMP_OVER + 2);
+const _: () = assert!(stats::CLOCK_SKEW_MS == stats::HW_STAMP_LAT_US + 2);
+const _: () = assert!(stats::LEN == stats::CLOCK_SKEW_MS + 2);
+const _: () = assert!(stats::LEN == 44 && stats::V2_LEN == 32 && stats::V1_LEN == 24);
+// The whole record still has to fit the framing's one-byte `len`.
+const _: () = assert!(stats::LEN <= 255);
 
 // EVT_UNSUPPORTED reason codes.
 const UNSUP_UNKNOWN_OPCODE: u8 = 0x01; // this firmware does not know the opcode at all
@@ -752,30 +909,89 @@ impl Csma {
     }
 }
 
-/// Free-running millisecond clock (SysTick ISR), and its wrap count.
+/// Free-running millisecond clock (SysTick ISR). Wraps every ~49.7 days, which is far outside any
+/// window this firmware measures; its one consumer is the Content Store's 30 s freshness check.
 static MILLIS: AtomicU32 = AtomicU32::new(0);
+/// [`MILLIS`]'s own wrap count (every ~49.7 days), so [`systick_micros64`] is 64-bit monotonic.
 static MILLIS_HI: AtomicU32 = AtomicU32::new(0);
 fn millis() -> u32 {
     MILLIS.load(Ordering::Relaxed)
 }
 
-/// SysTick reload: 8000 cycles = 1 ms at the 8 MHz HSI core clock, so the down-counter resolves
-/// 1/8000 ms = 0.125 µs and the value below is in whole MICROseconds.
+/// SysTick reload: 8000 cycles = 1 ms at the 8 MHz HSI core clock.
 const SYSTICK_RELOAD: u32 = 8_000 - 1;
-/// **`stamp_hz` = 1_000_000.** This is the unit of the EVT_RX timestamp and of EVT_CLOCK, and it is
-/// microseconds, not milliseconds: `micros64` adds `RELOAD - CVR` SysTick cycles / 8 to `ms * 1000`.
-/// The old `ts_ms` label on EVT_RX was simply wrong.
-const STAMP_HZ: u32 = 1_000_000;
 
-/// 64-bit monotonic microsecond clock — the counter EVT_RX stamps with and CMD_READ_CLOCK returns
-/// (#41 common-view timing needs sub-ms). Combines the ms tick (plus its wrap count) with the SysTick
-/// down-counter. Retries if a tick lands mid-read.
+/// **`stamp_hz` = 1_000_000.** The unit of the EVT_RX timestamp, of EVT_CLOCK and of
+/// `CMD_TX_AT_ABS`'s deadline: MICROseconds, not milliseconds. (The old `ts_ms` label on EVT_RX was
+/// simply wrong.) Defined once in [`capture`] and mirrored here, pinned below, because the same
+/// figure has to be the TIM3 tick rate, the capture rate and the wire field simultaneously.
 ///
-/// This is a SOFTWARE counter (EVT_CAP `stamp_kind = 2`): the MCU reads it when it notices the
-/// SX1262's RxDone IRQ in the poll loop, not a hardware capture at the air interface. Its resolution
-/// is ~1 µs but its ACCURACY against the air is bounded by the poll interval, so do not read it as an
-/// LR2021-style hardware RX stamp.
+/// ⚠ **Do not "conveniently" rescale this.** `CMD_TX_AT`'s delay is microseconds *by definition*
+/// while `CMD_TX_AT_ABS`, `EVT_CLOCK` and `EVT_RX.ts` are all `stamp_hz` ticks — and `Sched` mixes
+/// them in one `deadline` field. They coincide only because the rate is exactly 1 MHz. Changing it
+/// would rescale three wire fields, leave the fourth behind, and silently invalidate
+/// `SCHED_GRAN_NS`, `SCHED_GATE_US` and `SCHED_MAX_DELAY_US`, which are all µs/ns constants.
+const STAMP_HZ: u32 = 1_000_000;
+const _: () = assert!(STAMP_HZ == capture::STAMP_HZ);
+// TIM3 (the clock and the capture) and TIM2 (the deadline compare) must tick at the same rate, or a
+// deadline computed on one and released by the other acquires a scale factor nothing would report.
+const _: () = assert!(STAMP_HZ == SCHED_TIMER_HZ);
+
+/// **The node's one microsecond clock**: 64-bit, monotonic, free-running from boot — and the SAME
+/// counter the RX capture register belongs to.
+///
+/// It was SysTick-derived (`ms * 1000 + (RELOAD − CVR)/8`) until the hardware RX stamp landed. The
+/// reason it had to move is not accuracy — SysTick and TIM3 are the same 8 MHz HSI divided twice, so
+/// there is no drift term between them at all, only a ±1 µs phase dither. It is **counter
+/// identity**. The host declares one `ClockDomainId` per serial port and then uses it for three
+/// different things: the domain of every `EVT_RX` stamp, the domain `CMD_READ_CLOCK` answers in, and
+/// the domain `CMD_TX_AT_ABS` schedules against. If the stamp came from TIM3's capture while this
+/// function still read SysTick, all three would carry values from two counters whose epochs differ
+/// by an arbitrary offset — both "1 MHz", so no unit check on the wire could catch it, and the
+/// failure would hide in the scheduling half while common view kept working.
+///
+/// **The one thing this trades away, stated rather than glossed:** TIM3 is 16-bit, so the clock now
+/// depends on an overflow interrupt 15.26 times a second, and a lost overflow costs 65.536 ms where
+/// a lost SysTick tick cost 1 ms. The probability is far lower — you would need 65 ms of masked
+/// interrupts against 1 ms, and this firmware has no critical sections anywhere — but the quantum is
+/// 65× larger, so it is instrumented (`stats::CLOCK_SKEW_MS`) rather than argued away. `ticks64`
+/// also folds a *pending-but-unserviced* overflow, which the SysTick version could not do: it never
+/// read COUNTFLAG.
+///
+/// ★ **Which counter this is, is decided at boot by a measurement.** [`rxstamp::ticks64`] reads
+/// TIM3 only if `rxstamp::init` measured it ticking at [`STAMP_HZ`]; otherwise it reads
+/// [`systick_micros64`], the pre-capture clock. Either way the unit is a real microsecond and
+/// `EVT_CAP.stamp_hz` describes the counter actually being read — which is the property that broke
+/// when the rate check reached nothing but a capability byte. The capture is only claimed on the
+/// TIM3 branch, so counter identity above still holds in both.
+///
+/// 48 bits of microseconds ≈ 8.9 years, so it is a genuine monotonic u64 for `CMD_READ_CLOCK`.
 fn micros64() -> u64 {
+    rxstamp::ticks64()
+}
+
+/// **The pre-capture microsecond clock, kept as the fallback a detected rate fault actuates.**
+///
+/// `MILLIS * 1000 + (RELOAD − CVR)/8` — the SysTick counter read down to the cycle, extended by the
+/// ISR's millisecond count. Called by [`rxstamp::ticks64`] and by nothing else.
+///
+/// ☠ **Why it had to come back.** `rxstamp::init` measures TIM3's rate against SysTick precisely
+/// because a GD32 clock-tree or prescaler divergence is plausible and is a factor of 2 or 8. When
+/// that check fired, the only thing it moved was one capability byte: the node lowered `stamp_kind`
+/// to 2 — honest about the latch point — and went on using the mis-rated counter as its microsecond
+/// clock while `EVT_CAP.stamp_hz` still said 1 000 000. `EVT_CLOCK` would have read 2× fast,
+/// `CMD_TX_AT` would have aired at half the requested delay (its `delay_us` is microseconds *by
+/// definition*, so publishing the measured rate instead would not have fixed it), and `late_us`,
+/// `keyup_us` and the re-published `sched_gran_ns` would all have inherited the factor. Before the
+/// capture landed, that fault was structurally impossible here — this function is derived from the
+/// *core* clock via SysTick, not from the APB1 timer tree the self-test was written to distrust.
+///
+/// It is **not** a second clock domain in the sense the host cares about: exactly one of the two is
+/// live for the whole run, chosen at boot by [`capture::choose_timebase`] before the first reader,
+/// and the choice is reported in the boot `EVT_LOG`. What is given up on this path is the capture:
+/// an edge latched in TIM3 ticks cannot be published against a SysTick epoch, so `stamp_kind` drops
+/// to 2 and the host routes every frame to `host_stamp()`.
+fn systick_micros64() -> u64 {
     const SYST_CVR: *const u32 = 0xE000_E018 as *const u32; // SysTick current-value register
     loop {
         let hi1 = MILLIS_HI.load(Ordering::Relaxed);
@@ -789,8 +1005,8 @@ fn micros64() -> u64 {
 }
 
 /// The low 32 bits of [`micros64`] — the EVT_RX `ts_us` field. Exactly the truncation of the 64-bit
-/// clock (`(hi << 32) * 1000` is a multiple of 2^32), so the two never disagree; it wraps every
-/// ~71 min, which is fine for relative timing and is why CMD_READ_CLOCK returns the full 64 bits.
+/// clock, so the two never disagree; it wraps every ~71 min, which is fine for relative timing and
+/// is why CMD_READ_CLOCK returns the full 64 bits.
 fn micros() -> u32 {
     micros64() as u32
 }
@@ -882,7 +1098,9 @@ const SCHED_MAX_DELAY_US: u32 = 60_000_000;
 
 /// Everything about the release instant that is not the chip: TIM2's 1 us tick, the 1 us truncation
 /// in `micros64` (it reports whole microseconds), and the ~12-cycle UIF poll at 8 MHz = 1.5 us,
-/// rounded up to 2.
+/// rounded up to 2. TIM2 and TIM3 share the APB1 timer clock, so the deadline and the gate quantise
+/// identically rather than merely commensurately — which is one term less than when the deadline
+/// came off SysTick.
 const SCHED_JITTER_US: u32 = 1 + 1 + 2;
 
 /// **`sched_gran_ns`** — EVT_CAP [25..29], and the number a planner will believe.
@@ -893,7 +1111,7 @@ const SCHED_JITTER_US: u32 = 1 + 1 + 2;
 ///
 /// ```text
 ///   TIM2 tick                  1 us   1 MHz timer; a compare cannot resolve finer than one tick
-///   deadline quantization      1 us   micros64() reports whole us (SysTick CVR / 8)
+///   deadline quantization      1 us   micros64() reports whole us (one TIM3 tick)
 ///   UIF poll loop              2 us   read TIM2.SR + test + branch ~= 12 cycles at 8 MHz = 1.5 us,
 ///                                     rounded up                          } SCHED_JITTER_US = 4 us
 ///   SetTx SPI transaction     50 us   4 bytes at SCK = 1 MHz = 8 us/byte = 32 us, plus the two NSS
@@ -1122,10 +1340,13 @@ impl Sched {
 
 /// **The deadline timer: TIM2, one-pulse, 1 MHz.**
 ///
-/// SysTick is already the millisecond clock, so the scheduler needs its own compare. TIM2 is
-/// otherwise unused on this board. It is driven through the PAC rather than the HAL timer wrapper
-/// because the one thing that matters here is that arming and polling are a handful of register
-/// accesses with nothing between the compare firing and NSS going low.
+/// The microsecond clock is TIM3 and must stay free-running, so the scheduler needs its own
+/// compare; TIM2 is otherwise unused on this board. Both are on the APB1 timer clock, so a deadline
+/// computed on TIM3 and released by TIM2 quantises identically and carries no scale factor.
+///
+/// It is driven through the PAC rather than the HAL timer wrapper because the one thing that matters
+/// here is that arming and polling are a handful of register accesses with nothing between the
+/// compare firing and NSS going low.
 struct SchedTimer;
 
 impl SchedTimer {
@@ -1295,6 +1516,50 @@ fn send_frame<F: FnMut(u8)>(mut out: F, typ: u8, payload: &[u8]) {
     out(crc);
 }
 
+/// **Announce, for ONE frame, that its `EVT_RX.ts` is not the hardware capture this node
+/// advertises.** Emits nothing when the stamp is good, which is the normal case.
+///
+/// ⚠ **Why this is an event and not a byte in the EVT_RX header.** `stamp_kind` in EVT_CAP is a
+/// capability of the NODE; using it to cover a mixture of hardware captures and software fallbacks
+/// is exactly what the LR2021's distinct `HwStamp` type exists to prevent. The obvious fix — a
+/// validity byte in the EVT_RX header — is not free here: `8 + RX_MAX == 255` **exactly**, so a
+/// ninth header byte costs `max_payload` 247 → 246, and `max_payload` is an EVT_CAP-advertised
+/// quantity that peers size their frames against. Paying that for a byte that is 0 on every frame
+/// in normal operation is the wrong trade; a separate event costs nothing on the common path and
+/// nothing in the MTU.
+///
+/// The binding to the frame is ordering: this goes out immediately before that frame's `EVT_RX` on
+/// a single-producer, in-order link, with nothing else written to the USART in between. The
+/// reference host (`ndn-radio-drivers`' `lora_serial.rs`) consumes it exactly that way: it stashes
+/// the note and applies it to the next `EVT_RX`, so a degraded frame is published with
+/// `LatchPoint::HostRecv` instead of a 1 µs `RadioCapture`.
+///
+/// ☠ **That host change was not optional, and its absence was the defect.** This event alone did
+/// nothing: an un-updated host routes any non-`EVT_RX` opcode to the command-reply channel, where an
+/// unmatched type is skipped with `Ok(_) => continue`, and its only other treatment was an
+/// `eprintln!` inside `if debug` — so on a normal run the note was *completely silent*, not
+/// "logged", and every degraded frame was consumed as a 1 µs radio capture and folded into common
+/// view. A per-frame degrade that no consumer reads is not a degrade. An older host is no worse off
+/// than before (it ignores 0x90 and keeps its node-level `stamp_kind`), and the aggregate is in
+/// EVT_STATS either way — but the fix is on the path the host actually reads.
+///
+/// The test is [`capture::note_needed`] — "this frame's kind differs from the node's advertised
+/// kind" — not merely "the stamp was degraded". On a node whose boot self-test failed, EVT_CAP
+/// already says `stamp_kind = 2` and every frame agrees with it, so a note per frame would repeat
+/// the capability instead of qualifying it.
+///
+/// Byte 0 is the `stamp_kind` **of this frame**, in the same fleet vocabulary as `EVT_CAP[16]` —
+/// deliberately, so a reader needs one vocabulary and not two. Byte 1 is
+/// [`capture::Degrade`]'s code.
+fn send_rx_stamp_note<F: FnMut(u8)>(put: F, v: capture::StampVerdict) {
+    let advertised = capture::stamp_kind_byte(rxstamp::hw_stamp_live());
+    if !capture::note_needed(v, advertised) {
+        return;
+    }
+    let reason = v.degrade().map_or(0, |d| d.code());
+    send_frame(put, EVT_RX_STAMP, &[v.frame_stamp_kind(), reason]);
+}
+
 #[entry]
 fn main() -> ! {
     let dp = pac::Peripherals::take().unwrap();
@@ -1304,10 +1569,12 @@ fn main() -> ! {
     let rcc = dp.RCC.constrain();
     let clocks = rcc.cfgr.freeze(&mut flash.acr);
 
-    // 1 kHz SysTick for the millisecond clock (EVT_RX timestamps). Core clock is 8 MHz HSI (the same
-    // assumption sx1262.rs makes for its busy-wait delays), so reload = 8000 - 1.
+    // 1 kHz SysTick — the MILLISECOND clock only. The microsecond clock and the RX capture are TIM3
+    // (see `rxstamp` and `micros64`), which is why this no longer feeds EVT_RX timestamps. Core clock
+    // is 8 MHz HSI (the same assumption sx1262.rs makes for its busy-wait delays), so reload = 7999;
+    // named rather than repeated as a literal, since the doc on the constant carries the arithmetic.
     cp.SYST.set_clock_source(SystClkSource::Core);
-    cp.SYST.set_reload(8_000 - 1);
+    cp.SYST.set_reload(SYSTICK_RELOAD);
     cp.SYST.clear_current();
     cp.SYST.enable_counter();
     cp.SYST.enable_interrupt();
@@ -1316,6 +1583,15 @@ fn main() -> ! {
     // though the register block is reached through the PAC pointer inside `SchedTimer`.
     let _tim2 = dp.TIM2;
     let sched_psc = SchedTimer::init(clocks.pclk1_tim().raw());
+
+    // TIM3 = the microsecond clock AND the DIO1 input capture that stamps received frames — one
+    // counter for both, which is the property the host's single clock domain per port depends on.
+    // Taken here for the same reason as TIM2: the register block is reached through a PAC pointer
+    // inside `rxstamp`, so ownership would otherwise be invisible. This must run BEFORE anything
+    // calls `micros64()`, which now reads it — and AFTER SysTick is running, because the boot
+    // self-test measures TIM3's rate against it.
+    let _tim3 = dp.TIM3;
+    let cap = rxstamp::init(clocks.pclk1_tim().raw());
 
     let mut afio = dp.AFIO.constrain();
     let mut gpioa = dp.GPIOA.split();
@@ -1402,6 +1678,45 @@ fn main() -> ! {
         );
     }
 
+    // The capture self-test, as its own line rather than appended to the one above: a `BufWriter`
+    // silently TRUNCATES past LOG_BUF, and this is the evidence for the `stamp_kind` byte the host
+    // gates common view on — the last diagnostic that should be lost to a formatting overflow.
+    //
+    // `st` is the bit field from `rxstamp::SelfTest::bits` (0x1F = clean pass), `tps` the TIM3 ticks
+    // counted across exactly one SysTick period (expect 1000; 0 means SysTick, the reference, never
+    // moved), and `kind` the byte EVT_CAP will actually advertise. A node that comes up with
+    // `kind=2` here is saying, at boot, that its hardware stamp did not prove out — which is a fact
+    // about this GD32, not about the build.
+    //
+    // ★ `clk` is the counter `micros64()` actually reads: `tim3` when the rate measurement above
+    // agreed with STAMP_HZ, `systick` when it did not. That second value is the whole point of
+    // measuring the rate — a detected clock-tree fault moves the node's timebase instead of quietly
+    // rescaling EVT_CLOCK, EVT_RX.ts and both CMD_TX_AT deadlines — so it is stated at boot rather
+    // than left to be inferred from a `tps` an operator would have to know the band for.
+    {
+        let mut log = BufWriter::new();
+        let _ = write!(
+            log,
+            "rxstamp psc={} st=0x{:02X} tps={} kind={} clk={}",
+            cap.psc,
+            cap.self_test.bits(),
+            cap.self_test.ticks_per_ms,
+            capture::stamp_kind_byte(rxstamp::hw_stamp_live()),
+            if rxstamp::clock_is_capture_timer() {
+                "tim3"
+            } else {
+                "systick"
+            },
+        );
+        send_frame(
+            |b| {
+                let _ = block!(tx.write(b));
+            },
+            EVT_LOG,
+            log.as_slice(),
+        );
+    }
+
     let mut parser = Parser::new();
     // C1: sized to RX_MAX (247), the real end-to-end cap. This was 64 while CMD_TX accepted 240 and
     // the host face declared an MTU of 200 — every received frame over 64 B was silently truncated,
@@ -1410,6 +1725,8 @@ fn main() -> ! {
     // Frames the radio reported LONGER than RX_MAX (so still truncated). Should stay 0 — reported in
     // EVT_STATS so a peer transmitting past our advertised max_payload is visible instead of silent.
     let mut rx_trunc: u16 = 0;
+    // Hardware-RX-stamp outcomes, per frame. See `capture::Tally` and the EVT_STATS v3 tail.
+    let mut stamps = capture::Tally::default();
     // Default OFF: a fresh/reset dongle stays quiet (no stray beacon before a host attaches). Opt in
     // on-air discovery with CMD_SET_BEACON[1] (or the host's LoraParams.beacon = true).
     // One-deep scheduled-TX queue (CMD_TX_AT). Idle until the host arms it, so a node that never
@@ -1441,6 +1758,7 @@ fn main() -> ! {
                     &mut csma,
                     &mut plane,
                     &mut rx_trunc,
+                    &mut stamps,
                     &mut sched,
                 );
                 // A single command can cost 80+ ms (any SET_* re-arms RX and pays a TCXO startup), so
@@ -1460,7 +1778,18 @@ fn main() -> ! {
         // While merely `Armed` the radio is still in RX and this runs exactly as usual.
         if sched.state != SchedState::Staged {
             if let Some(pkt) = radio.poll_rx(&mut rxbuf) {
-                let ts = micros();
+                // ★ **The timestamp.** `pkt.stamp` was latched in silicon at the DIO1 edge and read
+                // inside `poll_rx` while the chip's IRQ status still said `RxDone`, so it is
+                // attributable to THIS frame or it is nothing. When it is nothing we fall back to
+                // reading the clock here — the same TIM3 counter, just microseconds-to-milliseconds
+                // later — and the frame is announced as software-stamped rather than passed off as
+                // a capture. There is no third option: a plausible timestamp on the wrong frame is
+                // the worst failure a measurement instrument has.
+                let ts = match pkt.stamp.ticks() {
+                    Some(t) => t as u32,
+                    None => micros(),
+                };
+                stamps.observe(pkt.stamp);
                 let n = core::cmp::min(pkt.len as usize, rxbuf.len());
                 // `pkt.len` is the TRUE on-air length. With rxbuf at RX_MAX this can only trip if a peer
                 // ignores our advertised max_payload; count it rather than corrupt the frame in silence.
@@ -1507,6 +1836,14 @@ fn main() -> ! {
                     radio.start_rx();
                 }
                 if deliver {
+                    // A degraded stamp is announced for THIS frame, immediately before it. See
+                    // [`send_rx_stamp_note`].
+                    send_rx_stamp_note(
+                        |b| {
+                            let _ = block!(tx.write(b));
+                        },
+                        pkt.stamp,
+                    );
                     // 8 header bytes + up to RX_MAX frame bytes = 255, the largest payload the one-byte
                     // `len` field of the 7E-A5 framing can carry. That is what sets RX_MAX.
                     let mut ev = [0u8; 8 + RX_MAX];
@@ -1839,6 +2176,7 @@ fn handle_cmd<SPI, NSS, RST, BSY, DIO1, RFSW, E, TX>(
     csma: &mut Csma,
     plane: &mut ndn::DataPlane,
     rx_trunc: &mut u16,
+    stamps: &mut capture::Tally,
     sched: &mut Sched,
 ) where
     SPI: embedded_hal::blocking::spi::Transfer<u8, Error = E>
@@ -2213,9 +2551,9 @@ fn handle_cmd<SPI, NSS, RST, BSY, DIO1, RFSW, E, TX>(
                 csma.defer,
             );
         }
-        // EVT_STATS v2 = 32 bytes. Bytes 0..24 are byte-identical to v1 and the existing host parser
-        // checks `len < 24` (not `!= 24`), so a v1 host reads it unchanged and simply ignores the
-        // tail; the host contract gains the extra fields when it is updated to read them.
+        // EVT_STATS v3 = 44 bytes. Bytes 0..24 are byte-identical to v1 and 0..32 to v2; the host
+        // parser checks `len < 24` (not `!= 24`), reads the v2 tail only at >= 32, and accepts a
+        // longer reply while ignoring the excess. So v1, v2 and v3 hosts all read this correctly.
         CMD_GET_STATS => {
             let chip = radio.get_stats();
             let mut p = [0u8; stats::LEN];
@@ -2238,6 +2576,29 @@ fn handle_cmd<SPI, NSS, RST, BSY, DIO1, RFSW, E, TX>(
             // Frames whose on-air length exceeded RX_MAX and were therefore truncated. Should stay 0
             // — a non-zero value means a peer is transmitting past our advertised max_payload.
             p[stats::RX_TRUNC..stats::RX_TRUNC + 2].copy_from_slice(&rx_trunc.to_be_bytes());
+            // --- v3 tail: the evidence for `stamp_kind = 3`. Without these a stamp that quietly
+            // fell back to the software read would look exactly like one that did not, and the
+            // capability byte would be a claim with nothing behind it.
+            let (over, lat) = rxstamp::counters();
+            p[stats::HW_STAMPED..stats::HW_STAMPED + 2].copy_from_slice(&stamps.hw.to_be_bytes());
+            p[stats::HW_STAMP_SW..stats::HW_STAMP_SW + 2].copy_from_slice(&stamps.sw.to_be_bytes());
+            p[stats::HW_STAMP_AMBIG..stats::HW_STAMP_AMBIG + 2]
+                .copy_from_slice(&stamps.ambig.to_be_bytes());
+            p[stats::HW_STAMP_OVER..stats::HW_STAMP_OVER + 2]
+                .copy_from_slice(&(over.min(u16::MAX as u32) as u16).to_be_bytes());
+            p[stats::HW_STAMP_LAT_US..stats::HW_STAMP_LAT_US + 2]
+                .copy_from_slice(&(lat.min(u16::MAX as u32) as u16).to_be_bytes());
+            // The two clocks compared. Same oscillator, so this measures neither of them — it
+            // catches a LOST TIM3 OVERFLOW, whose signature is a jump of 65 (one 65.536 ms wrap)
+            // that never comes back. Computed here rather than continuously because a 64-bit
+            // division is ~15 µs at 8 MHz and this is a once-per-query diagnostic, not a hot path.
+            let skew_ms = {
+                let us_ms = (micros64() / 1000) as u32;
+                let ms = millis();
+                us_ms.abs_diff(ms).min(u16::MAX as u32) as u16
+            };
+            p[stats::CLOCK_SKEW_MS..stats::CLOCK_SKEW_MS + 2]
+                .copy_from_slice(&skew_ms.to_be_bytes());
             send_frame(&mut put, EVT_STATS, &p);
         }
         CMD_RESET_STATS => {
@@ -2246,6 +2607,11 @@ fn handle_cmd<SPI, NSS, RST, BSY, DIO1, RFSW, E, TX>(
             csma.cad_busy_base = csma.cad_busy;
             csma.defer = 0;
             *rx_trunc = 0;
+            stamps.reset();
+            // The latency WATERMARK is re-baselined; the overcapture count is not. `rxstamp::take`
+            // reads overcaptures as a difference against the window's own baseline, and moving one
+            // side of a difference under the reader is how a counter starts lying.
+            rxstamp::reset_lat_watermark();
             radio.reset_stats(); // zero the chip's packet counters too
             send_info(
                 &mut put,
@@ -2570,8 +2936,10 @@ fn handle_cmd<SPI, NSS, RST, BSY, DIO1, RFSW, E, TX>(
 ///  [10]     pwr_min_dbm   = -9            } real dBm, the SetTxParams range `set_power` clamps to
 ///  [11]     pwr_max_dbm   = 22            } (sx1262::PWR_*_DBM) — not a chip register unit
 ///  [12..16] stamp_hz      = 1_000_000     MICROseconds; see STAMP_HZ / `micros64`
-///  [16]     stamp_kind    = 2 (software counter — the MCU reads its own clock when it notices
-///                              RxDone in the poll loop; there is NO hardware capture on this radio)
+///  [16]     stamp_kind    = 3 (hardware free-running — TIM3_CH3 latches the counter at the SX1262's
+///                              DIO1 edge; see [`rxstamp`]) **IF the boot self-test passed**,
+///                              otherwise 2. The byte is [`capture::stamp_kind_byte`] of
+///                              [`rxstamp::hw_stamp_live`], never a literal
 ///  [17..19] max_payload   = 247           PER-PHY. Both PHYs land on RX_MAX because the binding
 ///                                         limit is the serial framing in both; the radio caps
 ///                                         (255 B LoRa PDU, 255 B GFSK PDU) are larger
@@ -2600,8 +2968,34 @@ fn send_cap<F: FnMut(u8)>(put: F, sched_gran_ns: u32, phy: u8) {
     c[6..10].copy_from_slice(&sx1262::FREQ_MAX_HZ.to_be_bytes());
     c[10] = sx1262::PWR_MIN_DBM as u8;
     c[11] = sx1262::PWR_MAX_DBM as u8;
-    c[12..16].copy_from_slice(&STAMP_HZ.to_be_bytes());
-    c[16] = 2; // stamp_kind: software counter
+    // ★ The timestamp pair, written together by [`capture::encode_stamp_fields`] rather than
+    // indexed by hand, because they must agree: the host's common-view predicate is
+    // `stamp_kind == HardwareFreeRun && stamp_hz > 0`, so a hardware kind with a zero rate would
+    // advertise a capability and then fail the predicate with nothing saying why.
+    //
+    // **The kind is a measurement, not a constant.** `rxstamp::hw_stamp_live` is the boot
+    // self-test's verdict — it proved on this silicon that a capture raises CC3IF, that reading
+    // CCR3 clears it, that a second capture raises CC3OF, that a write clears that, and that the
+    // counter advances at the declared rate. A `3` makes the host publish
+    // `LatchPoint::RadioCapture`, a 1 µs `stamp_precision_ns` in place of the 1 ms host-receive
+    // floor, and `can_common_view = true` — a 1000x tightening of a number the timekeeper acts on.
+    // That is not a claim to make on the strength of the code having compiled, and a GD32 that
+    // diverges from the STM32 flag semantics says so here instead of silently stamping garbage.
+    //
+    // `stamp_hz` stays 1 MHz either way, and that is now a fact rather than an excuse. It used to
+    // rest on "when the self-test fails it is the LATCH POINT that got worse, not the rate" — true
+    // of the four flag checks and FALSE of the fifth, which is the one that fires precisely when the
+    // rate is wrong. A 2 MHz TIM3 would have been detected, dropped this byte to 2, and gone on
+    // being the node's microsecond clock at a declared 1 MHz. `capture::choose_timebase` closes it:
+    // the capture timer is only ever `micros64()` when its rate was MEASURED at STAMP_HZ, and
+    // otherwise the clock is SysTick, which counts microseconds by construction. So whichever
+    // counter is live, this field describes it. Zeroing it would tell the host there is no per-frame
+    // stamp at all, which is a different and false claim.
+    capture::encode_stamp_fields(
+        &mut c,
+        STAMP_HZ,
+        capture::stamp_kind_byte(rxstamp::hw_stamp_live()),
+    );
     c[17..19].copy_from_slice(&caps.max_payload.to_be_bytes());
     c[19..23].copy_from_slice(&caps.cmd_bitmap.to_be_bytes());
     c[23] = caps.sf_min;
@@ -2631,6 +3025,14 @@ const _: () = assert!(CAP_LEN == CAP_PHY_CURRENT_OFF + 1);
 const _: () = assert!(CAP_LEN == 34);
 // The whole record must still fit the framing's one-byte `len`, with room for the sync/type/crc.
 const _: () = assert!(CAP_LEN <= 255);
+// ★ The two fields `capture::encode_stamp_fields` writes are the only ones this file does not index
+// by hand, so they were also the only ones not tied to the record by an assertion: a reorder here
+// would have silently written the stamp rate over `pwr_max_dbm`/`max_payload` with nothing failing.
+// Pinned to the same layout the emitter above lays out, and to the host's `p[16]` slice.
+const _: () = assert!(capture::CAP_STAMP_HZ_OFF == 12);
+const _: () = assert!(capture::CAP_STAMP_KIND_OFF == 16);
+const _: () = assert!(capture::CAP_STAMP_KIND_OFF == capture::CAP_STAMP_HZ_OFF + 4);
+const _: () = assert!(capture::CAP_STAMP_KIND_OFF < CAP_LEN_V2);
 
 /// Reset-surviving handshake between CMD_ENTER_BOOTLOADER and [`maybe_enter_bootloader`]. The slot is
 /// the top 4 bytes of SRAM, carved out of the linker's RAM region in `memory.x` (so nothing else uses

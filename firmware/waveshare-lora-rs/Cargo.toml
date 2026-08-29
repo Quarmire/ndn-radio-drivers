@@ -11,7 +11,17 @@ edition = "2021"
 description = "Open Rust firmware for the Waveshare USB-LoRa dongle (GD32F103C8 + SX1262)"
 license = "MIT OR Apache-2.0"
 
-[dependencies]
+# ── Embedded dependencies, DEVICE TARGET ONLY ───────────────────────────────────────────────────
+#
+# Under `cfg(target_os = "none")` rather than plain `[dependencies]` so that
+# `cargo test --target <host> --lib` can build `src/lib.rs` and run the tests for `capture` — the
+# RX-timestamp wrap arithmetic, the edge-attribution rule and the `stamp_kind` byte, all of which
+# are contracts with the host driver and none of which needs a GD32 to check. Before this split
+# `cargo test` could not even start: `cortex-m-rt` and the `stm32f1` PAC build for no hosted target.
+#
+# This changes nothing about the firmware build: `.cargo/config.toml` pins the target to
+# `thumbv7m-none-eabi`, which IS `target_os = "none"`.
+[target.'cfg(target_os = "none")'.dependencies]
 cortex-m = "0.7"
 cortex-m-rt = "0.7"
 panic-halt = "0.2"
@@ -22,7 +32,7 @@ nb = "1"
 # allocation-free path (see ndn-embedded's `forwarder` feature) so this no-heap binary links clean.
 ndn-embedded = { path = "../../../ndn-embedded/crates/ndn-embedded", default-features = false, features = ["cs"] }
 
-[dependencies.stm32f1xx-hal]
+[target.'cfg(target_os = "none")'.dependencies.stm32f1xx-hal]
 version = "0.10"
 features = ["stm32f103", "rt", "medium"]
 

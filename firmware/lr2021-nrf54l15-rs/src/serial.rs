@@ -419,6 +419,23 @@ pub const EVT_PHY_ERR: u8 = 0x8D;
 pub const EVT_HOPTRACE: u8 = 0x8E;
 /// payload = `[cmd, reason]` — see [`REASON_UNKNOWN_OPCODE`] and friends.
 pub const EVT_UNSUPPORTED: u8 = 0x8F;
+/// **Not emitted by this firmware — reserved fleet-wide, and listed here because this file is where
+/// the fleet's event numbering is written down and pinned.**
+///
+/// `[frame_stamp_kind u8, reason u8]`, emitted by the Waveshare node immediately before an `EVT_RX`
+/// whose `ts` is not the hardware capture its `EVT_CAP` advertises. It is a *per-frame* qualifier on
+/// a *node-level* capability byte, which is a shape this firmware may well want later (its own
+/// `HwStamp` type makes the same distinction in the type system instead).
+///
+/// ☠ It was born at **0x8E**, which is [`EVT_HOPTRACE`] here and on the Heltec. Nothing caught it:
+/// [`fleet_event_numbering`] listed only *this* node's constants, so a collision introduced in
+/// another firmware could not fail it — precisely the failure that test was written to prevent, and
+/// exactly how `EVT_STATS = 0x87` survived. The consequence was live rather than theoretical:
+/// `tools/hoptrace.py` probes for hop support by sending `CMD_GET_HOPTRACE` (0x20, past the end of
+/// `cmd_bitmap`) and taking the first `EVT_HOPTRACE` or `EVT_UNSUPPORTED` inside 3 s, so one
+/// degraded frame from a Waveshare would have answered the probe with a "hop timeline" from a node
+/// that structurally cannot hop. The constant lives here now so the registry covers the whole space.
+pub const EVT_RX_STAMP: u8 = 0x90;
 
 // `EVT_UNSUPPORTED` reason codes. **Fleet-wide space** — these are the same four values the
 // Waveshare and Heltec nodes use (`UNSUP_*` in their `main.rs`). They were 1/2/3 =
@@ -1301,13 +1318,42 @@ mod tests {
                 EVT_SENSE,
                 EVT_PHY_ERR,
                 EVT_HOPTRACE,
-                EVT_UNSUPPORTED
+                EVT_UNSUPPORTED,
+                EVT_RX_STAMP
             ],
             [
                 0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88, 0x89, 0x8A, 0x8B, 0x8C, 0x8D, 0x8E,
-                0x8F
+                0x8F, 0x90
             ]
         );
+        // ★ The registry only fails a collision if it covers events this firmware does not emit.
+        // `EVT_RX_STAMP` is the Waveshare's; it sat on `EVT_HOPTRACE`'s 0x8E for a whole feature
+        // because the array above listed only local constants. Pairwise-distinct, checked here, so
+        // the next one fails a build instead of a bench run.
+        let all = [
+            EVT_RX,
+            EVT_TXDONE,
+            EVT_INFO,
+            EVT_LOG,
+            EVT_CAD,
+            EVT_RSSI,
+            EVT_SF_DETECTED,
+            EVT_TX_STARTED,
+            EVT_STATS,
+            EVT_CLOCK,
+            EVT_CAP,
+            EVT_SENSE,
+            EVT_PHY_ERR,
+            EVT_HOPTRACE,
+            EVT_UNSUPPORTED,
+            EVT_RX_STAMP,
+        ];
+        for (i, a) in all.iter().enumerate() {
+            assert!(*a >= 0x81, "events live above the command space");
+            for b in &all[i + 1..] {
+                assert_ne!(a, b, "two fleet events share an opcode");
+            }
+        }
     }
 
     /// ★ **`CMD_GET_HOPTRACE` does not fit `cmd_bitmap`, and that is pinned rather than discovered

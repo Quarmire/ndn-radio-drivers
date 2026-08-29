@@ -179,6 +179,26 @@ const EVT_SENSE: u8 = 0x8C; //  payload = [activity u16 BE, rssi i16 BE]
 /// calibration it lacks). Both are definite, so both end a command wait immediately.
 const EVT_PHY_ERR: u8 = 0x8D;
 const EVT_UNSUPPORTED: u8 = 0x8F; // payload = [cmd, reason] — the node does not implement `cmd`
+/// **v3.** `[frame_stamp_kind u8, reason u8]` — **this one frame's** `ts` is not the stamp the
+/// node's `EVT_CAP` advertises.
+///
+/// ★ The reason it must exist at all: `stamp_kind` in `EVT_CAP` is a capability of the NODE, and the
+/// Waveshare's per-frame verdict can be worse than it. Its capture is discarded whenever the edge
+/// cannot be attributed to the frame being reported — no edge, a timer overcapture, two edges in one
+/// window, an ISR latency past half a wrap, or (the common one on a busy channel) a *coalesced*
+/// window in which the chip completed more than one packet, so the edge belongs to an earlier frame
+/// than the payload. The `ts` field is then a software read, and the layout is unchanged, so nothing
+/// about the `EVT_RX` itself distinguishes the two.
+///
+/// It arrives **immediately before** the `EVT_RX` it qualifies, with nothing else written to the
+/// link in between, on a single-producer in-order transport. [`handle_event`] therefore stashes it
+/// and applies it to the next `EVT_RX`, which is the only reason the node's degrade reaches a
+/// consumer: routing it to the reply channel (where an unmatched type is skipped) and printing it
+/// under `if debug` — the previous treatment for any unknown event — meant a degraded frame was
+/// consumed as a 1 µs `RadioCapture` and folded into common view, silently, on a normal run.
+///
+/// A host that does not know the opcode is no worse off than before; it keeps the node-level kind.
+const EVT_RX_STAMP: u8 = 0x90;
 
 /// **Longest hop list `CMD_SET_HOP` carries**, from the wire contract (`n <= 40`) — and the same
 /// bound the two parts that hop autonomously enforce. The host refuses a longer plan rather than
@@ -2314,15 +2334,42 @@ pub struct NdnStats {
     /// 0**; anything else means a peer is transmitting past the `max_payload` this node advertises,
     /// which is the silent-corruption failure the v2 capability protocol exists to stop.
     pub rx_trunc: Option<u16>,
+
+    // ---- v3 tail (`EVT_STATS` bytes 32..44) — the EVIDENCE for `stamp_kind = 3` ----------------
+    //
+    // These were on the wire and reached no reader: the parser stopped at 32. A capability byte
+    // whose supporting counters nothing decodes is a claim, not a measurement.
+    /// Frames whose `ts` was the hardware capture.
+    pub hw_stamped: Option<u16>,
+    /// Frames that fell back to the node's software read — each announced individually by an
+    /// `EVT_RX_STAMP` immediately before its `EVT_RX`.
+    pub hw_stamp_sw: Option<u16>,
+    /// Of those, the ones discarded for **mis-attribution**: more than one edge in the capture
+    /// window, or a chip packet count that did not advance by exactly one across it (a frame that
+    /// arrived while the IRQ line was already high, so the payload is a later frame's than the
+    /// edge). Non-zero is the node refusing to guess, not an error.
+    pub hw_stamp_ambig: Option<u16>,
+    /// Timer overcaptures — **an edge was LOST**, which is worse than a stamp being imprecise.
+    /// Free-running on the node; a `CMD_RESET_STATS` deliberately does not touch it.
+    pub hw_stamp_over: Option<u16>,
+    /// Worst capture-ISR entry latency, µs — how wrong a software stamp taken *in the ISR* would
+    /// have been, i.e. what the hardware path bought.
+    pub hw_stamp_lat_us: Option<u16>,
+    /// `|micros64()/1000 − millis()|` on the node: its microsecond clock against its millisecond
+    /// one. Both are divided from the same oscillator, so this measures neither — it catches a
+    /// **lost timer overflow**, whose signature is a jump of 65 that never comes back.
+    pub clock_skew_ms: Option<u16>,
 }
 
 impl NdnStats {
-    /// Parse an `EVT_STATS` payload: 24 bytes (v1) or 32 (v2). `None` if shorter — a truncated
-    /// counter block is not a counter block, and zeroing the missing fields would invent traffic.
+    /// Parse an `EVT_STATS` payload: 24 bytes (v1), 32 (v2) or 44 (v3). `None` if shorter than 24 —
+    /// a truncated counter block is not a counter block, and zeroing the missing fields would invent
+    /// traffic.
     ///
-    /// A reply **longer** than 32 is accepted and its excess ignored, so a future firmware that
-    /// appends another counter does not break this host; a length between 24 and 32 keeps the v1
-    /// fields and drops the partial tail rather than reading half a counter.
+    /// A reply **longer** than the newest layout is accepted and its excess ignored, so a future
+    /// firmware that appends another counter does not break this host; a length between two
+    /// generations keeps the fields it covers and drops the partial tail rather than reading half a
+    /// counter. Every generation appends, which is what makes that possible.
     pub fn parse(p: &[u8]) -> Option<Self> {
         if p.len() < 24 {
             return None;
@@ -2330,6 +2377,7 @@ impl NdnStats {
         let u32be = |o: usize| u32::from_be_bytes([p[o], p[o + 1], p[o + 2], p[o + 3]]);
         let u16be = |o: usize| u16::from_be_bytes([p[o], p[o + 1]]);
         let v2 = p.len() >= 32;
+        let v3 = p.len() >= 44;
         Some(Self {
             rx: u32be(0),
             filtered: u32be(4),
@@ -2342,6 +2390,12 @@ impl NdnStats {
             chip_crc_err: v2.then(|| u16be(26)),
             chip_hdr_err: v2.then(|| u16be(28)),
             rx_trunc: v2.then(|| u16be(30)),
+            hw_stamped: v3.then(|| u16be(32)),
+            hw_stamp_sw: v3.then(|| u16be(34)),
+            hw_stamp_ambig: v3.then(|| u16be(36)),
+            hw_stamp_over: v3.then(|| u16be(38)),
+            hw_stamp_lat_us: v3.then(|| u16be(40)),
+            clock_skew_ms: v3.then(|| u16be(42)),
         })
     }
 
@@ -2576,9 +2630,26 @@ fn configure(
 /// is 10 ns — one tick of a 100 MHz capture timer — which admits the measured 63 ns and still clamps
 /// an over-claim. Mislabelling this as `PhyPreamble` to slip under the clamp would have been gaming
 /// the guard rather than fixing it.
-fn rx_stamp(prof: &NodeProfile, domain: ClockDomainId, ts_raw: u32) -> LinkStamp {
+/// ★ `frame_kind` is the node's verdict about **this one frame** ([`EVT_RX_STAMP`]), or `None` when
+/// it said nothing — which means the frame agrees with the capability. Both must be
+/// `HardwareFreeRun` for the stamp to reach the device clock domain: the capability alone is a claim
+/// individual frames are allowed to violate, and a per-frame note claiming *better* than the
+/// capability is a contradiction, so the pair is combined by taking the worse of the two rather than
+/// by letting either override.
+///
+/// Keying on the node-level kind alone was the defect: every frame from a self-test-passing dongle
+/// was published as a 1 µs `RadioCapture`, including the ones whose firmware had already computed,
+/// counted and announced that their `ts` was a poll-loop software read — wrong by up to a whole poll
+/// gap (~22 ms), which is four orders of magnitude past what the latch point claims.
+fn rx_stamp(
+    prof: &NodeProfile,
+    domain: ClockDomainId,
+    ts_raw: u32,
+    frame_kind: Option<StampKind>,
+) -> LinkStamp {
+    let degraded = matches!(frame_kind, Some(k) if k != StampKind::HardwareFreeRun);
     match prof.stamp_kind {
-        StampKind::HardwareFreeRun if prof.stamp_hz > 0 => LinkStamp::new(
+        StampKind::HardwareFreeRun if prof.stamp_hz > 0 && !degraded => LinkStamp::new(
             ts_raw as u64,
             domain,
             prof.tick_ns().unwrap_or(1),
@@ -2601,6 +2672,11 @@ fn reader_loop(
     let debug = std::env::var_os("LORA_DEBUG").is_some();
     let mut acc: Vec<u8> = Vec::new();
     let mut tmp = [0u8; 512];
+    // The per-frame stamp verdict from an `EVT_RX_STAMP`, waiting for the `EVT_RX` it qualifies.
+    // Lives here rather than in `handle_event` because this loop is the single decoder for one
+    // port: the note and its frame are adjacent on an in-order link, and this is the one place that
+    // ordering is observable.
+    let mut pending_stamp: Option<StampKind> = None;
     loop {
         match port.read(&mut tmp) {
             Ok(n) if n > 0 => {
@@ -2612,7 +2688,16 @@ fn reader_loop(
                             payload,
                             consumed,
                         } => {
-                            handle_event(typ, &payload, &tx, &resp, &profile, domain, debug);
+                            handle_event(
+                                typ,
+                                &payload,
+                                &tx,
+                                &resp,
+                                &profile,
+                                domain,
+                                debug,
+                                &mut pending_stamp,
+                            );
                             acc.drain(..consumed);
                             if tx.is_closed() {
                                 return;
@@ -2645,10 +2730,32 @@ fn handle_event(
     profile: &Mutex<NodeProfile>,
     domain: ClockDomainId,
     debug: bool,
+    pending_stamp: &mut Option<StampKind>,
 ) {
+    // ★ **The per-frame stamp verdict, held for the frame it qualifies.** Unsolicited chatter like
+    // `EVT_LOG`: it must never satisfy a command wait, and it is not a reply, so it does not reach
+    // the response channel at all. The binding to its frame is ordering — the node writes it
+    // immediately before that `EVT_RX` with nothing in between — so it is consumed by the next
+    // `EVT_RX` and dropped by anything else, which is the conservative direction: a note whose frame
+    // never arrived would otherwise degrade an unrelated later frame.
+    if typ == EVT_RX_STAMP {
+        let kind = payload.first().copied().map(StampKind::from_code);
+        if debug {
+            eprintln!(
+                "lora RX_STAMP frame_kind={:?} reason={} (this frame's ts is NOT the advertised \
+                 hardware capture)",
+                kind,
+                payload.get(1).copied().unwrap_or(0),
+            );
+        }
+        *pending_stamp = kind;
+        return;
+    }
     // Everything that is not a received frame is a reply to a command we sent; route it to the
     // caller blocked in `exec_on` so the next command only goes out once this one is serviced.
     if typ != EVT_RX {
+        // The note's frame did not follow it. Drop it rather than let it qualify a later one.
+        *pending_stamp = None;
         if debug {
             match typ {
                 EVT_TXDONE => {
@@ -2726,10 +2833,13 @@ fn handle_event(
         let ts = u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]);
         let ndn = &payload[8..];
         let prof = *profile.lock().unwrap();
+        // Consumed here, exactly once: the note qualifies this frame and no other.
+        let frame_kind = pending_stamp.take();
         if debug {
             eprintln!(
-                "lora RX [{rssi} dBm, SNR {snr} dB, ts {ts} @{} Hz] {} bytes",
+                "lora RX [{rssi} dBm, SNR {snr} dB, ts {ts} @{} Hz, kind {:?}] {} bytes",
                 prof.stamp_hz,
+                frame_kind.unwrap_or(prof.stamp_kind),
                 ndn.len()
             );
         }
@@ -2742,7 +2852,7 @@ fn handle_event(
             htc: None,
             rssi_dbm: Some(rssi.clamp(i8::MIN as i16, i8::MAX as i16) as i8),
             mcs_index: None,
-            stamp: Some(rx_stamp(&prof, domain, ts)),
+            stamp: Some(rx_stamp(&prof, domain, ts, frame_kind)),
             // ★ Per-frame SNR, which this backend parsed and then threw away. On LoRa it is THE
             // signal cognition needs: the chip demodulates well below the noise floor (down to
             // ~-20 dB SNR at SF12), so RSSI alone says nothing about whether a rate will decode —
@@ -3582,7 +3692,7 @@ mod tests {
         // 16 MHz hardware capture: raw ticks in the DEVICE domain, 63 ns per tick (62.5 rounded).
         let lr = RadioKindHint::Lr2021Flrc.profile();
         assert_eq!(lr.tick_ns(), Some(63));
-        let s = rx_stamp(&lr, dom, 16_625_857);
+        let s = rx_stamp(&lr, dom, 16_625_857, None);
         assert_eq!(s.domain, dom);
         assert_eq!(
             s.raw, 16_625_857,
@@ -3594,9 +3704,219 @@ mod tests {
         // firmware scheduler tick as a link clock would let common view difference two main loops.
         let ws = NodeProfile::legacy_sx1262();
         assert_eq!(ws.tick_ns(), Some(1_000_000));
-        let s = rx_stamp(&ws, dom, 1234);
+        let s = rx_stamp(&ws, dom, 1234, None);
         assert_eq!(s.domain, HOST_CLOCK_DOMAIN);
         assert_eq!(s.latch, LatchPoint::HostRecv);
+    }
+
+    // ── the per-frame stamp verdict (EVT_RX_STAMP, 0x90) ────────────────────────────────────────
+
+    /// Build the eight-byte `EVT_RX` header the firmware emits, plus a payload.
+    fn rx_payload(ts: u32, body: &[u8]) -> Vec<u8> {
+        let mut p = Vec::new();
+        p.extend_from_slice(&(-42i16).to_be_bytes());
+        p.extend_from_slice(&7i16.to_be_bytes());
+        p.extend_from_slice(&ts.to_be_bytes());
+        p.extend_from_slice(body);
+        p
+    }
+
+    /// ★ **A frame the node says is software-stamped must not be published as a 1 µs radio
+    /// capture.**
+    ///
+    /// This is the consumer half of the firmware's per-frame degrade. The node computes it, counts
+    /// it and announces it; before this, the host keyed only on the NODE-level `stamp_kind`, so
+    /// every frame from a self-test-passing dongle became `LatchPoint::RadioCapture` at the
+    /// capture's tick — including the ones whose `ts` was a poll-loop software read, wrong by up to
+    /// a whole poll gap. Exercised through `handle_event`, the real reader dispatch.
+    #[test]
+    fn a_per_frame_degrade_note_stops_that_frame_reaching_the_device_clock() {
+        let (txf, mut rxf) = mpsc::unbounded_channel();
+        let (resp, resp_rx) = std::sync::mpsc::channel();
+        let stored = Mutex::new(RadioKindHint::Lr2021Flrc.profile());
+        let dom = ClockDomainId(0x1234);
+        assert_eq!(stored.lock().unwrap().stamp_kind, StampKind::HardwareFreeRun);
+        let mut pending = None;
+
+        // 1. A clean frame: no note, so it is the capture the capability advertises.
+        handle_event(
+            EVT_RX,
+            &rx_payload(1_000, b"clean"),
+            &txf,
+            &resp,
+            &stored,
+            dom,
+            false,
+            &mut pending,
+        );
+        let clean = rxf.try_recv().unwrap().stamp.unwrap();
+        assert_eq!(clean.latch, LatchPoint::RadioCapture);
+        assert_eq!(clean.domain, dom);
+        assert_eq!(clean.raw, 1_000);
+
+        // 2. A note (kind = 2 software counter, reason = 6 coalesced) then its frame.
+        handle_event(
+            EVT_RX_STAMP,
+            &[StampKind::SoftwareCounter.code(), 6],
+            &txf,
+            &resp,
+            &stored,
+            dom,
+            false,
+            &mut pending,
+        );
+        assert_eq!(pending, Some(StampKind::SoftwareCounter));
+        handle_event(
+            EVT_RX,
+            &rx_payload(2_000, b"degraded"),
+            &txf,
+            &resp,
+            &stored,
+            dom,
+            false,
+            &mut pending,
+        );
+        let degraded = rxf.try_recv().unwrap().stamp.unwrap();
+        assert_eq!(
+            degraded.latch,
+            LatchPoint::HostRecv,
+            "a software fallback is not a radio capture"
+        );
+        assert_eq!(
+            degraded.domain, HOST_CLOCK_DOMAIN,
+            "and it must not enter the device clock domain, where common view would difference it"
+        );
+
+        // 3. The note is consumed by exactly one frame; the next is clean again.
+        assert_eq!(pending, None);
+        handle_event(
+            EVT_RX,
+            &rx_payload(3_000, b"clean again"),
+            &txf,
+            &resp,
+            &stored,
+            dom,
+            false,
+            &mut pending,
+        );
+        assert_eq!(
+            rxf.try_recv().unwrap().stamp.unwrap().latch,
+            LatchPoint::RadioCapture,
+            "one note qualifies one frame, not the rest of the run"
+        );
+
+        // The note is unsolicited chatter: it must never reach the reply channel, where it could
+        // satisfy — or be skipped by — a command wait.
+        assert!(
+            resp_rx.try_recv().is_err(),
+            "EVT_RX_STAMP is not a reply to anything"
+        );
+    }
+
+    /// A note whose frame never arrives must not qualify some later frame. The pairing is ordering
+    /// on an in-order link, so anything else on the wire in between breaks it — and the safe
+    /// reading of a broken pairing is "this note describes nothing".
+    #[test]
+    fn a_stranded_note_is_dropped_rather_than_applied_to_the_wrong_frame() {
+        let (txf, mut rxf) = mpsc::unbounded_channel();
+        let (resp, _resp_rx) = std::sync::mpsc::channel();
+        let stored = Mutex::new(RadioKindHint::Lr2021Flrc.profile());
+        let dom = ClockDomainId(0x1234);
+        let mut pending = None;
+
+        handle_event(
+            EVT_RX_STAMP,
+            &[StampKind::SoftwareCounter.code(), 1],
+            &txf,
+            &resp,
+            &stored,
+            dom,
+            false,
+            &mut pending,
+        );
+        handle_event(EVT_TXDONE, &[1, 0], &txf, &resp, &stored, dom, false, &mut pending);
+        assert_eq!(pending, None, "the pairing was broken; the note is stale");
+        handle_event(
+            EVT_RX,
+            &rx_payload(4_000, b"unrelated"),
+            &txf,
+            &resp,
+            &stored,
+            dom,
+            false,
+            &mut pending,
+        );
+        assert_eq!(
+            rxf.try_recv().unwrap().stamp.unwrap().latch,
+            LatchPoint::RadioCapture
+        );
+    }
+
+    /// The two kinds are combined by taking the WORSE of the pair. A per-frame note claiming a
+    /// hardware capture from a node that advertises a software counter is a contradiction, and the
+    /// resolution is never to promote: the capability is what was earned by a boot self-test.
+    #[test]
+    fn a_per_frame_note_can_only_ever_lower_the_claim() {
+        let dom = ClockDomainId(0x1234_5678);
+        let ws = NodeProfile::legacy_sx1262();
+        assert_eq!(ws.stamp_kind, StampKind::SoftwareCounter);
+        assert_eq!(
+            rx_stamp(&ws, dom, 1234, Some(StampKind::HardwareFreeRun)).latch,
+            LatchPoint::HostRecv
+        );
+        let lr = RadioKindHint::Lr2021Flrc.profile();
+        assert_eq!(
+            rx_stamp(&lr, dom, 1234, Some(StampKind::HardwareFreeRun)).latch,
+            LatchPoint::RadioCapture,
+            "a note that agrees with the capability changes nothing"
+        );
+        for k in [
+            StampKind::NoStamp,
+            StampKind::HostRecv,
+            StampKind::SoftwareCounter,
+            StampKind::Unknown(9),
+        ] {
+            assert_eq!(
+                rx_stamp(&lr, dom, 1234, Some(k)).latch,
+                LatchPoint::HostRecv,
+                "{k:?} is not a hardware capture"
+            );
+        }
+    }
+
+    /// The evidence for `stamp_kind = 3` has to be readable. These six counters were on the wire
+    /// from the Waveshare and the parser stopped at 32 bytes, so nothing decoded them.
+    #[test]
+    fn the_v3_stats_tail_is_parsed_and_older_layouts_still_are() {
+        let mut p = vec![0u8; 44];
+        p[32..34].copy_from_slice(&1234u16.to_be_bytes()); // hw_stamped
+        p[34..36].copy_from_slice(&12u16.to_be_bytes()); // hw_stamp_sw
+        p[36..38].copy_from_slice(&5u16.to_be_bytes()); // hw_stamp_ambig
+        p[38..40].copy_from_slice(&0u16.to_be_bytes()); // hw_stamp_over
+        p[40..42].copy_from_slice(&7u16.to_be_bytes()); // hw_stamp_lat_us
+        p[42..44].copy_from_slice(&1u16.to_be_bytes()); // clock_skew_ms
+        let v3 = NdnStats::parse(&p).unwrap();
+        assert_eq!(v3.hw_stamped, Some(1234));
+        assert_eq!(v3.hw_stamp_sw, Some(12));
+        assert_eq!(v3.hw_stamp_ambig, Some(5));
+        assert_eq!(v3.hw_stamp_over, Some(0));
+        assert_eq!(v3.hw_stamp_lat_us, Some(7));
+        assert_eq!(v3.clock_skew_ms, Some(1));
+
+        // A v2 node reports None rather than a fabricated 0 — "not reported" is not "it never
+        // happened", which is the whole reason these are Option.
+        let v2 = NdnStats::parse(&p[..32]).unwrap();
+        assert_eq!(v2.chip_rx, Some(0));
+        assert_eq!(v2.hw_stamped, None);
+        assert_eq!(v2.hw_stamp_ambig, None);
+        let v1 = NdnStats::parse(&p[..24]).unwrap();
+        assert_eq!(v1.chip_rx, None);
+        assert_eq!(v1.hw_stamped, None);
+        // A longer reply than we know is still accepted, excess ignored.
+        let mut longer = p.clone();
+        longer.extend_from_slice(&[0xAA; 8]);
+        assert_eq!(NdnStats::parse(&longer).unwrap().hw_stamped, Some(1234));
+        assert!(NdnStats::parse(&p[..23]).is_none());
     }
 
     /// **The measured 62.5 ns tick must survive the latch-point clamp.**
@@ -3613,7 +3933,7 @@ mod tests {
     fn a_hardware_capture_publishes_its_measured_precision_not_the_tsft_floor() {
         let dom = ClockDomainId(0x1234_5678);
         let lr = RadioKindHint::Lr2021Flrc.profile();
-        let s = rx_stamp(&lr, dom, 16_625_857);
+        let s = rx_stamp(&lr, dom, 16_625_857, None);
         assert_eq!(
             s.latch,
             LatchPoint::RadioCapture,
@@ -3627,7 +3947,7 @@ mod tests {
         assert!(LatchPoint::RadioCapture.precision_floor_ns() == 10);
         // A software counter is still refused the device domain entirely.
         let ws = NodeProfile::legacy_sx1262();
-        assert_eq!(rx_stamp(&ws, dom, 1234).latch, LatchPoint::HostRecv);
+        assert_eq!(rx_stamp(&ws, dom, 1234, None).latch, LatchPoint::HostRecv);
     }
 
     #[test]
@@ -4667,6 +4987,7 @@ mod tests {
             &stored,
             dom,
             false,
+            &mut None,
         );
 
         let now = *stored.lock().unwrap();
@@ -4686,7 +5007,7 @@ mod tests {
         assert_eq!(resp_rx.try_recv().unwrap().0, EVT_CAP);
 
         // …and a payload that does not parse must never blank a good profile.
-        handle_event(EVT_CAP, &[0x03, 0x02], &txf, &resp, &stored, dom, false);
+        handle_event(EVT_CAP, &[0x03, 0x02], &txf, &resp, &stored, dom, false, &mut None);
         assert_eq!(
             stored.lock().unwrap().sched_gran_ns,
             50_000,

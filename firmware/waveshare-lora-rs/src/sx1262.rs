@@ -16,6 +16,9 @@
 use embedded_hal::blocking::spi::{Transfer as SpiTransfer, Write as SpiWrite};
 use embedded_hal::digital::v2::{InputPin, OutputPin};
 
+use crate::capture::{self, StampVerdict};
+use crate::rxstamp;
+
 // --- Opcodes ---
 const OP_SET_STANDBY: u8 = 0x80;
 const OP_SET_PACKET_TYPE: u8 = 0x8A;
@@ -79,6 +82,25 @@ pub const IRQ_CRC_ERR: u16 = 0x0040;
 pub const IRQ_CAD_DONE: u16 = 0x0080; //     #52: CAD finished
 pub const IRQ_CAD_DETECTED: u16 = 0x0100; // #52: CAD saw channel activity (busy)
 pub const IRQ_TIMEOUT: u16 = 0x0200;
+
+/// ★ **What is allowed to drive the DIO1 pin: `RxDone`, and nothing else.**
+///
+/// PB0 is wired to DIO1 and is the TIM3_CH3 capture input ([`crate::rxstamp`]), so this mask decides
+/// what a captured edge can *mean*. It used to be `TX_DONE | RX_DONE | TIMEOUT`, which made an edge
+/// **not self-identifying** and left the attribution resting on an argument about which of those
+/// bits could latch while RX was armed. The argument had a hole: `start_rx` clears the latch ~40 µs
+/// before it issues `SetRx`, so a `TxDone` arriving in that gap (reachable when `wait_txdone`'s
+/// 2000 × 1 ms ceiling expires — SF12/BW125 at 247 B is ~8.9 s of airtime, well past it) leaves
+/// `TX_DONE` latched with the receiver armed. DIO1 then stays HIGH, the next frame's `RxDone` raises
+/// **no rising edge at all**, and `take()` hands back the stale TX edge with `edges == 1` and no
+/// overcapture — indistinguishable, to the timer, from a clean reception.
+///
+/// Narrowing the mask deletes that class rather than arguing about it. Nothing is lost: no code
+/// reads the DIO1 pin as a GPIO (`wait_txdone`, `poll_rx` and `do_cad` all poll `GetIrqStatus` over
+/// SPI), and the full IRQ **status** word is unaffected — `set_dio_irq`'s first argument stays
+/// `0xFFFF`, so `TX_DONE`, `TIMEOUT`, `CRC_ERR` and the CAD bits all still latch and are all still
+/// read. Only the pin gets quieter.
+pub const DIO1_MASK: u16 = IRQ_RX_DONE;
 
 // --- `SetPacketType` (0x8A) argument values, in the SX126x's OWN numbering (DS Table 13-38) ---
 //
@@ -220,6 +242,16 @@ pub struct RxPacket {
     pub len: u8,
     pub rssi_dbm: i16,
     pub snr_db: i16,
+    /// **The hardware RX timestamp, and the verdict on whether it may be attributed to THIS frame.**
+    ///
+    /// Read inside [`Sx1262::poll_rx`] rather than by the caller, and that is a correctness
+    /// requirement rather than a convenience: the read has to happen between `GetIrqStatus` and
+    /// `ClearIrqStatus`, in the one window where DIO1 is provably still high and no second rising
+    /// edge can exist. After the clear, `poll_rx` spends ~2 ms reading the buffer out; a frame
+    /// arriving in that stretch would take its own capture and OVERWRITE the register, so a stamp
+    /// read at the call site could carry frame 2's instant on frame 1's payload — silently. See
+    /// [`crate::rxstamp`].
+    pub stamp: StampVerdict,
 }
 
 /// The SX126x's own RX packet counters (`GetStats`, DS §13.5.5). These are the ONLY place a CRC
@@ -255,6 +287,15 @@ pub struct Sx1262<SPI, NSS, RST, BSY, DIO1, RFSW> {
     gfsk_sync: [u8; 3],
     /// LNA gain written to [`REG_RX_GAIN`] on every RX arm. Defaults to [`RX_GAIN_BOOSTED`].
     rx_gain: u8,
+    /// **The chip's own completed-reception count at the instant the current capture window
+    /// opened** — the baseline half of the coalescing detector. See [`Sx1262::completed_packets`]
+    /// and [`crate::capture::attribute`]. Snapshotted inside `clear_irq`, so it is refreshed by the
+    /// same call that arms the timer window and cannot drift from it.
+    pkt_base: u16,
+    /// Set when a `ResetStats` moved [`Self::pkt_base`] out from under an OPEN capture window, so
+    /// that window's edge count and packet count no longer share an origin. Consumed by the next
+    /// `poll_rx`, which refuses to attribute that one frame. See the ☠ note there.
+    window_dirty: bool,
     /// **Image-calibration memo** — the (f1, f2) band pair currently loaded in the chip, or (0, 0)
     /// if none. `CalibrateImage` takes a BAND, so re-running it for a hop that stays inside the
     /// band it already calibrated is pure cost; this remembers what is loaded so `set_frequency`
@@ -285,6 +326,8 @@ where
             lora_sync: 0x12,
             gfsk_sync: GFSK_SYNC_DEFAULT,
             rx_gain: RX_GAIN_BOOSTED,
+            pkt_base: 0, // the chip's counters are 0 out of reset; `init`'s clear re-reads anyway
+            window_dirty: false,
             cal_band: (0, 0), // nothing calibrated until `init` runs
         };
         let _ = s.nss.set_high();
@@ -548,8 +591,63 @@ where
             ],
         );
     }
+    /// Clear the chip's IRQ latch — **and, with it, open a fresh hardware-capture window.**
+    ///
+    /// The three belong together. DIO1 is the OR of the latched masked bits and stays high until
+    /// this command drops it, so "edges since the last ClearIrq", "IRQ bits since the last
+    /// ClearIrq" and "packets the chip completed since the last ClearIrq" are all the same window —
+    /// and the timer's capture register only means anything relative to it. Doing all three here
+    /// rather than at the call sites is what makes the pairing structural: `transmit`, `stage_tx`,
+    /// `wait_txdone`, `start_rx`, `poll_rx` and the three CAD clears all get it without anyone
+    /// having to remember.
+    ///
+    /// The arm runs *after* the SPI transaction, deliberately. If DIO1 has not physically fallen yet
+    /// the line is simply still high, which produces no new rising edge, so nothing is captured
+    /// until the genuine next event.
     fn clear_irq(&mut self, mask: u16) {
+        // ★ Read BEFORE the clear, never after. A frame landing between the two is then absent from
+        // the baseline and shows up in the NEXT window's delta, which costs a good stamp; reading
+        // after the clear would put that frame IN the baseline while its edge sat in the new
+        // window, which admits a wrong one. See [`crate::capture::attribute`].
+        let base = self.completed_packets();
+        self.clear_irq_from(mask, base);
+    }
+
+    /// [`Self::clear_irq`] with the baseline already in hand — for `poll_rx`, which has just read
+    /// the count to compute this window's delta and must not pay for a second `GetStats`.
+    fn clear_irq_from(&mut self, mask: u16, base: u16) {
         self.cmd(OP_CLR_IRQ, &[(mask >> 8) as u8, mask as u8]);
+        self.pkt_base = base;
+        rxstamp::arm();
+    }
+
+    /// **The chip's own count of receptions that reached completion**, as one wrapping `u16`.
+    ///
+    /// ⚠ **Why it is a SUM and not `nbPktReceived` alone.** The SX126x datasheet (§13.5.5) does not
+    /// say whether `nbPktReceived` counts every reception or only the CRC-good ones, and nothing on
+    /// this bench has established it — the same disclosure the host makes about `phy_counters`. So
+    /// the detector is built to be correct under *either* reading: a CRC-failed packet raises a real
+    /// `RxDone` and a real DIO1 edge, and it increments `nbPktReceived`, or `nbPktCrcError`, or
+    /// both. Summing the two can therefore over-count a bad packet (a +2 that degrades a stamp) but
+    /// can never miss one (a +0 that admits a wrong one), which is the direction this has to err in.
+    ///
+    /// `nbPktHeaderErr` is deliberately **excluded**: a header error aborts before `RxDone`, so it
+    /// raises no edge, does not move `payloadLengthRx`, and cannot mis-attribute anything. Counting
+    /// it would only discard good stamps on a noisy channel.
+    ///
+    /// ☠ **Also not measured: whether these counters wrap or saturate at `0xFFFF`.** The host's
+    /// `NdnStats` documents them as free-running and wrapping, which is what the arithmetic here
+    /// assumes (`wrapping_sub`). If they in fact *saturate*, this detector fails CLOSED — the delta
+    /// pins at 0 after the 65 536th reception and every frame degrades to the software stamp, which
+    /// is visible immediately in `hw_stamped`/`hw_stamp_ambig` and in the per-frame notes, and a
+    /// `CMD_RESET_STATS` (which zeroes the chip's counters and this baseline together) recovers it.
+    /// That is the acceptable direction for an unknown; the other one would admit wrong stamps.
+    ///
+    /// One 6-byte status read, ~64 µs at SCK = 1 MHz, and safe with RX armed (see
+    /// [`Self::get_stats`]).
+    fn completed_packets(&mut self) -> u16 {
+        let s = self.get_stats();
+        s.pkt_received.wrapping_add(s.pkt_crc_error)
     }
     fn get_irq(&mut self) -> u16 {
         let mut b = [0u8; 2];
@@ -667,7 +765,7 @@ where
         // change is exactly such a transition, so it is re-written here as well as on every RX arm.
         let g = self.rx_gain;
         self.write_regs(REG_RX_GAIN, &[g]);
-        self.set_dio_irq(0xFFFF, IRQ_TX_DONE | IRQ_RX_DONE | IRQ_TIMEOUT);
+        self.set_dio_irq(0xFFFF, DIO1_MASK);
         self.clear_irq(0xFFFF);
         status
     }
@@ -907,22 +1005,79 @@ where
     pub fn poll_rx(&mut self, out: &mut [u8]) -> Option<RxPacket> {
         let irq = self.get_irq();
         if irq & IRQ_RX_DONE == 0 {
+            // No clear, so the capture window stays open. That is correct **given the narrow
+            // [`DIO1_MASK`]**: the only edge that can be pending is an `RxDone` whose status bit
+            // landed after `get_irq` sampled it, and the next poll reports that frame against that
+            // edge — which is the right pairing.
+            //
+            // ⚠ It was NOT correct with the old three-source mask, and the guard below is written
+            // against `DIO1_MASK` rather than against today's value of it so that widening the mask
+            // cannot quietly restore the bug. A non-RX source latching here holds DIO1 high with the
+            // receiver armed: the next frame's `RxDone` raises no edge, and `take()` returns the
+            // stale edge with `edges == 1` and no overcapture, which `classify` cannot see through.
+            // Clearing those bits (and, via `clear_irq`, re-arming) is the one-line fix; `RX_DONE`
+            // is deliberately not in the mask, so a frame landing in this window is never dropped.
+            let stale = irq & DIO1_MASK & !IRQ_RX_DONE;
+            if stale != 0 {
+                self.clear_irq(stale);
+            }
             return None;
         }
+        // ★ **The stamp is read HERE**, between the status read and the clear. `irq` is the REASON,
+        // the capture is the INSTANT, and they describe the same event only because both are read in
+        // this one IRQ-clear cycle.
+        let stamp = rxstamp::take();
         let crc_err = irq & IRQ_CRC_ERR != 0;
-        self.clear_irq(0xFFFF);
-        if crc_err {
-            return None;
-        }
+
+        // ★ **The packet's identity is pinned in the SAME cycle as the stamp.** These two reads used
+        // to sit *after* the clear — after DIO1 had fallen and a fresh window was open — so a frame
+        // arriving in the ~50 µs between the arm and `GetRxBufferStatus` moved
+        // `rxStartBufferPointer`, `payloadLengthRx` and the packet status, and this frame's stamp
+        // went out with the NEXT frame's length, RSSI and SNR (which the next poll then reported a
+        // second time). The stamp supplies the instant, the IRQ word supplies the reason, and these
+        // supply the identity: all three are only the same event if they are read in one cycle.
         let mut st = [0u8; 2];
         self.read_cmd(OP_GET_RX_BUF_STATUS, &mut st);
         let len = st[0];
         let ptr = st[1];
-        let n = core::cmp::min(len as usize, out.len());
-        self.read_buffer(ptr, &mut out[..n]);
-
         let mut ps = [0u8; 3];
         self.read_cmd(OP_GET_PKT_STATUS, &mut ps);
+
+        // ★ **The chip's half of the attribution rule** — and the fix for the failure this whole
+        // path exists to prevent. DIO1 is level-latched, so a frame arriving while it is already
+        // high raises NO edge while the buffer and packet status above advance to describe it: the
+        // timer then sees one clean edge belonging to an EARLIER frame and cannot tell. The chip's
+        // own completed-packet count is the only per-frame detector this part has. Read last, so it
+        // covers everything read above; exactly one completion is the only attributable window.
+        let completed = self.completed_packets();
+        // ☠ A `CMD_RESET_STATS` that landed *inside* this window zeroed the chip's counters and
+        // `pkt_base` while leaving the timer's edge count and the chip's `RxDone` latch untouched.
+        // The two halves of the rule then count from different origins, and the delta can read a
+        // benign `1` for a frame whose edge belongs to its predecessor — the coalescing failure
+        // again, through a smaller hole. A window in that state is not attributable, so it is not
+        // attributed: exactly one frame pays, and `clear_irq_from` below re-bases the next.
+        let delta = if core::mem::replace(&mut self.window_dirty, false) {
+            0
+        } else {
+            completed.wrapping_sub(self.pkt_base)
+        };
+        let stamp = capture::attribute(stamp, delta);
+
+        // The window closes here, and the count just read becomes the next window's baseline.
+        self.clear_irq_from(0xFFFF, completed);
+        if crc_err {
+            // A CRC failure raises a real `RxDone` and a real edge. Both have now been consumed:
+            // the IRQ status by the clear above, and the capture by the `arm` inside it, which
+            // discards whatever is in the register and opens the next window. Neither is left to be
+            // mis-attributed to the next frame. The chip's own `nbPktCrcError` counts the drop.
+            return None;
+        }
+        // The payload readback stays AFTER the clear, deliberately: it is the ~2 ms transaction, and
+        // holding DIO1 high across it would widen the coalescing window for no gain. Its hazard is
+        // payload corruption by a later frame's write into the same buffer address, which is
+        // pre-existing, orthogonal to attribution, and not what this reordering is about.
+        let n = core::cmp::min(len as usize, out.len());
+        self.read_buffer(ptr, &mut out[..n]);
         // `GetPacketStatus` returns three bytes in both modes and means something different by them
         // (DS §13.5.3):
         //   LoRa: [rssiPkt, snrPkt, signalRssiPkt]  -> rssi = -rssiPkt/2 dBm, snr = (i8)snr/4 dB
@@ -939,6 +1094,7 @@ where
             len,
             rssi_dbm,
             snr_db,
+            stamp,
         })
     }
 
@@ -1016,8 +1172,16 @@ where
     }
 
     /// Zero the chip's packet counters (`ResetStats`), so the host can re-baseline without a reflash.
+    ///
+    /// The coalescing baseline moves with them, because it is a *difference* against these
+    /// counters. But moving it is not enough on its own: this is the one writer of `pkt_base` that
+    /// does NOT also arm the timer window, so a window already open when the reset lands is left
+    /// with its two halves measured from different origins. [`Self::window_dirty`] marks that one
+    /// window unattributable rather than letting its delta read a benign `1`.
     pub fn reset_stats(&mut self) {
         self.cmd(OP_RESET_STATS, &[0, 0, 0, 0, 0, 0]);
+        self.pkt_base = 0;
+        self.window_dirty = true;
     }
 
     /// One 32-bit sample from the SX1262 hardware RNG (LNA noise, read with IRQ masked while in RX).
@@ -1030,7 +1194,12 @@ where
         let mut b = [0u8; 4];
         self.read_regs(REG_RANDOM_GEN, &mut b);
         self.set_standby(0x00);
-        self.set_dio_irq(0xFFFF, IRQ_TX_DONE | IRQ_RX_DONE | IRQ_TIMEOUT);
+        self.set_dio_irq(0xFFFF, DIO1_MASK);
+        // The RNG ran with the receiver armed and DIO1 masked, so an `RxDone` may have latched
+        // unseen; re-enabling the mask on the line above would then drive DIO1 high immediately and
+        // manufacture a rising edge that belongs to nothing. Clearing here consumes it — and, via
+        // `clear_irq`, opens a clean capture window at the same instant.
+        self.clear_irq(0xFFFF);
         u32::from_be_bytes(b)
     }
 }

@@ -2024,12 +2024,37 @@ pub fn calibrate_with(
         0x600
     };
 
-    mcu_calibrate(bus, mcu_cal::FULL, val)?;
-    mcu_calibrate(bus, mcu_cal::LC, u32::from(is_5ghz))?;
+    // ☠ **The restores below are UNCONDITIONAL, and that is the whole point.**
+    //
+    // These two calls used to propagate with `?`. When `MCU_CAL_FULL` timed out — which it does,
+    // intermittently, on this part — the early return skipped both restores and left the chip with
+    // `MT_TX_ALC_CFG_0 = 0` (automatic level control OFF) and `MT_BBP(IBI, 9)` in its
+    // calibration-tone override, **latched**. `bring_up` then takes the warm path on a chip whose
+    // firmware is still running, so nothing re-runs the init that owns these registers: every
+    // subsequent measurement on that dongle, across processes, is taken on a radio with its ALC
+    // disabled and its baseband in a test mode. A failed calibration silently converted itself
+    // into corrupted data.
+    //
+    // Upstream cannot reach that state: `mt76x0_phy_calibrate` is `void` and discards every return
+    // code (`mt76x0/phy.c:903-909`). Match it — a calibration timeout costs EVM, not the chip.
+    let cal = mcu_calibrate(bus, mcu_cal::FULL, val)
+        .and_then(|()| mcu_calibrate(bus, mcu_cal::LC, u32::from(is_5ghz)));
     sleep(Duration::from_millis(15));
 
-    bus.wr(BBP_IBI_9, reg_val)?;
-    bus.wr(MT_TX_ALC_CFG_0, tx_alc)?;
+    // Restore first, report second: the registers must come back even on the failure path.
+    let restore = bus
+        .wr(BBP_IBI_9, reg_val)
+        .and_then(|()| bus.wr(MT_TX_ALC_CFG_0, tx_alc));
+
+    if let Err(e) = cal {
+        // Loud, because a silent calibration failure is indistinguishable from a good tune and the
+        // next person to measure this radio deserves to know which they are looking at.
+        eprintln!(
+            "mt7610u: channel calibration failed ({e}) — ALC and the BB override HAVE been \
+             restored, but this tune is uncalibrated; treat its EVM/RSSI with suspicion"
+        );
+    }
+    restore?;
     mcu_calibrate(bus, mcu_cal::RXDCOC, 1)
 }
 

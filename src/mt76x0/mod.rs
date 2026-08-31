@@ -330,16 +330,36 @@ impl LegacyRate {
 ///   * `ldpc` is dropped: `mt76x02_mac.c:403` gates the LDPC bit on `is_mt76x2(dev)`.
 ///     Upstream states no reason and neither can we — ported faithfully.
 ///
-/// The BW field is left 0 (20 MHz) because [`RadioKnobs::set_channel`] only ever tunes
-/// 20 MHz here; a rate word wider than the tuned baseband is a malformed PPDU.
-fn mt76_rate_val(m: &McsDescriptor) -> u16 {
+/// ★ **`bw_code` fills `MT_RXWI_RATE_BW`, bits [8:7]** (`mt76x02_mac.h:88`), values from
+/// `enum mt76x2_phy_bandwidth`: 0 = 20, 1 = 40, 2 = 80 MHz.
+///
+/// ☠ **This field was left at 0 and that made the width knob a no-op.** Bandwidth on an mt76x02
+/// part has TWO actuators — the channel program (BBP/RF) and this rate word — and upstream sets
+/// both from one chandef (`mt76x02_mac_tx_rate_val`). Widening only the channel transmits **20 MHz
+/// PPDUs on a wider channel**, which is exactly why a historical Bw80 run measured 2719 f/s against
+/// Bw20's 2732 and was read as "80 MHz buys nothing". The channel moved; the transmitter did not.
+///
+/// Clamped by PHY type, as upstream clamps it: legacy has no wide PPDU (always 0), HT has no
+/// 80 MHz (max 1), VHT may use all three. A rate word wider than the tuned baseband is a malformed
+/// PPDU, so callers pass the width the radio is *currently* tuned to.
+const fn rate_bw_field(phy: u16, bw_code: u8) -> u16 {
+    let max = match phy {
+        MT_PHY_TYPE_VHT => 2u8,
+        MT_PHY_TYPE_HT => 1,
+        _ => 0,
+    };
+    let bw = if bw_code > max { max } else { bw_code };
+    (bw as u16) << 7
+}
+
+fn mt76_rate_val(m: &McsDescriptor, bw_code: u8) -> u16 {
     let (phy, idx): (u16, u16) = if m.vht {
         // VHT: index[3:0] = MCS, index[5:4] = NSS-1 (MT_RATE_INDEX_VHT_*, mt76x02_mac.h:94).
         (MT_PHY_TYPE_VHT, u16::from(m.index) & 0x0f)
     } else {
         (MT_PHY_TYPE_HT, u16::from(m.index.min(7)))
     };
-    let mut v = idx | (phy << 13);
+    let mut v = idx | (phy << 13) | rate_bw_field(phy, bw_code);
     if m.short_gi {
         v |= 1 << 9;
     }
@@ -1850,7 +1870,11 @@ impl FrameIo for Mt7610uBackend {
     /// still overrides this with legacy OFDM 6 Mbps, so control traffic stays decodable by
     /// a legacy-only neighbour no matter what the control plane set.
     fn set_rate(&self, mcs: McsDescriptor) -> Result<(), FaceError> {
-        *self.cur_rate.lock().unwrap_or_else(|e| e.into_inner()) = Some(mt76_rate_val(&mcs));
+        // The width is read at set_rate time from what the radio is tuned to; `set_channel`
+        // re-stamps any stored rate word so a later retune cannot leave a stale width behind.
+        let bw_code = self.bw.load(Ordering::Relaxed);
+        *self.cur_rate.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some(mt76_rate_val(&mcs, bw_code));
         Ok(())
     }
 
@@ -1952,7 +1976,21 @@ impl RadioKnobs for Mt7610uBackend {
         //
         // The tests were real and tested the wrong thing: centre-channel arithmetic, not the
         // MCU sequence. Declaration follows the actuator, and the actuator is 20 MHz.
-        if !matches!(bw, Bandwidth::Bw20) {
+        // ★ `NDN_MT7610_WIDE=1` lifts this for an on-air width experiment, which is exactly what
+        // the refusal below asks for. Two things changed that make the experiment worth running:
+        //
+        //  1. The TXWI rate word's BW field was never written (`rate_bw_field`, added with this
+        //     change), so the historical "Bw80 -> 2719 f/s vs Bw20's 2732" was **20 MHz PPDUs on
+        //     an 80 MHz channel**. The width lever has never actually been pulled.
+        //  2. A failed `MCU_CAL_FULL` no longer leaves ALC off and the baseband in its
+        //     calibration override latched across processes (`phy::set_channel_ext`), so a
+        //     calibration timeout during this experiment costs EVM rather than corrupting every
+        //     later measurement on the dongle.
+        //
+        // Still opt-in, and still to be judged by a WITNESS RECEIVER — the transmitter cannot see
+        // its own PPDU width.
+        let wide_ok = std::env::var_os("NDN_MT7610_WIDE").is_some();
+        if !matches!(bw, Bandwidth::Bw20) && !wide_ok {
             return Err(io_err(format!(
                 "mt7610u: set_channel({channel}, {bw:?}) — only 20 MHz is MEASURED working. \
                  phy::set_channel_ext implements 40/80 and its MCU calibration returns an empty \
@@ -1975,6 +2013,17 @@ impl RadioKnobs for Mt7610uBackend {
         // RSSI on a high 5 GHz channel carries the low group's gain.
         self.eeprom.set_channel(channel);
         self.bw.store(bw.code(), Ordering::Relaxed);
+        // ★ Re-stamp any stored rate word with the new width. Rate and width are set through two
+        // independent seams (`FrameIo::set_rate` and `RadioKnobs::set_channel`) and either can move
+        // last; without this a retune after set_rate would transmit at the OLD width — the same
+        // stale-shadow class of bug as leaving the field at 0 in the first place.
+        {
+            let mut cur = self.cur_rate.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(rate) = *cur {
+                let phy = (rate >> 13) & 0x7;
+                *cur = Some((rate & !(0x3 << 7)) | rate_bw_field(phy, bw.code()));
+            }
+        }
         // The idle/busy and RX_STAT counters accumulated on the *previous* channel. They are
         // read-and-clear, so one discarded read is all it takes to keep the first occupancy
         // window after a hop from being charged to the wrong channel. (Upstream reaches for
@@ -2293,6 +2342,23 @@ pub fn declared_capability() -> RadioCapability {
 
 #[cfg(test)]
 mod tests {
+    /// ★ The bandwidth field must actually appear in the rate word, and must be clamped by PHY.
+    /// Leaving it at 0 made the width knob a no-op: the channel widened and the PPDU did not.
+    #[test]
+    fn rate_word_carries_the_bandwidth_and_clamps_by_phy() {
+        // VHT may use all three widths.
+        for (code, want) in [(0u8, 0u16), (1, 1 << 7), (2, 2 << 7)] {
+            let v = mt76_rate_val(&McsDescriptor::vht(7), code);
+            assert_eq!(v & (0x3 << 7), want, "VHT bw code {code}");
+        }
+        // HT has no 80 MHz — asking for it must clamp to 40, not build an impossible PPDU.
+        assert_eq!(mt76_rate_val(&McsDescriptor::ht(7), 2) & (0x3 << 7), 1 << 7);
+        // And the field must not disturb the rest of the word.
+        let base = mt76_rate_val(&McsDescriptor::vht(7), 0);
+        let wide = mt76_rate_val(&McsDescriptor::vht(7), 2);
+        assert_eq!(base & !(0x3 << 7), wide & !(0x3 << 7));
+    }
+
     use super::*;
 
     /// A `RadioTime` over a fixed source list, so a DECLARATION can go through
@@ -2417,7 +2483,7 @@ mod tests {
     fn rate_words_round_trip_and_clamp_to_one_stream() {
         for idx in 0u8..=7 {
             let d = McsDescriptor::ht(idx);
-            let r = decode_rate_word(mt76_rate_val(&d));
+            let r = decode_rate_word(mt76_rate_val(&d, 0));
             assert_eq!(r.phy as u16, MT_PHY_TYPE_HT);
             assert_eq!(r.mcs, Some(idx));
             assert_eq!(r.nss, 1);
@@ -2428,24 +2494,24 @@ mod tests {
         // HT MCS 8-15 (2 streams) are clamped down to MCS7, not truncated into a different
         // rate: mcs 12 & 0x3f would otherwise encode a 2-stream MCS4.
         for idx in 8u8..=15 {
-            let r = decode_rate_word(mt76_rate_val(&McsDescriptor::ht(idx)));
+            let r = decode_rate_word(mt76_rate_val(&McsDescriptor::ht(idx), 0));
             assert_eq!(r.mcs, Some(7), "HT {idx} must clamp to the 1SS ceiling");
         }
 
         // VHT keeps its NSS field at one stream even when asked for two.
-        let r = decode_rate_word(mt76_rate_val(&McsDescriptor::vht_2ss(7)));
+        let r = decode_rate_word(mt76_rate_val(&McsDescriptor::vht_2ss(7), 0));
         assert_eq!(r.phy as u16, MT_PHY_TYPE_VHT);
         assert_eq!(r.mcs, Some(7));
         assert_eq!(r.nss, 1, "one chain cannot carry two spatial streams");
 
         // STBC and LDPC are dropped on this part (see mt76_rate_val); short GI is not.
-        let r = decode_rate_word(mt76_rate_val(&McsDescriptor::ht(5).with_stbc().with_ldpc()));
+        let r = decode_rate_word(mt76_rate_val(&McsDescriptor::ht(5).with_stbc().with_ldpc(), 0));
         assert!(!r.stbc && !r.ldpc);
         let sgi = McsDescriptor {
             short_gi: true,
             ..McsDescriptor::ht(3)
         };
-        assert!(decode_rate_word(mt76_rate_val(&sgi)).short_gi);
+        assert!(decode_rate_word(mt76_rate_val(&sgi, 0)).short_gi);
     }
 
     /// Legacy rate words, against `mt76x02_rates` (`mt76x02_util.c:10-30`). These are the

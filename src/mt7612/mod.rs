@@ -57,7 +57,9 @@ use rusb::{Context, Device, DeviceHandle, Direction, TransferType, UsbContext};
 use crate::{CapturedFrame, FrameFormat, FrameIo, InjectFrame, McsDescriptor};
 use async_trait::async_trait;
 use bytes::Bytes;
-use ndn_radio_hal::{Band, RadioCapability, RadioProfile, RateCapability};
+use ndn_radio_hal::{
+    Band, ClockDomainId, RadioCapability, RadioProfile, RadioTime, RadioTimeSource, RateCapability,
+};
 use ndn_transport::FaceError;
 
 /// Async USB TX ring (libusb URBs) — the TX-pipelining path. Linux-only.
@@ -108,8 +110,21 @@ const MT_USB_U3DMA_CFG: u16 = 0x9018; // CFG-space USB DMA config
 const MT_FCE_DMA_ADDR: u16 = 0x0230; // +0x0232 = high half
 const MT_FCE_DMA_LEN: u16 = 0x0234; // +0x0236 = high half
 
-/// MCU↔host scratch register polled for firmware readiness after load-IVB.
+/// MCU↔host **mailbox** (`mt76x02_mcu.h:13`).
+///
+/// ⚠ It is a mailbox, not a status flag, and treating it as one is what wedged this dongle three
+/// times. `start_mcu` writes `0x001140fb` here as the runtime handshake, so immediately after a
+/// bring-up it reads back as "firmware running" — but the MCU uses the same register for its own
+/// traffic, and after a channel set plus a few seconds of operation it no longer does. The next
+/// `open()` then concluded "cold", re-downloaded the ROM patch into a live MCU, and timed out at
+/// chunk 2 with the device dropping off the bus (`device not accepting address, error -62`).
+/// Use [`Mt7612uBackend::rom_patch_applied`] for a persistent answer.
 const MT_MCU_COM_REG0: u32 = 0x0730;
+/// `MT_MCU_CLOCK_CTL` (`mt76x2/mcu.h:13`). Bit 0 is the **ROM-patch-applied latch** on rev ≥ E3 —
+/// the flag upstream itself tests to print "ROM patch already applied" and skip the download
+/// (`mt76x2/usb_mcu.c:72-83`). Unlike the mailbox it survives normal operation, clearing only on a
+/// real chip power cycle.
+const MT_MCU_CLOCK_CTL: u32 = 0x0708;
 
 // MCU download target offsets (mt76x2u_mcu_load_*).
 const MCU_ROM_PATCH_OFFSET: u32 = 0x9_0000;
@@ -235,7 +250,7 @@ pub struct Mt7612uBackend {
     /// TX pump: `inject` hands pre-built USB bulks to a dedicated thread that does
     /// `write_bulk` in a tight loop — no per-frame `spawn_blocking` task dispatch
     /// (that capped TX at ~2000 frames/s). Set by [`spawn_tx_pump`](Self::spawn_tx_pump).
-    tx_sender: std::sync::Mutex<Option<std::sync::mpsc::Sender<Vec<u8>>>>,
+    tx_sender: std::sync::Mutex<Option<std::sync::mpsc::SyncSender<Vec<u8>>>>,
     /// Bytes and frames the TX-pump thread has actually written (throughput
     /// measurement / queue-drain waits).
     tx_bytes: std::sync::atomic::AtomicU64,
@@ -245,17 +260,52 @@ pub struct Mt7612uBackend {
     /// RF tune (an 80MHz rate word on a 20MHz-tuned BB would be malformed). Read by
     /// `build_data_bulk` so VHT80 frames carry the right bandwidth. Default 20MHz.
     tx_bw: std::sync::atomic::AtomicU8,
+    /// This radio's port-TSF clock domain (`MT_TSF_TIMER_DW0/DW1`). Keyed on
+    /// bus/address like the Realtek backends so two identical dongles on one host
+    /// are never conflated into one clock.
+    tsf_domain: ClockDomainId,
+    /// As-found ED-CCA register pair, captured the first time
+    /// [`RadioKnobs::set_edcca_ignore`] turns the knob on so `off` can restore the
+    /// state the driver actually started in rather than a guessed default.
+    edcca_saved: crate::mt76::knobs::EdccaSaved,
+    /// As-found EDCA state, so a contention posture can be undone. See
+    /// [`crate::mt76::knobs::set_contention`].
+    edca_saved: crate::mt76::knobs::EdcaSaved,
+    /// Wall-clock instant of the last [`read_channel_activity`] sample. The
+    /// channel-time counters are read-and-clear, so a sample *is* its window —
+    /// but `MT_ED_CCA_TIMER` has no idle counterpart and must be normalised
+    /// against elapsed host time, which is what this remembers.
+    ct_last: std::sync::Mutex<std::time::Instant>,
 }
 
 impl Mt7612uBackend {
-    /// Find, reset, and open the first MT7612U, claiming its interface.
+    /// Find and open the first MT7612U, claiming its interface.
+    ///
+    /// ★ **This no longer resets the device, and that polarity change is a safety
+    /// fix, not a preference.** The old default reset every matching dongle on
+    /// every open, justified as "clean power-on state". It never bought that: a
+    /// USB reset does not reset the on-chip MCU, so the thing that actually
+    /// prevents a bad re-download is the `firmware_running()` warm guard below,
+    /// not the reset. What the reset *did* buy was the failure mode itself —
+    /// MEASURED on minidronesys-05, `usb 2-1.3-port4: cannot reset (err = -110)`
+    /// five times over, and six seconds later the port was marked
+    /// `disable=1 / state=not attached` by the USB core, leaving the device a
+    /// zombie: present in sysfs, `ENODEV` at usbfs, and recoverable only by a
+    /// physical replug. Every mt76 part in this lab has been wedged this way at
+    /// least once, and the sibling MT7921AU is in that state right now.
+    ///
+    /// So: no reset by default. `NDN_RADIO_FORCE_RESET=1` opts back in for the
+    /// rare case where a genuinely half-initialised device needs re-enumerating
+    /// and you are physically next to it. (`NDN_RADIO_NO_RESET`, the old opt-out,
+    /// is now the default and is accepted-and-ignored so existing scripts run
+    /// unchanged.)
     pub fn open() -> Result<Self, FaceError> {
-        // Pass 1 — reset any matching dongle to a clean power-on state so a
-        // half-loaded firmware from a previous run doesn't wedge the MCU. A USB
-        // reset does NOT reset the on-chip MCU though, so on a warm device the
-        // firmware_running() guard (not the reset) is what prevents a re-download.
-        // `NDN_RADIO_NO_RESET=1` skips it (the reset itself can wedge the FCE).
-        if std::env::var("NDN_RADIO_NO_RESET").is_err() {
+        if std::env::var("NDN_RADIO_FORCE_RESET").is_ok() {
+            eprintln!(
+                "mt7612u: NDN_RADIO_FORCE_RESET set — issuing a USB reset. This is the operation \
+                 that has wedged mt76 parts on this fleet; a failed reset can leave the hub port \
+                 disabled until a physical replug."
+            );
             let ctx = Context::new().map_err(usb_err)?;
             for dev in ctx.devices().map_err(usb_err)?.iter() {
                 if let Ok(d) = dev.device_descriptor()
@@ -360,6 +410,12 @@ impl Mt7612uBackend {
             tx_bytes: std::sync::atomic::AtomicU64::new(0),
             tx_count: std::sync::atomic::AtomicU64::new(0),
             tx_bw: std::sync::atomic::AtomicU8::new(0),
+            tsf_domain: ClockDomainId(
+                (u32::from(device.bus_number()) << 8) | u32::from(device.address()),
+            ),
+            edcca_saved: crate::mt76::knobs::EdccaSaved::default(),
+            edca_saved: crate::mt76::knobs::EdcaSaved::default(),
+            ct_last: std::sync::Mutex::new(std::time::Instant::now()),
         })
     }
 
@@ -611,11 +667,30 @@ impl Mt7612uBackend {
 
     /// Download the ROM patch (`mt76x2u_mcu_load_rom_patch`): skip the 30-byte
     /// patch header, stream the body to `MCU_ROM_PATCH_OFFSET`.
+    /// Has the ROM patch already been applied to this chip? (`MT_MCU_CLOCK_CTL` bit 0.)
+    ///
+    /// This is the check upstream makes before every ROM-patch download and we did not, which is
+    /// the whole of the difference between "reopening the radio is free" and "reopening the radio
+    /// costs a physical replug". The latch is set by the patch activation and survives until the
+    /// chip loses power, so it answers the question the [`MT_MCU_COM_REG0`] mailbox cannot.
+    pub fn rom_patch_applied(&self) -> bool {
+        matches!(self.rr(MT_MCU_CLOCK_CTL), Ok(v) if v & 1 != 0)
+    }
+
     fn load_rom_patch(&self) -> Result<(), FaceError> {
         if ROM_PATCH.len() <= PATCH_HEADER_LEN {
             return Err(init_err("mt7612u rom patch too small".into()));
         }
         let d = std::env::var("NDN_RADIO_EP_DEBUG").is_ok();
+        // ★ Skip a patch that is already in the chip — `mt76x2u_mcu_load_rom_patch` does exactly
+        // this (`mt76x2/usb_mcu.c:80-83`, "ROM patch already applied"). Re-sending it over a live
+        // MCU is not merely wasteful: MEASURED 2026-08-27, the second chunk's bulk write times
+        // out and the device stops answering the host controller entirely.
+        // `NDN_RADIO_FORCE_FW=1` overrides, for the case where the patch really must be reloaded.
+        if self.rom_patch_applied() && std::env::var("NDN_RADIO_FORCE_FW").is_err() {
+            eprintln!("mt7612u: ROM patch already applied (MT_MCU_CLOCK_CTL bit0) — skipping");
+            return Ok(());
+        }
         self.fce_setup()?;
         self.mcu_fw_send_data(
             &ROM_PATCH[PATCH_HEADER_LEN..],
@@ -726,6 +801,74 @@ impl Mt7612uBackend {
         matches!(self.rr(MT_MCU_COM_REG0), Ok(v) if v & 1 != 0 && (v >> 16) == 0x0011)
     }
 
+    /// Is this chip already initialised enough that a cold bring-up would be destructive?
+    ///
+    /// [`firmware_running`](Self::firmware_running) alone is not a sound answer: it reads the
+    /// MCU **mailbox**, which the firmware reuses, so it goes stale within seconds of a
+    /// successful bring-up and reports "cold" on a chip that is very much warm. This adds the
+    /// persistent evidence: the ROM-patch latch, plus the MAC actually being enabled.
+    ///
+    /// MEASURED on this dongle: after a successful bring-up plus one channel set plus 25 s of
+    /// RX, `MT_MCU_COM_REG0` read `0x00090ff0` (a leftover firmware **destination address**),
+    /// while `MT_MAC_SYS_CTRL` still read `0x0c` — the chip was fully up and the mailbox said
+    /// nothing about it.
+    pub fn already_initialised(&self) -> bool {
+        if self.firmware_running() {
+            return true;
+        }
+        let mac_enabled = matches!(self.rr(0x1004), Ok(v) if v & 0x0c == 0x0c);
+        self.rom_patch_applied() && mac_enabled
+    }
+
+    /// Does the MCU answer **us**, as opposed to merely being loaded?
+    ///
+    /// [`already_initialised`](Self::already_initialised) answers "is firmware running", which is a
+    /// weaker claim than it looks: the kernel driver's firmware satisfies it completely while
+    /// leaving a chip our channel-set deltas cannot drive. This sends a real command and waits for
+    /// a real answer, which is the only evidence that actually matters.
+    ///
+    /// Uses `MCU_CMD_RANDOM_READ` (0x0a) on a register we already know, because it is the cheapest
+    /// command that requires the MCU to *compose a response*: a fire-and-forget command would
+    /// "succeed" against a dead MCU and tell us nothing.
+    ///
+    /// ⚠ It cannot go through [`mcu_cmd`](Self::mcu_cmd), which deliberately treats a response
+    /// timeout as success (correct there — with the ROM patch the MCU does not need every ACK
+    /// drained for flow control). Liveness is exactly the question that distinction erases, so
+    /// this does its own write/read pair and requires bytes back.
+    ///
+    /// Deliberately conservative — any error, timeout or empty read reports **not** responsive.
+    /// A false "responsive" costs a bench trip; a false "unresponsive" costs one register replay.
+    pub fn mcu_responsive(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        let seq = (self.mcu_seq.fetch_add(1, Ordering::Relaxed).wrapping_add(1) & 0xf).max(1);
+        // MCU_CMD_RANDOM_READ payload is {u32 reg, u32 val} pairs.
+        let mut payload = [0u8; 8];
+        payload[..4].copy_from_slice(&MT_MCU_CLOCK_CTL.to_le_bytes());
+        let info = (payload.len() as u32 & 0xffff)
+            | ((seq as u32) << 16)
+            | ((0x0au32 & 0x7f) << 20)
+            | (2u32 << 27)
+            | (1u32 << 30);
+        let mut buf = Vec::with_capacity(16);
+        buf.extend_from_slice(&info.to_le_bytes());
+        buf.extend_from_slice(&payload);
+        buf.extend_from_slice(&[0u8; 4]);
+        if self
+            .handle
+            .write_bulk(self.ep_cmd, &buf, Duration::from_millis(200))
+            .is_err()
+        {
+            return false;
+        }
+        let ep_resp = *self.ep_ins.last().unwrap_or(&self.ep_in);
+        let mut rx = [0u8; 512];
+        matches!(
+            self.handle
+                .read_bulk(ep_resp, &mut rx, Duration::from_millis(300)),
+            Ok(n) if n > 0
+        )
+    }
+
     /// Full firmware bring-up: ROM patch then RAM firmware (each preceded by the
     /// FCE/USB-DMA setup). Skipped if firmware is already running.
     pub fn load_firmware(&self) -> Result<(), FaceError> {
@@ -759,7 +902,11 @@ impl Mt7612uBackend {
         if d {
             eprintln!("  start_mcu: running={}", self.firmware_running());
         }
-        if !self.firmware_running() {
+        // ⚠ `firmware_running()` reads the MCU **mailbox** and goes stale (see MT_MCU_COM_REG0),
+        // so on a warm re-open it says "cold" and this used to re-send load-IVB to an MCU that was
+        // already running. MEASURED cost of that mistake: the next `set_channel` took **18.6 s**
+        // with 16 MCU command timeouts, against 1.3 s and zero on a chip whose MCU was left alone.
+        if !self.already_initialised() {
             let _ = self.wr(MT_FCE_PSE_CTRL_GO, 0x14); // ack last FCE completion
             self.handle
                 .write_control(REQ_OUT, MT_VEND_DEV_MODE, 0x0012, 0, &[], CTRL_TIMEOUT)
@@ -966,25 +1113,55 @@ impl Mt7612uBackend {
         // re-assert runtime mode via start_mcu(). `NDN_RADIO_FORCE_FW=1` overrides
         // to force the full cold replay. Poll a few times — the first register
         // read right after claim() can be racy.
+        // ── Warm or cold? Decide it with a ROUND TRIP, not with a status bit. ──────────────
+        //
+        // ★ This decision has gone wrong in both directions on this part, and each mistake cost a
+        // physical replug, so it is worth stating exactly what the evidence is:
+        //
+        // * The old test was `already_initialised()` — the MCU **mailbox** `MT_MCU_COM_REG0` plus
+        //   the ROM-patch latch. Both are *heuristics about state*, not evidence the MCU will
+        //   talk to us. MEASURED: the mailbox goes stale within seconds and reports "cold" on a
+        //   chip whose firmware the kernel had just loaded; taking the cold path there downloads
+        //   firmware into a live MCU, which collides with the FCE and hangs — the original
+        //   "warm run wedges" failure. The ROM-patch latch fails the other way: it survives a USB
+        //   reset and reports "warm" on a chip that answers nothing.
+        // * `mcu_responsive()` sends a real `MCU_CMD_RANDOM_READ` and requires bytes back. It is
+        //   strictly better evidence than either latch, so it **overrules both**, in both
+        //   directions.
+        //
+        // The three outcomes, and why each is right:
+        //   live                -> warm re-open. The MCU answers; re-initialising would be the
+        //                          destructive act, not the safe one.
+        //   !live && heuristic  -> **error out.** Firmware is loaded but not talking to us. Do NOT
+        //                          try to fix it here: replaying ~5900 register writes and ~50 MCU
+        //                          commands against a silent MCU leaves the FCE mid-transaction,
+        //                          after which `mt76x2u`'s own probe fails `firmware upload
+        //                          failed: -110` forever while `ASIC revision` still reads a
+        //                          correct 0x76120044. The silicon is fine; the load path is stuck,
+        //                          and only a power cycle clears it. Each attempt cost a bench trip.
+        //   !live && !heuristic -> genuinely cold (no firmware yet). Full replay, as intended.
         if !force {
-            let warm = (0..5).any(|_| {
-                let v = self.rr(MT_MCU_COM_REG0);
-                if dbg {
-                    eprintln!("  warm-check: COM_REG0 = {v:?}");
-                }
-                if matches!(v, Ok(x) if x & 1 != 0 && (x >> 16) == 0x0011) {
-                    true
-                } else {
-                    std::thread::sleep(Duration::from_millis(20));
-                    false
-                }
-            });
-            if warm {
-                eprintln!(
-                    "mt7612u bring_up: firmware already running — warm re-open (skipping cold replay)"
-                );
+            let live = self.mcu_responsive();
+            let heuristic = self.already_initialised();
+            if dbg {
+                eprintln!("  bring_up: mcu_responsive={live} already_initialised={heuristic}");
+            }
+            if live {
+                eprintln!("mt7612u bring_up: MCU answers — warm re-open (skipping cold replay)");
                 self.start_mcu()?;
                 return Ok(());
+            }
+            if heuristic {
+                return Err(init_err(
+                    "mt7612u: firmware is loaded but the MCU does not answer us (a set_channel \
+                     here would report all-op-errors and transmit nothing).\n  NOT attempting a \
+                     register replay: that leaves the FCE mid-transaction and the part then \
+                     refuses firmware upload (-110) until it is physically replugged.\n  Try \
+                     `mt76_acquire.sh release <pid>` to let the kernel reload firmware, then \
+                     `acquire`. If dmesg then shows `firmware upload failed: -110` alongside a \
+                     good `ASIC revision`, it needs a physical replug."
+                        .to_string(),
+                ));
             }
         }
 
@@ -1100,8 +1277,18 @@ impl Mt7612uBackend {
         // firmware-load value (0xc00020) enables RX streaming. Without it the
         // device never delivers frames to bulk-IN.
         self.wr_cfg(MT_USB_U3DMA_CFG, 0x00c4_0020)?;
-        self.wr(0x1400, 0x0000_0000)?; // MT_RX_FILTR_CFG: promiscuous
+        // Promiscuous, minus the two "this frame is broken" drops — see the note in
+        // `replay_chanset`, which re-asserts this after a tune overwrites it.
+        self.wr(0x1400, crate::mt76::knobs::RX_FILTER_PROMISCUOUS_VALID)?;
         self.wr(0x1004, 0x0000_000c)?; // MT_MAC_SYS_CTRL: ENABLE_TX|ENABLE_RX
+        // Arm the TSF and the channel-time counters here rather than leaving them to a caller
+        // who would have to know they exist. Both are free (four register writes), both are off
+        // after bring_up, and a radio that is receiving but silently has no clock and no
+        // occupancy sense is the exact shape of gap this port set out to close. Failure is
+        // logged, not fatal: monitor RX is the job, timekeeping is the bonus.
+        if let Err(e) = self.arm_time_and_sense() {
+            tracing::warn!("mt7612u: monitor RX is up but arming TSF/channel-time failed: {e}");
+        }
         Ok(())
     }
 
@@ -1184,6 +1371,22 @@ impl Mt7612uBackend {
             }
         }
         eprintln!("mt7612u set_channel {what}: {nw} writes + {nm} mcu cmds, {ne} op errors");
+        // ★ RX BUG FIX (MEASURED 2026-08-27). The captured channel op-stream contains the
+        // kernel's own `MT_RX_FILTR_CFG` write, so replaying it **silently overwrites whatever
+        // `setup_monitor_rx` installed** — and since every caller tunes *after* bringing monitor
+        // up, the replay always won. Measured on this dongle: after `setup_monitor_rx` wrote 0
+        // (full promiscuity) and `set_channel_ch6` replayed, `MT_RX_FILTR_CFG` read back
+        // `0x00001093` = drop CRC_ERR|PHY_ERR|VER_ERR|DUP|RTS. In the same run the PHY logged
+        // **9975 CRC errors** and the host received essentially nothing — the hardware was
+        // demodulating and the MAC was discarding the result before it reached USB, which
+        // presents exactly like a dead antenna.
+        //
+        // Re-assert the monitor state after the replay. `RX_FILTER_PROMISCUOUS_VALID` rather
+        // than 0: bad-FCS frames are evidence for a *sensor* but poison for a *decoder*, and
+        // this path feeds `parse_dot11`. The error counts remain available, unfiltered, through
+        // `read_rx_stat` — which is the honest place for them.
+        self.wr(0x1400, crate::mt76::knobs::RX_FILTER_PROMISCUOUS_VALID)?;
+        self.wr(0x1004, 0x0000_000c)?; // MT_MAC_SYS_CTRL: ENABLE_TX|ENABLE_RX
         Ok(())
     }
 
@@ -1323,14 +1526,127 @@ impl Mt7612uBackend {
         self.wr(0x0820, if two { 0x31 } else { 0x11 })
     }
 
-    /// Minimize EDCA channel-access overhead for all ACs: AIFSN=1, CWmin=CWmax=0
-    /// (no random backoff). The per-MPDU air cycle is preamble + AIFS + backoff +
-    /// frame; the default backoff (CWmin exponent → up to ~67µs avg) and AIFS
-    /// (~34µs) dominate the ~280µs/transfer fixed overhead on a clean channel. This
-    /// strips them — a broadcast NDN bearer has no contention to defer to. Registers
-    /// `MT_WMM_AIFSN`(0x0214), `MT_WMM_CWMIN`(0x0218), `MT_WMM_CWMAX`(0x021c); each
-    /// holds a 4-bit field per AC [AC0=3:0 .. AC3=15:12]. Diagnostic + throughput.
+    /// Zero the EDCA backoff on all four ACs — `MT_WMM_AIFSN`/`CWMIN`/`CWMAX` (0x0214/18/1c).
+    ///
+    /// ☠ **MEASURED HARMFUL. Do not call this expecting throughput.** It had never been run on
+    /// hardware until 2026-08-28; the A/B, ch36 VHT80 2x2 MCS9 short-GI, 5650 B MPDUs, 8 TX-pump
+    /// threads, on a quiet 5 GHz channel:
+    ///
+    /// | EDCA state | offered |
+    /// |---|---|
+    /// | as-initialised (AIFSN 2, CWmin 15, CWmax 1023) | 2636 f/s / **119 Mbit/s** |
+    /// | this function (`MT_WMM_*`: AIFSN 1, CW 0) | 466 f/s / **21 Mbit/s** |
+    /// | the other block (`MT_EDCA_CFG_AC(n)` 0x1300+4n, same idea) | 206 f/s / **9.3 Mbit/s** |
+    ///
+    /// **5.7x and 13x WORSE respectively.** Removing the backoff does not make this MAC
+    /// transmit sooner; it makes it transmit far less. The mechanism is not established here —
+    /// a CW exponent of 0 may be out of range for the arbiter, or self-collision across the four
+    /// ACs may be the cost — but the direction is unambiguous and reproducible. It is the same
+    /// shape as the 8812au's EDCCA result: a knob whose name promises aggression and whose
+    /// effect is starvation.
+    ///
+    /// ★ The run also settles an open question: **both EDCA register blocks are live.** The
+    /// tree carried a doubt about whether the MAC arbitrates from `MT_WMM_*` (what this writes)
+    /// or from `MT_EDCA_CFG_AC(n)` (what `init_replay` programs as `0x000a4200` =
+    /// TXOP 0, AIFSN 2, CWmin exp 4, CWmax exp 10). Writing *either* changes on-air behaviour
+    /// enormously, so neither is dead and they are not alternatives to choose between.
+    ///
+    /// Kept, rather than deleted, because a knob measured to hurt is worth more than a knob
+    /// nobody has tried — and because the reverse direction (raising CW to yield the medium) is
+    /// the same register and may yet be useful for a politeness/coexistence experiment.
+    /// Put the EDCA blocks back to the values `init_replay` programs.
+    ///
+    /// ☠ **This exists because [`set_edca_aggressive`](Self::set_edca_aggressive) has no undo and
+    /// the warm re-open path does not provide one.** MEASURED 2026-08-28: after the aggressive
+    /// A/B, every subsequent MCU command failed (`set_channel … 32 op errors`, where a healthy
+    /// run reports 0) and the device stopped transmitting entirely. `bring_up` could not fix it
+    /// — it correctly takes the warm path on a chip whose firmware is still running, so it never
+    /// re-runs the init that owns these registers — and forcing the cold path re-downloads the
+    /// ROM patch into a live MCU, which is the wedging hazard. The only clean recovery was to
+    /// write the init values back.
+    ///
+    /// Values lifted from `init_replay.bin` itself (the last write to each address), not from a
+    /// datasheet: `MT_WMM_AIFSN = 0x2222`, `MT_WMM_CWMIN = 0x4444`, `MT_WMM_CWMAX = 0xaaaa`,
+    /// `MT_WMM_TXOP0/1 = 0`, and all four `MT_EDCA_CFG_AC(n) = 0x000a4200`.
+    ///
+    /// Any knob that can leave the MAC unable to transmit needs its restore written at the same
+    /// time as the setter — the [`crate::mt76::knobs::EdccaSaved`] discipline, which this pair
+    /// should adopt.
+    pub fn restore_edca_defaults(&self) -> Result<(), FaceError> {
+        self.wr(0x0214, 0x0000_2222)?; // MT_WMM_AIFSN
+        self.wr(0x0218, 0x0000_4444)?; // MT_WMM_CWMIN
+        self.wr(0x021c, 0x0000_aaaa)?; // MT_WMM_CWMAX
+        self.wr(0x0220, 0)?; // MT_WMM_TXOP0
+        self.wr(0x0224, 0)?; // MT_WMM_TXOP1
+        for ac in 0..4u32 {
+            self.wr(0x1300 + (ac << 2), 0x000a_4200)?;
+        }
+        // ★ MAC timing too, and for the same reason the EDCA restore exists: `bring_up` takes the
+        // warm path on a chip whose MCU is already running, so anything written into these
+        // registers survives every later process start until a physical replug. These are the
+        // values `init_replay.bin` leaves behind (slot 20, CC_DELAY 1; ACKTO 0x23 = 20 + SIFS 15).
+        self.wr(0x1104, 0x0000_0114)?; // MT_BKOFF_SLOT_CFG
+        crate::mt76::Mt76Regs::rmw(self, 0x1348, 0x0000_ffff, 0x0000_2390)?; // MT_TX_TIMEOUT_CFG
+        Ok(())
+    }
+
+    /// Set the MAC slot time (and the ack timeout that must track it), returning what the
+    /// register reads back as.
+    ///
+    /// ★ **This is the largest single contention knob on this part.** MEASURED from the init blob
+    /// and confirmed live: the MT7612U boots with `MT_BKOFF_SLOT_CFG = 0x114`, a **20 µs** slot,
+    /// where the MT7610U ships 9 and the MT7921AU programs 9. Backoff, AIFS and `CC_DELAY` are
+    /// all counted in slots, so this one register scales every term of the DCF budget at once:
+    /// at the boot EDCA (AIFSN 2, CWmin exponent 4) the budget is
+    /// `SIFS 16 + 2×20 + 7.5×20 = 206 µs`, most of the ~247 µs fixed per-PPDU cost.
+    ///
+    /// ★ MEASURED 2026-08-28, VHT80 MCS9 2SS SGI, 5650 B, A/B/A/B: slot 20 → 9 took this part from
+    /// **131.9 to 190.6 Mbit/s (+45 %)**, with the fixed cost falling 246.5 → 141.0 µs. The
+    /// predicted saving is 105 µs and the measured one is 105.5 — and that agreement is itself a
+    /// finding, because it excludes `CC_DELAY` from the per-frame budget (including it predicts
+    /// 116 µs, 10 % high). The residual ~40 µs at slot 9 is USB and PSE, not contention.
+    ///
+    /// Unlike [`Self::set_edca_aggressive`], 9 µs is not an out-of-spec value — it is the ordinary
+    /// 802.11a short slot every 5 GHz radio in the room is already using, and unlike the EDCA
+    /// window on this part it has been written, read back and reversed repeatedly with no ill
+    /// effect. On the mt76x2 this register is the *only* safe way to express
+    /// [`ndn_radio_hal::ContentionPosture::Owned`]; see [`crate::mt76::knobs::window_floor`].
+    pub fn set_slot_time(&self, slot_us: u8) -> Result<u8, FaceError> {
+        crate::mt76::knobs::set_slot_time(self, slot_us, &self.edca_saved)?;
+        crate::mt76::knobs::read_slot_time(self)
+    }
+
+    /// Read back the slot time the MAC is actually counting backoff in.
+    pub fn slot_time(&self) -> Result<u8, FaceError> {
+        crate::mt76::knobs::read_slot_time(self)
+    }
+
     pub fn set_edca_aggressive(&self) -> Result<(), FaceError> {
+        // ☠ **Gated, because this call cost a physical replug.** After the A/B below, every MCU
+        // command on the part failed (`set_channel … 32 op errors`) and it stopped transmitting;
+        // `restore_edca_defaults` did not bring it back, the kernel driver's own probe then
+        // failed with `firmware upload failed: -110`, and a USB reset does not power-cycle the
+        // on-chip MCU. Only unplugging it did.
+        //
+        // It stays in the tree because a measured-harmful knob is more useful than an untried
+        // one, and because the *opposite* direction (raising CW to yield the medium for a
+        // coexistence experiment) is the same register. But it must be asked for explicitly,
+        // and the as-found state is saved first so the caller has an undo that the warm
+        // re-open path cannot provide.
+        if std::env::var_os("NDN_MT7612_EDCA_AGGRESSIVE").is_none() {
+            return Err(init_err(
+                "mt7612u: set_edca_aggressive is MEASURED HARMFUL (119 -> 21 Mbit/s) and has \
+                 wedged this part's MCU beyond software recovery. Set \
+                 NDN_MT7612_EDCA_AGGRESSIVE=1 if you mean it, and be next to the dongle."
+                    .into(),
+            ));
+        }
+        let saved = (self.rr(0x0214)?, self.rr(0x0218)?, self.rr(0x021c)?);
+        eprintln!(
+            "mt7612u: EDCA as-found {:#010x}/{:#010x}/{:#010x} — restore with \
+             restore_edca_defaults() or these values",
+            saved.0, saved.1, saved.2
+        );
         self.wr(0x0214, 0x0000_1111)?; // AIFSN = 1 for all four ACs
         self.wr(0x0218, 0x0000_0000)?; // CWmin exponent 0 → CW=0 (no backoff)
         self.wr(0x021c, 0x0000_0000)?; // CWmax exponent 0
@@ -1485,7 +1801,14 @@ impl Mt7612uBackend {
         depth: usize,
     ) -> Vec<std::thread::JoinHandle<()>> {
         use std::sync::atomic::Ordering;
-        let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        // ★ BOUNDED. An unbounded queue makes `inject` a non-blocking enqueue with no
+        // backpressure at all: MEASURED on the sibling MT7921AU, a 3-second flood queued
+        // hundreds of thousands of frames that then took minutes to drain, so every throughput
+        // figure taken that way was the speed of a channel send and the radio was still
+        // transmitting long after the test thought it had stopped. Depth x 4 keeps every writer
+        // fed across a scheduling hiccup while making the caller wait on the radio, not on a
+        // queue.
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(depth.max(1) * 4);
         *self.tx_sender.lock().unwrap() = Some(tx);
         let rx = std::sync::Arc::new(std::sync::Mutex::new(rx));
         (0..depth.max(1))
@@ -1494,21 +1817,18 @@ impl Mt7612uBackend {
                 let rx = rx.clone();
                 std::thread::spawn(move || {
                     loop {
-                        let got = rx.lock().unwrap().try_recv();
-                        match got {
-                            Ok(buf) => {
-                                if let Ok(n) =
-                                    me.handle
-                                        .write_bulk(me.ep_data, &buf, Duration::from_secs(1))
-                                {
-                                    me.tx_bytes.fetch_add(n as u64, Ordering::Relaxed);
-                                    me.tx_count.fetch_add(1, Ordering::Relaxed);
-                                }
-                            }
-                            Err(std::sync::mpsc::TryRecvError::Empty) => {
-                                std::thread::sleep(Duration::from_micros(50));
-                            }
-                            Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+                        // Block rather than poll: the 50 us sleep this replaces put a floor
+                        // under per-frame latency and burned a core doing it.
+                        let buf = match rx.lock().unwrap().recv() {
+                            Ok(b) => b,
+                            Err(_) => break, // sender dropped
+                        };
+                        if let Ok(n) =
+                            me.handle
+                                .write_bulk(me.ep_data, &buf, Duration::from_secs(1))
+                        {
+                            me.tx_bytes.fetch_add(n as u64, Ordering::Relaxed);
+                            me.tx_count.fetch_add(1, Ordering::Relaxed);
                         }
                     }
                 })
@@ -1619,6 +1939,22 @@ impl Mt7612uBackend {
 #[async_trait]
 impl FrameIo for Mt7612uBackend {
     async fn inject(&self, frame: InjectFrame) -> Result<(), FaceError> {
+        // ★ **Refuse an over-long MPDU rather than letting it reset the radio.**
+        //
+        // MEASURED 2026-08-28: `MAX_MPDU_PAYLOAD` is a real hardware limit, not a cautious
+        // guess. At 5650 B this part sustains 2898 f/s / 131 Mbit/s; at **7000 B it collapses to
+        // 118 f/s**, and larger sizes take the device off the bus and back (the USB device
+        // number changed under us, 021 -> 024) leaving it degraded. An oversized frame is
+        // therefore not a slow frame — it is a self-inflicted radio reset, and a caller that
+        // sets too large an MTU should learn that from an error rather than from a dead link.
+        if frame.payload.len() > Self::MAX_MPDU_PAYLOAD {
+            return Err(FaceError::Io(io::Error::other(format!(
+                "mt7612u: payload {} B exceeds MAX_MPDU_PAYLOAD {} — MEASURED to reset this \
+                 radio, not merely to be dropped. Fragment above this seam, or lower the MTU.",
+                frame.payload.len(),
+                Self::MAX_MPDU_PAYLOAD
+            ))));
+        }
         let dot11 = crate::frame::build_dot11(self.format, &frame)?;
         // NDN frames are 802.11 DATA frames → data TXWI (wcid 0xff, no-ACK) on the
         // data AC endpoint (0x04). Mgmt TXWI/ep 0x07 would be dropped (see
@@ -1714,6 +2050,14 @@ impl Mt7612uBackend {
                 max_nss: 2,
                 max_bw: 2,
             },
+            // ★ This part has NO power actuator: `set_tx_power` is not implemented, and the
+            // registers are known (`MT_TX_PWR_CFG_0..9`, `MT_TX_ALC_CFG_0..4`) but the per-rate
+            // packing needs an EEPROM target-power/delta parse to mean anything. Declaring the
+            // absence is the point — until this field existed the radio accepted every back-off
+            // cognition asked for and nothing upstream could tell.
+            min_tx_power: None,
+            db_per_power_idx: None,
+            power_actuated: false,
             ..RadioCapability::wifi_monitor_5ghz(vec![6, 36])
         }
     }
@@ -1755,6 +2099,146 @@ impl crate::rx_pump::Pumpable for Mt7612uBackend {
     }
 }
 
+/// The shared mt76x02 register seam. Everything in [`crate::mt76::knobs`] is written against this
+/// trait rather than against a backend, so the knobs MEASURED on the MT7610U (which shares
+/// `mt76x02_regs.h` with this part) apply here without a second implementation — and, in the
+/// period when this dongle was off the bus, could be developed against the part that was up.
+impl crate::mt76::Mt76Regs for Mt7612uBackend {
+    fn rr(&self, addr: u32) -> Result<u32, FaceError> {
+        Mt7612uBackend::rr(self, addr)
+    }
+    fn wr(&self, addr: u32, val: u32) -> Result<(), FaceError> {
+        Mt7612uBackend::wr(self, addr, val)
+    }
+}
+
+impl Mt7612uBackend {
+    /// Arm the two hardware senses this part has and the driver never switched on:
+    /// the free-running TSF and the channel-time counters.
+    ///
+    /// Neither is on after `bring_up`, and neither was reachable before because the
+    /// register addresses in the tree were wrong. MEASURED 2026-08-27 on this exact
+    /// dongle: with `MT_BEACON_TIME_CFG` (0x1114) bit 16 set and `SYNC_MODE`
+    /// cleared, `MT_TSF_TIMER_DW0` (0x111c) advanced +10415 / +10456 / +10545 /
+    /// +10389 / +10430 against ~10.4 ms host steps — 1.000 µs per tick — where the
+    /// as-found register read a constant 0. (The 2026-08-18 "the mt76 TSF does not
+    /// tick" result read 0x1104, which is `MT_BKOFF_SLOT_CFG`; it reported the
+    /// constant `0x114`, and this part still reads exactly that there.)
+    ///
+    /// Call after [`setup_monitor_rx`](Self::setup_monitor_rx). Idempotent.
+    pub fn arm_time_and_sense(&self) -> Result<(), FaceError> {
+        use crate::mt76::knobs;
+        knobs::enable_tsf(self)?;
+        knobs::enable_channel_time_counters(self)?;
+        *self.ct_last.lock().unwrap() = std::time::Instant::now();
+        Ok(())
+    }
+
+    /// One window of channel occupancy: decode-busy per-mille, energy-detect
+    /// per-mille, and the raw counters. See [`crate::mt76::knobs::ChannelTime`].
+    pub fn sample_channel_time(&self) -> Result<(crate::mt76::knobs::ChannelTime, u32), FaceError> {
+        let ct = crate::mt76::knobs::read_channel_time(self)?;
+        let mut last = self.ct_last.lock().unwrap();
+        let window_us = last.elapsed().as_micros().min(u32::MAX as u128) as u32;
+        *last = std::time::Instant::now();
+        Ok((ct, window_us))
+    }
+
+    /// This device's port-TSF clock domain.
+    pub fn tsf_domain(&self) -> ClockDomainId {
+        self.tsf_domain
+    }
+
+    /// The saved-ED-CCA slot backing [`RadioKnobs::set_edcca_ignore`].
+    pub(crate) fn edcca_slot(&self) -> &crate::mt76::knobs::EdccaSaved {
+        &self.edcca_saved
+    }
+
+    /// The saved-EDCA slot backing [`RadioKnobs::set_contention`].
+    pub(crate) fn edca_slot(&self) -> &crate::mt76::knobs::EdcaSaved {
+        &self.edca_saved
+    }
+}
+
+/// ★ **This impl exists because the register map in this driver was wrong, not because the silicon
+/// changed.** The tree recorded, as MEASURED, that the mt76x2 TSF "is static even after enabling
+/// `MT_BEACON_TIME_CFG` bit4" — citing 0x1104 / 0x1108 / 0x110c and 0x1100. In `mt76x02_regs.h`
+/// those are `MT_BKOFF_SLOT_CFG`, an unnamed word, `MT_CH_TIME_CFG` and `MT_XIFS_TIME_CFG`: four
+/// configuration registers and no counter among them. The TSF is 0x111c/0x1120, its enable is bit
+/// **16** of 0x1114, and it runs at 1.000 MHz — re-measured on this dongle on 2026-08-27.
+///
+/// What that does and does not buy:
+///
+/// * **Does**: a real read-now [`RadioClockKind::PortTsf`], so this radio can date its own airtime
+///   against hardware instead of against a host clock, and a scheduler has a shared reference the
+///   MAC itself honours.
+/// * **Does not**: common view. That needs a per-frame RX stamp, and `struct mt76x02_rxwi`
+///   (`mt76x02_mac.h:97`) has no timestamp field — `mt76x02_mac_process_rx` never sets
+///   `status->mactime`. Substituting a register read is not available either: an EP0 round trip
+///   MEASURED **91.6 µs** on this SuperSpeed part (151 µs on the high-speed MT7610U), against a
+///   200 µs common-view guard. So `can_common_view` stays false, and it stays false for a reason
+///   that is now written down with the right register names.
+///
+/// `precision_ns` therefore describes the *stamp*, not the read: [`RadioTimeSource::port_tsf`]
+/// derives it from the latch point. The cost of reading it is the 91.6 µs above, and any caller
+/// putting this on a per-frame path is making a mistake this doc cannot prevent.
+/// **The MT7612U's declared time surface.** A free function so the declaration is assertable in a
+/// unit test without a USB device.
+///
+/// Reference: **UNKNOWN**, ⚠ corrected 2026-08-31 — this said `crystal()` and cited evidence that is
+/// not in this backend.
+///
+/// The citation was: "the MAC does not accept register writes until `MT_CMB_CTRL`'s `XTAL_RDY`
+/// (BIT 22) asserts, i.e. the whole chip is gated on a crystal starting". Nothing in `src/mt7612/`
+/// reads that register. `MT_CMB_CTRL_XTAL_RDY` resolves to a bare `pub const` (`mt76/regs.rs`) plus
+/// three polls that are all in the **mt76x0** path (`mt76x0/mod.rs`, `mt76x0/mcu.rs`) — a sibling
+/// driver's bring-up behaviour, described as if it were this one's. This backend brings the chip up
+/// by replaying a captured init table and never polls it.
+///
+/// Nor does the rate rescue it. The TSF was MEASURED at "1.000 us/tick" — +10415 / +10456 / +10545 /
+/// +10389 / +10430 ticks against **~10.4 ms** host steps — but the reference leg of that comparison
+/// is itself approximate, so the check bounds the rate at percent level. An RC oscillator is
+/// percent-class (this tree's own: +2253 ppm, ~-3100 ppm), i.e. INSIDE that spread. So the scale
+/// check cannot even exclude an RC, let alone establish a crystal.
+///
+/// Consequence today: none — a `PortTsf` is not a per-frame stamp, so `can_common_view` is false on
+/// the LATCH axis whatever the reference is. It is declared anyway, because "false because there is
+/// no per-frame stamp" and "false because nobody has established the oscillator" are different
+/// facts, and this part is one dark-bytes discovery away (`examples/mt7610_bringup.rs` stage 7,
+/// `rxwi.bbp_rxinfo[0..3]`) from the reference half being the only thing between it and a
+/// common-view claim.
+///
+/// To EARN `Crystal` here: a rate regression against the host clock at real precision (as `mt7921`
+/// did — 15_007_757 / 15_007_907 ticks over a known 15 s), or a documented read of a crystal
+/// trim/ready bit in THIS driver's own path.
+fn mt7612_time_sources(tsf_domain: ClockDomainId) -> Vec<RadioTimeSource> {
+    vec![RadioTimeSource {
+        reference: ndn_radio_hal::ClockReference::unknown(),
+        ..RadioTimeSource::port_tsf(tsf_domain)
+    }]
+}
+
+impl RadioTime for Mt7612uBackend {
+    fn time_sources(&self) -> Vec<RadioTimeSource> {
+        mt7612_time_sources(self.tsf_domain)
+    }
+
+    /// Read the 64-bit port TSF (µs). Wrap-safe across the DW0 carry.
+    ///
+    /// ⚠ Returns `Ok(None)` — not an error — when the timer is not armed, because a stopped
+    /// counter reads a perfectly plausible zero and "the clock is off" must not be mistaken for
+    /// "the epoch just started". Arm it with [`arm_time_and_sense`](Self::arm_time_and_sense).
+    fn read_clock(&self, domain: ClockDomainId) -> Result<Option<u64>, FaceError> {
+        if domain != self.tsf_domain {
+            return Ok(None);
+        }
+        if !crate::mt76::knobs::tsf_running(self)? {
+            return Ok(None);
+        }
+        crate::mt76::knobs::read_tsf(self).map(Some)
+    }
+}
+
 impl RadioProfile for Mt7612uBackend {
     fn capability(&self) -> RadioCapability {
         Self::declared_capability()
@@ -1770,5 +2254,71 @@ impl Mt7612uBackend {
         self.cur_mcs.lock().unwrap().unwrap_or_else(|| {
             crate::McsDescriptor::for_intent(&frame.tx, crate::MAX_RELIABLE_MCS, true, false)
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ndn_radio_hal::{ClockReferenceKind, FaceTimeProfile, TxDiscipline};
+
+    /// A `RadioTime` over a fixed source list, so a DECLARATION can go through
+    /// `FaceTimeProfile::derive` without a USB device.
+    struct Declared(Vec<RadioTimeSource>);
+    impl RadioTime for Declared {
+        fn time_sources(&self) -> Vec<RadioTimeSource> {
+            self.0.clone()
+        }
+    }
+
+    /// ★ **This backend claims no reference, because it witnesses none.** It used to declare
+    /// `Crystal` on the strength of `MT_CMB_CTRL`'s `XTAL_RDY` gate — which is real, and is in the
+    /// **mt76x0** driver, not this one. `src/mt7612/` never reads that register (it replays a
+    /// captured init table), and its TSF rate check is against "~10.4 ms" host steps, a percent-level
+    /// bound that does not even exclude a percent-class RC.
+    ///
+    /// Nil consequence today, pinned here so it stays that way: a `PortTsf` fails common view on the
+    /// LATCH axis regardless. The point is that if a per-frame stamp is ever found in the undecoded
+    /// RXWI dwords, an unearned `Crystal` would convert straight into `can_common_view = true` with
+    /// no new evidence.
+    #[test]
+    fn the_declared_reference_is_unknown_because_nothing_here_witnesses_one() {
+        let dom = ClockDomainId(0x7612);
+        let v = mt7612_time_sources(dom);
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].kind, ndn_time::RadioClockKind::PortTsf);
+        assert_eq!(v[0].domain, dom);
+        assert_eq!(
+            v[0].reference.kind,
+            ClockReferenceKind::Unknown,
+            "no code in this backend establishes the oscillator"
+        );
+        assert!(!v[0].reference.holds_rate());
+        assert_eq!(v[0].reference.measured, None);
+
+        let p = FaceTimeProfile::derive(&Declared(v), TxDiscipline::BestEffort);
+        assert!(
+            !p.hw_rx_stamp,
+            "no per-frame stamp: mt76x02_rxwi has no timestamp"
+        );
+        assert!(!p.can_common_view);
+        assert_eq!(
+            p.clock_reference.map(|r| r.kind),
+            Some(ClockReferenceKind::Unknown),
+            "and the report can say WHICH half is missing"
+        );
+    }
+
+    /// The sibling comparison, mechanically: the evidence belongs to the mt76x0 path, and the two
+    /// declarations must not be copies of each other. (`mt7610_time_sources` keeps `Crystal` — it is
+    /// the one that polls the crystal-ready bit.)
+    #[test]
+    fn the_two_mt76_siblings_do_not_share_a_reference_claim() {
+        let a = mt7612_time_sources(ClockDomainId(1))[0].reference.kind;
+        let b = crate::mt76x0::mt7610_time_sources(ClockDomainId(2))[0]
+            .reference
+            .kind;
+        assert_eq!(a, ClockReferenceKind::Unknown);
+        assert_eq!(b, ClockReferenceKind::Crystal);
     }
 }

@@ -1560,14 +1560,78 @@ fn send_rx_stamp_note<F: FnMut(u8)>(put: F, v: capture::StampVerdict) {
     send_frame(put, EVT_RX_STAMP, &[v.frame_stamp_kind(), reason]);
 }
 
+/// Polls allowed for `HSERDY`. The RM quotes a few ms of crystal start-up; each iteration is a
+/// volatile register read plus a branch, so at 8 MHz this is tens of milliseconds — generously past
+/// any real oscillator, and still a hard bound. **The loop is bounded because an unbounded one is
+/// how a dongle with no crystal becomes an ST-Link job.**
+const HSE_PROBE_POLLS: u32 = 400_000;
+
+/// Turn HSE on, see whether it ever reports ready, turn it off again if not. Returns true iff
+/// `HSERDY` asserted.
+///
+/// This is the GUARD on the `use_hse` switch, not a diagnostic: the HAL's own `use_hse` waits on
+/// `HSERDY` with no bound, so it must never be reached on a board whose crystal is absent or dead.
+/// On the true path `HSEON` is deliberately left set, so the HAL finds the oscillator already
+/// running and its wait returns at once.
+fn probe_hse() -> bool {
+    let rcc = unsafe { &*pac::RCC::ptr() };
+    rcc.cr.modify(|_, w| w.hseon().set_bit());
+    let mut ready = false;
+    for _ in 0..HSE_PROBE_POLLS {
+        if rcc.cr.read().hserdy().bit_is_set() {
+            ready = true;
+            break;
+        }
+    }
+    if !ready {
+        // Leave the bit exactly as it was found rather than powering an oscillator that answered
+        // nothing for the rest of the run.
+        rcc.cr.modify(|_, w| w.hseon().clear_bit());
+    }
+    ready
+}
+
 #[entry]
 fn main() -> ! {
     let dp = pac::Peripherals::take().unwrap();
     let mut cp = cortex_m::Peripherals::take().unwrap();
 
     let mut flash = dp.FLASH.constrain();
+
+    // ★ **Is there an 8 MHz crystal on this board?** — asked, not assumed, and asked in the one way
+    // that cannot brick the dongle.
+    //
+    // This node's whole timebase (SysTick, TIM2's deadline, TIM3's capture) descends from the 8 MHz
+    // **HSI**, an internal RC good to about +/-1%. Two of these dongles were MEASURED at ~-3100 ppm
+    // relative, and that wander — not the stamp — is now what limits their common view, since the
+    // TIM3 capture stamps 95/95 frames with no fallback. Moving to HSE would be the next real gain,
+    // but only if the part is populated, and nothing in the repo records whether it is.
+    //
+    // ☠ The obvious way to find out is the dangerous one: `cfgr.use_hse(8.MHz())` spins forever on
+    // `HSERDY` when no crystal is fitted, and firmware that hangs in clock init never reaches
+    // `CMD_ENTER_BOOTLOADER` — the dongle would then need an ST-Link to recover, and the whole point
+    // of the self-DFU path is that it does not. So the question is asked by a BOUNDED probe that
+    // leaves the clock alone, and its answer GUARDS the switch below: `use_hse` is only ever reached
+    // on a part that has already been seen to assert `HSERDY`, and a dongle with no crystal (or a
+    // dead one) silently keeps the HSI it has always run on.
+    //
+    // MEASURED 2026-08-31 on the o5p-0 dongle: `hse=1` — the crystal is fitted and starts.
+    let hse_present = probe_hse();
+
     let rcc = dp.RCC.constrain();
-    let clocks = rcc.cfgr.freeze(&mut flash.acr);
+    // **`sysclk` is pinned at 8 MHz on BOTH paths, deliberately.** Every timing constant in this
+    // firmware descends from it — SysTick's 8000-cycle reload, TIM2's `psc = pclk1_tim/1 MHz - 1`,
+    // TIM3's identical prescaler and therefore `capture::STAMP_HZ` — so raising the core clock here
+    // would silently rescale the scheduler and the RX timestamp together. The gain being sought is
+    // not speed, it is the REFERENCE: the same 8 MHz from a crystal rather than from an RC.
+    let clocks = if hse_present {
+        rcc.cfgr
+            .use_hse(8.MHz())
+            .sysclk(8.MHz())
+            .freeze(&mut flash.acr)
+    } else {
+        rcc.cfgr.freeze(&mut flash.acr)
+    };
 
     // 1 kHz SysTick — the MILLISECOND clock only. The microsecond clock and the RX capture are TIM3
     // (see `rxstamp` and `micros64`), which is why this no longer feeds EVT_RX timestamps. Core clock
@@ -1697,7 +1761,7 @@ fn main() -> ! {
         let mut log = BufWriter::new();
         let _ = write!(
             log,
-            "rxstamp psc={} st=0x{:02X} tps={} kind={} clk={}",
+            "rxstamp psc={} st=0x{:02X} tps={} kind={} clk={} hse={}",
             cap.psc,
             cap.self_test.bits(),
             cap.self_test.ticks_per_ms,
@@ -1707,6 +1771,9 @@ fn main() -> ! {
             } else {
                 "systick"
             },
+            // 1 = an 8 MHz crystal is fitted and started, and the core is running FROM it;
+            // 0 = none answered and the core stayed on the HSI RC.
+            hse_present as u8,
         );
         send_frame(
             |b| {

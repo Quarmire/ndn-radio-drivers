@@ -4119,7 +4119,7 @@ const EFUSE_REAL_CONTENT_LEN_JAGUAR: u16 = 512;
 const EFUSE_MAX_SECTION_JAGUAR: usize = 64;
 const EFUSE_MAX_WORD_UNIT: usize = 4;
 const PG_TXPWR_SADDR: usize = 0x10; // EFUSE PG tx-power block start
-const TXAGC_MAX: u8 = 63; // 6-bit TXAGC index rail
+const TXAGC_MAX: u8 = 63;
 
 /// 5 GHz center channels the per-group base table is scattered across (mirrors
 /// devourer `kCenterCh5gAll`).
@@ -4339,6 +4339,23 @@ fn mcs_diff_sum(r: u8, diff: &[i8; 4]) -> i32 {
 /// A userspace RTL8812AU radio. Open with [`open`](Self::open); the handle keeps
 /// interface 0 claimed for the backend's lifetime.
 pub struct Rtl8812auBackend {
+    /// As-found four-AC EDCA state, so a contention posture change can be undone.
+    /// See [`crate::realtek_contention`] for why this is a knob and not a side effect.
+    pub(crate) ndr_contention: crate::realtek_contention::RtlEdcaSaved,
+    /// The deliberate RX detection floor as an IGI index (`floor_dBm = IGI - 110`). Re-asserted
+    /// after every channel program, because the captured per-channel traces each leave a different
+    /// value and ten of them leave none at all.
+    rx_floor_igi: std::sync::atomic::AtomicU8,
+    /// Round-robin index over the four H2C mailboxes, matching the kernel's observed rotation.
+    h2c_box: std::sync::atomic::AtomicU32,
+    /// CCX transmit reports seen (C2H id 0x03), and how many of those the MAC reported delivered.
+    /// See [`Rtl8812auBackend::read_tx_counters`] for what these do and do NOT mean.
+    tx_rpt_seen: std::sync::atomic::AtomicU32,
+    tx_rpt_ok: std::sync::atomic::AtomicU32,
+    tx_rpt_retries: std::sync::atomic::AtomicU32,
+    /// As-found `REG_TX_RPT_CTRL`/`+1`/`TIME`, packed; `u32::MAX` = nothing saved.
+    tx_rpt_saved: std::sync::atomic::AtomicU32,
+
     handle: Arc<DeviceHandle<Context>>,
     /// Bulk OUT endpoint (frame injection).
     bulk_out: u8,
@@ -4375,7 +4392,6 @@ pub struct Rtl8812auBackend {
     cca_saved: std::sync::atomic::AtomicU16,
     /// Saved `REG_EDCA_BE_PARAM` (0x0508) before [`set_cca_ignore`](Self::set_cca_ignore) zeroed the
     /// contention window (aggressive-EDCA blast). `0xffff_ffff` = nothing saved yet.
-    edca_saved: std::sync::atomic::AtomicU32,
     /// Current transmit rate as **state** — the exact MCS every `inject` uses once the
     /// control plane has decided one via [`FrameIo::set_rate`]; `None` ⇒ fall back to the
     /// legacy 6 Mbps default (or the `NDN_RADIO_TX_RATE` override). Mirrors the 88xx
@@ -4466,11 +4482,34 @@ impl Rtl8812auBackend {
         }
         let no_ep = || init_err("RTL8812AU exposes no bulk IN/OUT endpoint");
         Ok(Self {
+            ndr_contention: crate::realtek_contention::RtlEdcaSaved::new(),
+            // 0x20 = -78 dBm, the value the majority of the captured programs settle on and the
+            // vendor's `dm_dig_min`.
+            rx_floor_igi: std::sync::atomic::AtomicU8::new(0x20),
+            h2c_box: std::sync::atomic::AtomicU32::new(0),
+            tx_rpt_seen: std::sync::atomic::AtomicU32::new(0),
+            tx_rpt_ok: std::sync::atomic::AtomicU32::new(0),
+            tx_rpt_retries: std::sync::atomic::AtomicU32::new(0),
+            tx_rpt_saved: std::sync::atomic::AtomicU32::new(u32::MAX),
             handle,
             bulk_out: bulk_out.ok_or_else(no_ep)?,
             bulk_in: bulk_in.ok_or_else(no_ep)?,
             pid,
-            format: FrameFormat::Raw80211,
+            // ★ **`RawNdn`, matching every other backend in this crate.**
+            //
+            // This defaulted to `Raw80211` ("the payload IS the frame, verbatim") for the NAN
+            // management-frame path. That default had NO production benefit — the real open path
+            // (`src/lib.rs`) always calls `.with_format(fmt)` explicitly — and it was reachable
+            // only by a caller who forgot. MEASURED cost of forgetting, 2026-08-28: the flood
+            // examples transmitted `vec![0x42; N]` as a malformed management frame with a
+            // **unicast** `addr1 = 42:42:42:42:42:42`, so the MAC retried every frame to CWmax and
+            // throughput collapsed from ~654 f/s to a dead-flat 10 f/s (the 100 ms `TX_TIMEOUT`).
+            // A whole day of this radio's throughput and contention numbers was void.
+            //
+            // Every other backend here defaults to `RawNdn`; this one being different was an
+            // accident of history, not a property of the silicon. NAN still gets `Raw80211` by
+            // asking for it, which is what the production path already does.
+            format: FrameFormat::default(),
             rx_pump: crate::rx_pump::RxPumpState::new(),
             ctrl_ops: std::sync::atomic::AtomicU64::new(0),
             tsf_domain,
@@ -4478,7 +4517,6 @@ impl Rtl8812auBackend {
             cur_channel: std::sync::atomic::AtomicU8::new(0),
             tx_power_info: std::sync::Mutex::new(None),
             cca_saved: std::sync::atomic::AtomicU16::new(0xffff),
-            edca_saved: std::sync::atomic::AtomicU32::new(0xffff_ffff),
             cur_mcs: std::sync::Mutex::new(None),
         })
     }
@@ -4985,6 +5023,12 @@ impl Rtl8812auBackend {
         self.write32(0x0EB0, 0x7777_7777)?;
         self.bb_set(0x0CB4, 0x3FF0_0000, 0x000)?;
         self.bb_set(0x0EB4, 0x3FF0_0000, 0x000)?;
+        // ★ Arm the page-F sensing counters. The 5 GHz golden programs replay these three toggles
+        // (0x09a4 bit17, 0x0a2c bit15, 0x0b58 bit0) and this branch did not, so on 2.4 GHz the
+        // FA/CCA block read a flat zero — which is how it came to be recorded as "dead" hardware.
+        // The mainline kernel reads live values from it on this dongle at ch6
+        // (`golden/rtw88-2g-ch6.txt`: OFDM FA 10867 / 48980 / 50133 across three DIG ticks).
+        let _ = self.reset_fa_counters();
         // CCK FA / scan workaround + CCK check (clear 0x454[7] for 2.4 G).
         self.bb_set(0x080C, 0xF0, 0x1)?;
         self.bb_set(0x0A04, 0x0F00_0000, 0x1)?;
@@ -5003,6 +5047,10 @@ impl Rtl8812auBackend {
         self.bb_set(0x08AC, 0x300, 0x2)?; // spur workaround, ch ≤ 14
         let trx = self.read16(0x0668)?;
         self.write16(0x0668, trx & 0xFE7F)?; // WMAC TRXPTCL: 20 MHz
+        // ★ The captured per-channel programs each leave a different IGI, and ten of the 25
+        // write none at all — an 8 dB, order-dependent detection-floor swing. Make it
+        // deterministic. See `reassert_rx_floor`.
+        let _ = self.reassert_rx_floor();
         Ok(())
     }
 
@@ -5024,6 +5072,323 @@ impl Rtl8812auBackend {
     /// mode, trigger the LC cal on RF `0x18[15]`, poll until done, and restore.
     /// Locks the synthesizer for the current channel; run after
     /// [`set_channel`](Self::set_channel).
+    /// ★ **Host-to-Card command transport** — the firmware interface this driver has never used.
+    ///
+    /// The parts this fleet calls "best supported" are the firmware-mediated ones: the MT7921AU
+    /// (whose MCU *validates* requests, which is why a `cw_min` of 2 was safe there and cost the
+    /// mt76x2 register path a replug) and the RTL8733BU (exact TX counters, the best transmit
+    /// instrument here). The 8812AU has the same class of interface and it was never opened —
+    /// which is why it has no TX feedback, no rate adaptation, and nothing firmware-mediated.
+    ///
+    /// **The transaction is not reverse-engineered from a foreign driver — it is captured on THIS
+    /// dongle.** `golden/rtw88-5g-ch149.txt` and every per-channel capture show the mainline kernel
+    /// doing exactly this, every 2.0 s:
+    ///
+    /// ```text
+    /// Ci 01cc  1 byte    <- poll HMETFR: which boxes still hold an unconsumed command
+    /// Co 01d0  4 bytes   <- write HMEBOX_0 with the command
+    /// ...next time 01d4, then 01d8, then 01dc, wrapping to 01d0  (round-robin, 4 boxes)
+    /// ```
+    ///
+    /// The firmware side corroborates: the image reads `0x1D0` through a helper, ORs status bits
+    /// into `0x1C0`, and writes responses to `0x1C2`/`0x1C4`.
+    ///
+    /// ⚠ Four bytes only. Longer commands use the EXT boxes (`0x01F0+`), which no capture we hold
+    /// exercises — do not assume their layout.
+    pub fn h2c(&self, payload: [u8; 4]) -> Result<(), FaceError> {
+        use std::sync::atomic::Ordering::Relaxed;
+        // HMETFR bit N is set while box N still holds a command the firmware has not taken.
+        // Wait for ours to clear rather than overwriting a pending command.
+        let box_idx = (self.h2c_box.fetch_add(1, Relaxed) & 0x3) as u16;
+        let bit = 1u8 << box_idx;
+        let deadline = std::time::Instant::now() + Duration::from_millis(200);
+        loop {
+            let tfr = self.read8(0x01cc)?;
+            if tfr & bit == 0 {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(init_err(format!(
+                    "rtl8812au h2c: box {box_idx} still busy after 200 ms (HMETFR {tfr:#04x}) —                      firmware is not consuming commands"
+                )));
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        self.write32(0x01d0 + box_idx * 4, u32::from_le_bytes(payload))
+    }
+
+    /// ★ **Arm the MAC's transmit-report engine.**
+    ///
+    /// The per-frame descriptor bit (`W2 SPE_RPT`) makes the MAC *tag* a frame for reporting, and
+    /// MEASURED it does move the CCX ring index — but it yielded only 1-4 records per ~2300 armed
+    /// frames. The firmware cannot be the limiter: exactly one site in the whole image touches the
+    /// ring at XDATA `0x8000` (the drain at code `0x7A6E`), so the MAC fills it directly. The
+    /// remaining gate therefore had to be a MAC register, and this is it.
+    ///
+    /// **Address provenance — in-generation, which is why this is not a guess.**
+    /// `REG_TX_RPT_CTRL = 0x04EC` / `REG_TX_RPT_TIME = 0x04F0` are defined in the mainline
+    /// **Jaguar1** driver `rtlwifi/rtl8821ae/reg.h:225-226` — the PCIe sibling of this exact
+    /// silicon generation. (rtl8821ae *defines* but never *writes* them, which is precisely why
+    /// they never appear in our golden traces and why this looked unsourced.) The write sequence
+    /// is taken from a driver that does use them, `rtlwifi/rtl8188ee/hw.c:851-855`:
+    ///
+    /// ```text
+    /// REG_TX_RPT_CTRL     |= BIT(0) | BIT(1)
+    /// REG_TX_RPT_CTRL + 1  = 2        // number of MACIDs to track
+    /// REG_TX_RPT_TIME      = 0xcdf0   // report timer
+    /// ```
+    ///
+    /// Restorable: [`disarm_tx_report`](Self::disarm_tx_report) puts back the exact bytes found.
+    pub fn arm_tx_report(&self) -> Result<(), FaceError> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let ctrl = self.read8(0x04ec)?;
+        let macid = self.read8(0x04ed)?;
+        let time = self.read16(0x04f0)?;
+        // Pack the as-found state once so a later disarm is a restore and not a guess.
+        let _ = self.tx_rpt_saved.compare_exchange(
+            u32::MAX,
+            u32::from(ctrl) | (u32::from(macid) << 8) | (u32::from(time) << 16),
+            Relaxed,
+            Relaxed,
+        );
+        self.write8(0x04ec, ctrl | 0x03)?;
+        self.write8(0x04ed, 2)?;
+        self.write16(0x04f0, 0xcdf0)?;
+        Ok(())
+    }
+
+    /// Put `REG_TX_RPT_CTRL`/`TIME` back exactly as found. No-op if never armed.
+    pub fn disarm_tx_report(&self) -> Result<(), FaceError> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let v = self.tx_rpt_saved.swap(u32::MAX, Relaxed);
+        if v == u32::MAX {
+            return Ok(());
+        }
+        self.write8(0x04ec, (v & 0xff) as u8)?;
+        self.write8(0x04ed, ((v >> 8) & 0xff) as u8)?;
+        self.write16(0x04f0, ((v >> 16) & 0xffff) as u16)?;
+        Ok(())
+    }
+
+    /// ★ **Transmit feedback** — `(reports seen, reports delivered)`, plus accumulated retries.
+    ///
+    /// ⚠ **This is NOT the same quantity the RTL8733BU reports through the same trait method, and
+    /// comparing them across radios without reading this will produce a wrong answer.**
+    ///
+    /// * The **8733BU** pair are *baseband* counters — MAC→BB transmit requests and BB→RF keys,
+    ///   one per attempt, MEASURED at exactly +50 per 50 injects. They answer **"did the MAC ever
+    ///   ask?"** and they are exact.
+    /// * **This** pair are *frame completions the firmware reported*: sampled 1-in-N (whatever
+    ///   `NDN_AU_TXRPT` requested), and lossy when the 16-slot CCX ring or the firmware's C2H ring
+    ///   overflows under load. They answer **"did the air eat it?"** — which the 8733BU pair
+    ///   cannot — but they are a SAMPLE, not a census.
+    ///
+    /// So a delivery ratio from this is meaningful; an absolute frame count is not.
+    /// `(0, 0)` until reports are armed: the arming is a per-frame TX-descriptor bit
+    /// (`W2 bit 19 SPE_RPT`), not a register, and an RX pump must be running to collect them.
+    pub fn tx_report_counters(&self) -> (u32, u32, u32) {
+        use std::sync::atomic::Ordering::Relaxed;
+        (
+            self.tx_rpt_seen.load(Relaxed),
+            self.tx_rpt_ok.load(Relaxed),
+            self.tx_rpt_retries.load(Relaxed),
+        )
+    }
+
+    /// Read the firmware's H2C status byte (`0x01C0`) and its two response bytes
+    /// (`0x01C2`, `0x01C3`).
+    ///
+    /// The firmware ORs bits `0x01/0x02/0x10/0x20` into `0x01C0` at four distinct sites in the
+    /// image — the only visible acknowledgement that a command was seen, since C2H reports are
+    /// silent until enabled (MEASURED: 0 C2H buffers in 12 s of flooding).
+    pub fn h2c_status(&self) -> Result<(u8, u8, u8), FaceError> {
+        Ok((
+            self.read8(0x01c0)?,
+            self.read8(0x01c2)?,
+            self.read8(0x01c3)?,
+        ))
+    }
+
+    /// Per-queue MAC transmit gate — the hardware half of a slot MAC.
+    ///
+    /// Bit map (`hal_com_reg.h` `REG_TXPAUSE`): b0 VO, b1 VI, b2 BE, b3 BK, b4 MGQ, b5 HIQ,
+    /// b6 BCNQ. [`TXPAUSE_DATA_QUEUES`](Self::TXPAUSE_DATA_QUEUES) = 0x3f gates every data and
+    /// management queue while sparing the beacon queue.
+    ///
+    /// Address provenance: `0x0522` is already written by [`lc_calibrate`](Self::lc_calibrate) in
+    /// this file, and the firmware image itself touches it at six sites — so this is not an
+    /// address imported from another chip generation.
+    ///
+    /// ⚠ MEASURED SEMANTICS on the sibling RTL8733BU: `REG_TXPAUSE` **HOLDS, it does not drop**.
+    /// A held queue drains when released (~20 KB there), so this is only safe where the burst
+    /// lands in a window you own. Throughput under a 50 % duty measured **13.9 %**, not 50 %.
+    /// Budget from that measurement, not from the duty cycle.
+    pub fn set_tx_pause(&self, mask: u8) -> Result<(), FaceError> {
+        self.write8(0x0522, mask)?;
+        // Read back: a gate that silently did not take is worse than no gate, because the
+        // scheduler above believes the airtime lease is enforced.
+        let rb = self.read8(0x0522)?;
+        if rb != mask {
+            return Err(init_err(format!(
+                "rtl8812au: TXPAUSE readback {rb:#04x} != requested {mask:#04x}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// ★ **The fleet's first dB-denominated RX sensitivity knob.**
+    ///
+    /// On Jaguar1 the initial-gain index is an absolute axis: `floor_dBm = IGI - 110`
+    /// (`IGI_2_DBM`, `phydm_adaptivity.h:36`) — the same -110 that anchors RSSI and EDCCA on this
+    /// generation. The a81a's equivalent is explicitly *not* dB-denominated, so this is the only
+    /// receive knob in the fleet a link budget can reason about.
+    ///
+    /// Address provenance: `rA_IGI_Jaguar 0xc50` / `rB_IGI_Jaguar 0xe50`, field mask `0x7f`
+    /// (`ODM_BIT_IGI_11AC`). Decisive: `golden/rtw88-2g-ch6.txt` shows the mainline kernel walking
+    /// `0c50` through 0x1e -> 0x20 -> 0x22 with `0e50` mirrored, on this dongle. Bounds 0x20..0x3e
+    /// are the vendor's own `dm_dig_min`/`dm_dig_max`.
+    ///
+    /// ⚠ Two SEPARATE registers, one per path — not the a81a's packed `0x1d70[6:0]/[14:8]`.
+    /// Returns the **achieved** floor read back from path A, never the requested one.
+    pub fn set_rx_floor_dbm(&self, dbm: i8) -> Result<i8, FaceError> {
+        const IGI_MIN: u32 = 0x20;
+        const IGI_MAX: u32 = 0x3e;
+        let igi = (i32::from(dbm) + 110).clamp(IGI_MIN as i32, IGI_MAX as i32) as u32;
+        self.bb_set(0x0C50, 0x7f, igi)?;
+        self.bb_set(0x0E50, 0x7f, igi)?;
+        self.rx_floor_igi
+            .store(igi as u8, std::sync::atomic::Ordering::Relaxed);
+        Ok(((self.read32(0x0C50)? & 0x7f) as i16 - 110) as i8)
+    }
+
+    /// The detection floor currently programmed, in dBm, read from path A.
+    pub fn read_rx_floor_dbm(&self) -> Result<i8, FaceError> {
+        Ok(((self.read32(0x0C50)? & 0x7f) as i16 - 110) as i8)
+    }
+
+    /// ☠ **Re-assert the RX floor after a channel program.**
+    ///
+    /// MEASURED from our own captured programs: the per-channel 5 GHz traces each end with a
+    /// different IGI — ch36 `0x24`, ch56/140/153/157 `0x1c`, ch100 `0x1f`, most others `0x20` —
+    /// and **10 of the 25 channels never write it at all**, silently inheriting whatever the
+    /// previously-tuned channel left. On the `IGI - 110` axis that is a **-82 to -74 dBm swing,
+    /// 8 dB, plus order dependence**: every cross-channel RSSI or occupancy comparison this radio
+    /// has ever produced carries that bias, including anything feeding channel-choice cognition.
+    ///
+    /// The captured traces are left intact (they are observed kernel behaviour); the floor is made
+    /// deterministic by writing it again afterwards.
+    pub fn reassert_rx_floor(&self) -> Result<(), FaceError> {
+        let igi = u32::from(self.rx_floor_igi.load(std::sync::atomic::Ordering::Relaxed));
+        self.bb_set(0x0C50, 0x7f, igi)?;
+        self.bb_set(0x0E50, 0x7f, igi)?;
+        Ok(())
+    }
+
+    /// Read the current per-queue transmit gate.
+    pub fn read_tx_pause(&self) -> Result<u8, FaceError> {
+        self.read8(0x0522)
+    }
+
+    /// Every data + management queue, beacon queue spared — the mask `iqk_configure_mac` already
+    /// proves this silicon accepts.
+    pub const TXPAUSE_DATA_QUEUES: u8 = 0x3f;
+}
+
+/// `REG_RXERR_RPT` counter selectors (`hal_com_reg.h:440-453`). The register exposes thirteen
+/// different counters through one 4-bit selector; the driver had never written that selector.
+pub mod rxerr_type {
+    /// OFDM PPDUs seen — the frame-rate proxy the shipped occupancy sensor uses.
+    pub const OFDM_PPDU: u8 = 0;
+    /// OFDM false alarms.
+    pub const OFDM_FALSE_ALARM: u8 = 1;
+    /// CCK PPDUs seen.
+    pub const CCK_PPDU: u8 = 4;
+    /// HT PPDUs seen.
+    pub const HT_PPDU: u8 = 8;
+    /// ★ **RX FIFO full — frames the hardware dropped because the host could not drain it.**
+    /// A direct hardware measure of the receive ceiling this fleet previously had to infer from
+    /// delivery ratios (see the note that a "high drop ratio" was an observer RX limit, not
+    /// on-air loss). Nothing else in the fleet reports this directly.
+    pub const RX_FULL_DROP: u8 = 15;
+}
+
+/// Frame-free sensing counters — false alarms, CCA and per-modulation CRC, straight from the PHY.
+///
+/// ★ This block was recorded as **DEAD** in this project's notes. It is not: the mainline kernel
+/// reads live, growing values from it on this dongle. `golden/rtw88-2g-ch6.txt` carries three DIG
+/// ticks 2 s apart with `0x0f48` (OFDM FA) = **10867, 48980, 50133** and `0x0a5c` (CCK FA) =
+/// 30, 197, 192 — MEASURED by decoding that trace.
+///
+/// The "dead" reading is fully explained by two things, both ours:
+///   1. the arming sequence (`0x09a4` bit17, `0x0a2c` bit15, `0x0b58` bit0 — see
+///      [`Rtl8812auBackend::reset_fa_counters`]) appears in our **5 GHz** golden programs and
+///      **nowhere in the 2.4 GHz branch of `set_channel`** — and the probe that produced the
+///      verdict defaulted to ch6;
+///   2. it read CCA from `0xF4C`, which the vendor header names `rOFDM_FalseAlarm2_Jaguar` — the
+///      *spoofing* counter. CCA lives at `0x0F08`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FaCounters {
+    /// OFDM false alarms (`0x0F48`, `ODM_REG_OFDM_FA_11AC`).
+    pub ofdm_fa: u16,
+    /// CCK false alarms (`0x0A5C`, `ODM_REG_CCK_FA_11AC`).
+    pub cck_fa: u16,
+    /// CCK clear-channel assessments (`0x0F08[15:0]`).
+    pub cck_cca: u16,
+    /// OFDM clear-channel assessments (`0x0F08[31:16]`).
+    pub ofdm_cca: u16,
+    /// CRC32 OK, indexed CCK / OFDM / HT / VHT.
+    pub crc_ok: [u16; 4],
+    /// CRC32 error, same order.
+    pub crc_err: [u16; 4],
+}
+
+impl Rtl8812auBackend {
+    /// Read the page-F sensing block. Counters are free-running since the last
+    /// [`reset_fa_counters`](Self::reset_fa_counters); difference two reads, or reset then read.
+    pub fn read_fa_counters(&self) -> Result<FaCounters, FaceError> {
+        // CRC32 pairs: OK in [13:0], ERR in [29:16]. Order matches `crc_ok`/`crc_err`.
+        const CRC: [u16; 4] = [0x0f04, 0x0f14, 0x0f10, 0x0f0c]; // cck, ofdm, ht, vht
+        let mut crc_ok = [0u16; 4];
+        let mut crc_err = [0u16; 4];
+        for (i, reg) in CRC.iter().enumerate() {
+            let v = self.read32(*reg)?;
+            crc_ok[i] = (v & 0x3fff) as u16;
+            crc_err[i] = ((v >> 16) & 0x3fff) as u16;
+        }
+        let cca = self.read32(0x0f08)?;
+        Ok(FaCounters {
+            ofdm_fa: self.read16(0x0f48)?,
+            cck_fa: self.read16(0x0a5c)?,
+            cck_cca: (cca & 0xffff) as u16,
+            ofdm_cca: ((cca >> 16) & 0xffff) as u16,
+            crc_ok,
+            crc_err,
+        })
+    }
+
+    /// Arm/reset the sensing counters — the three read-modify-write toggles the kernel performs
+    /// after every DIG tick (`golden/rtw88-2g-ch6.txt:555-590`), and which our own 5 GHz golden
+    /// programs already replay.
+    ///
+    /// ⚠ Read-modify-write, never a blind dword: these registers carry unrelated PHY configuration
+    /// in their other bits, and the kernel restores the original value after strobing.
+    pub fn reset_fa_counters(&self) -> Result<(), FaceError> {
+        for (reg, bit) in [(0x09a4u16, 1u32 << 17), (0x0a2c, 1 << 15), (0x0b58, 1 << 0)] {
+            let orig = self.read32(reg)?;
+            // 0x0a2c is strobed by CLEARING its bit; the other two by SETTING theirs.
+            let strobe = if reg == 0x0a2c {
+                orig & !bit
+            } else {
+                orig | bit
+            };
+            self.write32(reg, strobe)?;
+            self.write32(reg, orig)?;
+        }
+        Ok(())
+    }
+}
+
+impl Rtl8812auBackend {
     pub fn lc_calibrate(&self) -> Result<(), FaceError> {
         const RF_LCK: u32 = 0xB4;
         const RF_CHNLBW: u32 = 0x18;
@@ -5032,6 +5397,15 @@ impl Rtl8812auBackend {
         // If a continuous-tone TX is active (0x914[18:16]), don't pause; else
         // pause packet TX during the cal.
         let cont_tx = self.read32(0x0914)? & 0x7_0000 != 0;
+        // ★ Save the as-found gate. This used to write 0x00 on exit unconditionally, which
+        // silently RE-OPENS a hold that `RadioKnobs::set_tx_hold` had deliberately asserted — a
+        // retune inside a held airtime slot would let the queues drain into somebody else's turn,
+        // which is the exact bleed a slot schedule exists to prevent.
+        let saved_pause = if cont_tx {
+            None
+        } else {
+            Some(self.read8(REG_TXPAUSE)?)
+        };
         if !cont_tx {
             self.write8(REG_TXPAUSE, 0xFF)?;
         }
@@ -5055,8 +5429,8 @@ impl Rtl8812auBackend {
         // Leave LCK mode + un-pause TX.
         let lck = self.rf_read(RfPath::A, RF_LCK)?;
         self.rf_write(RfPath::A, RF_LCK, lck & !(1 << 14))?;
-        if !cont_tx {
-            self.write8(REG_TXPAUSE, 0x00)?;
+        if let Some(prev) = saved_pause {
+            self.write8(REG_TXPAUSE, prev)?;
         }
         Ok(())
     }
@@ -5752,6 +6126,51 @@ impl Rtl8812auBackend {
         if std::env::var_os("NDN_NAVUSEHDR").is_some() {
             Self::set_desc_bits(&mut d, 12, 15, 1, 1); // NAV_USE_HDR
         }
+        // ★ **Per-frame CCX TX report** — the arm for this radio's only transmit instrument.
+        //
+        // The 8812AU has no `read_tx_counters()`: every "throughput" it has ever reported is an
+        // *offered* rate, the host's `inject` call count, which a bulk-OUT queue will happily
+        // absorb whether or not the MAC ever keyed the RF. The firmware image DOES build a
+        // per-frame report — code 0x7A38 drains a 16-slot × 8-byte FIFO at XDATA 0x8000, indexed
+        // by MAC `0x047E` (hardware write) / `0x047F` (firmware read), and emits it as C2H id
+        // `0x03` — but nothing in this driver ever asked for one.
+        //
+        // The request is a *descriptor* bit, not an H2C command and not a register write. Three
+        // independent sources agree on the two fields:
+        //   * mainline rtw88 `tx.h:37`  `RTW_TX_DESC_W2_SPE_RPT   = BIT(19)` of word 2 (desc+8),
+        //     set from `pkt_info->report` at `tx.c:57`;
+        //   * mainline rtw88 `tx.h:53`  `RTW_TX_DESC_W6_SW_DEFINE = GENMASK(11,0)` of word 6
+        //     (desc+24) — the tag the firmware echoes back, built at `tx.c:171` as
+        //     `(sn << 2) & 0xfc` ([7:2] sequence, [1:0] reserved for firmware);
+        //   * the 8812A-specific vendor header agrees exactly:
+        //     `SET_TX_DESC_SPE_RPT_8812(d) = d+8 bit 19`,
+        //     `SET_TX_DESC_SW_DEFINE_8812(d) = d+24 [11:0]`.
+        // And `C2H_CCX_TX_RPT = 0x03` is rtw88 `fw.h:52`, chip-independent, matching the id the
+        // blob's builder writes.
+        //
+        // ⚠ Off by default and UNMEASURED on this part: no capture we hold shows a report coming
+        // back, and `rtl8xxxu core.c:4168` notes bit 0 of `REG_TX_REPORT_CTRL` (0x04EC) is
+        // "required for both types" while setting it only on the 8188E — so this bit alone may or
+        // may not be sufficient here. Set `NDN_AU_TXRPT=1`, run with `NDN_C2H_DBG=1`, and look for
+        // `C2H8812AU id=0x03 len=8`. Both fields ride inside the descriptor checksum below, so
+        // they must be written before it is computed — they are.
+        // ⚠ SAMPLE, do not ask for every frame. The hardware CCX FIFO is 16 slots of 8 bytes at
+        // XDATA 0x8000 and the firmware's C2H ring is 10 slots — at flood rates both overflow, and
+        // the firmware's only signal for that is `0x01C1 |= 0x02` (code 0x7530), a sticky latch the
+        // host must read. `NDN_AU_TXRPT=N` requests a report on 1 frame in N (N=1 for every frame).
+        if let Some(n) = std::env::var("NDN_AU_TXRPT")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .filter(|&n| n > 0)
+        {
+            static TXRPT_SN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let seq = TXRPT_SN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if seq % n == 0 {
+                // rtw88 tx.c:171 tag layout: [7:2] sequence, [1:0] reserved for firmware.
+                Self::set_desc_bits(&mut d, 8, 19, 1, 1); // W2 SPE_RPT — report this frame
+                Self::set_desc_bits(&mut d, 24, 0, 12, ((seq / n) << 2) & 0xfc); // W6 SW_DEFINE
+            }
+        }
         let mut csum: u16 = 0;
         for i in 0..16 {
             csum ^= u16::from_le_bytes([d[i * 2], d[i * 2 + 1]]);
@@ -6058,16 +6477,97 @@ impl Rtl8812auBackend {
             if let (Some(info), true) = (guard.as_ref(), ch != 0) {
                 let offset = idx as i32 - TXAGC_MAX as i32; // 0 at full, negative = backoff
                 // (path-A reg, path-B reg, representative MGN_* rate) per group.
+                //
+                // ★ **All twelve Jaguar1 per-rate TXAGC groups.**
+                //
+                // Provenance, because an earlier attempt at this was reverted on a MISATTRIBUTION
+                // and the reasoning must not be repeated:
+                //
+                //  * **Decisive**: THIS DRIVER ALREADY WRITES ALL 24 OF THESE REGISTERS** on every
+                //    5 GHz channel program — `PROGS_5G` (`src/rtl8812au.rs:471-4004`) contains
+                //    0x0c20..0x0c4c and 0x0e20..0x0e4c, and this silicon has taken those writes
+                //    since the port was written, MEASURED at 490-1258 f/s.
+                //  * `fw/rtl8812au/rtl8812au_phy_reg.bin` boots all 24 at `0x12121212` — the flat
+                //    four-byte TXAGC packing (index 18 x4), not arbitrary BB values.
+                //  * `golden/rtw88-2g-ch6.txt` — the MAINLINE KERNEL driving THIS dongle — writes
+                //    `0c34 = 1c1c1c1c` and `0c38 = 1c1a1816`: a per-rate ladder descending across
+                //    rates, which is what TXAGC looks like and what BB config does not.
+                //  * `Hal8812PhyReg.h:178` names 0xc34 `rTxAGC_A_MCS11_MCS8_JAguar`.
+                //
+                // ☠ **Where the earlier error came from**, recorded so nobody repeats it: the SAME
+                // vendor header gives these addresses 11N names at lines 472-485
+                // (`rOFDM0_RxDetector2` 0xc34, `rOFDM0_ECCAThreshold` 0xc4c). Reading the 11N name
+                // and concluding "live baseband register on Jaguar1" is wrong — Jaguar re-uses the
+                // block for per-rate TXAGC. The throughput collapse blamed on this change was in
+                // fact the frame-format bug (a malformed UNICAST `addr1` driving the retry ladder,
+                // see `examples/rtl_contention_ab.rs`), which was present before and after it.
+                //
+                // Without these seven, HT MCS8-15 and every VHT rate keep the init `0x12` (index
+                // 18) while the calibrated base is ~27 — so on 2.4 GHz the rates cognition actually
+                // sends go out ~4.5 dB BELOW the rates the knob moves, and under a deep back-off
+                // the ordering inverts.
+                //
+                // (path-A reg, path-B reg, representative MGN_* rate) per group. Rate codes:
+                // `ODM_MGN_MCS0 = 0x80`, `ODM_MGN_VHT1SS_MCS0 = 0xa0` — the same classification
+                // `mcs_diff_sum` above uses, so base and register agree on what a rate means.
                 let groups = [
                     (0xc20u16, 0xe20u16, 0x02u8), // CCK 11-1
                     (0xc24, 0xe24, 0x0c),         // OFDM 18-6
                     (0xc28, 0xe28, 0x30),         // OFDM 54-24
-                    (0xc2c, 0xe2c, 0x80),         // MCS 3-0
-                    (0xc30, 0xe30, 0x84),         // MCS 7-4
+                    (0xc2c, 0xe2c, 0x80),         // HT MCS 0-3
+                    (0xc30, 0xe30, 0x84),         // HT MCS 4-7
+                    (0xc34, 0xe34, 0x88),         // HT MCS 8-11   (2SS)
+                    (0xc38, 0xe38, 0x8c),         // HT MCS 12-15  (2SS)
+                    (0xc3c, 0xe3c, 0xa0),         // VHT 1SS MCS 0-3
+                    (0xc40, 0xe40, 0xa4),         // VHT 1SS MCS 4-7
+                    (0xc44, 0xe44, 0xa8),         // VHT 1SS MCS 8-9 + VHT 2SS MCS 0-1
+                    (0xc48, 0xe48, 0xac),         // VHT 2SS MCS 2-5
+                    (0xc4c, 0xe4c, 0xb0),         // VHT 2SS MCS 6-9
                 ];
-                for (reg_a, reg_b, rate) in groups {
+                // ☠☠ **FIVE groups. MEASURED AGAINST A WITNESS RECEIVER — this is settled.**
+                //
+                //     12 groups: offered 711 f/s,  ON AIR   7 frames in 11 s =   1 f/s
+                //      5 groups: offered 2805 f/s, ON AIR 2704 frames in 11 s = 246 f/s
+                //
+                // Writing the seven HT2SS/VHT groups **stops this radio transmitting.** A 250x
+                // difference on air — which the offered rate could not see at all (711 vs 2805
+                // reads as a modest difference), and which two rounds of careful source-reading
+                // got wrong in both directions.
+                //
+                // ⚠ The addresses are NOT the issue, and the artefact evidence for them is real:
+                // `PROGS_5G` in this file writes all 24 of these registers, `phy_reg.bin` boots
+                // them at the flat TXAGC packing `0x12121212`, the mainline kernel writes per-rate
+                // ladders into them on this dongle, and `Hal8812PhyReg.h:178` names 0xc34
+                // `rTxAGC_A_MCS11_MCS8_JAguar`. What differs is the VALUE: `PROGS_5G` replays
+                // captured ladders, while `set_tx_power` writes `index_base(..) + offset` — and for
+                // the 2SS/VHT rate codes that computation evidently lands somewhere this silicon
+                // will not transmit from. Closing the gap needs the value investigated, not the
+                // address list re-argued.
+                //
+                // `NDN_AU_TXAGC12=1` re-enables all twelve for that investigation. Do not turn it
+                // on without a witness receiver in the loop: the transmitter cannot detect this.
+                let groups: &[(u16, u16, u8)] = if std::env::var_os("NDN_AU_TXAGC12").is_some() {
+                    &groups[..]
+                } else {
+                    &groups[..5]
+                };
+                for &(reg_a, reg_b, rate) in groups {
                     for (path, reg) in [(0usize, reg_a), (1usize, reg_b)] {
                         let base = info.index_base(path, rate, 0, 0, ch) as i32;
+                        // ☠ **No floor here, and that is MEASURED, not an oversight.**
+                        //
+                        // The RF-frontend plan recommended clamping the calibrated write to a
+                        // non-zero minimum, reasoning that a fused base of ~27 plus an 18 dB
+                        // back-off lands exactly on index 0. Tried on 2026-08-28 with a floor of
+                        // 4 and A/B'd on air: **33-50 f/s with the floor, 1258 f/s without it** —
+                        // a >25x collapse, on ch36/149/6 alike. Forcing a rate's index up to the
+                        // floor where `index_base` legitimately returns something lower (it
+                        // returns 0 for CCK on 5 GHz outright) is actively harmful on this part.
+                        //
+                        // If the index-0 landing turns out to matter, the fix belongs in the
+                        // POLICY — `RadioCapability::min_tx_power`, which exists for exactly this
+                        // and is honoured by `decide_power` — not in a blanket driver clamp that
+                        // cannot tell a legitimately-low base from an over-deep back-off.
                         let v = (base + offset).clamp(0, TXAGC_MAX as i32) as u8;
                         self.write32(reg, u32::from_le_bytes([v, v, v, v]))?;
                     }
@@ -6191,6 +6691,16 @@ impl Rtl8812auBackend {
     /// the medium idle, saving the bring-up value to restore on `ignore=false`. `ignore=true` also
     /// applies the EDCCA-ignore path; `false` restores both. RX detection is affected while off, which
     /// is fine for a TX-only blast node. This is the doctrine's "monitor mode without CSMA".
+    ///
+    /// ★ **This no longer touches the contention window.** It used to also write
+    /// `REG_EDCA_BE_PARAM = 0x005e_0002` — both window exponents zero, AIFS 2 µs (below SIFS) —
+    /// which meant a caller asking to ignore *carrier sense* silently also abolished its
+    /// *backoff*, on a path cognition arms automatically whenever the channel is busy. A zero
+    /// window is the configuration that MEASURED 119 → 21 Mbit/s on an MT7612U and then took that
+    /// radio out until it was physically replugged. The capability it was reaching for is now
+    /// [`ndn_radio_hal::RadioKnobs::set_contention`] with
+    /// [`ndn_radio_hal::ContentionPosture::Owned`], which is aggressive at a *legal* window; see
+    /// [`crate::realtek_contention`] for the full reasoning.
     pub fn set_cca_ignore(&self, ignore: bool) -> Result<(), FaceError> {
         use std::sync::atomic::Ordering;
         // `REG_EDCA_BE_PARAM` (0x0508): TXOP[31:16] | ECWmax[15:12] | ECWmin[11:8] | AIFS[7:0]. The
@@ -6198,32 +6708,18 @@ impl Rtl8812auBackend {
         // busy channel (measured: 330 f/s vs an a81a's ~13000, because the a81a wins EDCA contention).
         // Zeroing the contention window (ECWmin=ECWmax=0) + minimal AIFS makes it transmit with no
         // random backoff — the aggressive "blast" config (TXOP kept from the a81a's 0x005e).
-        const REG_EDCA_BE_PARAM: u16 = 0x0508;
-        const EDCA_BLAST: u32 = 0x005e_0002; // TXOP 0x5e, CWmax 0, CWmin 0, AIFS 2
         if ignore {
-            // Save the bring-up CCA nibble + EDCA-BE once, then force CCA off + zero-backoff EDCA.
+            // Save the bring-up CCA nibble once, then force CCA off.
             let cur = (self.bb_query(0x838, 0xf)? & 0xf) as u16;
             let _ =
                 self.cca_saved
                     .compare_exchange(0xffff, cur, Ordering::SeqCst, Ordering::SeqCst);
-            let edca = self.read32(REG_EDCA_BE_PARAM)?;
-            let _ = self.edca_saved.compare_exchange(
-                0xffff_ffff,
-                edca,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            );
             self.bb_set(0x838, 0xf, 0xc)?; // OFDM CCA off — the MAC now reads the medium idle
-            self.write32(REG_EDCA_BE_PARAM, EDCA_BLAST)?; // no EDCA backoff on the BE (data) queue
             self.disable_edcca() // energy-detect path too (thresholds max + ignore-EDCCA bit)
         } else {
             let saved = self.cca_saved.swap(0xffff, Ordering::SeqCst);
             if saved != 0xffff {
                 self.bb_set(0x838, 0xf, saved as u32)?;
-            }
-            let edca = self.edca_saved.swap(0xffff_ffff, Ordering::SeqCst);
-            if edca != 0xffff_ffff {
-                self.write32(REG_EDCA_BE_PARAM, edca)?;
             }
             self.set_edcca_honor(true)
         }
@@ -6249,8 +6745,41 @@ impl Rtl8812auBackend {
         Ok(PhySense {
             igi_a: (self.read32(REG_IGI_A)? & 0x7f) as u8,
             igi_b: (self.read32(REG_IGI_B)? & 0x7f) as u8,
-            rx_activity: (self.read32(REG_RXERR_RPT)? & 0xffff) as u16,
+            // ★ The counter is **20 bits** (`RXERR_COUNTER_MASK 0xFFFFF`), not 16. Masking 16 made
+            // it wrap invisibly at 65535 — and since the caller deltas two samples, a wrap reads as
+            // a large NEGATIVE activity swing, i.e. a quiet channel. Also select the type
+            // explicitly: nothing ever wrote the selector, so the shipped sensor has been reading
+            // whichever type reset happened to leave. Type 0 = `RXERR_TYPE_OFDM_PPDU`, which is
+            // what makes the MEASURED "tracks frame rate 1:1" behaviour true — now by construction
+            // rather than by luck.
+            rx_activity: (self.read_rxerr(rxerr_type::OFDM_PPDU)? & 0xffff) as u16,
         })
+    }
+
+    /// Read one of the 13 selectable `REG_RXERR_RPT` counters, full 20-bit width.
+    ///
+    /// Semantics from the chip-common vendor header (`hal_com_reg.h:439-476`):
+    /// `_RXERR_RPT_SEL(type) = type << 28`, `RXERR_RPT_RST = BIT(27)`,
+    /// `RXERR_COUNTER_MASK = 0xFFFFF`.
+    ///
+    /// Free-running after selection; sample twice and difference, or reset with
+    /// [`reset_rxerr`](Self::reset_rxerr).
+    pub fn read_rxerr(&self, ty: u8) -> Result<u32, FaceError> {
+        let sel = (u32::from(ty) & 0xf) << 28;
+        // Preserve the low bits; only the selector nibble is ours to move.
+        let cur = self.read32(REG_RXERR_RPT)?;
+        if (cur >> 28) != u32::from(ty) & 0xf {
+            self.write32(REG_RXERR_RPT, sel)?;
+        }
+        Ok(self.read32(REG_RXERR_RPT)? & 0x000f_ffff)
+    }
+
+    /// Zero the currently selected `REG_RXERR_RPT` counter (`RXERR_RPT_RST`, BIT 27).
+    pub fn reset_rxerr(&self, ty: u8) -> Result<(), FaceError> {
+        let sel = (u32::from(ty) & 0xf) << 28;
+        self.write32(REG_RXERR_RPT, sel | (1 << 27))?;
+        self.write32(REG_RXERR_RPT, sel)?;
+        Ok(())
     }
 
     /// Release (resume) RX DMA by clearing `RW_RELEASE_EN` (`REG_RXPKT_NUM[18]`).
@@ -6404,12 +6933,65 @@ impl Rtl8812auBackend {
             // separately so the 5 GHz HT-RX diagnosis can tell the two apart.
             if crc_err && !rpt_sel && std::env::var("NDN_RX_META_DBG").is_ok() {
                 let rate = (u32::from_le_bytes([d[12], d[13], d[14], d[15]]) & 0x7f) as u8;
-                let rssi = (drvinfo >= 1 && rate >= 0x04)
-                    .then(|| realtek_rx::rssi_dbm(d[RXDESC_SIZE + 1]));
+                let rssi = (drvinfo >= 1 && rate >= 0x04).then(|| {
+                    // Per-path Jaguar1 decode, max across chains — the vendor's own
+                    // `rx_pwdb_all` is the max of the paths. Byte 0 is path A, byte 1 path B;
+                    // this used to read byte 1 alone, with TRSW unmasked.
+                    let a = realtek_rx::jaguar1_path_rssi_dbm(d[RXDESC_SIZE]);
+                    let b = realtek_rx::jaguar1_path_rssi_dbm(d[RXDESC_SIZE + 1]);
+                    a.max(b)
+                });
                 let w3 = u32::from_le_bytes([d[12], d[13], d[14], d[15]]);
                 let w4 = u32::from_le_bytes([d[16], d[17], d[18], d[19]]);
                 eprintln!(
                     "RX8812AU_CRCERR len={pkt_len} rate=0x{rate:02x} rssi={rssi:?} w3={w3:08x} w4={w4:08x}"
+                );
+            }
+            // ★ **C2H: the firmware is talking and nothing was listening.**
+            //
+            // `rpt_sel` (dword2 bit 28) marks a buffer as a firmware Cmd-to-Host report rather
+            // than an 802.11 frame. Every consumer below gates on `!rpt_sel`, so these were
+            // parsed, recognised and silently dropped — and this driver has no H2C path either,
+            // which is why it has no TX feedback, no rate adaptation and no firmware-mediated
+            // anything, while the fleet's "best supported" radios are exactly the
+            // firmware-mediated ones.
+            //
+            // Triple-anchored: the firmware image builds this report's own 24-byte RX descriptor
+            // and sets byte 0x0B |= 0x10 (dword2 bit 28); the vendor macro is
+            // `GET_RX_DESC_C2H(rxdesc) = LE_BITS_TO_4BYTE(rxdesc + 0x08, 28, 1)`; and this driver
+            // already computes the same bit. The payload starts at exactly `RXDESC_SIZE` — the
+            // firmware writes `drvinfo_sz = 0` and `shift = 0`.
+            //
+            // Surfaced under an env gate rather than wired to a consumer, because what this
+            // firmware actually emits is UNMEASURED — one run with this on answers it.
+            if rpt_sel {
+                // ★ CCX transmit report. Layout MEASURED and cross-checked against the blob's
+                // builder at code 0x7A38 (`id = 0x03`, `plen = 8`, a 16x8 B ring at XDATA 0x8000):
+                //   [0] C2H id (0x03)   [1] seq   [2..10] the 8-byte CCX record
+                // and within the record:
+                //   [0] b7 RETRY_OVER, b6 LIFE_TIME_OVER  ⇒ both clear = delivered
+                //   [2] [5:0] retry count
+                //   [5] final data rate (DESC_RATE) — MEASURED 0x04 = legacy 6M, matching what
+                //       `TxIntent::ROBUST` actually transmits. That agreement is what makes the
+                //       rest of the record trustworthy.
+                let pl = &d[RXDESC_SIZE..(RXDESC_SIZE + pkt_len).min(n - off)];
+                if pl.len() >= 10 && pl[0] == 0x03 {
+                    let rec = &pl[2..10];
+                    self.tx_rpt_seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if rec[0] & 0xc0 == 0 {
+                        self.tx_rpt_ok.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    self.tx_rpt_retries
+                        .fetch_add(u32::from(rec[2] & 0x3f), std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+            if rpt_sel && std::env::var_os("NDN_C2H_DBG").is_some() {
+                let payload = &d[RXDESC_SIZE..(RXDESC_SIZE + pkt_len).min(n - off)];
+                let id = payload.first().copied().unwrap_or(0);
+                eprintln!(
+                    "C2H8812AU id=0x{id:02x} len={pkt_len} drvinfo={drvinfo} shift={shift} \
+                     payload={:02x?}",
+                    &payload[..payload.len().min(16)]
                 );
             }
             if !crc_err && !rpt_sel && pkt_len >= DOT11_HDR_LEN {
@@ -6419,8 +7001,14 @@ impl Rtl8812auBackend {
                 // -> RSSI; RXTSFL (dword5) -> free-run per-frame hardware stamp.
                 let rate = (u32::from_le_bytes([d[12], d[13], d[14], d[15]]) & 0x7f) as u8;
                 let mcs_index = realtek_rx::mcs_from_desc_rate(rate);
-                let rssi_dbm = (drvinfo >= 1 && rate >= 0x04)
-                    .then(|| realtek_rx::rssi_dbm(d[RXDESC_SIZE + 1]));
+                let rssi_dbm = (drvinfo >= 1 && rate >= 0x04).then(|| {
+                    // Per-path Jaguar1 decode, max across chains — the vendor's own
+                    // `rx_pwdb_all` is the max of the paths. Byte 0 is path A, byte 1 path B;
+                    // this used to read byte 1 alone, with TRSW unmasked.
+                    let a = realtek_rx::jaguar1_path_rssi_dbm(d[RXDESC_SIZE]);
+                    let b = realtek_rx::jaguar1_path_rssi_dbm(d[RXDESC_SIZE + 1]);
+                    a.max(b)
+                });
                 let rxtsfl = u32::from_le_bytes([d[20], d[21], d[22], d[23]]);
                 let stamp = Some(realtek_rx::rx_stamp(rxtsfl, self.tsf_domain));
                 // #75 mesh common-view leaf: a locally-administered BEACON (FC 0x80) carries a
@@ -6568,6 +7156,37 @@ impl crate::rx_pump::Pumpable for Rtl8812auBackend {
 /// USB I/O runs on the blocking pool so the async reactor is never stalled.
 #[async_trait]
 impl FrameIo for Rtl8812auBackend {
+    /// ⚠ **This backend serves common-view observations while its own
+    /// [`FaceTimeProfile::can_common_view`](ndn_radio_hal::FaceTimeProfile::can_common_view) is
+    /// `false`.** Both statements are true, they answer different questions, and the gap between
+    /// them is a real one — recorded here rather than papered over.
+    ///
+    /// * This method: "did I pair a neighbour's beacon TSF with my own RXTSFL?" The parse is real
+    ///   and the latch is real (RXTSFL, per frame, in hardware).
+    /// * The profile: "may anyone difference my counter against someone else's?" That needs the
+    ///   latch **and** a reference that holds a rate, and nothing in this tree establishes what this
+    ///   part's TSF runs on — see the ⚠ block on `impl RadioTime for Rtl8812auBackend` below.
+    ///
+    /// **Nothing gates the first on the second today.** The live consumer,
+    /// `ndn-phy-wifi`'s `medium.rs`, polls this and feeds it straight into
+    /// `FaceScheduler::ingest_common_view` / `ingest_mesh_beacon`; `FaceTimeProfile` is not
+    /// consulted anywhere in that crate. So on an 8812au face the scheduler's `cv_hw` clock is
+    /// disciplined from observations this radio's own profile says it cannot produce.
+    ///
+    /// The gate belongs at that consumer, not here — a backend reporting what it observed is
+    /// correct, and suppressing the observation would also destroy the only signal that could ever
+    /// characterise this counter. Two ways to close it, in preference order:
+    ///
+    /// 1. **Settle the reference.** One run of `examples/rxtick.rs` on this part (it prints the
+    ///    declared reference) plus a rate regression against the host clock, or a two-node pairing
+    ///    against a part whose reference IS established (the 8822E or the 8733BU). If it lands in
+    ///    tens of ppm this becomes `ClockReference::crystal()` with a citation and the contradiction
+    ///    evaporates.
+    /// 2. **Gate the consumer.** `medium.rs` checks
+    ///    `FaceTimeProfile::derive(radio_time, tx_discipline).can_common_view` for the same radio
+    ///    before ingesting. ⚠ Doing (2) before (1) silently switches the #75 mesh-CV leaf path off
+    ///    on this radio — which is the correct-but-costly outcome, and should be a deliberate choice
+    ///    rather than a side effect.
     fn mesh_common_view(&self) -> Option<ndn_radio_hal::MeshCv> {
         self.mesh_cv.lock().ok().and_then(|g| *g)
     }
@@ -6604,8 +7223,22 @@ impl FrameIo for Rtl8812auBackend {
         tokio::task::spawn_blocking(move || {
             handle
                 .write_bulk(ep, &buf, TX_TIMEOUT)
-                .map(|_| ())
                 .map_err(usb_err)
+                .and_then(|n| {
+                    // ★ A short write is a PARTIAL descriptor in the bulk-OUT stream — every later
+                    // frame in that pipe is then misaligned garbage, and the old `.map(|_| ())`
+                    // discarded the transferred count so it was invisible. The a81a backend already
+                    // asserts this; this one silently reported success. An `inject` that returns Ok
+                    // on a truncated transfer makes every throughput number downstream a fiction.
+                    if n == buf.len() {
+                        Ok(())
+                    } else {
+                        Err(init_err(format!(
+                            "rtl8812au inject: short bulk write {n}/{} bytes",
+                            buf.len()
+                        )))
+                    }
+                })
         })
         .await
         .map_err(|e| init_err(format!("inject join: {e}")))?
@@ -6647,8 +7280,30 @@ impl FrameIo for Rtl8812auBackend {
 /// Exposes the always-on free-run per-frame RX-stamp clock (RXTSFL) now latched onto every
 /// received management frame. No read-now port TSF here, so `read_clock` stays the default `None`.
 impl RadioTime for Rtl8812auBackend {
+    /// ⚠ Reference: **UNKNOWN**, and that is a statement about this PORT, not about the silicon.
+    ///
+    /// Its two siblings here both witness a crystal from their own bring-up — the RTL8822E reads the
+    /// factory crystal cap out of efuse `0x110` into `0x1040`, the RTL8733BU reads `EEPROM_XTAL_B9`
+    /// and has a MEASURED trim curve. This port does neither: `grep -i 'xtal\|crystal'` over
+    /// `rtl8812au.rs` finds nothing, it never touches a crystal-cap register, and nobody has
+    /// regressed its TSF against a host or a peer clock. So nothing in this tree witnesses what this
+    /// part's counter runs on.
+    ///
+    /// "It is an 802.11ac MAC, of course it has a crystal" is exactly the plausible inference this
+    /// contract refuses: plausible is not measured, and the same reasoning declared a 1 us tick on
+    /// the 8733b that MEASURED 4 us. The cost of the honest answer is that
+    /// `FaceTimeProfile::can_common_view` is now false for this part; the cure is one run of
+    /// `examples/rxtick.rs` (or a two-node pairing) and a one-line change here.
+    ///
+    /// ⚠ **This part therefore says two things about itself, and both are true.** It declares
+    /// `can_common_view = false` here while [`FrameIo::mesh_common_view`] keeps emitting real
+    /// observations — which are consumed, ungated, by `ndn-phy-wifi`'s `medium.rs`. The reason they
+    /// are not the same claim, and what would close the gap, is written out on that method.
     fn time_sources(&self) -> Vec<RadioTimeSource> {
-        vec![RadioTimeSource::free_run_rx_stamp(self.tsf_domain, 1_000)]
+        vec![
+            RadioTimeSource::free_run_rx_stamp(self.tsf_domain, 1_000)
+                .with_reference(ndn_radio_hal::ClockReference::unknown()),
+        ]
     }
 }
 
@@ -6658,6 +7313,18 @@ impl RadioProfile for Rtl8812auBackend {
         // channels (2.4 ch6 + 5 GHz ch44/149). Reports the hardware profile (NAN-only is policy).
         RadioCapability {
             bands: vec![Band::Band2_4GHz, Band::Band5GHz],
+            // ★ `max_bw: 0` (20 MHz), not the preset's 2 (80 MHz). `RadioKnobs::set_channel` on
+            // this backend returns `Err` for every width except `Bw20` — the per-channel RF tables
+            // for 40/80 are not ported — so declaring 80 was not optimism, it was a request the
+            // policy would make every tick and the driver would refuse every tick. Before
+            // `apply_knobs` degraded per knob, that refusal ABORTED the whole tick before reaching
+            // the power branch, so this radio's power knob was unreachable for a reason that had
+            // nothing to do with power. Declare what the driver can actually do.
+            rate: ndn_radio_hal::RateCapability::Wifi {
+                max_mcs: 9,
+                max_nss: 2,
+                max_bw: 0,
+            },
             ..RadioCapability::wifi_monitor_5ghz(vec![6, 44, 149])
         }
     }
@@ -6668,6 +7335,55 @@ mod tests {
     use super::*;
     use crate::McsDescriptor;
     use ndn_radio_hal::TxIntent;
+
+    /// ☠ **The shipped calibrated path writes FIVE groups, and that is a MEASURED result.**
+    ///
+    /// Covering the other seven (HT MCS8-15, all VHT) is a real gap — cognition sets `vht = true`
+    /// here, so a commanded back-off moves CCK and legacy OFDM and leaves the data rate alone. But
+    /// writing them with `index_base(..) + offset` **stops this radio transmitting**, measured
+    /// against a witness receiver:
+    ///
+    /// | groups | offered | on air (11 s) |
+    /// |---|---|---|
+    /// | 12 | 711 f/s | **7 frames = 1 f/s** |
+    /// | 5 | 2805 f/s | **2704 frames = 246 f/s** |
+    ///
+    /// ★ Note the offered rates: 711 vs 2805 looks like a difference of degree. On air it is 250x.
+    /// The transmitter cannot see this, which is why two rounds of artefact reasoning got it wrong
+    /// in both directions before anyone put a second radio on the channel.
+    #[test]
+    fn txagc_writes_five_groups_by_default() {
+        let src = include_str!("rtl8812au.rs");
+        assert!(
+            src.contains("&groups[..5]"),
+            "the default must be the five-group write — twelve MEASURED 1 f/s on air"
+        );
+        assert!(
+            src.contains(concat!("NDN_AU_", "TXAGC12")),
+            "the twelve-group path must stay reachable for investigation, behind a gate"
+        );
+    }
+
+    /// ☠ A blanket driver-side index floor is MEASURED HARMFUL on this part: a floor of 4 took
+    /// it from 1258 f/s to 33-50 f/s. `index_base` legitimately returns values below any floor you
+    /// would pick (0 for CCK on 5 GHz), and forcing those up is worse than the problem the floor
+    /// was for. Bottom-of-scale protection belongs in `RadioCapability::min_tx_power`, which the
+    /// policy honours and which can distinguish a low base from an over-deep back-off.
+    #[test]
+    fn the_calibrated_path_has_no_blanket_floor() {
+        let src = include_str!("rtl8812au.rs");
+        // The DECLARATION, not a mention — this test's own doc names the constant.
+        assert!(
+            // Split so the needle does not match this line itself.
+            !src.contains(concat!("const ", "TXAGC_CAL", "_FLOOR")),
+            "a blanket TXAGC floor was reintroduced — it MEASURED 1258 -> 33 f/s on this part"
+        );
+        // And the calibrated write must clamp from 0, not from a floor.
+        assert!(
+            src.contains("(base + offset).clamp(0, TXAGC_MAX as i32)"),
+            "the calibrated TXAGC write no longer clamps from 0"
+        );
+    }
 
     /// Read back the 7-bit `TX_RATE` field (DWORD4, bits\[6:0\]) of a built TX descriptor.
     fn desc_tx_rate(d: &[u8; TXDESC_SIZE]) -> u32 {

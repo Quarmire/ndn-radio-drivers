@@ -18,6 +18,12 @@ pub use ndn_frame_io::{
 // dependency on the other to name it.
 pub use ndn_radio_hal::{OpenRadio, RadioKnobs, RadioProfile, RadioTime};
 
+pub mod mt76;
+/// Shared MediaTek mt76x02 layer: the register map, USB transport and the MEASURED knob
+/// implementations common to the mt76x0 (MT7610U) and mt76x2 (MT7612U) parts. The two families
+/// ship one register header upstream, so a knob validated on either is validated for both.
+pub mod realtek_contention;
+
 /// Selecting one dongle among several identical ones (by index or USB bus:port) + a guard against
 /// claiming the device that currently carries a live kernel link. Shared by the Realtek backends.
 pub mod usb_select;
@@ -55,6 +61,21 @@ mod rtl8821c;
 pub use rtl8821c::{RTL8821CU_PIDS, Rtl8821cuBackend};
 mod mt7612;
 pub use mt7612::{MT7612U_PIDS, Mt7612uBackend};
+// MT7610U (mt76x0u, 1x1 dual-band 802.11ac) — the sibling port. Shares `mt76x02_regs.h` with the
+// MT7612U above, so the two share `crate::mt76`'s register map, transport and knob layer; what
+// differs is the firmware (no ROM patch), the RF programming model (host-programmable via
+// MT_RF_CSR_CFG, MEASURED working over USB) and the 1x1 chain configuration.
+mod mt76x0;
+pub use mt76x0::{MT7610U_PIDS, Mt7610uBackend};
+/// Shared MediaTek **connac2** layer (MT7921/MT792x): a different architecture from `mt76`, not a
+/// newer revision of one — extended vendor requests, a composite BT+WLAN device, patch+RAM
+/// firmware, and a variable-length RX descriptor whose group 2 carries a per-frame hardware
+/// timestamp.
+pub mod connac2;
+// MT7921AU (connac2, 2x2 802.11ax) — the only Wi-Fi part in this crate that can actuate the HAL's
+// HE levers, and the only MediaTek one that can source common view.
+mod mt7921;
+pub use mt7921::{MT7921U_PIDS, Mt7921uBackend};
 mod rtl8812au;
 pub use rtl8812au::{ChipInfo, IqkResult, PhySense, RTL8812AU_PIDS, Rtl8812auBackend};
 // RTL8731BU / RTL8733BU (halmac_87xx, 1x1 802.11n, dual-band, 20/40) — ground-up port, complete
@@ -74,26 +95,61 @@ pub use libusb_rtl8733b::{
 #[cfg(feature = "serial-radio")]
 mod serial_radio;
 #[cfg(feature = "serial-radio")]
-pub use serial_radio::{Esp32SerialBackend, SERIAL_RADIO_BAUD, SerialRadioBackend};
+pub use serial_radio::{
+    Bw16SerialBackend, ChannelProfile, Esp32SerialBackend, SERIAL_RADIO_BAUD, SerialRadioBackend,
+    bw16_clock_domain,
+};
 
-// Waveshare USB-TO-LoRa (SX1262) serial-bridged sub-GHz backend: a transparent-mode byte pipe with
 // The 7E-A5 serial sub-GHz fleet — Waveshare SX1262, Heltec SX1276, and the nRF54L15+LR2021 bridge —
-// behind ONE capability-driven backend implementing the same FrameIo/RadioKnobs/RadioTime/
-// RadioProfile contract as the USB drivers. The node describes itself over `CMD_GET_CAP`, so the
-// three are told apart by what they report rather than by which constructor was called
-// (see src/lora_serial.rs).
-#[cfg(feature = "lora")]
-mod lora_serial;
+// behind ONE capability-driven backend implementing the same FrameIo/RadioKnobs/RadioTime/RadioProfile
+// contract as the USB drivers. What each node can do is learned from its own EVT_CAP at open
+// (`NodeProfile`), never assumed from its family; see src/lora_serial.rs.
 //
 // v3 of that protocol adds the **modulation** axis: a node reports which PHYs it can run and which
-// one it is in, and `RadioKnobs::set_phy` switches it — so `LoraRadioKind` names the PART again
-// rather than the part-plus-mode it happened to boot in. The `PhyMode`/`PhyModeSet`/`HopCapability`
-// types live in `ndn-radio-hal`, because none of them is LoRa-specific.
+// it is in, and `RadioKnobs::set_phy` switches it — so `LoraRadioKind` names the PART again rather
+// than the part-plus-mode it was compiled with. The PhyMode/PhyModeSet/HopCapability/RxGain types
+// live in `ndn-radio-hal` (they are not LoRa-specific) and are reached through it.
+#[cfg(feature = "lora")]
+mod lora_serial;
 #[cfg(feature = "lora")]
 pub use lora_serial::{
     HOP_LIST_MAX, LORA_BAUD, LoraParams, LoraRadioKind, LoraSerialBackend, MAX_LORA_PAYLOAD,
     NdnStats, NodeProfile, PROTO_VER, RadioKindHint, StampKind, lora_clock_domain, name_hash,
 };
+
+// Newracom NRC7292 (802.11ah/S1G) read-now clock. The AF_PACKET monitor backend surfaces this
+// radio's per-frame radiotap TSFT but reports `read_clock() = None`, which is true of a packet
+// socket in general and false of this radio: its firmware keeps a microsecond counter in chip RAM
+// that the vendor CLI can sample on demand, MEASURED to be the same clock that stamps frames. That
+// pair (per-frame stamps + a readable clock) is what a common-view estimator needs; a two-node
+// common view over ordinary beacons measured sd = 5.8 µs with no firmware change (see nrc7292.rs).
+// Also this radio's cognition control surface (`Nrc7292Knobs`): channel (via `iw`, verified by
+// read-back), the genuine 1-30 dBm TX-power axis, airtime shaping through `set tx_time`, the dBm
+// CCA threshold, and the FCS-error / carrier-sense counters. Eleven RadioKnobs methods stay at the
+// trait default with a written reason each. ★ `cli_app` ALWAYS EXITS 0 and has NO interface
+// selector — both traps are handled in one place; read the type docs before adding a knob.
+// Morse Micro MM6108 (802.11ah/S1G) channel control. The generic `iw dev … set channel` CANNOT
+// tune this radio — it returns -16 EBUSY on a Morse monitor vif (measured) — so tuning must go
+// through the vendor nl80211 command that `morse_cli` wraps. S1G needs FOUR parameters, and the
+// primary-channel index is the one that silently decides whether anything is heard at all
+// (measured: index 1 heard a 4 MHz AP, indices 0/2/3 heard nothing). See src/morse.rs.
+pub mod morse;
+
+pub mod nrc7292;
+
+// The 802.11ah (HaLow / S1G) DATA plane for both sub-GHz radios — injection, capture, and the
+// per-frame metadata that comes back with a frame. Kept as one module because the two parts share
+// the body format, the radiotap TX header and (verified from both vendors' sources) a byte-identical
+// S1G radiotap TLV; what they do NOT share is the shape of the data plane itself, and getting that
+// wrong is silent on both. ☠ The MM6108's `morse0` accepts a `sendto()` and radiates nothing, so its
+// TX and RX must be different netdevs. Also the single home for what the two HaLow backends must
+// answer IDENTICALLY: the capability skeleton (`halow_base`) and the `Bandwidth` reading
+// (`s1g_width_request`).
+// ⚠ OPEN HAL GAP: `ndn_radio_hal::Bandwidth` enumerates 20/40/80/10/5 MHz and cannot express S1G's
+// 1/2/4/8 MHz at all, so `set_channel`'s width argument is unusable on this bearer and width has to
+// travel with the channel number. `s1g_width_request` is the agreed workaround, not a fix.
+// See src/halow.rs.
+pub mod halow;
 
 /// The canonical named-data-over-802.11 EtherType — the LLC/SNAP protocol id every backend uses so a
 /// payload injected on one radio de-frames identically on any other. (Matches `FrameFormat::default()`.)
@@ -188,6 +244,50 @@ pub fn open_named_radio(pid: u16, channel: u8) -> Result<OpenRadio, FaceError> {
         });
     }
     let sel = crate::DeviceSelect::from_env();
+    // MT7610U (mt76x0u, 1×1 dual-band 11ac). Unlike the MT7612U beside it, this port programs the
+    // RF itself — no captured channel replay — so `set_channel` reaches any channel the frequency
+    // plan covers, and the caller's `channel` is honoured rather than snapped to a captured one.
+    if MT7610U_PIDS.contains(&pid) {
+        let d = Arc::new(Mt7610uBackend::open_selected(sel.clone())?.with_format(fmt));
+        d.bring_up()?;
+        d.setup_monitor_rx()?;
+        // 2.4 GHz below 15, else 5 GHz; both are in this part's plan. A tune failure is fatal
+        // here on purpose: an untuned monitor receives nothing, and returning a working-looking
+        // handle that hears silence is the failure this repo keeps paying for.
+        ndn_radio_hal::RadioKnobs::set_channel(
+            d.as_ref(),
+            channel,
+            ndn_radio_hal::Bandwidth::Bw20,
+        )?;
+        apply_bw_override(d.as_ref(), channel);
+        start_pump(&d);
+        return Ok(OpenRadio {
+            io: d.clone(),
+            knobs: Some(d.clone()),
+            time: Some(d.clone()),
+            profile: Some(d),
+        });
+    }
+    // MT7921AU (connac2, 2x2 802.11ax). The only radio this opener returns that can source
+    // common view from a per-frame hardware RX stamp *and* actuate the HAL's HE levers.
+    if MT7921U_PIDS.contains(&pid) {
+        let d = Arc::new(Mt7921uBackend::open_selected(sel.clone())?.with_format(fmt));
+        d.bring_up()?;
+        d.setup_monitor_rx()?;
+        ndn_radio_hal::RadioKnobs::set_channel(
+            d.as_ref(),
+            channel,
+            ndn_radio_hal::Bandwidth::Bw20,
+        )?;
+        apply_bw_override(d.as_ref(), channel);
+        start_pump(&d);
+        return Ok(OpenRadio {
+            io: d.clone(),
+            knobs: Some(d.clone()),
+            time: Some(d.clone()),
+            profile: Some(d),
+        });
+    }
     let radio: Arc<dyn FrameIo> = if matches!(pid, 0xa81a | 0xa811 | 0x8814) {
         // RTL8822E: `open_monitor_pid_select` claims the selected device + BB/RF-inits + monitors +
         // channel in one call, and its default format is already the canonical RawNdn(0x8624).
@@ -357,10 +457,15 @@ pub fn open_ath9k(channel: u8) -> Result<OpenRadio, FaceError> {
             Err(e) => eprintln!("open_ath9k: board cal skipped: {e}"),
         }
         match dev.set_txpower_4k(chan_mhz) {
-            Ok(peak) => eprintln!(
-                "open_ath9k: power cal applied (peak target {} dBm)",
-                peak / 2
-            ),
+            Ok(peak) => {
+                eprintln!("open_ath9k: power cal applied (peak target {peak} dBm)");
+                // ★ Remember it. A later HT20<->HT40 change re-streams the gain tables and wipes
+                // this cal; `reapply_power_state` needs to know whether to put it back, or whether
+                // this dongle deliberately came up on the initval defaults. The peak itself is the
+                // only per-chip absolute anchor the EEPROM gives us and used to be printed and
+                // discarded.
+                dev.note_cal_applied(peak);
+            }
             Err(e) => eprintln!("open_ath9k: power cal skipped: {e}"),
         }
     }
@@ -453,7 +558,60 @@ mod radio_knobs {
     use ndn_radio_hal::{Bandwidth, RadioKnobs};
     use ndn_transport::FaceError;
 
+    // ── Contention knob plumbing for the Realtek backends ───────────────────────────────────────
+    //
+    // One trait impl per backend, all three identical because all three already expose the same
+    // inherent register accessors. The postures themselves live in [`crate::realtek_contention`].
+
+    macro_rules! rtl_edca_regs {
+        ($t:ty) => {
+            impl crate::realtek_contention::RtlEdcaRegs for $t {
+                fn rd32(&self, addr: u16) -> Result<u32, FaceError> {
+                    self.read32(addr)
+                }
+                fn wr32(&self, addr: u16, val: u32) -> Result<(), FaceError> {
+                    self.write32(addr, val)
+                }
+                fn rd8(&self, addr: u16) -> Result<u8, FaceError> {
+                    self.read8(addr)
+                }
+            }
+        };
+    }
+
+    rtl_edca_regs!(crate::Rtl8812auBackend);
+    rtl_edca_regs!(crate::LibUsbRtl88xxBackend);
+    rtl_edca_regs!(crate::Rtl8733buBackend);
+
     impl RadioKnobs for crate::LibUsbRtl88xxBackend {
+        /// ★ **The dBm clear-channel threshold** — the RX half of spatial reuse, and the only
+        /// genuinely dBm-denominated RX knob in the fleet.
+        ///
+        /// The encoding (`(dBm + 110) + 0x80` into `0x84c` bytes 2/3) has existed on this backend
+        /// all along and matches the vendor exactly; it was simply off-trait, reachable only from
+        /// an example, so cognition could never pair a power back-off with a matching change in
+        /// what this node defers to. Backing off power alone shrinks this node's reach without
+        /// buying any concurrency — the two must move together.
+        fn set_edcca_threshold_dbm(&self, l2h: i8, h2l: i8) -> Result<(), FaceError> {
+            crate::LibUsbRtl88xxBackend::set_edcca_threshold(self, l2h, h2l)
+        }
+
+        /// RX sensitivity as a posture, via IGI. See
+        /// [`LibUsbRtl88xxBackend::set_rx_gain_igi`](crate::LibUsbRtl88xxBackend::set_rx_gain_igi)
+        /// — in particular for why the autonomous DIG walk must stand down while this is in force.
+        fn set_rx_gain(&self, gain: ndn_radio_hal::RxGain) -> Result<(), FaceError> {
+            crate::LibUsbRtl88xxBackend::set_rx_gain_igi(self, gain).map(|_| ())
+        }
+
+        /// Contention posture. See [`crate::realtek_contention`] — in particular for why this is
+        /// a knob in its own right rather than something `set_edcca_ignore` did on the side.
+        fn set_contention(
+            &self,
+            posture: ndn_radio_hal::ContentionPosture,
+        ) -> Result<ndn_radio_hal::ContentionApplied, FaceError> {
+            crate::realtek_contention::set_contention(self, posture, &self.ndr_contention)
+        }
+
         fn set_channel(&self, channel: u8, bw: Bandwidth) -> Result<(), FaceError> {
             let cbw = match bw {
                 Bandwidth::Bw20 => crate::ChannelBw::Bw20,
@@ -479,24 +637,190 @@ mod radio_knobs {
     }
 
     impl RadioKnobs for crate::Mt7612uBackend {
+        /// Two channels, because two RF programs have been captured: 2.4 GHz ch6/20 MHz and
+        /// 5 GHz ch36/80 MHz. Anything else needs its own capture (docs/RADIO_SUBSYSTEM.md,
+        /// "Adding a channel") — or the programmatic tune, which upstream shows is entirely
+        /// reachable (`mt76x2/usb_phy.c:62` is register writes plus documented MCU commands,
+        /// and the payloads decode identically out of our own capture blobs).
+        ///
+        /// ★ The ch36 arm matters beyond one more channel: this backend **declares**
+        /// `max_bw = 2` and `max_nss = 2` to the planner, and until now `set_channel` could
+        /// not reach the VHT80 program at all — the 2x2/80 MHz path existed only as an
+        /// inherent method no uniform caller could name. A capability the knob cannot
+        /// actuate is the decided-but-unactuated defect, in the one place a planner believes.
+        ///
+        /// ⚠ Ordering: the 5 GHz blob is a **delta on ch6 state**, not a standalone program —
+        /// `start_high_throughput` calls `set_channel_ch6()` first for exactly this reason, so
+        /// this arm replicates it rather than relying on the caller to know.
         fn set_channel(&self, channel: u8, bw: Bandwidth) -> Result<(), FaceError> {
-            // Only channel 6 / 20 MHz has been captured + replayed so far. Other
-            // channels need the per-channel RF program captured the same way
-            // (see docs/RADIO_SUBSYSTEM.md "Adding a channel"). This is the
-            // "capability added incrementally" boundary made explicit.
-            if channel == 6 && bw == Bandwidth::Bw20 {
-                crate::Mt7612uBackend::set_channel_ch6(self)
-            } else {
-                Err(FaceError::Io(std::io::Error::other(format!(
-                    "mt7612u: only ch6/20MHz tuned so far (requested ch{channel}/{bw:?})"
-                ))))
+            // ★★ **This clamps rather than errors, and that is a bug fix, not laxity.**
+            //
+            // `RadioCapability` models channels and width as INDEPENDENT — a `Vec<u8>` of
+            // channels plus one `max_bw` scalar — but this backend's two captured op-streams are
+            // COUPLED pairs: ch6 exists only at 20 MHz and ch36 only at 80. Declaring
+            // `channels: [6, 36]` with `max_bw: 2` therefore advertises four combinations of
+            // which two do not exist, and cognition reaches a non-existent one immediately:
+            // `pick_channel` takes `min_by_key` over the channel list, which returns the FIRST
+            // minimum on a tie, so an unsensed radio picks **ch6**; `tx_params` then sets
+            // `bw = cap.max_bw()` = **2**; and the first `apply_knobs` tick calls
+            // `set_channel(6, Bw80)`.
+            //
+            // Returning `Err` there did far more damage than it looks: `apply_knobs` propagates
+            // with `?`, so one impossible width also skipped `set_tx_csd`, `set_edcca_ignore`
+            // and the TX-power call for that tick — a single bad combination silently disarmed
+            // the whole control surface. The contention path failed symmetrically, since
+            // narrowing under load does `bw.saturating_sub(1)` and asks ch36 for 40 MHz.
+            //
+            // So: tune the width this channel actually has, and say so. A radio that is 20 MHz
+            // when 80 was requested is a radio; one that refuses to tune is not.
+            let want = bw;
+            let (r, actual) = match channel {
+                6 => (
+                    crate::Mt7612uBackend::set_channel_ch6(self),
+                    Bandwidth::Bw20,
+                ),
+                36 => (
+                    crate::Mt7612uBackend::set_channel_ch6(self)
+                        .and_then(|()| crate::Mt7612uBackend::set_channel_5g80(self)),
+                    Bandwidth::Bw80,
+                ),
+                _ => {
+                    return Err(FaceError::Io(std::io::Error::other(format!(
+                        "mt7612u: only ch6 (20 MHz) and ch36 (80 MHz) have a captured RF program \
+                         (requested ch{channel}/{bw:?}); adding one means capturing it — see \
+                         docs/RADIO_SUBSYSTEM.md"
+                    ))));
+                }
+            };
+            r?;
+            if want != actual {
+                tracing::info!(
+                    requested = ?want,
+                    applied = ?actual,
+                    channel,
+                    "mt7612u: this channel has exactly one captured width; clamping"
+                );
             }
+            Ok(())
         }
-        // set_tx_power / set_tx_csd / set_edcca_ignore: default no-ops until the
-        // mt76x2 power-table / TXOP-CTRL / ED-CCA registers are ported.
+
+        /// Channel occupancy as **decode-busy per-mille**, from `MT_CH_BUSY`/`MT_CH_IDLE`.
+        ///
+        /// ★ A genuinely better sense than the frame-count proxy the 8812au uses
+        /// (`REG_RXERR_RPT`): these are the MAC's own busy/idle **microsecond** accumulators,
+        /// so the answer is the fraction of airtime the medium was unavailable — which is the
+        /// quantity a scheduler competes for — rather than a frame rate standing in for it.
+        /// MEASURED read-and-clear on both mt76 families: `(busy + idle) / elapsed = 1.00`
+        /// over 100 ms windows.
+        ///
+        /// ⚠ **Unit substitution, stated rather than hidden.** `ChannelOccupancy::from_activity`
+        /// expects frames-per-second; this returns per-mille busy time. Feeding microseconds
+        /// into a frames-per-second consumer would be nonsense, so the conversion is done here
+        /// and the unit is documented at both ends. ⚠ Read-and-clear also means **two readers
+        /// split the count** — do not run this alongside a bound kernel driver and believe it.
+        fn read_channel_activity(&self) -> Result<Option<u16>, FaceError> {
+            let (ct, _window_us) = crate::Mt7612uBackend::sample_channel_time(self)?;
+            Ok(Some(crate::mt76::knobs::busy_permille(&ct)))
+        }
+
+        /// `(ok, err)` PPDU counters, from `MT_RX_STAT_0`/`_1`.
+        ///
+        /// ⚠ **`ok` is structurally 0 and that is the honest answer, not a stub.** The mt76x02
+        /// MIB block counts only failures — CRC, PHY, false-CCA and PLCP errors — and exposes
+        /// no successful-PPDU counter (`MT_CH_TIME_CFG`'s `MDRDY_CNT_EN` hints at one, but
+        /// nothing in the mt76 tree enables it and no register is named as its readout). The
+        /// caller already knows how many frames it decoded; what it cannot see from the RX side
+        /// is the energy that failed, and that is exactly what `err` reports. Reporting a
+        /// fabricated `ok` would make the pair look complete and the ratio meaningless.
+        ///
+        /// `err` sums CRC and PLCP errors: both are "a real PPDU began and did not survive",
+        /// which is the collision / marginal-link signature. False-CCA is deliberately excluded
+        /// — it is interference with no PPDU behind it, a different question, and it is
+        /// available separately through `read_rx_stat`.
+        fn read_ofdm_counters(&self) -> Result<Option<(u16, u16)>, FaceError> {
+            let st = crate::mt76::knobs::read_rx_stat(self)?;
+            Ok(Some((0, st.crc_err.saturating_add(st.plcp_err))))
+        }
+
+        /// Energy-detect CCA on/off (`MT_TXOP_CTRL_CFG` bit 20 + `MT_EXT_CCA_CFG` ED mask).
+        ///
+        /// ★ MEASURED as-found on this part: `MT_TXOP_CTRL_CFG = 0x04001b3f` — bit 20
+        /// (`MT_TXOP_ED_CCA_EN`) is **already clear**, because our replayed init writes
+        /// `0x04001b3f` where upstream writes `0x04101b3f` after every channel set. So
+        /// ED-CCA has been off on this radio the whole time, `set_edcca_ignore(true)` is
+        /// close to a no-op, and the knob's real work is the *other* direction. Any past
+        /// hypothesis that energy-detect CCA was deferring our transmissions is refuted by
+        /// our own init table.
+        ///
+        /// The on-air effect is UNVALIDATED. The prior from the 8812au is that arming ED-CCA
+        /// on a saturated channel trades collision loss for TX starvation (237 → 26 delivered
+        /// frames/s), so treat this as something to A/B, not as a fix.
+        fn set_edcca_ignore(&self, on: bool) -> Result<(), FaceError> {
+            let change = crate::mt76::knobs::set_edcca_ignore_with(
+                self,
+                on,
+                crate::Mt7612uBackend::edcca_slot(self),
+            )?;
+            if change.changed {
+                tracing::info!(
+                    txop = format!(
+                        "{:#010x}->{:#010x}",
+                        change.txop_ctrl_before, change.txop_ctrl_after
+                    ),
+                    ext_cca = format!(
+                        "{:#010x}->{:#010x}",
+                        change.ext_cca_before, change.ext_cca_after
+                    ),
+                    ed_cca_armed = change.ed_cca_armed(),
+                    "mt7612u ED-CCA knob applied"
+                );
+            }
+            Ok(())
+        }
+
+        /// Contention window as a posture — the actuator for the slot decision.
+        ///
+        /// Shared mt76x02 implementation ([`crate::mt76::knobs::set_contention`]).
+        ///
+        /// ☠ **On this part the posture is carried by the SLOT TIME, and the EDCA window is left
+        /// exactly as booted.** [`crate::mt76::knobs::window_floor`] pins it there. Writing a
+        /// *zero* window into these registers killed this radio once; writing a perfectly legal
+        /// `cw_min` exponent of **2** — the value that is measured good on the MT7610U, the
+        /// MT7921AU and all three Realtek parts — killed it twice more, collapsing TX to 19 f/s
+        /// and then stopping it entirely, past the reach of `restore_edca_defaults`, our cold
+        /// bring-up and the kernel driver's own probe alike. Each cost a physical replug.
+        ///
+        /// Nothing is given up by that: slot 20 → 9 MEASURED **131.9 → 190.6 Mbit/s (+45 %)** at
+        /// VHT80, which is the entire win the window was reaching for and then some.
+        fn set_contention(
+            &self,
+            posture: ndn_radio_hal::ContentionPosture,
+        ) -> Result<ndn_radio_hal::ContentionApplied, FaceError> {
+            crate::mt76::knobs::set_contention(
+                self,
+                posture,
+                crate::mt76::Family::Mt76x2,
+                crate::Mt7612uBackend::edca_slot(self),
+            )
+        }
+
+        // set_tx_power / set_tx_power_dbm: still the trait defaults. The registers are known
+        // (MT_TX_PWR_CFG_0..9 at 0x1314.., MT_TX_ALC_CFG_0..4) but the per-rate packing needs
+        // the EEPROM target-power/delta parse to mean anything in dBm, and an index knob whose
+        // dB effect nobody has measured is worse than no knob — it invites a planner to spend
+        // link budget it does not have. Left absent deliberately, not overlooked.
     }
 
     impl RadioKnobs for crate::Rtl8812auBackend {
+        /// Contention posture. See [`crate::realtek_contention`] — in particular for why this is
+        /// a knob in its own right rather than something `set_edcca_ignore` did on the side.
+        fn set_contention(
+            &self,
+            posture: ndn_radio_hal::ContentionPosture,
+        ) -> Result<ndn_radio_hal::ContentionApplied, FaceError> {
+            crate::realtek_contention::set_contention(self, posture, &self.ndr_contention)
+        }
+
         fn set_channel(&self, channel: u8, bw: Bandwidth) -> Result<(), FaceError> {
             // Monitor bring-up tunes 20 MHz; other bandwidths need their per-channel
             // RF/BB program captured (docs/RADIO_SUBSYSTEM.md "Adding a channel").
@@ -514,11 +838,47 @@ mod radio_knobs {
             // cognition policy's reciprocity `decide_power` backoff.
             crate::Rtl8812auBackend::set_tx_power(self, idx.min(63) as u8)
         }
+        /// ★ **Hold or release transmissions at the MAC** — the hardware half of a slot MAC.
+        ///
+        /// This was previously the HAL default, which returns **`Ok(())`**. So
+        /// `FaceScheduler`'s `TxHoldGuard` was told its airtime lease was enforced while nothing
+        /// was ever written: frames already queued in the MAC went out inside somebody else's
+        /// slot, charged to a name that did not cause them. That default's own doc says it — "the
+        /// default must never be 'pretend it worked'".
+        ///
+        /// See [`Rtl8812auBackend::set_tx_pause`] for the MEASURED hold-not-drop semantics a
+        /// caller must design around.
+        fn set_tx_hold(&self, hold: bool) -> Result<(), FaceError> {
+            let mask = if hold {
+                crate::Rtl8812auBackend::TXPAUSE_DATA_QUEUES
+            } else {
+                0x00
+            };
+            crate::Rtl8812auBackend::set_tx_pause(self, mask)
+        }
+
         fn set_edcca_ignore(&self, on: bool) -> Result<(), FaceError> {
             // ignore == TX does not defer to carrier sense at all — both the energy-detect EDCCA and
             // the OFDM packet CCA (the latter is what still deferred an 8812au on a busy channel).
             crate::Rtl8812auBackend::set_cca_ignore(self, on)
         }
+        /// RX sensitivity as a posture, via the Jaguar1 initial-gain index.
+        ///
+        /// ★ Unlike every other `set_rx_gain` in this crate, this part's axis is **absolute dBm**:
+        /// `floor_dBm = IGI - 110`. See [`Rtl8812auBackend::set_rx_floor_dbm`], which cognition
+        /// should prefer — this posture form exists so the generic seam works.
+        fn set_rx_gain(&self, gain: ndn_radio_hal::RxGain) -> Result<(), FaceError> {
+            use ndn_radio_hal::RxGain;
+            // -78 dBm is the value most captured programs settle on (IGI 0x20 = the vendor's
+            // dm_dig_min); Reduced raises the floor for spatial reuse, Boosted lowers it.
+            let dbm = match gain {
+                RxGain::Auto => -78,
+                RxGain::Reduced => -66,
+                RxGain::Boosted => -78, // already at dm_dig_min; going lower is not available
+            };
+            crate::Rtl8812auBackend::set_rx_floor_dbm(self, dbm).map(|_| ())
+        }
+
         fn read_channel_activity(&self) -> Result<Option<u16>, FaceError> {
             // REG_RXERR_RPT occupancy counter — frame-free channel-activity sensing.
             crate::Rtl8812auBackend::read_phy_sense(self).map(|s| Some(s.rx_activity))

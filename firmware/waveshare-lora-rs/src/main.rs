@@ -335,6 +335,35 @@ const EVT_PHY_ERR: u8 = 0x8D; //     payload = [requested_phy u8, chip_status u8
 //                                   ADVERTISES that the chip refused at runtime, with the SX126x's
 //                                   literal GetStatus byte (see `sx1262::cmd_status_ok`)
 const EVT_UNSUPPORTED: u8 = 0x8F; // payload = [cmd, reason] — never silence, never a fake success
+/// **`CMD_GET_CLOCK_REF` (0x21) → [`EVT_CLOCK_REF`] (0x91) — what is the counter DERIVED FROM?**
+///
+/// `EVT_CAP.stamp_kind` says where a timestamp is LATCHED; it says nothing about the oscillator the
+/// counter is counting. Those are independent, and this node is the proof: it latched in hardware
+/// while running on an internal RC measured at ~-3100 ppm against its peer, and its common-view
+/// residual was ~16 us until the reference moved to the crystal, after which it was ~1.1 us with the
+/// same latch point. A host that reads only the latch point cannot tell those two builds apart.
+///
+/// `EVT_CAP` is a frozen 34-byte record shared by four firmwares and is full, so this is an ADDITIVE
+/// pair rather than a wire break. Like `CMD_GET_HOPTRACE` (0x20) it is past the u32 `CMD_BITMAP` and
+/// is discovered by asking: a node that does not implement it answers `EVT_UNSUPPORTED`, which a host
+/// must read as **unknown**, not as "fine".
+const CMD_GET_CLOCK_REF: u8 = 0x21; // payload = []  → EVT_CLOCK_REF
+/// `[ref_class u8][accuracy_ppm u16 BE]`. `ref_class`: 0 = unknown, 1 = internal RC, 2 = crystal/TCXO.
+/// `accuracy_ppm` is `0xFFFF` when **not measured** — this node reports the CLASS it can prove from
+/// `HSERDY` and refuses to invent an accuracy figure it has never measured against a standard. The
+/// -1.6 ppm seen between two of these boards is a RELATIVE trim between two crystals, not an accuracy
+/// spec, and publishing it here would be exactly the kind of unmeasured number this codebase keeps
+/// having to retract.
+const EVT_CLOCK_REF: u8 = 0x91;
+/// [`EVT_CLOCK_REF`] `ref_class` values.
+const CLOCK_REF_UNKNOWN: u8 = 0;
+/// See [`CLOCK_REF_UNKNOWN`].
+const CLOCK_REF_RC: u8 = 1;
+/// See [`CLOCK_REF_UNKNOWN`].
+const CLOCK_REF_XTAL: u8 = 2;
+/// `accuracy_ppm` sentinel: this node has not measured its own accuracy.
+const CLOCK_ACCURACY_UNKNOWN: u16 = 0xFFFF;
+
 const EVT_RX_STAMP: u8 = 0x90; //    payload = [frame_stamp_kind u8, reason u8] — emitted
 //                                   IMMEDIATELY BEFORE the EVT_RX it qualifies, and ONLY when that
 //                                   frame's `ts` is NOT the hardware capture EVT_CAP advertises.
@@ -843,6 +872,12 @@ const RX_MAX: usize = 247;
 /// Runtime diagnostics toggle (CMD_SET_DEBUG) — emit EVT_LOG traces of data-plane decisions on demand,
 /// no reflash. Off by default (quiet link).
 static DEBUG: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// What the core clock is running from, established by `probe_hse` at boot and reported by
+/// [`CMD_GET_CLOCK_REF`]. Starts at [`CLOCK_REF_UNKNOWN`] so a read before `main` sets it cannot
+/// claim anything.
+static CLOCK_REF: core::sync::atomic::AtomicU8 =
+    core::sync::atomic::AtomicU8::new(CLOCK_REF_UNKNOWN);
 fn debug_on() -> bool {
     DEBUG.load(Ordering::Relaxed)
 }
@@ -1617,6 +1652,14 @@ fn main() -> ! {
     //
     // MEASURED 2026-08-31 on the o5p-0 dongle: `hse=1` — the crystal is fitted and starts.
     let hse_present = probe_hse();
+    CLOCK_REF.store(
+        if hse_present {
+            CLOCK_REF_XTAL
+        } else {
+            CLOCK_REF_RC
+        },
+        Ordering::Relaxed,
+    );
 
     let rcc = dp.RCC.constrain();
     // **`sysclk` is pinned at 8 MHz on BOTH paths, deliberately.** Every timing constant in this
@@ -2740,6 +2783,16 @@ fn handle_cmd<SPI, NSS, RST, BSY, DIO1, RFSW, E, TX>(
         // is its low 32 bits and wraps every ~71 min). Units are EVT_CAP.stamp_hz = 1 MHz.
         CMD_READ_CLOCK => {
             send_frame(&mut put, EVT_CLOCK, &micros64().to_be_bytes());
+        }
+        // The companion to CMD_READ_CLOCK: that returns the counter, this says what the counter is
+        // derived from. See [`CMD_GET_CLOCK_REF`] for why the two are not the same question.
+        CMD_GET_CLOCK_REF => {
+            let ppm = CLOCK_ACCURACY_UNKNOWN.to_be_bytes();
+            send_frame(
+                &mut put,
+                EVT_CLOCK_REF,
+                &[CLOCK_REF.load(Ordering::Relaxed), ppm[0], ppm[1]],
+            );
         }
         // 7E-A5 v2 §P4: **scheduled TX**. `payload = [delay_us u32 BE][frame]`; the frame airs
         // `delay_us` after this command is decoded, on the `micros64()` timebase — the same counter

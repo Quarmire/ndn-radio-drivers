@@ -437,6 +437,13 @@ pub const EVT_UNSUPPORTED: u8 = 0x8F;
 /// that structurally cannot hop. The constant lives here now so the registry covers the whole space.
 pub const EVT_RX_STAMP: u8 = 0x90;
 
+/// Reserved fleet-wide: `EVT_CLOCK_REF`, the reply to `CMD_GET_CLOCK_REF` (0x21) — what the node's
+/// counter is DERIVED FROM, as distinct from where `EVT_CAP.stamp_kind` says it is latched. Not
+/// emitted by this node (it has never been asked what its HFXO is), and listed here so the number is
+/// SPOKEN FOR: the registry below is the only thing standing between a new event and a silent
+/// mis-decode on a host that shares this table across four firmwares.
+pub const EVT_CLOCK_REF: u8 = 0x91;
+
 // `EVT_UNSUPPORTED` reason codes. **Fleet-wide space** — these are the same four values the
 // Waveshare and Heltec nodes use (`UNSUP_*` in their `main.rs`). They were 1/2/3 =
 // not-implemented/param/hardware here, which put `NO_HARDWARE` and `BAD_LENGTH` in each other's
@@ -1319,11 +1326,12 @@ mod tests {
                 EVT_PHY_ERR,
                 EVT_HOPTRACE,
                 EVT_UNSUPPORTED,
-                EVT_RX_STAMP
+                EVT_RX_STAMP,
+                EVT_CLOCK_REF
             ],
             [
                 0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88, 0x89, 0x8A, 0x8B, 0x8C, 0x8D, 0x8E,
-                0x8F, 0x90
+                0x8F, 0x90, 0x91
             ]
         );
         // ★ The registry only fails a collision if it covers events this firmware does not emit.

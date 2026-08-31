@@ -437,12 +437,28 @@ pub const EVT_UNSUPPORTED: u8 = 0x8F;
 /// that structurally cannot hop. The constant lives here now so the registry covers the whole space.
 pub const EVT_RX_STAMP: u8 = 0x90;
 
-/// Reserved fleet-wide: `EVT_CLOCK_REF`, the reply to `CMD_GET_CLOCK_REF` (0x21) — what the node's
-/// counter is DERIVED FROM, as distinct from where `EVT_CAP.stamp_kind` says it is latched. Not
-/// emitted by this node (it has never been asked what its HFXO is), and listed here so the number is
-/// SPOKEN FOR: the registry below is the only thing standing between a new event and a silent
-/// mis-decode on a host that shares this table across four firmwares.
+/// **`CMD_GET_CLOCK_REF` (0x21) → [`EVT_CLOCK_REF`] — what is the counter DERIVED FROM?**
+///
+/// `EVT_CAP.stamp_kind` says where a stamp is LATCHED and nothing about the oscillator underneath
+/// it, and the two are independent: the Waveshare node scored ~16 us of common-view residual and
+/// ~1.1 us with the SAME latch point, on an RC and then on a crystal. This node has the answer in
+/// `hw::init_peripherals`, which pins `HfclkSource::ExternalXtal` precisely because the RC default
+/// MEASURED ~+2000 ppm — so it should say so rather than leave a host to infer it.
+pub const CMD_GET_CLOCK_REF: u8 = 0x21;
+/// Reply to [`CMD_GET_CLOCK_REF`]: `[ref_class u8][accuracy_ppm u16 BE]`. Listed in the registry
+/// below so the number is SPOKEN FOR — that test is the only thing standing between a new event and
+/// a silent mis-decode on a host sharing one table across four firmwares.
 pub const EVT_CLOCK_REF: u8 = 0x91;
+/// [`EVT_CLOCK_REF`] `ref_class`: the node cannot say.
+pub const CLOCK_REF_UNKNOWN: u8 = 0;
+/// [`EVT_CLOCK_REF`] `ref_class`: an internal RC oscillator.
+pub const CLOCK_REF_RC: u8 = 1;
+/// [`EVT_CLOCK_REF`] `ref_class`: a crystal or TCXO.
+pub const CLOCK_REF_XTAL: u8 = 2;
+/// [`EVT_CLOCK_REF`] `accuracy_ppm` sentinel: **not measured**. This node's +16.7 ppm figure is an
+/// inter-node comparison from one session, not an accuracy against a standard, and the fleet's rule
+/// is that a number goes on the wire only when the node can stand behind it.
+pub const CLOCK_ACCURACY_UNKNOWN: u16 = 0xFFFF;
 
 // `EVT_UNSUPPORTED` reason codes. **Fleet-wide space** — these are the same four values the
 // Waveshare and Heltec nodes use (`UNSUP_*` in their `main.rs`). They were 1/2/3 =

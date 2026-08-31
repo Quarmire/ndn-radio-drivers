@@ -1394,6 +1394,21 @@ async fn main(_spawner: Spawner) {
                     serial::CMD_GET_CAP => {
                         send(&mut uart, &mut out, serial::EVT_CAP, &cap_bytes).await;
                     }
+                    // The companion to CMD_READ_CLOCK: that returns the counter, this says what the
+                    // counter is COUNTING. `hw::init_peripherals` pins `HfclkSource::ExternalXtal`
+                    // for every binary in this crate, so the answer is a constant here — but it is a
+                    // constant this node can prove, whereas a host inferring it from `EVT_CAP` is
+                    // reasoning about which firmware happens to be flashed.
+                    serial::CMD_GET_CLOCK_REF => {
+                        let ppm = serial::CLOCK_ACCURACY_UNKNOWN.to_be_bytes();
+                        send(
+                            &mut uart,
+                            &mut out,
+                            serial::EVT_CLOCK_REF,
+                            &[serial::CLOCK_REF_XTAL, ppm[0], ppm[1]],
+                        )
+                        .await;
+                    }
                     serial::CMD_TX_AT if pl.len() >= 4 => {
                         // ★ **Scheduled TX, CPU-mediated — and the pin conflict that shapes it.**
                         //

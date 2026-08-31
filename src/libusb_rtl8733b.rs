@@ -433,6 +433,10 @@ impl FwHeader {
 /// register I/O. Grows into a full [`FrameIo`](ndn_frame_io::FrameIo) backend as
 /// the bring-up milestones land.
 pub struct Rtl8733buBackend {
+    /// As-found four-AC EDCA state, so a contention posture change can be undone.
+    /// See [`crate::realtek_contention`] for why this is a knob and not a side effect.
+    pub(crate) ndr_contention: crate::realtek_contention::RtlEdcaSaved,
+
     handle: Arc<DeviceHandle<Context>>,
     bulk_out: u8,
     /// All bulk-OUT endpoints, in descriptor order — Realtek USB chips expose one
@@ -560,6 +564,7 @@ impl Rtl8733buBackend {
             }
         }
         Ok(Self {
+            ndr_contention: crate::realtek_contention::RtlEdcaSaved::new(),
             handle,
             bulk_out: *bulk_outs
                 .first()
@@ -4286,6 +4291,14 @@ impl FrameIo for Rtl8733buBackend {
 // lives in `tx_rate`/`tx_flags`, which `inject` already uses.
 
 impl RadioKnobs for Rtl8733buBackend {
+    /// Contention posture. See [`crate::realtek_contention`].
+    fn set_contention(
+        &self,
+        posture: ndn_radio_hal::ContentionPosture,
+    ) -> Result<ndn_radio_hal::ContentionApplied, FaceError> {
+        crate::realtek_contention::set_contention(self, posture, &self.ndr_contention)
+    }
+
     fn set_channel(&self, channel: u8, bw: Bandwidth) -> Result<(), FaceError> {
         self.tune_channel(channel)?;
         self.set_bandwidth(bw)
@@ -4480,7 +4493,28 @@ impl RadioTime for Rtl8733buBackend {
             // "26 ms windows at 50% duty" cannot coexist with 13.9% throughput, and under the
             // correct scale (~104 ms of silence per cycle) the two agree. Ratios are unaffected,
             // so the common-view ppm results (762c346) stand: a common scale cancels there.
-            RadioTimeSource::free_run_rx_stamp(self.tsf_domain, 4_000),
+            //
+            // Reference: **crystal**, and this is the best-witnessed one in the fleet. The power-on
+            // cap is the FACTORY value from efuse (`EEPROM_XTAL_B9_8733B`, logical byte 0xB9) — an
+            // efuse field that exists to trim a quartz load capacitance, calibrated per unit. And
+            // the rate is MEASURED against a peer by two-node common view (762c346, ~20k common
+            // frames per point): at the factory-adjacent cap 70 this chip sits at **-0.338 ppm**
+            // against the other f72b, with 0.4 us of residual.
+            //
+            // ⚠ That offset WANDERS: re-measured across three sessions it read -0.338 / -1.095 /
+            // -0.838 ppm (`freq_discipline.rs`), so the figure below is one run's number and about
+            // a ppm is the honest spread. It is still crystal territory by three orders of
+            // magnitude, which is what `holds_rate` turns on, and it is why this part carries a
+            // real `clock_steering` — a wandering *sub-ppm* offset is worth re-applying a trim for.
+            RadioTimeSource::free_run_rx_stamp(self.tsf_domain, 4_000).with_reference(
+                ndn_radio_hal::ClockReference::crystal().measured(
+                    ndn_radio_hal::RateMeasurement::new(
+                        -0.338,
+                        0.0, // the sweep records ~20k frames per point, not a span in seconds
+                        ndn_radio_hal::RateWitness::PeerUnit,
+                    ),
+                ),
+            ),
             // The port-0 beacon TSF: readable via read_clock, but only advances under
             // set_tsf_run and is beacon-resynced (not monotonic) — its own domain.
             //
@@ -4493,6 +4527,10 @@ impl RadioTime for Rtl8733buBackend {
             // (it declares its own 1_000 explicitly and is a different physical counter).
             RadioTimeSource {
                 tick_ns: 4_000,
+                // Same silicon, same crystal — a DIFFERENT counter (the two MEASURED different 4 us
+                // scale errors and had to be corrected independently), but one reference feeds
+                // both. No separate measurement: the ppm figure above is the RX-stamp clock's.
+                reference: ndn_radio_hal::ClockReference::crystal(),
                 ..RadioTimeSource::port_tsf(self.port_tsf_domain())
             },
         ]
@@ -4618,6 +4656,14 @@ impl RadioProfile for Rtl8733buBackend {
             // (The inherited 16_000 was, by coincidence, close to this radio's max — conservative
             // rather than wrong. The provenance was the problem, not the magnitude.)
             retune_us: Some(15_500),
+            // MEASURED on this part: 0.111-0.155 dB per DE step across the sweep, against the
+            // vendor's own arithmetic of 0.125 (TSSI DE is a 1/8 dB scale). Published so cognition
+            // renders a dB decision with THIS part's number instead of the old global 0.5, which
+            // was 4x wrong here and silently turned an 18 dB back-off into ~4.5 dB.
+            // `tx_power_dbm` stays None for the cross-boot reason argued above; a per-step slope is
+            // reproducible even where the absolute anchor is not.
+            db_per_power_idx: Some(0.125),
+            power_actuated: true,
             ..RadioCapability::wifi_monitor_5ghz(vec![1, 6, 11, 36, 40, 44, 48, 149, 153, 157, 161])
         }
     }

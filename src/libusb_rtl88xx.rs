@@ -246,6 +246,16 @@ fn init_err(what: String) -> FaceError {
 /// A userspace RTL8812EU radio. Open with [`open`](Self::open); the handle
 /// keeps the interface claimed for the backend's lifetime.
 pub struct LibUsbRtl88xxBackend {
+    /// As-found four-AC EDCA state, so a contention posture change can be undone.
+    /// See [`crate::realtek_contention`] for why this is a knob and not a side effect.
+    pub(crate) ndr_contention: crate::realtek_contention::RtlEdcaSaved,
+    /// Set while a commanded [`ndn_radio_hal::RxGain`] is in force, so the autonomous DIG walk
+    /// stands down instead of overwriting it within ~2 s.
+    rx_gain_owned: std::sync::atomic::AtomicBool,
+    /// The IGI value as found before the first commanded gain change; `0xff` = nothing saved.
+    /// `RxGain::Auto` restores it, so the posture is always reversible.
+    rx_gain_saved: std::sync::atomic::AtomicU8,
+
     /// `Arc` so blocking USB transfers can be moved onto `spawn_blocking`.
     handle: Arc<DeviceHandle<Context>>,
     /// Bulk OUT endpoint address (frame injection) — the HIGH/MGT queue.
@@ -367,6 +377,9 @@ impl LibUsbRtl88xxBackend {
             ))
         };
         Ok(Self {
+            ndr_contention: crate::realtek_contention::RtlEdcaSaved::new(),
+            rx_gain_owned: std::sync::atomic::AtomicBool::new(false),
+            rx_gain_saved: std::sync::atomic::AtomicU8::new(0xff),
             handle,
             bulk_out: bulk_out.ok_or_else(no_ep)?,
             bulk_in: bulk_in.ok_or_else(no_ep)?,
@@ -3677,9 +3690,75 @@ impl LibUsbRtl88xxBackend {
     /// channel lowers IGI (hear weaker peers), a noisy one raises it. Call
     /// periodically (~2 s); returns the new IGI. Without it the RX gain floor is
     /// frozen at its init value and sensitivity never adapts.
+    /// Command the RX front-end sensitivity via **IGI** (initial gain index, `0x1d70[6:0]`).
+    ///
+    /// Higher IGI = a higher detection floor = **less** sensitive. That is the direction spatial
+    /// reuse needs and the one the `RxGain` set could not previously express: every position was at
+    /// or above the part's default, so no node could be told to hear less.
+    ///
+    /// * [`RxGain::Reduced`] raises IGI by [`Self::IGI_REUSE_STEP`], clamped at the vendor's
+    ///   `IGI_MAX`. ⚠ The dB delta is **unmeasured** — do not convert it into link budget. For a
+    ///   genuinely dBm-denominated defer threshold on this part use
+    ///   [`RadioKnobs::set_edcca_threshold_dbm`](ndn_radio_hal::RadioKnobs::set_edcca_threshold_dbm).
+    /// * [`RxGain::Boosted`] lowers it toward `IGI_MIN`.
+    /// * [`RxGain::Auto`] restores the value found before the first command AND hands the front end
+    ///   back to the autonomous DIG walk.
+    ///
+    /// While a non-`Auto` posture is in force, [`dig_tick`](Self::dig_tick) stands down — otherwise
+    /// the ~2 s walk overwrites the command and the knob does nothing.
+    pub fn set_rx_gain_igi(&self, gain: ndn_radio_hal::RxGain) -> Result<u8, FaceError> {
+        use ndn_radio_hal::RxGain;
+        use std::sync::atomic::Ordering::Relaxed;
+        const IGI_MIN: u32 = 0x1c;
+        const IGI_MAX: u32 = 0x3e;
+
+        let cur = self.bb_read(0x1d70, 0x7f)?;
+        // Save the as-found value once, so `Auto` is a restore and not a guess.
+        let _ = self
+            .rx_gain_saved
+            .compare_exchange(0xff, cur as u8, Relaxed, Relaxed);
+
+        let want = match gain {
+            RxGain::Auto => {
+                self.rx_gain_owned.store(false, Relaxed);
+                let saved = self.rx_gain_saved.swap(0xff, Relaxed);
+                if saved == 0xff {
+                    return Ok(cur as u8); // never commanded; leave the walk alone
+                }
+                u32::from(saved)
+            }
+            RxGain::Reduced => {
+                self.rx_gain_owned.store(true, Relaxed);
+                (cur + Self::IGI_REUSE_STEP).min(IGI_MAX)
+            }
+            RxGain::Boosted => {
+                self.rx_gain_owned.store(true, Relaxed);
+                cur.saturating_sub(Self::IGI_REUSE_STEP).max(IGI_MIN)
+            }
+        };
+        let want = want.clamp(IGI_MIN, IGI_MAX);
+        // Both paths, as the vendor does: path A and path B share the posture.
+        self.bb_write(0x1d70, 0x0000_007f, want)?;
+        self.bb_write(0x1d70, 0x0000_7f00, want << 8)?;
+        Ok(want as u8)
+    }
+
+    /// IGI steps per `RxGain` command. Chosen as a visible-but-bounded move; ⚠ its dB value is
+    /// UNMEASURED on this part, which is exactly why `RxGain` is a posture and not a number.
+    pub const IGI_REUSE_STEP: u32 = 8;
+
     pub fn dig_tick(&self) -> Result<u8, FaceError> {
         const IGI_MIN: u32 = 0x1c;
         const IGI_MAX: u32 = 0x3e;
+        // ★ Cognition owns the gain right now — do not fight it. Without this the autonomous walk
+        // overwrites a commanded `RxGain` inside ~2 s, so the knob would read as implemented and
+        // do nothing, which is this codebase's characteristic defect.
+        if self
+            .rx_gain_owned
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return self.bb_read(0x1d70, 0x7f).map(|v| v as u8);
+        }
         // OFDM false-alarm count (`phydm_fa_cnt_statistics_jgr3`): parity +
         // rate-illegal + crc8 + fast-fsync + sb-search + mcs fails (5 GHz, no CCK).
         let v04 = self.read32(0x2d04)?;
@@ -3693,8 +3772,16 @@ impl LibUsbRtl88xxBackend {
             + (v20 & 0xffff)
             + (v20 >> 16);
         // Reset the FA counters so the next interval reads a fresh delta.
-        self.bb_write(0x2a44, 1 << 21, 0)?;
-        self.bb_write(0x2a44, 1 << 21, 1)?;
+        //
+        // ☠ This used to strobe `0x2a44[21]`, which is the **8723F-family** reset — while the
+        // counters read above are the **JGR3** ones (`phydm_fa_cnt_statistics_jgr3`, 0x2d04..0x2d20).
+        // So the counters were never cleared: `fa` returned a CUMULATIVE total that only ever grew,
+        // the `fa > 750` branch won every tick after the first, and IGI ratcheted monotonically to
+        // the `IGI_MAX` deaf clamp — the exact opposite of adapting sensitivity. Latent only
+        // because `spawn_watchdog` has no production caller; it becomes live the moment anything
+        // arms this path, which `RadioKnobs::set_rx_gain` now does.
+        self.bb_write(0x1eb4, 1 << 25, 0)?;
+        self.bb_write(0x1eb4, 1 << 25, 1)?;
 
         // FA-driven IGI walk (`phydm_get_new_igi`): thresholds 250/500/750.
         let cur = self.bb_read(0x1d70, 0x7f)?;
@@ -5279,7 +5366,7 @@ impl LibUsbRtl88xxBackend {
                             payload: bytes::Bytes::copy_from_slice(&msdu[8..]),
                             addr: Some(sa),
                             group: Some(da),
-                            addr3, // outer-header nonce, shared by all A-MSDU subframes
+                            addr3,       // outer-header nonce, shared by all A-MSDU subframes
                             addr4: None, // A-MSDU is a 3-address QoS frame, never the wide profile
                             htc: None,
                             rssi_dbm,
@@ -5421,9 +5508,22 @@ impl crate::rx_pump::Pumpable for LibUsbRtl88xxBackend {
 /// This backend exposes only the always-on free-run per-frame RX-stamp clock (RXTSFL). It does
 /// not surface the port/beacon TSF (no read-now clock here), so `read_clock` stays the default
 /// `None` — honestly reporting a single, latch-only link clock.
+///
+/// Reference: **crystal**, witnessed by this port's own bring-up rather than by the part's family.
+/// `init_bb_rf` reads the FACTORY crystal cap out of logical efuse `0x110` and programs it into
+/// `0x1040[23:10]` as `cap || cap` — an efuse field whose whole job is trimming the load
+/// capacitance of a quartz crystal, calibrated per unit at manufacture. A part with no crystal has
+/// nothing for that byte to trim.
+///
+/// `measured: None`, and that gap is real: nobody has regressed this chip's TSF against a host or a
+/// peer, so the *rate* is unquantified even though the *kind* is established. `examples/rxtick.rs`
+/// against this part would fill it in.
 impl RadioTime for LibUsbRtl88xxBackend {
     fn time_sources(&self) -> Vec<RadioTimeSource> {
-        vec![RadioTimeSource::free_run_rx_stamp(self.tsf_domain, 1_000)]
+        vec![
+            RadioTimeSource::free_run_rx_stamp(self.tsf_domain, 1_000)
+                .with_reference(ndn_radio_hal::ClockReference::crystal()),
+        ]
     }
 }
 
@@ -5466,6 +5566,16 @@ impl RadioProfile for LibUsbRtl88xxBackend {
                 max_bw: 1,
             },
             retune_us: Some(26_000),
+            // ★ MEASURED (B210, 3 scrambled passes, +-0.1-0.3 dB): 9.6 dB over indices 20..63 at
+            // **0.22 dB/step** — not the 0.5 the global constant assumed, so every back-off this
+            // radio was given was less than half the decided one.
+            db_per_power_idx: Some(0.22),
+            // ★ MEASURED INVERSION below index 20: commanded power turns around and peaks ~11 dB
+            // ABOVE the calibrated maximum. A back-off that walks past this floor shouts into the
+            // channel it was trying to protect. `set_tx_power` clamps; this publishes the same
+            // floor so the policy never asks.
+            min_tx_power: Some(20),
+            power_actuated: true,
             ..RadioCapability::wifi_monitor_5ghz(vec![36, 40, 44, 48, 149, 153, 157, 161])
         }
     }

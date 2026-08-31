@@ -455,9 +455,16 @@ pub const CLOCK_REF_UNKNOWN: u8 = 0;
 pub const CLOCK_REF_RC: u8 = 1;
 /// [`EVT_CLOCK_REF`] `ref_class`: a crystal or TCXO.
 pub const CLOCK_REF_XTAL: u8 = 2;
-/// [`EVT_CLOCK_REF`] `accuracy_ppm` sentinel: **not measured**. This node's +16.7 ppm figure is an
-/// inter-node comparison from one session, not an accuracy against a standard, and the fleet's rule
-/// is that a number goes on the wire only when the node can stand behind it.
+/// [`EVT_CLOCK_REF`] `accuracy_ppm` sentinel: **not measured** — by this firmware, for the board it
+/// is running on.
+///
+/// ⚠ The +16.7 ppm on record for this part is NOT the reason. That figure was taken *against a
+/// precise host cadence* (`README.md`, `hw::init_peripherals`), which is a real witness — the same
+/// runs put the internal RC at +2253/+2019 ppm, and separating those two is exactly what it was for.
+/// The reason the number stays off the wire is narrower and harder: it is **one measurement of one
+/// board's crystal at one temperature**, and this constant would assert it for every board this
+/// image is ever flashed to. A crystal's spec is a distribution, not a sample. A node may publish an
+/// accuracy when it MEASURES its own, against a reference it names.
 pub const CLOCK_ACCURACY_UNKNOWN: u16 = 0xFFFF;
 
 // `EVT_UNSUPPORTED` reason codes. **Fleet-wide space** — these are the same four values the

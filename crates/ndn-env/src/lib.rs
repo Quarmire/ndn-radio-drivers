@@ -131,7 +131,57 @@ pub const KNOWN: &[Var] = &[
         "NDN_RADIO_TXPWR",
         "TXAGC index 0..63 — read natively ONLY by the 8821c bring-up; campaign tools apply it via RadioKnobs::set_tx_power (a81a/8812au honor the knob, not the var)",
     ),
-    cfg("NDN_TX_PWR", "TX power (LoRa)"),
+    cfg(
+        "NDN_TX_PWR",
+        "Realtek TXAGC index 0..63 applied by open_named_radio's 8812au arm — NOT LoRa, which this \
+         entry claimed until 2026-09-01. It exists for the USB brownout: a full-power 2-chain TX can \
+         brown the PA out so the TX FIFO never drains",
+    ),
+    cfg(
+        "NDN_RADIO_BW",
+        "channel width applied after bring-up: 5|10|20|40|80. Was 5|10|20|40 until 2026-09-01 — \
+         80 was unreachable through the plan on parts that actuate it",
+    ),
+    cfg(
+        "NDN_TX_PUMP",
+        "pipelined TX depth (writer threads); 0 restores one synchronous USB round trip per frame. \
+         MEASURED on the MT7610U: the synchronous path costs ~295 + 0.031*B us per PPDU and is \
+         width-independent, which is why channel width looked worthless at small payloads",
+    ),
+    cfg(
+        "NDN_TX_QUEUES",
+        "mt76 TX endpoints to round-robin across, 1..4",
+    ),
+    cfg(
+        "NDN_POSTURE",
+        "contention posture: owned|shared|yielding. PIN IT IN ANY THROUGHPUT MEASUREMENT — before \
+         bring-up began pinning EDCA, an unset posture measured 2724 or 6706 f/s on one radio \
+         purely by run order",
+    ),
+    cfg(
+        "NDN_ATH9K_FW",
+        "path to htc_9271.fw — the AR9271 firmware is not embedded and open fails without this",
+    ),
+    cfg("NDN_ATH9K_PUMP", "start the RX pump on the AR9271 arm (off by default there)"),
+    cfg("NDN_8733B_RX_ONLY", "stop the 8733b bring-up at monitor RX, skipping the TX calibration"),
+    cfg("NDN_RADIO_DEV", "select the radio by USB bus:port (stable across replugs)"),
+    cfg("NDN_USB_ADDR", "select the radio by USB address"),
+    cfg("NDN_RADIO_RX_STRICT", "drop RX units the parser cannot fully account for, rather than best-effort"),
+    dbg_(
+        "NDN_RADIO_FORCE_RESET",
+        "issue a blind USB port reset on open. ☠ A failed reset marks the hub port disabled and the \
+         device becomes a sysfs zombie that only a physical replug clears",
+    ),
+    dbg_(
+        "NDN_MT76X2_SLOT_KNOB",
+        "☠ re-enable the MT7612U slot-time actuator, which is OFF by default because it is one of \
+         the two writes that cost physical replugs on that part",
+    ),
+    dbg_(
+        "NDN_MT7612_EDCA_AGGRESSIVE",
+        "☠ let the MT7612U EDCA window go below its boot value — the write that cost two replugs; \
+         window_floor(Mt76x2) exists to prevent it",
+    ),
     cfg("NDN_RADIO_LDPC", "enable LDPC FEC"),
     cfg("NDN_RADIO_STBC", "enable space-time block coding"),
     cfg("NDN_RADIO_FIXEDRATE", "pin the rate rather than adapt"),
@@ -393,6 +443,138 @@ mod tests {
             KNOWN.iter().any(|v| v.class == Class::Config)
                 && KNOWN.iter().any(|v| v.class == Class::DebugBisect),
             "both halves of the split must be represented"
+        );
+    }
+}
+
+#[cfg(test)]
+mod registry_ratchet {
+    use super::*;
+    use std::path::{Path, PathBuf};
+
+    /// `NDN_*` names read in `ndn-radio-drivers` library source that are **not yet** in the table.
+    ///
+    /// ★ This list may only SHRINK. It exists so the registry's drift is frozen rather than
+    /// growing: on 2026-09-01 an audit found **63** library-source reads unregistered against 90
+    /// registered entries, and one entry — `NDN_TX_PWR`, described as "TX power (LoRa)" — was
+    /// simply wrong (it is the Realtek TXAGC index the 8812au arm applies). That matters more than
+    /// tidiness: `snapshot` reports an unrecognised `NDN_*` as most likely a typo "silently doing
+    /// nothing", so a knob that WORKS while printing UNRECOGNISED inverts the one signal this
+    /// module exists to give.
+    ///
+    /// Entries are listed rather than described because a wrong description is worse than an
+    /// absent one — several of these are per-chip bisect switches whose exact effect needs the
+    /// bench, and inventing text for them would put fiction in the run record.
+    const KNOWN_UNREGISTERED: &[&str] = &[
+        "NDN_8733B_NO_TSSI",
+        "NDN_AF_RCVBUF",
+        "NDN_ATH9K_HIGHPWR",
+        "NDN_ATH9K_HT40",
+        "NDN_ATH9K_NORMPWR",
+        "NDN_ATH9K_NO_CAL",
+        "NDN_ATH9K_SETBOARD",
+        "NDN_AU_TXAGC12",
+        "NDN_AU_TXRPT",
+        "NDN_C2H_DBG",
+        "NDN_GUARD_LIVE_LINK",
+        "NDN_MT7921_IFACE",
+        "NDN_MT7921_VENDOR_TAG",
+        "NDN_SB_NO_ANT",
+        "NDN_SB_NO_XPA",
+        "NDN_SB_SKIP_GAIN",
+        "NDN_SB_SKIP_OBDB",
+    ];
+
+    fn rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
+        let Ok(rd) = std::fs::read_dir(dir) else { return };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                rs_files(&p, out);
+            } else if p.extension().is_some_and(|x| x == "rs") {
+                out.push(p);
+            }
+        }
+    }
+
+    /// Every `env::var("NDN_…")` / `env::var_os("NDN_…")` name in a file, without a regex crate.
+    fn reads(src: &str) -> Vec<String> {
+        let mut v = Vec::new();
+        let b = src.as_bytes();
+        let mut i = 0;
+        while let Some(hit) = src[i..].find("env::var") {
+            let start = i + hit;
+            // the first quote after the call, if it is close enough to be this call's argument
+            if let Some(q) = src[start..].find('"').filter(|q| *q < 24) {
+                let a = start + q + 1;
+                if let Some(end) = src[a..].find('"') {
+                    let name = &src[a..a + end];
+                    if name.starts_with("NDN_")
+                        && name.bytes().all(|c| c.is_ascii_uppercase() || c == b'_' || c.is_ascii_digit())
+                    {
+                        v.push(name.to_string());
+                    }
+                }
+            }
+            i = start + 8;
+            if i >= b.len() {
+                break;
+            }
+        }
+        v
+    }
+
+    /// ★ The ratchet: a NEW unregistered `NDN_*` in library source fails here, rather than
+    /// surfacing months later as an UNRECOGNISED line in someone's run record.
+    #[test]
+    fn no_new_unregistered_env_reads_in_library_source() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("src");
+        if !root.is_dir() {
+            eprintln!("registry ratchet: {} not found; skipping", root.display());
+            return;
+        }
+        let mut files = Vec::new();
+        rs_files(&root, &mut files);
+        assert!(!files.is_empty(), "found no .rs under {}", root.display());
+
+        let registered: std::collections::HashSet<&str> = KNOWN.iter().map(|v| v.name).collect();
+        let allowed: std::collections::HashSet<&str> = KNOWN_UNREGISTERED.iter().copied().collect();
+
+        let mut fresh: Vec<String> = Vec::new();
+        for f in &files {
+            let Ok(src) = std::fs::read_to_string(f) else { continue };
+            for name in reads(&src) {
+                if !registered.contains(name.as_str()) && !allowed.contains(name.as_str()) {
+                    fresh.push(format!("{name}  ({})", f.display()));
+                }
+            }
+        }
+        fresh.sort();
+        fresh.dedup();
+        assert!(
+            fresh.is_empty(),
+            "these NDN_* are read in library source but are in neither the registry nor \
+             KNOWN_UNREGISTERED — add a cfg()/dbg_() entry describing what the knob DOES, so a run \
+             record can be reproduced from its own output:\n  {}",
+            fresh.join("\n  ")
+        );
+    }
+
+    /// The frozen list must not rot either: an entry that has since been registered, or whose
+    /// reader was deleted, should be removed so the list keeps shrinking honestly.
+    #[test]
+    fn the_known_unregistered_list_has_no_stale_entries() {
+        let registered: std::collections::HashSet<&str> = KNOWN.iter().map(|v| v.name).collect();
+        let stale: Vec<&&str> = KNOWN_UNREGISTERED
+            .iter()
+            .filter(|n| registered.contains(**n))
+            .collect();
+        assert!(
+            stale.is_empty(),
+            "these are now registered and must be removed from KNOWN_UNREGISTERED: {stale:?}"
         );
     }
 }

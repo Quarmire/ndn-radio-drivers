@@ -12,13 +12,29 @@
 //! bug invisible) and then alternates two arms, labelled by SOURCE ADDRESS:
 //!
 //! ```text
-//!   MostRobust  src 02:4e:44:4e:00:a0  -> must air at 6.0 Mb/s legacy OFDM
-//!   Throughput  src 02:4e:44:4e:00:b0  -> must air at the stored MCS7
+//!   A  MostRobust  src 02:4e:44:4e:00:a0  at MCS7  -> must air at 6.0 Mb/s legacy OFDM
+//!   B  Throughput  src 02:4e:44:4e:00:b0  at MCS7  -> must air at MCS 7
+//!   C  Throughput  src 02:4e:44:4e:00:c0  at MCS0  -> must air at MCS 0
 //! ```
 //!
 //! Labelling by address rather than payload means the witness needs only the radiotap header and
 //! one `tcpdump` filter per arm — no payload parsing, and no ambiguity about which frame is which.
-//! **If both arms read the same rate, the intent is not reaching the rate.**
+//! **If A and B read the same rate, the intent is not reaching the rate.**
+//!
+//! ## ☠ Why arm C exists — it rescues the experiment from an ambiguity I published without it
+//!
+//! The first 8733b run read 376/431 on arm A and **3/431 on arm B**, and that was written up as
+//! the one-way link demonstrating itself. It is not sound on its own: the SAME witness, same host,
+//! same session, decoded the MT7612U's MCS7 arm 348/431. So "MCS7 does not survive the link" and
+//! "**this witness cannot demodulate THIS transmitter's HT at all**" produce an identical capture,
+//! and a two-arm harness cannot separate them.
+//!
+//! Arm C is the discriminator. HT MCS0 (6.5 Mb/s) needs roughly the same SNR as legacy 6 Mb/s, so:
+//!
+//! * witness reads C but not B  => the loss really is rate/margin; arm B was evidence.
+//! * witness reads neither      => this witness's HT decode of this DUT is dead, and arm B never
+//!                                 said anything about the link. Report the A-vs-B RATE result
+//!                                 (which is what the fix is about) and drop the delivery claim.
 //!
 //! ## Paced on purpose
 //!
@@ -41,6 +57,9 @@ use std::time::{Duration, Instant};
 /// (mac-addressing doctrine) — they exist only so the witness can attribute a rate to an intent.
 const SRC_ROBUST: [u8; 6] = [0x02, 0x4e, 0x44, 0x4e, 0x00, 0xa0];
 const SRC_BULK: [u8; 6] = [0x02, 0x4e, 0x44, 0x4e, 0x00, 0xb0];
+/// Arm C: Throughput at the HT FLOOR — the control that separates "MCS7 lost on the link" from
+/// "this witness cannot decode this transmitter's HT at all".
+const SRC_HTFLOOR: [u8; 6] = [0x02, 0x4e, 0x44, 0x4e, 0x00, 0xc0];
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::runtime::Runtime::new()?.block_on(run())
@@ -79,40 +98,43 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let payload = bytes::Bytes::from(b"NDNINTENTAB0123456789".to_vec());
     let period = Duration::from_micros(1_000_000 / fps.max(1));
     let t = Instant::now();
-    let (mut n_robust, mut n_bulk, mut errs) = (0u64, 0u64, 0u64);
-    let mut robust_turn = true;
+    let (mut n_robust, mut n_bulk, mut n_floor, mut errs) = (0u64, 0u64, 0u64, 0u64);
+    let mut arm = 0u8;
 
     while t.elapsed() < Duration::from_secs(secs) {
-        let (intent, src) = if robust_turn {
-            (TxIntent::broadcast(Reliability::MostRobust), SRC_ROBUST)
-        } else {
-            (TxIntent::broadcast(Reliability::Throughput), SRC_BULK)
+        // The stored rate is re-asserted per arm, so arm C really is an HT MCS0 PPDU rather than
+        // MCS7 relabelled. `MostRobust` must override it in arm A exactly as it must in arm B.
+        let (reliability, src, rate) = match arm {
+            0 => (Reliability::MostRobust, SRC_ROBUST, stored),
+            1 => (Reliability::Throughput, SRC_BULK, stored),
+            _ => (Reliability::Throughput, SRC_HTFLOOR, McsDescriptor::ht(0)),
         };
-        let mut f = InjectFrame::broadcast(payload.clone(), intent);
+        let _ = FrameIo::set_rate(io.as_ref(), rate);
+        let mut f = InjectFrame::broadcast(payload.clone(), TxIntent::broadcast(reliability));
         f.src = src;
         match FrameIo::inject(io.as_ref(), f).await {
-            Ok(()) => {
-                if robust_turn {
-                    n_robust += 1
-                } else {
-                    n_bulk += 1
-                }
-            }
+            Ok(()) => match arm {
+                0 => n_robust += 1,
+                1 => n_bulk += 1,
+                _ => n_floor += 1,
+            },
             Err(_) => errs += 1,
         }
-        robust_turn = !robust_turn;
+        arm = (arm + 1) % 3;
         tokio::time::sleep(period).await;
     }
 
     let el = t.elapsed().as_secs_f64();
     println!(
-        "sent: robust={n_robust} bulk={n_bulk} err={errs} in {el:.1}s \
+        "sent: A robust={n_robust} B bulk={n_bulk} C htfloor={n_floor} err={errs} in {el:.1}s \
          ({:.0} f/s total)",
-        (n_robust + n_bulk) as f64 / el
+        (n_robust + n_bulk + n_floor) as f64 / el
     );
     println!("⚠ those are USB writes ACCEPTED, not radiation. The witness decides:");
     println!("    robust arm:  tcpdump -e -i <mon> 'wlan addr2 02:4e:44:4e:00:a0'  -> expect 6.0 Mb/s");
-    println!("    bulk arm:    tcpdump -e -i <mon> 'wlan addr2 02:4e:44:4e:00:b0'  -> expect MCS{mcs_index}");
-    println!("    same rate in both arms => intent is NOT reaching the rate.");
+    println!("    B bulk arm:  tcpdump -e -i <mon> 'wlan addr2 02:4e:44:4e:00:b0'  -> expect MCS{mcs_index}");
+    println!("    C floor arm: tcpdump -e -i <mon> 'wlan addr2 02:4e:44:4e:00:c0'  -> expect MCS 0");
+    println!("    A and B at the same rate => intent is NOT reaching the rate.");
+    println!("    B and C both absent      => the witness cannot decode this DUT's HT; B says nothing about the link.");
     Ok(())
 }

@@ -1573,7 +1573,7 @@ impl Mt7610uBackend {
                 return v;
             }
         }
-        if frame.tx.reliability == ndn_radio_hal::Reliability::MostRobust {
+        if frame.tx.needs_basic_rate() {
             return LegacyRate::Ofdm6.rate_val();
         }
         self.cur_rate

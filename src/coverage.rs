@@ -62,6 +62,49 @@ pub struct Row {
 
 use Seam::{Excluded, Provided};
 
+/// ★ **Does each backend honour `TxIntent::needs_basic_rate`?** (added 2026-09-01)
+///
+/// `MostRobust` means "the worst receiver in earshot must decode this" — cooperative reports,
+/// discovery, control. An HT/VHT/HE PPDU excludes every receiver without that decoder *by
+/// construction*, and this stack has MEASURED that as a real one-way link (drone→GCS perfect,
+/// GCS→drone nothing but legacy 6M, because the peer transmitted 2-stream MCS9 in good faith).
+///
+/// The doctrine was documented four times, in four backends, one of which says "Same rule as every
+/// other backend here" — and it was **absent from ten of fifteen**. `Rtl8733buBackend::inject` read
+/// only its stored rate/flags and never looked at `frame.tx` at all, so on that radio the traffic
+/// whose entire purpose is universal decodability went out at the last throughput rate. That is the
+/// worst-receiver failure reintroduced by omission, in exactly the frames it exists to protect.
+///
+/// The ENCODING is necessarily per-backend (a Realtek DESC code, an mt76x02 TXWI word and a connac2
+/// rate word are three different things); the DECISION is now one predicate, and this table records
+/// who applies it.
+pub enum TxIntentSupport {
+    /// Forces the basic rate for a `MostRobust` frame. The string names the mechanism.
+    Honoured(&'static str),
+    /// Not applicable to this PHY, with the reason.
+    NotApplicable(&'static str),
+    /// A KNOWN GAP: this radio could honour it and does not. The reason must say what would lift it.
+    Gap(&'static str),
+}
+
+/// One row per backend that transmits. Adding a backend without an entry fails the gate below.
+pub const TX_INTENT: &[(&str, TxIntentSupport)] = &[
+    ("LibUsbRtl88xxBackend", TxIntentSupport::Honoured("inject forces DESC 0x04 (legacy OFDM 6M) and suppresses HT-only SGI/LDPC/STBC")),
+    ("Rtl8812auBackend", TxIntentSupport::Honoured("desc_rate_for returns DESC_RATE_6M ahead of the stored descriptor")),
+    ("Rtl8733buBackend", TxIntentSupport::Honoured("inject picks DESC_RATE_6M with flags cleared, instead of the stored tx_rate/tx_flags")),
+    ("Rtl8821cuBackend", TxIntentSupport::Honoured("build_tx forces DESC_RATE_OFDM6M where the DESC code is chosen, so a stored cur_mcs cannot bypass it")),
+    ("Mt7610uBackend", TxIntentSupport::Honoured("resolved_rate returns the legacy OFDM-6M TXWI word ahead of cur_rate")),
+    ("Mt7612uBackend", TxIntentSupport::Honoured("inject builds at MT76_RATE_OFDM6M via build_data_bulk_at, with the width field clamped to 0 (legacy PPDUs carry no wide format)")),
+    ("Mt7921uBackend", TxIntentSupport::Honoured("legacy OFDM 6M rate word, deliberately not for_intent's HE ER-SU branch")),
+    ("Ath9kHtcBackend", TxIntentSupport::Honoured("build_tx_frame returns early at LegacyRate::Ofdm6 with rate_flags 0, ahead of both cur_legacy and cur_mcs")),
+    ("SerialRadioBackend", TxIntentSupport::NotApplicable("rate is device state set by a command over the serial link, not a per-frame field; honouring intent per frame would cost a round trip per frame")),
+    ("Bw16SerialBackend", TxIntentSupport::NotApplicable("as SerialRadioBackend — rate is a command, not a per-frame field")),
+    ("Esp32SerialBackend", TxIntentSupport::NotApplicable("as SerialRadioBackend — rate is a command, not a per-frame field")),
+    ("LoraSerialBackend", TxIntentSupport::NotApplicable("LoRa has no basic rate; robustness is the spreading factor, which is channel state adapted by the LoRa phy, not a per-frame choice")),
+    ("MorseFrameIo", TxIntentSupport::Gap("HaLow injects through mac80211 and does not name a rate; lifting this means writing the S1G MCS field into the injected radiotap header")),
+    ("Nrc7292FrameIo", TxIntentSupport::Gap("as MorseFrameIo — would need an explicit rate in the injected radiotap header")),
+];
+
 /// ★ **How each backend makes its contention posture DETERMINISTIC** (added 2026-08-31).
 ///
 /// USB never power-cycles a dongle between processes, so any MAC state a bring-up does not
@@ -478,6 +521,42 @@ mod tests {
             n += 4;
         }
         n
+    }
+
+    /// ★ **The TX-intent gate, as a test** — see [`TX_INTENT`].
+    ///
+    /// Every transmitting backend must have ANSWERED whether it honours the basic-rate doctrine.
+    /// A `Gap` is allowed and printed — a known unknown beats a silent one — but a blank is not.
+    #[test]
+    fn every_backend_states_whether_it_honours_tx_intent() {
+        let mut gaps = vec![];
+        for (name, t) in TX_INTENT {
+            let reason = match t {
+                TxIntentSupport::Honoured(r) | TxIntentSupport::NotApplicable(r) => r,
+                TxIntentSupport::Gap(r) => {
+                    gaps.push(*name);
+                    r
+                }
+            };
+            assert!(
+                reason.len() >= 30,
+                "{name}: TX-intent disposition needs a real written reason, got {reason:?}"
+            );
+        }
+        for r in COVERAGE {
+            if matches!(r.frame_io, Provided) {
+                let short = r.backend.split_whitespace().next().unwrap_or(r.backend);
+                assert!(
+                    TX_INTENT.iter().any(|(n, _)| *n == short),
+                    "{short} transmits but does not say whether it honours \
+                     TxIntent::needs_basic_rate — a MostRobust frame going out at a throughput \
+                     rate is the one-way link this doctrine exists to prevent"
+                );
+            }
+        }
+        if !gaps.is_empty() {
+            println!("TX intent GAPS (radio could honour it, does not): {gaps:?}");
+        }
     }
 
     /// ★ **The bring-up contention gate, as a test** — see [`CONTENTION`].

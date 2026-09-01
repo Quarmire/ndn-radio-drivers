@@ -1610,7 +1610,7 @@ impl Mt7921uBackend {
         }) {
             return Some(mac::FixedRate::at(v));
         }
-        if frame.tx.reliability == ndn_radio_hal::Reliability::MostRobust {
+        if frame.tx.needs_basic_rate() {
             return Some(mac::FixedRate::at(mac::LegacyRate::Ofdm6.rate_val()));
         }
         Some(

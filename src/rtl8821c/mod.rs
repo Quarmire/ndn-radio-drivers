@@ -1076,7 +1076,17 @@ impl Rtl8821cuBackend {
 
         // `mcs` is the resolved rate — from the frame's intent (generic path) or
         // an exact rate (the `WifiRadio` path).
-        let rate = rate_code(&mcs);
+        //
+        // ★ INTENT OVERRIDES THE STORED RATE (2026-09-01). `resolved_mcs` only consults the frame's
+        // intent when `cur_mcs` is unset, so once the control plane named a rate, cooperative
+        // reports and discovery — the traffic whose whole purpose is that the worst receiver
+        // decodes it — went out at that throughput rate. Force the basic rate here, where the DESC
+        // code is chosen, so it cannot be bypassed by a stored `cur_mcs`.
+        let rate = if frame.tx.needs_basic_rate() {
+            DESC_RATE_OFDM6M
+        } else {
+            rate_code(&mcs)
+        };
         // The kernel injects with USE_RATE=0 (rate adaptation). Forcing a fixed
         // rate (USE_RATE+DISDATAFB) with no rate-table entry may be why TX didn't
         // key; default to the kernel style, `NDN_RADIO_FIXEDRATE=1` forces fixed.

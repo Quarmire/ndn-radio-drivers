@@ -278,6 +278,9 @@ pub struct Mt7612uBackend {
     ct_last: std::sync::Mutex<std::time::Instant>,
 }
 
+/// Legacy OFDM 6 Mbps as an mt76x02 TXWI rate word — the universally decodable basic rate.
+pub const MT76_RATE_OFDM6M: u16 = 0x2000;
+
 impl Mt7612uBackend {
     /// Find and open the first MT7612U, claiming its interface.
     ///
@@ -1678,12 +1681,27 @@ impl Mt7612uBackend {
     /// mgmt TXWI on ep 0x07 is silently dropped by the firmware (it never
     /// radiates). `rate` sets the TXWI rate field from the frame's MCS.
     pub fn build_data_bulk(&self, frame: &[u8], mcs: &McsDescriptor) -> Vec<u8> {
+        self.build_data_bulk_at(frame, mt76_rate_val(mcs))
+    }
+
+    /// The same, at an explicit raw TXWI rate word — what [`TxIntent::needs_basic_rate`] needs, so
+    /// a `MostRobust` frame can be forced to legacy OFDM regardless of the stored `McsDescriptor`.
+    pub fn build_data_bulk_at(&self, frame: &[u8], rate: u16) -> Vec<u8> {
         let mut txwi = TXWI_DATA;
         // Rate word + the channel bandwidth (BW[8:7]) the RF is tuned to. A VHT80
         // rate on a 20MHz BB (or vice-versa) is malformed, so the bandwidth comes
         // from `tx_bw` (set by `set_channel_5g80` = 2 = 80MHz), not the descriptor.
-        let bw = (self.tx_bw.load(std::sync::atomic::Ordering::Relaxed) as u16 & 0x3) << 7;
-        txwi[2..4].copy_from_slice(&(mt76_rate_val(mcs) | bw).to_le_bytes());
+        //
+        // ★ …but ONLY for HT/VHT. A legacy PPDU (CCK/OFDM, PHY field 0x0000/0x2000) has no wide
+        // format to signal, and a non-zero BW on one is a malformed rate word — the same
+        // clamp `mt76x0::rate_bw_field` applies. Without this the basic-rate override below would
+        // emit "OFDM 6M at 80 MHz", which is not a thing.
+        let bw = if rate & 0xe000 > MT76_RATE_OFDM6M {
+            (self.tx_bw.load(std::sync::atomic::Ordering::Relaxed) as u16 & 0x3) << 7
+        } else {
+            0
+        };
+        txwi[2..4].copy_from_slice(&(rate | bw).to_le_bytes());
         txwi[6..8].copy_from_slice(&(frame.len() as u16).to_le_bytes()); // len_ctl
         self.wrap_tx(&txwi, frame)
     }
@@ -1990,8 +2008,14 @@ impl FrameIo for Mt7612uBackend {
         // build_data_bulk / docs/RADIO_SUBSYSTEM.md).
         // Rate is bearer state: the control-plane-set MCS if present, else resolve the
         // frame's intent (the MT7612U is 11ac-capable).
-        let mcs = self.resolved_mcs(&frame);
-        let buf = self.build_data_bulk(&dot11, &mcs);
+        // ★ Intent overrides the stored rate (2026-09-01). `resolved_mcs` consults the frame only
+        // when `cur_mcs` is unset, so once the control plane named a rate, the traffic whose whole
+        // purpose is that the worst receiver decodes it went out at that throughput rate.
+        let buf = if frame.tx.needs_basic_rate() {
+            self.build_data_bulk_at(&dot11, MT76_RATE_OFDM6M)
+        } else {
+            self.build_data_bulk(&dot11, &self.resolved_mcs(&frame))
+        };
         self.send_bulk(buf).await
     }
 

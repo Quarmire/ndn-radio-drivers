@@ -4230,6 +4230,10 @@ impl crate::rx_pump::Pumpable for Rtl8733buBackend {
 /// The 8733b as an async monitor radio: inject NDN-framed 802.11 at the current fixed
 /// rate and capture every frame on the channel. Blocking USB I/O runs on the blocking
 /// pool so the async reactor is never stalled.
+/// `DESC_RATE6M` — legacy OFDM 6 Mbps, the universally decodable basic rate. Also this
+/// backend's boot default, so the value is not new here, only its use for TX intent.
+const DESC_RATE_6M: u8 = 0x04;
+
 #[async_trait]
 impl FrameIo for Rtl8733buBackend {
 
@@ -4239,8 +4243,21 @@ impl FrameIo for Rtl8733buBackend {
         Some(<Self as ndn_radio_hal::RadioProfile>::capability(self))
     }
     async fn inject(&self, frame_in: InjectFrame) -> Result<(), FaceError> {
-        let rate = self.tx_rate.load(Ordering::Relaxed);
-        let flags = self.tx_flags.load(Ordering::Relaxed);
+        // ★ Honour the frame's INTENT (2026-09-01). This path previously read only the stored
+        // rate/flags and never looked at `frame_in.tx` at all — so on this radio the cooperative
+        // reports and discovery frames, whose entire purpose is that the worst receiver decodes
+        // them, went out at whatever throughput rate `set_rate` last stored. That is the one-way
+        // link the worst-receiver work exists to prevent, reintroduced by omission.
+        //
+        // Flags are cleared with the rate: legacy OFDM carries no HT-SIG to signal SGI/LDPC/STBC.
+        let (rate, flags) = if frame_in.tx.needs_basic_rate() {
+            (DESC_RATE_6M, 0)
+        } else {
+            (
+                self.tx_rate.load(Ordering::Relaxed),
+                self.tx_flags.load(Ordering::Relaxed),
+            )
+        };
         self.tx_dot11(frame_in, rate, flags).await
     }
 

@@ -4833,7 +4833,7 @@ impl LibUsbRtl88xxBackend {
         // RX demods legacy OFDM but not HT-MCS (measured 2026-07-24) — can only decode the basic
         // rate, exactly as 802.11 sends beacons/probes at basic rates. HT-only SGI/LDPC/STBC are
         // suppressed for such frames below (legacy OFDM carries no HT-SIG/VHT-SIG to signal them).
-        let legacy_robust = frame.tx.reliability == crate::Reliability::MostRobust;
+        let legacy_robust = frame.tx.needs_basic_rate();
         let rate_code = if legacy_robust {
             0x04 // DESC_RATE6M — legacy OFDM, universally decodable
         } else if mcs.vht {

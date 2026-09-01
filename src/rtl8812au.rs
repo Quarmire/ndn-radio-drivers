@@ -442,7 +442,7 @@ const DESC_RATE_VHT2SS_MCS0: u32 = 0x36;
 /// (`DESC_RATE6M`, `0x04`) regardless of the stored rate, exactly as 802.11 sends
 /// beacons/probes at a basic rate for universal reach.
 fn desc_rate_for(mcs: &crate::McsDescriptor, intent: &ndn_radio_hal::TxIntent) -> u32 {
-    if intent.reliability == ndn_radio_hal::Reliability::MostRobust {
+    if intent.needs_basic_rate() {
         return DESC_RATE_6M;
     }
     let index = mcs.index as u32;

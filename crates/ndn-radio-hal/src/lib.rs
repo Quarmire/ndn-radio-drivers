@@ -229,6 +229,30 @@ pub enum Reach {
 }
 
 impl TxIntent {
+    /// **Must this frame go out at the radio's most universally decodable rate?**
+    ///
+    /// ★ The single home for a doctrine that was previously re-typed per backend and, as a
+    /// result, silently absent from most of them. `MostRobust` means "the worst receiver in
+    /// earshot must decode this" — cooperative reports, discovery, control — so the frame is
+    /// forced to the **basic rate** (legacy OFDM 6 Mbps on Wi-Fi), whatever rate the control
+    /// plane last stored, exactly as 802.11 sends beacons and probes at a basic rate. HT-only
+    /// SGI / LDPC / STBC must be suppressed with it: a legacy OFDM PPDU carries no HT-SIG or
+    /// VHT-SIG to signal them.
+    ///
+    /// ⚠ **What ignoring it costs, MEASURED.** An HT/VHT/HE PPDU excludes every receiver without
+    /// that decoder *by construction*. The RTL8812AU's 5 GHz golden-trace RX demodulates legacy
+    /// OFDM but not HT-MCS, and the a81a's userspace bring-up raises one RX chain — so a peer
+    /// transmitting 2-stream MCS9 in good faith produced a real one-way link: drone→GCS perfect,
+    /// GCS→drone nothing. Reports and discovery going out at the last throughput rate is that
+    /// failure reintroduced in exactly the traffic the worst-receiver work exists to protect.
+    ///
+    /// The ENCODING stays per-backend — a Realtek DESC code, an mt76x02 TXWI word and a connac2
+    /// rate word are three different things — but the DECISION is this one predicate. Every
+    /// backend's disposition is recorded in `ndn_radio_drivers::coverage::TX_INTENT`.
+    pub fn needs_basic_rate(&self) -> bool {
+        self.reliability == Reliability::MostRobust
+    }
+
     /// Maximum-robustness broadcast — the discovery / beacon / control default,
     /// and what a NAN or unmeasured face should use.
     pub const ROBUST: TxIntent = TxIntent {
@@ -753,6 +777,26 @@ impl Bandwidth {
             Bandwidth::Bw20 => Some(Bandwidth::Nb10),
             Bandwidth::Nb10 => Some(Bandwidth::Nb5),
             Bandwidth::Nb5 => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tx_intent_predicate {
+    use super::*;
+
+    /// ★ The basic-rate doctrine, as a test. It was documented four times in four backends and
+    /// absent from ten of fifteen; this pins the decision itself so the per-backend encodings have
+    /// one thing to agree with.
+    #[test]
+    fn only_most_robust_demands_the_basic_rate() {
+        assert!(TxIntent::ROBUST.needs_basic_rate(), "discovery/control must be universally decodable");
+        for r in [Reliability::Balanced, Reliability::Throughput] {
+            let i = TxIntent { reliability: r, reach: Reach::Broadcast };
+            assert!(
+                !i.needs_basic_rate(),
+                "{r:?} must NOT be forced to the basic rate — that would cap the link at 6 Mbps"
+            );
         }
     }
 }

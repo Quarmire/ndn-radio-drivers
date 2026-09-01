@@ -3150,6 +3150,21 @@ impl Ath9kHtcBackend {
         use std::sync::atomic::Ordering::Relaxed;
         // A selected legacy rate (#6) wins: inject at a specific CCK/OFDM PHY rate with NO HT flags
         // (rate_flags = 0 ⇒ the firmware's `series[i].RateFlags` is legacy, `series[i].Rate` = the code).
+        // ★ INTENT FIRST (2026-09-01). Neither `cur_legacy` nor `cur_mcs` consulted the frame, so a
+        // `MostRobust` frame — cooperative reports, discovery, control, the traffic whose whole
+        // purpose is that the WORST receiver decodes it — went out at whatever rate mode was last
+        // selected, including HT MCS7. Force 6 Mbps OFDM with no HT flags, the same doctrine every
+        // other backend applies. See `TxIntent::needs_basic_rate`.
+        if frame.tx.needs_basic_rate() {
+            return build_tx_frame_bytes(
+                self.mgmt_ep,
+                self.format,
+                frame,
+                LegacyRate::Ofdm6 as u8,
+                self.cur_power.load(Relaxed),
+                0, // legacy PHY: no HT/SGI/HT40 flags to signal
+            );
+        }
         let legacy = self.cur_legacy.load(Relaxed);
         let (rate_code, mut rate_flags) = if legacy != 0 {
             (legacy, 0)

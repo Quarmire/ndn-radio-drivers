@@ -3504,7 +3504,22 @@ impl RadioKnobs for Ath9kHtcBackend {
     /// bit); a channel-only change re-runs synth+cal at the new centre.
     fn set_channel(&self, channel: u8, bw: Bandwidth) -> Result<(), FaceError> {
         use std::sync::atomic::Ordering::Relaxed;
-        let want_ht40 = matches!(bw, Bandwidth::Bw40);
+        // ★ Refuse, do not collapse. `apply_knobs` records the REQUESTED width as applied on
+        // `Ok`, and dedupes on it — so a silent clamp to 20 MHz makes the control plane believe a
+        // width the PA never transmitted, permanently. This part has exactly two PHY programs
+        // here, the 2G_HT20 and 2G_HT40 initval columns; everything else has no column to load.
+        // Same wording as the MT7921AU's refusal for the identical case.
+        let want_ht40 = match bw {
+            Bandwidth::Bw20 => false,
+            Bandwidth::Bw40 => true,
+            other => {
+                return Err(err(format!(
+                    "ar9271: only 20 and 40 MHz have an initval column on this part \
+                     (requested ch{channel}/{other:?}) — refusing rather than tuning 20 and \
+                     reporting the request as applied"
+                )));
+            }
+        };
         let width_changed = want_ht40 != self.ht40.load(Relaxed);
         let channel_changed = channel != self.channel.load(Relaxed);
         if !width_changed && !channel_changed {

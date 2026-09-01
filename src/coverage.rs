@@ -142,7 +142,7 @@ pub const CONTENTION: &[(&str, Contention)] = &[
     ("Rtl8812auBackend", Contention::Pinned("mac_config -> config_table(MAC_REG); the writes are DATA in an include_bytes! blob, invisible to a source grep — MEASURED identical across five processes")),
     ("Rtl8733buBackend", Contention::PowerCycled("bring_up_monitor -> power_off() then power_on(); every entry point routes through it")),
     ("Rtl8821cuBackend", Contention::PowerCycled("bring-up card-disables first when REG_CR != 0xea, then CARD_ENABLE. Its own EDCA write is gated behind NDN_RADIO_IBSS and does NOT run by default")),
-    ("Ath9kHtcBackend", Contention::Unreviewed("not established; the ported ath9k_hw_set_txq_props path has not been read for this question")),
+    ("Ath9kHtcBackend", Contention::Pinned("init_queues resets all four TX queues on every bring-up via the ath9k_hw_resettxqueue sequence, writing AR_DLCL_IFS/AR_DRETRY_LIMIT/AR_QMISC/AR_DMISC with the USEDEFAULT DCF parameters (cwmin 15, cwmax 1023, aifs 2). Contention is therefore re-established per open, not inherited. ★ Reviewed 2026-09-01; the earlier Unreviewed reason named ath9k_hw_set_txq_props, which was never ported and so was the wrong thing to look for")),
     ("MorseFrameIo", Contention::NotApplicable("HaLow via mac80211 — the kernel driver owns the EDCA arbiter")),
     ("Nrc7292FrameIo", Contention::NotApplicable("HaLow via mac80211 — the kernel driver owns the EDCA arbiter")),
     ("SerialRadioBackend", Contention::NotApplicable("the MAC lives in device firmware across a serial link")),

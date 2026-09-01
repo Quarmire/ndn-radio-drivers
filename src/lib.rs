@@ -365,6 +365,18 @@ pub fn open_named_radio(pid: u16, channel: u8) -> Result<OpenRadio, FaceError> {
         // `NDN_NO_PUMP=1` skips the RX pump — a pure TX-blast node needs no RX, and the pump's bulk-IN
         // threads otherwise contend with inject for USB bandwidth on a busy channel (measured: an 8812au
         // TX collapses to ~250 f/s under heavy RX while the pump drains thousands of frames/s).
+        // ★ The power knob must be applied BEFORE the no-pump early return (moved 2026-09-01).
+        // `NDN_TX_PWR` exists for the USB brownout: a full-power 2-chain TX can brown the PA out so
+        // the FIFO never drains. It was read *after* the `NDN_NO_PUMP` return below — so on the one
+        // path built for a pure TX-blast node, the mitigation for a TX-induced fault was
+        // unreachable. Same shape as the other bugs this audit found: the step exists, the path
+        // that needs it does not reach it.
+        if let Some(p) = std::env::var("NDN_TX_PWR")
+            .ok()
+            .and_then(|s| s.parse::<u8>().ok())
+        {
+            let _ = d.set_tx_power(p.min(63));
+        }
         if std::env::var_os("NDN_NO_PUMP").is_some() {
             if std::env::var_os("NDN_CCA_OFF").is_some() {
                 let _ = d.set_cca_ignore(true);
@@ -377,14 +389,6 @@ pub fn open_named_radio(pid: u16, channel: u8) -> Result<OpenRadio, FaceError> {
                 time: Some(d.clone()),
                 profile: Some(d),
             });
-        }
-        // `bring_up_monitor` sets TXAGC to full 0x3f; on a USB-power-limited host a full-power 2-chain
-        // TX can brown the PA out so the FIFO never drains. `NDN_TX_PWR=<0..63>` overrides the index.
-        if let Some(p) = std::env::var("NDN_TX_PWR")
-            .ok()
-            .and_then(|s| s.parse::<u8>().ok())
-        {
-            let _ = d.set_tx_power(p.min(63));
         }
         // `NDN_CCA_OFF=1` forces full carrier-sense off (EDCCA + OFDM packet CCA) so this radio blasts
         // regardless of a busy medium — the doctrine's monitor-mode-without-CSMA sender for the token

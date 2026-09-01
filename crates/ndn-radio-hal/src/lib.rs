@@ -774,7 +774,22 @@ impl Bandwidth {
         match self {
             Bandwidth::Bw80 => Some(Bandwidth::Bw40),
             Bandwidth::Bw40 => Some(Bandwidth::Bw20),
-            Bandwidth::Bw20 => Some(Bandwidth::Nb10),
+            // ☠ **STOPS AT 20 MHz — narrowband is not reachable by decrement.**
+            //
+            // This returned `Some(Nb10)` for one day and it was a LIVE BUG, introduced by the
+            // same change that fixed the code-vs-width axis. Chain: the AR9271 declares
+            // `max_bw: 0`; cognition takes `bw = cap.max_bw()` and narrows on any channel at or
+            // above `busy_high` (default 50%); `Bw20.narrower()` handed back `Nb10`;
+            // `ath9k_htc::set_channel` computes `want_ht40 = matches!(bw, Bw40)`, sees no change,
+            // and returns `Ok(())` — so `apply_knobs` records 10 MHz as APPLIED and, because it
+            // dedupes on the last value, never asks again. The radio sits at 20 MHz forever while
+            // the control plane and the bandit's airtime proxy believe 10.
+            //
+            // 5/10 MHz are a distinct PHY mode a radio must actually program, not one step down a
+            // ladder. No backend declares them, and one that did would need an explicit request —
+            // never a contention response that walked off the end of the Wi-Fi widths.
+            Bandwidth::Bw20 => None,
+            // A radio ALREADY in narrowband may step down within it.
             Bandwidth::Nb10 => Some(Bandwidth::Nb5),
             Bandwidth::Nb5 => None,
         }
@@ -835,6 +850,20 @@ mod bandwidth_axis {
                 );
             }
         }
+        // ★ Narrowing must never LEAVE the Wi-Fi widths: reaching Nb10 from Bw20 made cognition
+        // request a mode the radio cannot program, which `ath9k_htc::set_channel` then accepted
+        // with `Ok(())`. Narrowband is entered deliberately or not at all.
+        assert_eq!(
+            Bandwidth::Bw20.narrower(),
+            None,
+            "narrowing past 20 MHz must not fall into narrowband"
+        );
+        assert_eq!(
+            Bandwidth::Nb10.narrower(),
+            Some(Bandwidth::Nb5),
+            "a radio already in narrowband may still step down within it"
+        );
+
         // The old arithmetic, shown failing, so the reason is not forgotten.
         let five = Bandwidth::Nb5.code();
         assert_eq!(

@@ -792,7 +792,22 @@ impl RadioKnobs for SerialRadioBackend {
         SerialRadioBackend::set_channel(self, channel)?;
         // Map the HAL bandwidth to the board's 40 MHz enable (the widest this SDK
         // exposes): Bw20 → off, wider → on.
-        self.set_bw40(!matches!(bw, Bandwidth::Bw20))
+        // ☠ This was `set_bw40(!matches!(bw, Bw20))`, which sent `enable = true` for Nb5 and
+        // Nb10 — i.e. it WIDENED to 40 MHz when asked to NARROW to 10. That is the same inversion
+        // already fixed on the decision side (cognition's `saturating_sub(1)` on the non-monotone
+        // code axis), surviving here in the actuator. The bridge exposes one boolean,
+        // `wext_set_bw40_enable`, and has no narrowband to offer at all.
+        match bw {
+            Bandwidth::Bw20 => self.set_bw40(false),
+            Bandwidth::Bw40 | Bandwidth::Bw80 => self.set_bw40(true),
+            narrow => Err(FaceError::Io(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                format!(
+                    "serial radio: {narrow:?} — the bridge exposes only wext_set_bw40_enable \
+                     (20/40 MHz); refusing rather than widening to 40 when asked to narrow"
+                ),
+            ))),
+        }
     }
     fn set_tx_power(&self, idx: u32) -> Result<(), FaceError> {
         // RTL8720DN: the phydm TXAGC index, ~0.25 dB/step (measured 0.274). Clamp to 0..=126 so a

@@ -264,6 +264,12 @@ impl MorseFrameIo {
 
 #[async_trait]
 impl FrameIo for MorseFrameIo {
+
+    /// This radio's own capability, so a face built from the bare `dyn FrameIo` does not have to
+    /// invent one. Delegates to this type's [`RadioProfile`] — the single source of truth.
+    fn radio_capability(&self) -> Option<ndn_radio_hal::RadioCapability> {
+        Some(<Self as ndn_radio_hal::RadioProfile>::capability(self))
+    }
     async fn inject(&self, frame: InjectFrame) -> Result<(), FaceError> {
         self.check_payload(&frame)?;
         self.af.inject(frame).await
@@ -497,6 +503,12 @@ impl Nrc7292FrameIo {
 
 #[async_trait]
 impl FrameIo for Nrc7292FrameIo {
+
+    /// This radio's own capability, so a face built from the bare `dyn FrameIo` does not have to
+    /// invent one. Delegates to this type's [`RadioProfile`] — the single source of truth.
+    fn radio_capability(&self) -> Option<ndn_radio_hal::RadioCapability> {
+        Some(<Self as ndn_radio_hal::RadioProfile>::capability(self))
+    }
     async fn inject(&self, frame: InjectFrame) -> Result<(), FaceError> {
         self.af.inject(frame).await
     }

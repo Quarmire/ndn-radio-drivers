@@ -775,6 +775,27 @@ impl Mt7921uBackend {
                 "mt7921u: could not read the factory MAC from the efuse; continuing",
             ),
         }
+
+        // ★★ Pin EDCA to a KNOWN posture. USB never power-cycles the chip between processes and
+        // the warm path above deliberately does NOT reload firmware state, so contention was
+        // simply whatever the previous run left. MEASURED on the sibling MT7610U, five consecutive
+        // processes: a run that set no posture returned 2724 or 6706 f/s — a **2.5x swing decided
+        // purely by run order**. This part is worse placed to notice, because its EDCA lives behind
+        // `MCU_CE_CMD(SET_EDCA_PARMS)` firmware state that no register read reveals.
+        //
+        // `restore_edca` was written for exactly this and had **zero callers in the workspace** —
+        // the same shape as the capability leak: the mechanism existed and nothing invoked it.
+        // Non-fatal on purpose: a contention write failing must not turn a working radio into no
+        // radio. See `mt76x0::bring_up` for the measurement and `coverage::CONTENTION_PINNED`.
+        if let Err(e) = self.restore_edca() {
+            tracing::warn!(
+                target: "named_radio",
+                chip = "MT7921AU",
+                error = %e,
+                "mt7921u: EDCA not pinned — contention posture is whatever the previous process \
+                 left; pin NDN_POSTURE before trusting any throughput figure",
+            );
+        }
         Ok(())
     }
 
@@ -1845,6 +1866,12 @@ impl crate::rx_pump::Pumpable for Mt7921uBackend {
 
 #[async_trait]
 impl FrameIo for Mt7921uBackend {
+
+    /// This radio's own capability, so a face built from the bare `dyn FrameIo` does not have to
+    /// invent one. Delegates to this type's [`RadioProfile`] — the single source of truth.
+    fn radio_capability(&self) -> Option<ndn_radio_hal::RadioCapability> {
+        Some(<Self as ndn_radio_hal::RadioProfile>::capability(self))
+    }
     async fn inject(&self, frame: InjectFrame) -> Result<(), FaceError> {
         // ★ Same hazard as the sibling MT7612U, whose limit is lower: an MPDU past what the part
         // accepts does not get dropped, it **resets the radio**. MEASURED here: 7935 B sustains
@@ -2453,7 +2480,17 @@ pub fn declared_capability() -> RadioCapability {
         retune_us: None,
         rx_only: false,
         duty_cycle_max: 1.0,
-        max_payload: 1500,
+        // ★ MEASURED, not inherited (2026-08-31 audit). This was `1500`, the unmeasured preset
+        // from `wifi_monitor_5ghz`, while `inject` guards at `MAX_MPDU_PAYLOAD` = 11454 — a 7.6x
+        // gap between what the radio advertised and what it would accept, which under-declares the
+        // payload lever exactly the way `max_bw: 0` under-declared the width lever on the 8812au.
+        //
+        // 7935 is this part's own measurement, recorded at the guard: "7935 B sustains 2742 f/s /
+        // 174 Mbit/s, while 11000 B collapses to 3 f/s". The GUARD stays at 11454 because it
+        // defends a different thing — past that the MPDU resets the radio rather than being
+        // dropped — so declaration (what is usable) and guard (what is survivable) are two honest
+        // numbers, and the invariant between them is `declared <= guard`. See `coverage::PAYLOAD`.
+        max_payload: 7935,
         half_duplex: true,
         csi: CsiSupport::None,
     }

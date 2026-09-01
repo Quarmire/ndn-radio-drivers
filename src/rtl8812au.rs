@@ -6830,6 +6830,55 @@ impl Rtl8812auBackend {
     /// `DMA_ENABLE`, so it must run *before* [`mac_init_queues`](Self::mac_init_queues)
     /// (which sets `MACTXEN|MACRXEN` last); the reverse silently disables RX. After
     /// this the dongle captures every frame on `channel`.
+    ///
+    /// ★ **Contention state does NOT leak across processes here — the EDCA registers are
+    /// re-pinned on every bring-up by [`mac_config`](Self::mac_config).**
+    ///
+    /// The MT7610U had that bug: it never wrote the EDCA registers at bring-up, nothing
+    /// power-cycles a USB chip between runs, and each process silently inherited the previous
+    /// one's posture — a 2.5x throughput swing decided by run order.
+    ///
+    /// ☠ **The trap, recorded because I fell in it.** Grepping this file for EDCA writes returns
+    /// nothing but comments, so it *looks* like it has the same hole. The writes are real; they
+    /// are just not source text. [`MAC_REG`] is `include_bytes!("../fw/rtl8812au/
+    /// rtl8812au_mac_reg.bin")` and `mac_config` walks it through
+    /// [`config_table`](Self::config_table) as `(u32 addr, u32 val)` byte writes. Decoding the
+    /// blob shows the EDCA block written in full:
+    ///
+    /// ```text
+    ///   0x0500..03 = 26 a2 2f 00 -> VO 0x002fa226     0x0512 = 0x1c  (PIFS)
+    ///   0x0504..07 = 28 a3 5e 00 -> VI 0x005ea328     0x0514 = 0x0a  (SIFS)
+    ///   0x0508..0b = 2b a4 5e 00 -> BE 0x005ea42b     0x0516 = 0x0a
+    ///   0x050c..0f = 4f a4 00 00 -> BK 0x0000a44f
+    /// ```
+    ///
+    /// **A register write can live as DATA in an `include_bytes!` blob — a source grep will never
+    /// see it.** Decode the table before concluding a register is unwritten. (These four words are
+    /// bit-identical to what `libusb_rtl88xx::init_edca_cfg` writes by name: the same Realtek
+    /// vendor defaults, arriving by a different route. They sit past the table's only conditional
+    /// block, so they apply for every cut/package/interface.)
+    ///
+    /// Belt and braces: `claim` also does a USB port reset, and on a warm chip without one
+    /// `power_on`'s `CARDEMU_TO_ACT` poll cannot complete, so bring-up returns `Err` at its first
+    /// `?` — a loud failure rather than silent inheritance.
+    ///
+    /// MEASURED 2026-08-31 across five processes with `Owned` applied in the middle,
+    /// `examples/au_edca_probe.rs` reports the SAME as-found state every time, byte for byte —
+    /// and it is exactly the table above:
+    ///
+    /// ```text
+    ///   VO 0x0500=002fa226  VI 0x0504=005ea328  BE 0x0508=005ea42b  BK 0x050c=0000a44f  slot=0x09
+    /// ```
+    ///
+    /// A process that had just written `Owned` (`...4219` on all four ACs) is followed by one that
+    /// reads the defaults back. Those constants are bit-identical to what
+    /// `libusb_rtl88xx::init_edca_cfg` writes explicitly, i.e. they are the Realtek vendor
+    /// defaults arriving by a different route.
+    ///
+    /// ⚠ Throughput is the WRONG instrument for this question: on a contended channel the same
+    /// A/B varied 22x between identical runs (648 to 14174 frames) and `Owned` came out *slowest*.
+    /// Read the registers. `examples/au_edca_probe.rs` is that instrument, kept for re-checking
+    /// after any change to the bring-up order.
     pub fn bring_up_monitor(&self, channel: u8) -> Result<(), FaceError> {
         self.power_on()?;
         self.download_firmware()?;
@@ -6977,12 +7026,16 @@ impl Rtl8812auBackend {
                 let pl = &d[RXDESC_SIZE..(RXDESC_SIZE + pkt_len).min(n - off)];
                 if pl.len() >= 10 && pl[0] == 0x03 {
                     let rec = &pl[2..10];
-                    self.tx_rpt_seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    self.tx_rpt_seen
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     if rec[0] & 0xc0 == 0 {
-                        self.tx_rpt_ok.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        self.tx_rpt_ok
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
-                    self.tx_rpt_retries
-                        .fetch_add(u32::from(rec[2] & 0x3f), std::sync::atomic::Ordering::Relaxed);
+                    self.tx_rpt_retries.fetch_add(
+                        u32::from(rec[2] & 0x3f),
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
                 }
             }
             if rpt_sel && std::env::var_os("NDN_C2H_DBG").is_some() {
@@ -7156,6 +7209,12 @@ impl crate::rx_pump::Pumpable for Rtl8812auBackend {
 /// USB I/O runs on the blocking pool so the async reactor is never stalled.
 #[async_trait]
 impl FrameIo for Rtl8812auBackend {
+
+    /// This radio's own capability, so a face built from the bare `dyn FrameIo` does not have to
+    /// invent one. Delegates to this type's [`RadioProfile`] — the single source of truth.
+    fn radio_capability(&self) -> Option<ndn_radio_hal::RadioCapability> {
+        Some(<Self as ndn_radio_hal::RadioProfile>::capability(self))
+    }
     /// ⚠ **This backend serves common-view observations while its own
     /// [`FaceTimeProfile::can_common_view`](ndn_radio_hal::FaceTimeProfile::can_common_view) is
     /// `false`.** Both statements are true, they answer different questions, and the gap between

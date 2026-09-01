@@ -763,6 +763,12 @@ fn deframe(buf: &[u8]) -> Option<(u8, Vec<u8>, usize)> {
 
 #[async_trait]
 impl FrameIo for SerialRadioBackend {
+
+    /// This radio's own capability, so a face built from the bare `dyn FrameIo` does not have to
+    /// invent one. Delegates to this type's [`RadioProfile`] — the single source of truth.
+    fn radio_capability(&self) -> Option<ndn_radio_hal::RadioCapability> {
+        Some(<Self as ndn_radio_hal::RadioProfile>::capability(self))
+    }
     async fn inject(&self, frame_in: InjectFrame) -> Result<(), FaceError> {
         // Build the 802.11 frame on the host — identical to the USB backends —
         // then hand the raw bytes to the board to inject (it adds FCS + seq).
@@ -939,20 +945,25 @@ impl Bw16SerialBackend {
     /// `with_format` builder because the transport is already behind an `Arc` by then — and the
     /// format must be fixed before the reader thread starts parsing with it.
     pub fn open_with_format(path: &str, format: FrameFormat) -> Result<Self, FaceError> {
-        let clock_domain = bw16_clock_domain(path);
-        let inner = SerialRadioBackend::open_clocked(path, clock_domain)?.with_format(format);
+        // Unclocked, as in `open` — the stamp is software; see the ⚠ block on this type.
+        let inner = SerialRadioBackend::open(path)?.with_format(format);
         Ok(Self {
             inner: Arc::new(inner),
             capability: RadioCapability::wifi_monitor_dual_1ss(vec![
                 1, 6, 11, 36, 40, 44, 48, 149, 153, 157, 161,
             ]),
-            clock_domain,
         })
     }
 }
 
 #[async_trait]
 impl FrameIo for Bw16SerialBackend {
+
+    /// This radio's own capability, so a face built from the bare `dyn FrameIo` does not have to
+    /// invent one. Delegates to this type's [`RadioProfile`] — the single source of truth.
+    fn radio_capability(&self) -> Option<ndn_radio_hal::RadioCapability> {
+        Some(<Self as ndn_radio_hal::RadioProfile>::capability(self))
+    }
     async fn inject(&self, frame_in: InjectFrame) -> Result<(), FaceError> {
         self.inner.inject(frame_in).await
     }
@@ -1133,6 +1144,12 @@ impl Esp32SerialBackend {
 
 #[async_trait]
 impl FrameIo for Esp32SerialBackend {
+
+    /// This radio's own capability, so a face built from the bare `dyn FrameIo` does not have to
+    /// invent one. Delegates to this type's [`RadioProfile`] — the single source of truth.
+    fn radio_capability(&self) -> Option<ndn_radio_hal::RadioCapability> {
+        Some(<Self as ndn_radio_hal::RadioProfile>::capability(self))
+    }
     async fn inject(&self, frame: InjectFrame) -> Result<(), FaceError> {
         self.inner.inject(frame).await
     }

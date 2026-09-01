@@ -1265,6 +1265,24 @@ impl Mt7612uBackend {
         }
         let _ = loaded_fw;
         eprintln!("mt7612u bring_up: {nw} writes + {nm} mcu cmds, {ne} op errors");
+
+        // ★★ Pin EDCA to a KNOWN posture. USB never power-cycles the chip between processes, so
+        // contention was whatever the previous run left. MEASURED on the sibling MT7610U, five
+        // consecutive processes: a run setting no posture returned 2724 or 6706 f/s — a **2.5x
+        // swing decided purely by run order**, which silently turns any unpinned A/B into a
+        // comparison of history. This file's own flood example names the same hazard.
+        //
+        // `restore_edca_defaults` already existed for this and was called only from an example.
+        // It writes the boot window directly (0x2222/0x4444/0xaaaa + TXOP 0), so it CANNOT go below
+        // the boot window — which matters here more than anywhere: on mt76x2 a window below boot is
+        // the fault that cost two physical replugs, and `window_floor(Mt76x2)` exists because of it.
+        // Non-fatal: a contention write failing must not turn a working radio into no radio.
+        if let Err(e) = self.restore_edca_defaults() {
+            eprintln!(
+                "mt7612u: EDCA not pinned ({e}) — contention posture is whatever the previous \
+                 process left; pin NDN_POSTURE before trusting any throughput figure"
+            );
+        }
         Ok(())
     }
 
@@ -1819,7 +1837,12 @@ impl Mt7612uBackend {
                     loop {
                         // Block rather than poll: the 50 us sleep this replaces put a floor
                         // under per-frame latency and burned a core doing it.
-                        let buf = match rx.lock().unwrap().recv() {
+                        // ⚠ Poison-tolerant: a bare `.unwrap()` here means ONE panicking pump
+                        // thread poisons the shared receiver and silently kills every OTHER TX
+                        // thread — the radio then transmits at a fraction of its rate with no
+                        // error anywhere. The MT7921AU pump already did this; the other two copies
+                        // of this loop did not, which is what three hand-copies of one loop costs.
+                        let buf = match rx.lock().unwrap_or_else(|e| e.into_inner()).recv() {
                             Ok(b) => b,
                             Err(_) => break, // sender dropped
                         };
@@ -1938,6 +1961,12 @@ impl Mt7612uBackend {
 
 #[async_trait]
 impl FrameIo for Mt7612uBackend {
+
+    /// This radio's own capability, so a face built from the bare `dyn FrameIo` does not have to
+    /// invent one. Delegates to this type's [`RadioProfile`] — the single source of truth.
+    fn radio_capability(&self) -> Option<ndn_radio_hal::RadioCapability> {
+        Some(<Self as ndn_radio_hal::RadioProfile>::capability(self))
+    }
     async fn inject(&self, frame: InjectFrame) -> Result<(), FaceError> {
         // ★ **Refuse an over-long MPDU rather than letting it reset the radio.**
         //
@@ -2058,6 +2087,13 @@ impl Mt7612uBackend {
             min_tx_power: None,
             db_per_power_idx: None,
             power_actuated: false,
+            // ★ MEASURED, not inherited (2026-08-31 audit). The spread below supplies
+            // `max_payload: 1500` — the preset's unmeasured default — while `inject` guards at
+            // `Self::MAX_MPDU_PAYLOAD` = 5650, "a real hardware limit, not a cautious guess".
+            // Declaring 1500 against a 5650 guard hides 3.8x of the payload lever, which on this
+            // family is the dominant throughput knob (per-frame cost dominates; width and rate do
+            // not move it). One number now, read from the guard itself.
+            max_payload: Self::MAX_MPDU_PAYLOAD,
             ..RadioCapability::wifi_monitor_5ghz(vec![6, 36])
         }
     }

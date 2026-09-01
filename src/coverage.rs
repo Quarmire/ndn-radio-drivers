@@ -62,6 +62,92 @@ pub struct Row {
 
 use Seam::{Excluded, Provided};
 
+/// ★ **How each backend makes its contention posture DETERMINISTIC** (added 2026-08-31).
+///
+/// USB never power-cycles a dongle between processes, so any MAC state a bring-up does not
+/// establish is simply **inherited from whatever ran before**. MEASURED on the MT7610U across five
+/// consecutive processes: a run that set no posture returned **2724 or 6706 f/s — a 2.5x swing
+/// decided purely by run order**. Every unpinned A/B on that radio had been comparing history.
+///
+/// The bug was fixed in the driver file where it was found. It then turned out the MT7921AU and
+/// MT7612U had the identical hole — each with a purpose-built restore function that nothing called
+/// (`restore_edca` had zero callers workspace-wide; `restore_edca_defaults` was used only by an
+/// example). That is the recurring shape this table exists to break: a fix that lands in one
+/// backend instead of in a checklist every backend answers.
+///
+/// A backend is clean by **either** mechanism — writing the posture, or power-cycling the MAC so
+/// the registers return to reset defaults. Both are recorded, because which one it is determines
+/// whether a future refactor (e.g. removing a redundant-looking power cycle) can reopen the hole.
+pub enum Contention {
+    /// Writes a known posture at bring-up. The string names the call that does it.
+    Pinned(&'static str),
+    /// Power-cycles the MAC at bring-up, so contention returns to hardware defaults.
+    PowerCycled(&'static str),
+    /// Cannot leak: this backend does not own the MAC arbiter.
+    NotApplicable(&'static str),
+    /// Not yet established. Non-empty reason required — an unreviewed backend is a known unknown,
+    /// not a silent assumption.
+    Unreviewed(&'static str),
+}
+
+/// One row per backend that owns a MAC. Adding a backend without an entry fails the gate below.
+pub const CONTENTION: &[(&str, Contention)] = &[
+    ("Mt7610uBackend", Contention::Pinned("bring_up -> mt76::knobs::set_contention(Shared); the radio the 2.5x swing was measured on")),
+    ("Mt7921uBackend", Contention::Pinned("bring_up -> restore_edca(); EDCA is MCU_CE_CMD firmware state no register read reveals")),
+    ("Mt7612uBackend", Contention::Pinned("bring_up -> restore_edca_defaults(); writes the boot window, never below it (mt76x2 window_floor hazard)")),
+    ("LibUsbRtl88xxBackend", Contention::Pinned("mac_init -> init_edca_cfg(); slot + all four AC params by name")),
+    ("Rtl8812auBackend", Contention::Pinned("mac_config -> config_table(MAC_REG); the writes are DATA in an include_bytes! blob, invisible to a source grep — MEASURED identical across five processes")),
+    ("Rtl8733buBackend", Contention::PowerCycled("bring_up_monitor -> power_off() then power_on(); every entry point routes through it")),
+    ("Rtl8821cuBackend", Contention::PowerCycled("bring-up card-disables first when REG_CR != 0xea, then CARD_ENABLE. Its own EDCA write is gated behind NDN_RADIO_IBSS and does NOT run by default")),
+    ("Ath9kHtcBackend", Contention::Unreviewed("not established; the ported ath9k_hw_set_txq_props path has not been read for this question")),
+    ("MorseFrameIo", Contention::NotApplicable("HaLow via mac80211 — the kernel driver owns the EDCA arbiter")),
+    ("Nrc7292FrameIo", Contention::NotApplicable("HaLow via mac80211 — the kernel driver owns the EDCA arbiter")),
+    ("SerialRadioBackend", Contention::NotApplicable("the MAC lives in device firmware across a serial link")),
+    ("Bw16SerialBackend", Contention::NotApplicable("the MAC lives in device firmware across a serial link")),
+    ("Esp32SerialBackend", Contention::NotApplicable("the MAC lives in device firmware across a serial link")),
+    ("LoraSerialBackend", Contention::NotApplicable("LoRa has no EDCA; contention is the firmware's CSMA/LBT")),
+];
+
+/// ★ **The declaration-vs-actuator gate for the payload ceiling** (added 2026-08-31).
+///
+/// `RadioCapability::max_payload` is what a backend ADVERTISES; the length check at the top of its
+/// `inject` is what it ACTUALLY ACCEPTS. Nothing related the two, and they drifted in both
+/// directions: the MT7921AU advertised 1500 against a 11454 guard (7.6x) and the MT7612U advertised
+/// 1500 against 5650 (3.8x) — both shipped *after* the MT7610U found, measured and documented the
+/// same bug, because the fix lived in one backend's `mod tests` instead of in a gate every backend
+/// passes through. (The sibling's copy of that test had the load-bearing assertion replaced with
+/// `assert!(c.max_payload > 0)`.)
+///
+/// The rule is deliberately **`declared <= guard`**, not equality: they are two honest and
+/// different numbers. The guard defends the silicon — past it an oversized MPDU resets the radio
+/// rather than being dropped. The declaration says what is *usable*, which measurement may put
+/// lower (the MT7921AU sustains 7935 B but collapses to 3 f/s at 11000).
+///
+/// Each entry READS the backend's own declaration through a function pointer rather than restating
+/// it — a hand-typed copy here would be the exact silent divergence this file exists to police.
+pub const PAYLOAD: &[(&str, fn() -> ndn_radio_hal::RadioCapability, usize)] = &[
+    (
+        "Mt7610uBackend",
+        crate::mt76x0::declared_capability,
+        crate::mt76x0::MAX_MPDU_PAYLOAD,
+    ),
+    (
+        "Mt7921uBackend",
+        crate::mt7921::declared_capability,
+        crate::mt7921::MAX_MPDU_PAYLOAD,
+    ),
+    (
+        "Mt7612uBackend",
+        crate::Mt7612uBackend::declared_capability,
+        crate::Mt7612uBackend::MAX_MPDU_PAYLOAD,
+    ),
+];
+
+/// The unmeasured payload default that `RadioCapability::wifi_monitor_5ghz` supplies. A backend
+/// that has measured its own MPDU ceiling and still declares this has inherited the preset by
+/// accident — which is precisely how both live bugs above happened.
+pub const UNMEASURED_PRESET_PAYLOAD: usize = 1500;
+
 /// The table. Order: campaign radios first.
 pub const COVERAGE: &[Row] = &[
     Row {
@@ -392,6 +478,72 @@ mod tests {
             n += 4;
         }
         n
+    }
+
+    /// ★ **The bring-up contention gate, as a test** — see [`CONTENTION`].
+    ///
+    /// Asserts only what a table can: that every backend has ANSWERED the question and that no
+    /// answer is a blank. It cannot prove a radio does not leak — only hardware can, and the
+    /// MT7610U measurement is what put this here. What it does prevent is the actual failure mode:
+    /// a backend added, or a bring-up reordered, with nobody having asked.
+    #[test]
+    fn every_backend_states_how_its_contention_is_made_deterministic() {
+        let mut unreviewed = vec![];
+        for (name, c) in CONTENTION {
+            let reason = match c {
+                Contention::Pinned(r)
+                | Contention::PowerCycled(r)
+                | Contention::NotApplicable(r) => r,
+                Contention::Unreviewed(r) => {
+                    unreviewed.push(*name);
+                    r
+                }
+            };
+            assert!(
+                reason.len() >= 30,
+                "{name}: contention disposition needs a real written reason, got {reason:?}"
+            );
+        }
+        // Every backend carrying a FrameIo seam must appear — that is what makes this a checklist
+        // rather than a list of the ones somebody remembered.
+        for r in COVERAGE {
+            if matches!(r.frame_io, Provided) {
+                let short = r.backend.split_whitespace().next().unwrap_or(r.backend);
+                assert!(
+                    CONTENTION.iter().any(|(n, _)| *n == short),
+                    "{short} drives a radio but does not say how its contention is made \
+                     deterministic — add a CONTENTION row (see the 2.5x run-order swing)"
+                );
+            }
+        }
+        if !unreviewed.is_empty() {
+            println!("contention UNREVIEWED (known unknowns): {unreviewed:?}");
+        }
+    }
+
+    /// ★ **The declaration-vs-actuator gate, as a test** — see [`PAYLOAD`].
+    ///
+    /// Two live bugs motivated it, both found by audit rather than by a test: the MT7921AU
+    /// advertising 1500 B against an 11454 B guard, and the MT7612U advertising 1500 against 5650.
+    /// Both are the same failure as the 8812au's `max_bw: 0` — a lever the hardware has and the
+    /// declaration hides, so cognition never asks for it.
+    #[test]
+    fn declared_payload_never_exceeds_the_inject_guard() {
+        for (name, declared, guard) in PAYLOAD {
+            let d = declared().max_payload;
+            assert!(
+                d <= *guard,
+                "{name} advertises max_payload {d} B but its inject guard refuses above {guard} B \
+                 — it would promise a peer a frame size it then rejects"
+            );
+            assert_ne!(
+                d, UNMEASURED_PRESET_PAYLOAD,
+                "{name} has a MEASURED MPDU guard of {guard} B but still declares the preset's \
+                 unmeasured {UNMEASURED_PRESET_PAYLOAD} B — the inherited-by-accident bug this \
+                 gate exists to catch"
+            );
+            assert!(d > 0, "{name} declares a zero payload ceiling");
+        }
     }
 
     /// The #79 gate, as a test: every row is full or excluded IN WRITING; every campaign radio is

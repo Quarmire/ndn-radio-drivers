@@ -4232,6 +4232,12 @@ impl crate::rx_pump::Pumpable for Rtl8733buBackend {
 /// pool so the async reactor is never stalled.
 #[async_trait]
 impl FrameIo for Rtl8733buBackend {
+
+    /// This radio's own capability, so a face built from the bare `dyn FrameIo` does not have to
+    /// invent one. Delegates to this type's [`RadioProfile`] — the single source of truth.
+    fn radio_capability(&self) -> Option<ndn_radio_hal::RadioCapability> {
+        Some(<Self as ndn_radio_hal::RadioProfile>::capability(self))
+    }
     async fn inject(&self, frame_in: InjectFrame) -> Result<(), FaceError> {
         let rate = self.tx_rate.load(Ordering::Relaxed);
         let flags = self.tx_flags.load(Ordering::Relaxed);

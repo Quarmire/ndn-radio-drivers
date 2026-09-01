@@ -5407,6 +5407,12 @@ impl LibUsbRtl88xxBackend {
 
 #[async_trait]
 impl FrameIo for LibUsbRtl88xxBackend {
+
+    /// This radio's own capability, so a face built from the bare `dyn FrameIo` does not have to
+    /// invent one. Delegates to this type's [`RadioProfile`] — the single source of truth.
+    fn radio_capability(&self) -> Option<ndn_radio_hal::RadioCapability> {
+        Some(<Self as ndn_radio_hal::RadioProfile>::capability(self))
+    }
     async fn inject(&self, frame: InjectFrame) -> Result<(), FaceError> {
         // Rate is state: transmit at the control-plane-set MCS if one has landed,
         // else resolve the frame's intent (robust bring-up default).

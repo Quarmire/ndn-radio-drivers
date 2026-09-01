@@ -502,6 +502,36 @@ pub struct PhyMetrics {
 /// task); `inject` may be called concurrently and must synchronise internally.
 #[async_trait]
 pub trait FrameIo: Send + Sync + 'static {
+    /// **What radio is this?** — the seam that stops a face from having to guess.
+    ///
+    /// ★ Added 2026-08-31 to close a capability leak that had survived two attempts to fix it.
+    /// An `Arc<dyn FrameIo>` could not be asked what it was, so every constructor that takes one
+    /// had to *invent* a [`RadioCapability`]. The production node did exactly that: it opened an
+    /// RTL8822E — which implements [`RadioProfile`], [`RadioKnobs`] and [`RadioTime`] — and then
+    /// built its face from the bare `dyn FrameIo`, so the radio's own profile was dropped and a
+    /// placeholder declaring `max_mcs 9 / max_nss 2 / max_bw 2` went on air over a part that
+    /// receives ONE spatial stream at MCS 7. Advertising streams a radio cannot receive is the
+    /// MEASURED cause of a one-way link.
+    ///
+    /// The capability-complete path (`RadioBearer::from_open`) already existed and was documented
+    /// as "precisely the leak the opener was created to close" — and had **zero** production
+    /// callers, because using it meant threading four handles through every call site. So the fix
+    /// for the unactuated contract was itself unactuated. This method makes the answer reachable
+    /// from the one handle every face already holds, which is why it is here and not in a
+    /// wider-but-optional interface.
+    ///
+    /// `None` means "I genuinely cannot say" and the caller's assertion stands. Every backend in
+    /// `ndn-radio-drivers` implements [`RadioProfile`] (14 of 14 at the time of writing) and
+    /// overrides this with `Some`; the default exists for test doubles and for any future backend
+    /// that has no self-description.
+    ///
+    /// ⚠ Deliberately NOT named `capability`: [`RadioProfile::capability`] already exists, and a
+    /// same-named method on a second trait would make every existing `backend.capability()` call
+    /// site ambiguous.
+    fn radio_capability(&self) -> Option<RadioCapability> {
+        None
+    }
+
     /// Transmit `frame.payload` on the medium for `frame.tx`. Fire-and-forget,
     /// unacknowledged — like all broadcast injection.
     async fn inject(&self, frame: InjectFrame) -> Result<(), FaceError>;
@@ -693,6 +723,82 @@ impl Bandwidth {
             _ => Bandwidth::Bw20,
         }
     }
+
+    /// **The physical channel width in MHz — the only correct ordering axis.**
+    ///
+    /// ☠ [`code`](Self::code) is a wire/register encoding and is **NOT ordered by width**:
+    /// `Bw20=0, Bw40=1, Bw80=2, Nb10=3, Nb5=4`, so the two NARROWBAND codes sort *above* 80 MHz.
+    /// Anything that compares or arithmetics on the code is silently wrong for narrowband:
+    /// cognition's contention response was `bw = bw.saturating_sub(1)`, which **widens** 5 MHz to
+    /// 10 MHz, and its VHT inference was `max_bw >= 2`, which reads a 10 MHz channel as
+    /// VHT-capable. Both were latent only because **no backend declares code 3 or 4** — the axis
+    /// punishes honesty, since declaring narrowband would make the planner pick 5 MHz as its
+    /// *default* width and then "narrow" toward 80. Use `mhz()` for every comparison.
+    pub fn mhz(self) -> u16 {
+        match self {
+            Bandwidth::Bw20 => 20,
+            Bandwidth::Bw40 => 40,
+            Bandwidth::Bw80 => 80,
+            Bandwidth::Nb10 => 10,
+            Bandwidth::Nb5 => 5,
+        }
+    }
+
+    /// The next narrower width, or `None` at the narrowest — the correct "back off under
+    /// contention" step, replacing arithmetic on [`code`](Self::code).
+    pub fn narrower(self) -> Option<Bandwidth> {
+        match self {
+            Bandwidth::Bw80 => Some(Bandwidth::Bw40),
+            Bandwidth::Bw40 => Some(Bandwidth::Bw20),
+            Bandwidth::Bw20 => Some(Bandwidth::Nb10),
+            Bandwidth::Nb10 => Some(Bandwidth::Nb5),
+            Bandwidth::Nb5 => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod bandwidth_axis {
+    use super::*;
+
+    /// ★ Pins the trap: the numeric code is NOT the width order. If someone "tidies" `code()` into
+    /// ascending width they will silently change a wire/register encoding; if someone compares
+    /// codes they get narrowband backwards. This test exists so both mistakes fail loudly.
+    #[test]
+    fn the_code_axis_is_not_the_width_axis() {
+        assert!(
+            Bandwidth::Nb5.code() > Bandwidth::Bw80.code(),
+            "codes are a wire encoding; 5 MHz sorting above 80 MHz is the trap this pins"
+        );
+        assert!(
+            Bandwidth::Nb5.mhz() < Bandwidth::Bw80.mhz(),
+            "mhz() is the ordering axis and must be monotone in real width"
+        );
+        // Narrowing must always reduce width, from every starting point.
+        for b in [
+            Bandwidth::Bw80,
+            Bandwidth::Bw40,
+            Bandwidth::Bw20,
+            Bandwidth::Nb10,
+            Bandwidth::Nb5,
+        ] {
+            if let Some(n) = b.narrower() {
+                assert!(
+                    n.mhz() < b.mhz(),
+                    "narrower() widened {b:?} -> {n:?} ({} -> {} MHz)",
+                    b.mhz(),
+                    n.mhz()
+                );
+            }
+        }
+        // The old arithmetic, shown failing, so the reason is not forgotten.
+        let five = Bandwidth::Nb5.code();
+        assert_eq!(
+            Bandwidth::from_code(five.saturating_sub(1)),
+            Bandwidth::Nb10,
+            "code-1 on 5 MHz yields 10 MHz — the 'narrowing' that widens"
+        );
+    }
 }
 
 /// The uniform stateful-knob surface every userspace radio backend exposes to
@@ -701,8 +807,23 @@ impl Bandwidth {
 /// drive any radio.
 ///
 /// Only [`set_channel`](Self::set_channel) is required — a radio that cannot at
-/// least tune is not useful. The remaining knobs default to no-ops so a port can
-/// land RX/TX first and grow contention/power control later. Per-frame
+/// least tune is not useful. **Every other knob defaults to an `Unsupported` refusal**, so a port
+/// can land RX/TX first and grow contention/power control later *without the unported knobs
+/// silently reporting success*.
+///
+/// ★ That default was `Ok(())` until 2026-08-31, on 7 of 18 knobs, and the cost is recorded on
+/// [`set_tx_power`](Self::set_tx_power): a silent success made the MT7612U and MT7921AU "accept"
+/// every power back-off cognition asked for although neither has a power actuator, `apply_knobs`
+/// recorded the request as applied, and the bandit's footprint term was rewarded for a spatial
+/// reuse that never physically happened. The same shape was live on `set_tx_csd` (un-overridden by
+/// 12 of 13 backends) and `set_tx_hold` (11 of 13) — the latter is the slot MAC's queue gate, so
+/// on those parts the queue bled into the next owner's slot while the scheduler believed it had
+/// been held. `apply_knobs` already degrades per knob and updates its cache only on success, so an
+/// honest default makes the false "applied" record impossible for free.
+///
+/// The one deliberate exception is
+/// [`configure_name_filter`](Self::configure_name_filter), whose contract names a real fallback
+/// (the host filters in software), so its `Ok(())` is a behaviour rather than a pretence. Per-frame
 /// rate/STBC/LDPC/short-GI/NSS is NOT here; that travels with each
 /// [`InjectFrame`]`.mcs` on the data plane.
 pub trait RadioKnobs: Send + Sync {
@@ -842,13 +963,19 @@ pub trait RadioKnobs: Send + Sync {
     /// A radio with no such gate leaves the default and relies on the scheduler's software wait,
     /// which is correct for it — the default must never be "pretend it worked".
     fn set_tx_hold(&self, _hold: bool) -> Result<(), FaceError> {
-        Ok(())
+        Err(FaceError::Io(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "radio exposes no MAC transmit-hold gate",
+        )))
     }
 
     /// Enable cyclic-shift diversity on the second chain (1-stream robustness via
     /// antenna diversity). Default: no-op (not supported / single-chain).
     fn set_tx_csd(&self, _on: bool) -> Result<(), FaceError> {
-        Ok(())
+        Err(FaceError::Io(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "radio exposes no cyclic-shift-diversity control (single chain, or not ported)",
+        )))
     }
 
     /// **The clear-channel threshold, in true dBm** — above `l2h` the medium counts as busy, below
@@ -874,7 +1001,10 @@ pub trait RadioKnobs: Send + Sync {
     /// Ignore EDCCA / listen-before-talk so TX proceeds under channel contention. Default: no-op.
     /// (A LoRa radio maps this to its LBT toggle.)
     fn set_edcca_ignore(&self, _on: bool) -> Result<(), FaceError> {
-        Ok(())
+        Err(FaceError::Io(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "radio exposes no ED-CCA threshold control",
+        )))
     }
 
     /// **Switch the radio's modulation**, returning the mode actually in effect.
@@ -953,19 +1083,28 @@ pub trait RadioKnobs: Send + Sync {
     /// sensitivity). No-op default; only a [`RadioKind::Lora`] radio acts on it. Cognition drives
     /// this the way it drives MCS — down for close/bulk, up for far/urgent.
     fn set_spreading_factor(&self, _sf: u8) -> Result<(), FaceError> {
-        Ok(())
+        Err(FaceError::Io(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "radio has no spreading factor (not a LoRa PHY)",
+        )))
     }
 
     /// Set the LoRa **coding rate** (`1`=4/5 … `4`=4/8) — a robustness/FEC dial (more coding = more
     /// resilience to interference, at the cost of airtime). No-op default.
     fn set_coding_rate(&self, _cr: u8) -> Result<(), FaceError> {
-        Ok(())
+        Err(FaceError::Io(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "radio has no settable coding rate",
+        )))
     }
 
     /// Set the LoRa channel **bandwidth in kHz** (125 / 250 / 500) — a rate/range axis orthogonal to
     /// spreading factor (wider = faster but noisier / shorter). No-op default.
     fn set_bandwidth_khz(&self, _khz: u32) -> Result<(), FaceError> {
-        Ok(())
+        Err(FaceError::Io(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "radio has no kHz-granular bandwidth control (see set_channel for Wi-Fi widths)",
+        )))
     }
 
     /// The transmit-timing discipline this radio can *promise* (named-time Cut 2) — the capability
@@ -2389,14 +2528,30 @@ mod tx_hold_default {
         }
     }
 
-    /// A radio with no transmit gate must accept the call and do nothing — never error, and never
-    /// report success for a hold it cannot perform. The scheduler relies on that: it closes the
-    /// gate unconditionally and falls back to its software wait for radios that have none.
+    /// A radio with no transmit gate must **not report success for a hold it cannot perform**.
+    ///
+    /// ★ This test previously asserted `is_ok()`, under a doc comment demanding both "never error"
+    /// and "never report success for a hold it cannot perform" — which `Result<(), FaceError>`
+    /// cannot express, because `Ok(())` IS reporting success. The two clauses were written when an
+    /// `Err` was assumed to abort something. It does not: the scheduler calls this as
+    /// `let _ = k.set_tx_hold(..)` (`sched.rs:614, :623`) and falls back to its software wait
+    /// regardless, which is exactly the behaviour the old comment wanted to protect.
+    ///
+    /// Why it matters that this is honest: `set_tx_hold` is un-overridden by 11 of 13 backends, and
+    /// it is the slot MAC's queue gate — "anything already queued would otherwise drain into
+    /// another owner's slot". On a silent `Ok(())` the scheduler believed the queue was held on
+    /// every mt76 and both HaLow parts while it was in fact bleeding into the next owner's slot.
     #[test]
-    fn default_tx_hold_is_a_no_op() {
+    fn default_tx_hold_refuses_rather_than_claiming_a_hold_it_cannot_perform() {
         let b = Bare;
-        assert!(b.set_tx_hold(true).is_ok());
-        assert!(b.set_tx_hold(false).is_ok());
+        for r in [b.set_tx_hold(true), b.set_tx_hold(false)] {
+            match r {
+                Err(FaceError::Io(io)) => {
+                    assert_eq!(io.kind(), std::io::ErrorKind::Unsupported)
+                }
+                other => panic!("expected an Unsupported refusal, got {other:?}"),
+            }
+        }
     }
 }
 
@@ -2542,6 +2697,18 @@ mod phy_capability {
             b.set_phy(PhyMode::Lora).err(),
             b.set_hop_plan(HopControl::On, 4, &[915_000_000]).err(),
             b.set_rx_gain(RxGain::Boosted).err(),
+            // ★ Extended 2026-08-31 from 3 knobs to all of them. The old name said "the NEW
+            // knobs", which was the confession: the convention was applied to each knob as it was
+            // written and never retro-applied, leaving 7 silently succeeding. A knob added later
+            // and left on the default is now caught here rather than in a bandit reward.
+            b.set_tx_hold(true).err(),
+            b.set_tx_csd(true).err(),
+            b.set_edcca_ignore(true).err(),
+            b.set_spreading_factor(9).err(),
+            b.set_coding_rate(5).err(),
+            b.set_bandwidth_khz(125).err(),
+            b.set_contention(ContentionPosture::Owned).err(),
+            b.set_tx_power_dbm(10).err(),
         ] {
             match e {
                 Some(FaceError::Io(io)) => {

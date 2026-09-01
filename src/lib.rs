@@ -260,6 +260,35 @@ pub fn open_named_radio(pid: u16, channel: u8) -> Result<OpenRadio, FaceError> {
             ndn_radio_hal::Bandwidth::Bw20,
         )?;
         apply_bw_override(d.as_ref(), channel);
+        // ★★ Pipelined TX — the difference between this radio's benchmark and its real traffic.
+        //
+        // MEASURED 2026-08-31: `inject`'s synchronous `write_bulk` costs `≈295 + 0.031·B µs` per
+        // PPDU — a width-INDEPENDENT constant plus USB bus time — capping the part near
+        // 3000 PPDU/s and pinning every channel width to the same period. Frames confirmed on air
+        // by a witness reading MCS 9 / 80 MHz on 100% of them; the pumped period tracks airtime
+        // per width (294/194/142 µs at 20/40/80), which no host-side artifact could do.
+        //
+        // Worth in context (posture PINNED, 3 reps): ~+24% at 1400 B under `Shared`, within noise
+        // at 11400 B under `Shared` (there the medium binds, not USB), and the full lever under an
+        // aggressive posture — peak ~250 Mbit/s at `Owned` + 11400 B + Bw80 + VHT MCS9. Kept on by
+        // default because it costs nothing when the medium is the limit and is worth 2x when USB
+        // is.
+        //
+        // This is spawned HERE, in the factory, and not only in the flood example, because that
+        // asymmetry is this repo's characteristic defect: a lever that is measured, documented and
+        // reaches no actuator. Before this line the benchmark had the fix and production did not.
+        // `NDN_TX_PUMP=0` restores the synchronous path for an A/B.
+        //
+        // ⚠ Frames may be reordered across pump threads. That is acceptable for connectionless
+        // NDN broadcast (and the MT7612U's pump already made the same trade), but it is the reason
+        // the knob exists rather than being unconditional.
+        let tx_depth = std::env::var("NDN_TX_PUMP")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(8);
+        if tx_depth > 0 {
+            std::mem::forget(d.spawn_tx_pump(tx_depth));
+        }
         start_pump(&d);
         return Ok(OpenRadio {
             io: d.clone(),
@@ -513,8 +542,13 @@ fn apply_bw_override(knobs: &dyn RadioKnobs, channel: u8) {
         "10" => Bandwidth::Nb10,
         "20" => Bandwidth::Bw20,
         "40" => Bandwidth::Bw40,
+        // ★ 80 was missing entirely, so no caller could ask for it even on a part that supports
+        // it. MEASURED on the MT7610U 2026-08-31: Bw80 is real on air (witness radiotap) and worth
+        // +84% at 7000 B over Bw20. A radio refusing a width it can actuate is the same
+        // declaration/actuator gap as declaring a width it cannot.
+        "80" => Bandwidth::Bw80,
         other => {
-            tracing::warn!("NDN_RADIO_BW={other}: expected 5|10|20|40, ignoring");
+            tracing::warn!("NDN_RADIO_BW={other}: expected 5|10|20|40|80, ignoring");
             return;
         }
     };

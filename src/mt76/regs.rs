@@ -284,7 +284,10 @@ pub const MT_TX_HW_QUEUE_MGMT: u32 = 9;
 // ── WMM (global per-AC parameters) ───────────────────────────────────────────
 // Four ACs are packed as nibbles into each of AIFSN/CWMIN/CWMAX, and as 16-bit
 // halves into a pair of TXOP words. The per-AC copy of the same knobs also
-// exists at MT_EDCA_CFG_AC(n) below; the mt76x0 init writes both.
+// exists at MT_EDCA_CFG_AC(n) below; ⚠ NEITHER block is written by the mt76x0 init tables
+// (src/mt76x0/initvals.rs) — until `bring_up` began calling `knobs::set_contention`, the MT7610U
+// ran on whatever the PREVIOUS PROCESS left, since USB never power-cycles the chip. MEASURED as a
+// 2.5x throughput swing decided by run order.
 
 pub const MT_WMM_AIFSN: u32 = 0x0214; // mt76x02_regs.h:141
 pub const MT_WMM_AIFSN_MASK: u32 = 0x0000_000f; // GENMASK(3,0) — :142

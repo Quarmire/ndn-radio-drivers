@@ -2941,6 +2941,12 @@ fn is_unsupported(e: &FaceError) -> bool {
 
 #[async_trait]
 impl FrameIo for LoraSerialBackend {
+
+    /// This radio's own capability, so a face built from the bare `dyn FrameIo` does not have to
+    /// invent one. Delegates to this type's [`RadioProfile`] — the single source of truth.
+    fn radio_capability(&self) -> Option<ndn_radio_hal::RadioCapability> {
+        Some(<Self as ndn_radio_hal::RadioProfile>::capability(self))
+    }
     async fn inject(&self, frame_in: InjectFrame) -> Result<(), FaceError> {
         // The payload is the NDN packet itself; the firmware frames it. `dst`/`src`/`tx` carry no
         // link addressing on this bearer, so they are advisory only.

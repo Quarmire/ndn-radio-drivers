@@ -1346,10 +1346,22 @@ pub fn set_slot_time(bus: &dyn Mt76Regs, slot_us: u8, saved: &EdcaSaved) -> Resu
     }
 
     bus.rmw(MT_BKOFF_SLOT_CFG, 0x0000_00ff, u32::from(slot_us))?;
+    // ★ SIFS is read from THIS chip, not assumed. `ACKTO = slot + SIFS`, and the SIFS here used to
+    // be the literal 15 — which is the **MT7612U's** OFDM_SIFS (`MT_XIFS_TIME_CFG = 0x33a40f0a`,
+    // mt7612/init_table.rs:35). The MT7610U ships 0x33A41010, i.e. SIFS 16 (mt76x0/initvals.rs:219),
+    // so on that part the old arithmetic wrote ACKTO 24 over the 32 its own init table had just
+    // programmed (0x1348 = 0x000A2090, initvals.rs:200) — a MAC-timing word silently retimed to
+    // another chip's constant. Harmless while `set_contention` only ran on request; it became a
+    // per-bring-up clobber the moment mt76x0 started pinning EDCA at bring-up. Reading the field
+    // keeps the mt76x2 answer bit-identical (still 15) and makes the mt76x0 answer correct.
+    let sifs_us = bus
+        .rr(crate::mt76::regs::MT_XIFS_TIME_CFG)
+        .map(|v| ((v & crate::mt76::regs::MT_XIFS_TIME_CFG_OFDM_SIFS) >> 8) as u8)
+        .unwrap_or(15);
     bus.rmw(
         MT_TX_TIMEOUT_CFG,
         0x0000_ff00,
-        u32::from(slot_us.saturating_add(15)) << 8,
+        u32::from(slot_us.saturating_add(sifs_us)) << 8,
     )?;
     Ok(slot_us)
 }

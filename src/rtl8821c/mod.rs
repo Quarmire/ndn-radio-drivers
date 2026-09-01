@@ -1366,6 +1366,12 @@ impl Rtl8821cuBackend {
 
 #[async_trait]
 impl FrameIo for Rtl8821cuBackend {
+
+    /// This radio's own capability, so a face built from the bare `dyn FrameIo` does not have to
+    /// invent one. Delegates to this type's [`RadioProfile`] — the single source of truth.
+    fn radio_capability(&self) -> Option<ndn_radio_hal::RadioCapability> {
+        Some(<Self as ndn_radio_hal::RadioProfile>::capability(self))
+    }
     async fn inject(&self, frame: InjectFrame) -> Result<(), FaceError> {
         let mcs = self.resolved_mcs(&frame);
         let buf = self.build_tx(&frame, mcs)?;

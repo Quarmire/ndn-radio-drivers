@@ -87,8 +87,11 @@
 //!     `mt76x0_phy_set_channel` handles both, but it needs the *control-channel offset*
 //!     (`chandef->center_freq1`, `mt76x0/phy.c:949-968`) to pick `ch_group_index`, and the
 //!     [`RadioKnobs::set_channel`] seam carries only `(channel, bw)`. Rather than guess an
-//!     offset, [`set_channel`](RadioKnobs::set_channel) **rejects** anything but 20 MHz and
-//!     [`declared_capability`] reports `max_bw: 0`. Declaration and actuator agree.
+//!     offset, [`set_channel`](RadioKnobs::set_channel) long **rejected** anything but 20 MHz.
+//!     ★ RESOLVED 2026-08-31: `ht40_secondary_above`/`VHT80_GROUPS` derive that offset, and a
+//!     WITNESS RECEIVER confirmed 20/40/80 MHz PPDUs on air (100% of frames in each arm), so the
+//!     refusal is gone and [`declared_capability`] reports `max_bw: 2`. Declaration and actuator
+//!     still agree — they now agree at 80 MHz.
 //!   * **The WCID / shared-key table wipe** (`mt76x0/init.c:198-203`: 64 shared keys +
 //!     256 WCIDs). ~1300 EP0 round trips ≈ 0.2 s, and nothing in this driver's RX or TX
 //!     path reads the WCID table — TX uses the no-station WCID `0xff` and RX is
@@ -612,6 +615,23 @@ pub struct Mt7610uBackend {
     tx_queues: std::sync::atomic::AtomicU8,
     /// Round-robin cursor for [`Mt7610uBackend::tx_endpoint`].
     tx_rr: std::sync::atomic::AtomicU32,
+    /// Sender into the pipelined TX pump, when one is running
+    /// ([`spawn_tx_pump`](Self::spawn_tx_pump)). `None` = the old one-transfer-at-a-time path.
+    ///
+    /// ★ MEASURED 2026-08-31: the synchronous `write_bulk` in `inject` serialises one bulk at a
+    /// time and costs **≈295 + 0.031·B µs** — a large width-INDEPENDENT constant plus a bus-time
+    /// term (0.031 µs/B ≈ 258 Mbit/s, i.e. one in-flight bulk on USB 2.0 HS). MEASURED: 64 B at
+    /// VHT MCS9/80 MHz carries ~1 µs of airtime and still took 305 µs/frame; 1400 B took 342 µs,
+    /// and the 37 µs difference is exactly the per-byte term. The governing model is
+    /// `period = max(PPDU + DCF, USB_serial(B))` — a MAX, not a sum. Because the USB term is
+    /// width-independent, it pins every width to the same period whenever it dominates, which is
+    /// precisely why 20/40/80 MHz measured identically at 1400 B. Same defect the MT7612U already
+    /// fixed; see `mt7612::spawn_tx_pump`.
+    tx_sender: Mutex<Option<std::sync::mpsc::SyncSender<Vec<u8>>>>,
+    /// Bytes / frames the pump has actually handed to USB — the honest throughput figure.
+    /// Counting `inject` returns instead would measure the speed of a channel send.
+    tx_bytes: AtomicU64,
+    tx_count: AtomicU64,
     /// As-found EDCA state, so a contention posture can be undone.
     edca_saved: crate::mt76::knobs::EdcaSaved,
     /// A-MPDU probe state: `(wcid, ba_window)`, or `(0xff, 0)` for off. See
@@ -694,6 +714,9 @@ impl Mt7610uBackend {
                     .unwrap_or(1),
             ),
             tx_rr: std::sync::atomic::AtomicU32::new(0),
+            tx_sender: Mutex::new(None),
+            tx_bytes: AtomicU64::new(0),
+            tx_count: AtomicU64::new(0),
             edca_saved: crate::mt76::knobs::EdcaSaved::default(),
             ampdu: std::sync::atomic::AtomicU16::new(0xff00),
             tsf_domain,
@@ -968,6 +991,63 @@ impl Mt7610uBackend {
         )?;
 
         self.set_mac_address(self.eeprom.mac_addr())?;
+
+        // ★★ Program EDCA to a KNOWN posture. This driver never wrote these registers at all,
+        // and on USB nothing power-cycles the chip between processes, so the contention state was
+        // simply **whatever the previous process left behind**.
+        //
+        // MEASURED 2026-08-31, Bw80 / VHT MCS7 / 1400 B / pump=8, five consecutive processes:
+        //
+        // ```text
+        //   A  no NDN_POSTURE            6321 f/s
+        //   B  NDN_POSTURE=owned         6382 f/s
+        //   C  no NDN_POSTURE            6706 f/s   <- inherited Owned
+        //   D  NDN_POSTURE=shared        2965 f/s
+        //   E  no NDN_POSTURE            2724 f/s   <- inherited Shared
+        // ```
+        //
+        // A run that sets no posture measured **2724 or 6706 f/s — a 2.5x swing — decided purely
+        // by what ran before it.** Any A/B that does not pin the posture is comparing history, and
+        // any absolute throughput figure taken without one is unreproducible. This is the same
+        // cross-process latching class as the ALC/baseband override, and the file's own
+        // `set_contention` already warns that "a fresh process inherits whatever the previous one
+        // left and has no 'as found' to go back to" — it just had no caller at bring-up.
+        //
+        // `Shared` (`MT_EDCA_CFG_AC(n) = 0x000a4200` = TXOP 0, AIFSN 2, CWMIN 4, CWMAX 10) is a
+        // known, conservative posture at or above every measured floor, and the polite one for a
+        // shared medium. `RadioKnobs::set_contention` still moves it afterwards for anyone who asks.
+        //
+        // ⚠ It is NOT this part's "boot value" — I claimed that and it is not supported. That
+        // constant comes from the MT7612U's captured `init_replay`, and there is no MT7610U EEPROM
+        // or datasheet read behind it. MEASURED with `examples/mt7610_edca_probe.rs` on a chip
+        // freshly initialised by the kernel `mt76x0u` driver, the as-found state is DIFFERENT:
+        //
+        // ```text
+        //   as found (kernel):  AIFSN 0x1111  CWMIN 0x2222  CWMAX 0xaaaa  AC0/AC1 0x000a2100
+        //   after our bring-up: AIFSN 0x2222  CWMIN 0x4444  CWMAX 0xaaaa  AC0/AC1 0x000a4200
+        // ```
+        //
+        // The kernel's AC0/AC1 are the aggressive categories (VO/VI) and legitimately carry AIFSN 1
+        // / CWMIN 2. Note the shared helper writes ONE posture to all four ACs, flattening
+        // VO/VI/BE/BK — deliberate for a radio with a single traffic class, but it means "restoring
+        // the default" is not what this does. What it does, and all it claims to do, is make the
+        // posture DETERMINISTIC instead of inherited.
+        //
+        // Safe on THIS family: the window-below-boot hazard that cost two MT7612U replugs is
+        // mt76x2-specific (`window_floor`), we are writing the boot value rather than below it,
+        // and the MT7610U is MEASURED fine even at `Owned`. Non-fatal on purpose — a contention
+        // write failing should not turn a working radio into no radio.
+        if let Err(e) = crate::mt76::knobs::set_contention(
+            self,
+            ndn_radio_hal::ContentionPosture::Shared,
+            crate::mt76::Family::Mt76x0,
+            &self.edca_saved,
+        ) {
+            eprintln!(
+                "mt7610u: EDCA not initialised ({e}) — contention posture is whatever the \
+                 previous process left; pin NDN_POSTURE before trusting any throughput figure"
+            );
+        }
         Ok(())
     }
 
@@ -1332,6 +1412,110 @@ impl Mt7610uBackend {
         self.tx_queues.store(n.clamp(1, 4), Ordering::Relaxed);
     }
 
+    /// Spawn `depth` dedicated TX-pump threads — the pipelined transmit path.
+    ///
+    /// ★ **Why this exists (MEASURED 2026-08-31).** `inject`'s synchronous `write_bulk` submits
+    /// one USB bulk and blocks for its completion — `≈295 + 0.031·B µs`, a width-independent
+    /// constant plus USB bus time. At VHT MCS9 / 80 MHz a 64 B frame carries ~1 µs of airtime and
+    /// still took 305 µs/frame; the radio was idle ~99% of that. It capped the part near
+    /// 3000 PPDU/s, and being width-independent it pinned all three widths to one period.
+    ///
+    /// ★ The paired proof (1400 B, 3 reps, VHT MCS7, µs/frame):
+    ///
+    /// ```text
+    ///            Bw20        Bw40        Bw80      predicted (pumped)
+    ///   pump=0   345/354/313 333/344/339 312/319/320   ~338 at every width
+    ///   pump=8   294/313/322 194/194/210 140/142/144   279 / 187 / 143
+    /// ```
+    ///
+    /// Synchronous is FLAT across width — the USB floor, masking the air entirely. Pipelined, the
+    /// period tracks airtime. That width-dependence is also the proof the frames are real: no
+    /// host-side or USB-side artifact can vary with channel width.
+    ///
+    /// ⚠⚠ **Those two rows were taken before EDCA was programmed at bring-up, so they share an
+    /// arbitrary inherited posture.** The pump=0 vs pump=8 comparison is still sound — the posture
+    /// was constant across every cell — but the absolute numbers are not reproducible and must not
+    /// be quoted on their own. With the posture PINNED (3 reps each, Bw80, VHT MCS9, Mbit/s):
+    ///
+    /// ```text
+    ///                        1400 B                 11400 B
+    ///   shared, sync    33.4 / 31.2 / 28.9     125.2 / 130.9 / 127.3
+    ///   shared, pump    43.3 / 43.0 / 30.1     127.6 / 169.8 / 123.1
+    ///   owned,  pump    77.8 / 84.6 / 83.1     246.5 / 255.6 / 248.8
+    /// ```
+    ///
+    /// Read honestly: the pump is worth ~+24% at 1400 B under `Shared` and is **within noise at
+    /// 11400 B under `Shared`** — at that size, on a channel carrying other networks, the MEDIUM
+    /// binds and not USB. Its full value appears where the USB term dominates: small payloads, and
+    /// any aggressive posture. On this bench the posture is the larger lever of the two
+    /// (`Owned` ≈ 2.1x `Shared` at both payloads). Peak measured: **~250 Mbit/s** at
+    /// `Owned` + pump + 11400 B + Bw80 + VHT MCS9.
+    ///
+    /// Each thread locks the receiver only for a fast `recv`, then does the slow `write_bulk`
+    /// OUTSIDE the lock, so up to `depth` transfers are in flight and the host controller
+    /// pipelines them. Endpoint selection still goes through [`tx_endpoint`](Self::tx_endpoint),
+    /// so `NDN_TX_QUEUES` round-robin composes with this. Call after `bring_up`.
+    ///
+    /// Frame order across threads is not preserved — fine for connectionless NDN broadcast,
+    /// and the reason this is opt-in rather than the default.
+    ///
+    /// ⚠ The queue is **bounded** (`depth * 4`). An unbounded one makes `inject` a non-blocking
+    /// enqueue with no backpressure: MEASURED on the sibling MT7921AU, a 3 s flood queued
+    /// hundreds of thousands of frames that took minutes to drain, so the "throughput" recorded
+    /// was the speed of a channel send while the radio was still transmitting. Measure with
+    /// [`tx_count_written`](Self::tx_count_written), never by counting `inject` returns.
+    pub fn spawn_tx_pump(
+        self: &std::sync::Arc<Self>,
+        depth: usize,
+    ) -> Vec<std::thread::JoinHandle<()>> {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(depth.max(1) * 4);
+        *self.tx_sender.lock().unwrap() = Some(tx);
+        let rx = std::sync::Arc::new(Mutex::new(rx));
+        (0..depth.max(1))
+            .map(|_| {
+                let me = self.clone();
+                let rx = rx.clone();
+                std::thread::spawn(move || {
+                    let handle = me.usb.handle();
+                    loop {
+                        // Block rather than poll: a sleep here would put a floor under
+                        // per-frame latency and burn a core doing it.
+                        // ⚠ Poison-tolerant: a bare `.unwrap()` here means ONE panicking pump
+                        // thread poisons the shared receiver and silently kills every OTHER TX
+                        // thread — the radio then transmits at a fraction of its rate with no
+                        // error anywhere. The MT7921AU pump already did this; the other two copies
+                        // of this loop did not, which is what three hand-copies of one loop costs.
+                        let buf = match rx.lock().unwrap_or_else(|e| e.into_inner()).recv() {
+                            Ok(b) => b,
+                            Err(_) => break, // sender dropped
+                        };
+                        if let Ok(n) = handle.write_bulk(me.tx_endpoint(), &buf, BULK_TX_TIMEOUT) {
+                            me.tx_bytes.fetch_add(n as u64, Ordering::Relaxed);
+                            me.tx_count.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                })
+            })
+            .collect()
+    }
+
+    /// Stop the TX pump: drops the sender so the pump threads see a closed channel and exit.
+    /// `inject` falls back to the synchronous path.
+    pub fn stop_tx_pump(&self) {
+        *self.tx_sender.lock().unwrap() = None;
+    }
+
+    /// Bytes the TX pump has actually written to USB (0 if no pump has run).
+    pub fn tx_bytes_written(&self) -> u64 {
+        self.tx_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Frames the TX pump has actually written to USB — the honest denominator for a
+    /// throughput figure, as opposed to how many `inject` calls returned.
+    pub fn tx_count_written(&self) -> u64 {
+        self.tx_count.load(Ordering::Relaxed)
+    }
+
     pub fn read_rx(&self, buf: &mut [u8]) -> Result<usize, FaceError> {
         match self
             .usb
@@ -1367,7 +1551,27 @@ impl Mt7610uBackend {
                 None => s.parse::<u16>().ok(),
             }
         }) {
-            return v;
+            // ☠ **Cross-encoding guard.** `NDN_RADIO_TX_RATE` is one env name meaning FIVE different
+            // things: a Realtek DESC code on three backends, a connac2 rate word on the MT7921AU,
+            // and an mt76x02 TXWI word here. The workspace's standing remedy for the one-way-link
+            // failure is `NDN_RADIO_TX_RATE=4`, which IS legacy 6M as a Realtek DESC code — and
+            // here decodes as `phy=CCK, index=4`, a rate that does not exist (CCK is indices 0-3)
+            // and could not be used on 5 GHz if it did. It would have gone out silently.
+            //
+            // A raw TXWI word for any real rate is either a valid CCK index (0-3) or has a non-zero
+            // PHY field (OFDM 0x2000, HT 0x4000, VHT 0x8000). Anything between is another driver's
+            // number. Warn and fall through rather than air a rate nobody chose.
+            const PHY_FIELD: u16 = 0xe000;
+            if v & PHY_FIELD == 0 && (v & 0x3f) > 3 {
+                eprintln!(
+                    "mt7610u: NDN_RADIO_TX_RATE={v} is not an mt76x02 TXWI rate word — it decodes \
+                     as CCK index {} (CCK has only 0-3, and none on 5 GHz). This is very likely a \
+                     Realtek DESC code; on this part use 0x2000 for OFDM-6M. IGNORING it.",
+                    v & 0x3f
+                );
+            } else {
+                return v;
+            }
         }
         if frame.tx.reliability == ndn_radio_hal::Reliability::MostRobust {
             return LegacyRate::Ofdm6.rate_val();
@@ -1840,14 +2044,66 @@ impl crate::rx_pump::Pumpable for Mt7610uBackend {
     }
 }
 
+/// Largest `RawNdn` payload this part will actually put on air.
+///
+/// ★ MEASURED ON AIR 2026-08-31 with a witness receiver, VHT MCS0 / Bw80 (rate chosen low enough
+/// that the offered frame rate stays under the monitor's capture ceiling, so the ratio below is a
+/// real delivery ratio and not the witness saturating):
+///
+/// ```text
+///   payload   MPDU = payload+36   delivered to the witness
+///    11410          11446                96.1 %
+///    11418          11454                95.8 %      <- MAX_MPDU_PAYLOAD
+///    11419          11455                 0.0 %
+///    11430          11466                 0.0 %
+///    11454          11490                 0.0 %
+/// ```
+///
+/// The cliff is exactly the **802.11 maximum MPDU of 11454 B**, and it lands to the byte on
+/// `payload + 36` — 24 B 802.11 header + 6 B LLC/SNAP + 2 B ethertype + the 4 B FCS the MAC
+/// appends. Below it delivery is a flat 93-97% from 5650 B up, so there is no size-dependent
+/// degradation approaching the limit; it is a hard edge, not a slope.
+///
+/// ⚠ **Why the guard below exists.** Over the limit the hardware discards the frame and reports
+/// nothing: at 11419 B the host still printed `1206 frames ... (0 err), 27.46 Mbit/s` while the
+/// witness saw **zero**. A TX counter counts USB writes the device accepted, not radiation
+/// (see the same trap recorded for the whole part). Silently transmitting nothing is the worst
+/// failure mode available, so it is refused loudly instead.
+pub const MAX_MPDU_PAYLOAD: usize = 11_418;
+
 // ── FrameIo ─────────────────────────────────────────────────────────────────
 
 #[async_trait]
 impl FrameIo for Mt7610uBackend {
+
+    /// This radio's own capability, so a face built from the bare `dyn FrameIo` does not have to
+    /// invent one. Delegates to this type's [`RadioProfile`] — the single source of truth.
+    fn radio_capability(&self) -> Option<ndn_radio_hal::RadioCapability> {
+        Some(<Self as ndn_radio_hal::RadioProfile>::capability(self))
+    }
     async fn inject(&self, frame: InjectFrame) -> Result<(), FaceError> {
+        // MEASURED cliff — see [`MAX_MPDU_PAYLOAD`]. One byte over and the frame never airs while
+        // every host-side counter reports success, so this is refused rather than silently lost.
+        if frame.payload.len() > MAX_MPDU_PAYLOAD {
+            return Err(io_err(format!(
+                "mt7610u: payload {} B exceeds MAX_MPDU_PAYLOAD {MAX_MPDU_PAYLOAD} (802.11 caps \
+                 the MPDU at 11454 B and this frame carries 36 B of header+FCS). MEASURED: one \
+                 byte over this and the radio transmits NOTHING while still reporting success. \
+                 Fragment above this seam.",
+                frame.payload.len()
+            )));
+        }
         let dot11 = crate::frame::build_dot11(self.format, &frame)?;
         let rate = self.resolved_rate(&frame);
         let buf = self.build_tx_bulk(&dot11, rate);
+        // Fast path: hand the bulk to the pump (bounded queue = real backpressure) and let
+        // `depth` transfers be in flight at once. Without it every frame pays a full
+        // synchronous USB round trip and the radio idles between PPDUs.
+        if let Some(s) = self.tx_sender.lock().unwrap().clone() {
+            return s
+                .send(buf)
+                .map_err(|_| io_err("mt7610u: TX pump closed".into()));
+        }
         let handle = self.usb.handle();
         let ep = self.tx_endpoint();
         tokio::task::spawn_blocking(move || {
@@ -1929,11 +2185,10 @@ impl FrameIo for Mt7610uBackend {
 // ── RadioKnobs ──────────────────────────────────────────────────────────────
 
 impl RadioKnobs for Mt7610uBackend {
-    /// Tune to `channel` at 20 MHz.
+    /// Tune to `channel` at 20, 40 or 80 MHz.
     ///
-    /// Tunes 20 MHz only (40/80 MEASURED to wedge the MCU), and [`declared_capability`] reports
-    /// `max_bw: 0` to
-    /// match. 40 and 80 MHz exist in the RF/BBP switch tables and in
+    /// ★ 20/40/80 are all MEASURED on air by a witness receiver (2026-08-31); [`declared_capability`]
+    /// reports `max_bw: 2` to match. 40 and 80 MHz live in the RF/BBP switch tables and in
     /// `mt76x0_phy_set_channel`, but selecting either needs the control-channel offset
     /// (`chandef->center_freq1`, `mt76x0/phy.c:949-968`) to compute `ch_group_index`, and
     /// this seam carries only `(channel, bw)`. Guessing the offset would put the secondary
@@ -1976,28 +2231,49 @@ impl RadioKnobs for Mt7610uBackend {
         //
         // The tests were real and tested the wrong thing: centre-channel arithmetic, not the
         // MCU sequence. Declaration follows the actuator, and the actuator is 20 MHz.
-        // ★ `NDN_MT7610_WIDE=1` lifts this for an on-air width experiment, which is exactly what
-        // the refusal below asks for. Two things changed that make the experiment worth running:
+        // ★★★ **UN-GATED 2026-08-31 ON A WITNESS RECEIVER — the confirmation this refusal demanded.**
         //
-        //  1. The TXWI rate word's BW field was never written (`rate_bw_field`, added with this
-        //     change), so the historical "Bw80 -> 2719 f/s vs Bw20's 2732" was **20 MHz PPDUs on
-        //     an 80 MHz channel**. The width lever has never actually been pulled.
-        //  2. A failed `MCU_CAL_FULL` no longer leaves ALC off and the baseband in its
-        //     calibration override latched across processes (`phy::set_channel_ext`), so a
-        //     calibration timeout during this experiment costs EVM rather than corrupting every
-        //     later measurement on the dongle.
+        // Witness: o5p-0's RTL8812AU under the kernel `rtw88_8812au` driver, monitor mode on
+        // channel 36, reading the radiotap of what the MT7610U (o5p-1) actually put in the air.
+        // A transmitter cannot see its own PPDU width, so the width is read off the receiver.
+        // Three arms, same channel, same 1400 B payload, our SA 02:4e:44:4e:00:01:
         //
-        // Still opt-in, and still to be judged by a WITNESS RECEIVER — the transmitter cannot see
-        // its own PPDU width.
-        let wide_ok = std::env::var_os("NDN_MT7610_WIDE").is_some();
-        if !matches!(bw, Bandwidth::Bw20) && !wide_ok {
-            return Err(io_err(format!(
-                "mt7610u: set_channel({channel}, {bw:?}) — only 20 MHz is MEASURED working. \
-                 phy::set_channel_ext implements 40/80 and its MCU calibration returns an empty \
-                 response on this part, wedging the MCU. Re-enable only with an on-air width \
-                 confirmation (radiotap), not a code-read."
-            )));
-        }
+        //   Bw20 -> 25948/25948 frames "MCS 7 20 MHz"           (65.0 Mb/s)
+        //   Bw40 -> 19256/19256 frames "MCS 7 40 MHz"           (135.0 Mb/s)
+        //   Bw80 -> 19386/19386 frames "MCS 7 BCC FEC 80 MHz"   (VHT)
+        //
+        // 100% in every arm, no mixing. The rate corroborates the width independently: HT MCS7
+        // 1SS long-GI is 65.0 Mb/s at 20 MHz and 135.0 at 40, and the receiver derives that from
+        // the PPDU it demodulated, not from what we asked for. The MCU calibration that used to
+        // return a 0-byte response and wedge the chip did not fire once across the three arms.
+        //
+        // What changed since the 2026-08-28 re-gate: `rate_bw_field` now writes the TXWI rate
+        // word's BW field. It was never written before — which is why the historical
+        // "Bw80 -> 2719 f/s vs Bw20's 2732" was **20 MHz PPDUs on an 80 MHz channel**, the width
+        // lever having never actually been pulled. A failed `MCU_CAL_FULL` also no longer latches
+        // ALC off and the baseband override across processes (`phy::set_channel_ext`).
+        //
+        // ★ Width converts into goodput — but ONLY above the payload where airtime starts to
+        // dominate the fixed per-PPDU cost. MEASURED the same day, VHT MCS7 1SS, ch36 (Mbit/s):
+        //
+        //           1400 B   3000 B   5650 B   7000 B
+        //   Bw20     34.4     50.5     55.9     57.1
+        //   Bw40     33.6     64.0     82.7     99.8   (+75% over Bw20)
+        //   Bw80     33.1     67.9     84.7    105.2   (+84% over Bw20)
+        //
+        // At 1400 B the three widths are indistinguishable, and reading ONLY that row is how this
+        // comment previously came to say "width buys no goodput" — wrong, and wrong in the
+        // direction that would have retired a working lever. (Those figures predate both the TX
+        // pump and the bring-up EDCA write; with BOTH in place, width at 1400 B pumped under
+        // `Shared` measures 26.9 / 34.9 / 43.2 Mbit/s for 20/40/80 — still +61%.) The per-frame period is
+        // roughly `fixed + airtime(payload, width)` with `fixed` ≈ 300-400 µs; at 1400 B the
+        // 20 MHz airtime is ~172 µs, so the fixed term swamps the very thing being varied.
+        // Measure a width knob at the LARGEST payload, never the smallest.
+        //
+        // Peak on this part: **139.0 Mbit/s** at 11000 B / Bw80 (was 73.8 on record). VHT MCS
+        // 7/8/9 at 11000 B/Bw80 all land within noise (130.4 / 128.8 / 133.1), so above ~7 kB
+        // the link is bound by the fixed per-PPDU cost, not by rate and not by airtime — which
+        // is why `max_mcs` stays at 7 until a witness confirms MCS8/9 on air and they buy something.
         if !freq_plan::FREQUENCY_PLAN
             .iter()
             .any(|f| f.channel == channel)
@@ -2266,10 +2542,12 @@ impl RadioProfile for Mt7610uBackend {
 /// Every field is deliberately modest, because the planner and the worst-receiver rate cap
 /// both believe what a radio says about itself:
 ///
-/// * **`rate: Wifi { max_mcs: 7, max_nss: 1, max_bw: 0 }`.** One chain, HT MCS 0-7, 20 MHz.
-///   The part is 11ac silicon and VHT-1SS at 20 MHz would reach MCS8, but no VHT transmit
-///   has been confirmed here and [`mt76_rate_val`] clamps HT to 7 for a reason. `max_bw: 0`
-///   matches [`RadioKnobs::set_channel`], which refuses anything wider.
+/// * **`rate: Wifi { max_mcs: 7, max_nss: 1, max_bw: 2 }`.** One chain, HT MCS 0-7, up to 80 MHz.
+///   `max_bw: 2` is MEASURED (2026-08-31): a witness receiver read 100% of our frames as
+///   "MCS 7 20 MHz", "MCS 7 40 MHz" and "MCS 7 BCC FEC 80 MHz" across three arms, so the 80 MHz
+///   VHT PPDU is confirmed emitted. `max_mcs` stays at **7** — VHT-1SS reaches MCS8/9 and
+///   [`mt76_rate_val`] would encode them, but only MCS7 was put on air, and an unverified
+///   MCS is exactly what the worst-receiver cap must not inherit.
 /// * **`channels`.** 2.4 GHz 1-14 and the standard 20 MHz 5 GHz centres, all of which have a
 ///   PLL program in [`freq_plan::FREQUENCY_PLAN`]. The plan actually covers every integer
 ///   channel from 36-64 and 100-173 plus the 802.11j band; listing only the standard centres
@@ -2310,10 +2588,11 @@ pub fn declared_capability() -> RadioCapability {
         rate: RateCapability::Wifi {
             max_mcs: 7,
             max_nss: 1,
-            // MEASURED 20 MHz only — see `set_channel`. The 40/80 path exists in `phy` and
-            // fails its MCU calibration on silicon, so declaring 2 here would be the
-            // declaration/actuator mismatch this file criticises elsewhere.
-            max_bw: 0,
+            // ★ MEASURED 20/40/80 on air by a witness receiver (2026-08-31) — see
+            // `set_channel`. This was `0` while the 40/80 MCU calibration failed on silicon;
+            // it now completes, and cognition reads `vht` as `max_bw() >= 2`, so under-declaring
+            // here would hide the width lever the same way it was hidden on the MT7921AU.
+            max_bw: 2,
         },
         channels: vec![
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, // 2.4 GHz
@@ -2332,7 +2611,11 @@ pub fn declared_capability() -> RadioCapability {
         retune_us: Some(135_000),
         rx_only: false,
         duty_cycle_max: 1.0,
-        max_payload: 1500,
+        // ★ MEASURED on air, not assumed: 11418 B delivers at 95.8% and 11419 B at 0.0%
+        // (see [`MAX_MPDU_PAYLOAD`]). This was 1500, which pinned every HAL consumer to the one
+        // corner where the fixed per-PPDU cost dominates: at Bw80, pumped, posture `Owned`,
+        // 1400 B yields ~82 Mbit/s and 11400 B yields ~250.
+        max_payload: MAX_MPDU_PAYLOAD,
         half_duplex: true,
         csi: CsiSupport::None,
     }
@@ -2418,16 +2701,32 @@ mod tests {
         assert!(!c.bands.is_empty());
         assert!(!c.rx_only, "this part transmits");
         assert!(c.max_payload > 0);
+        // ★ The declaration must BE the measured cliff, not a guess. 11418 B delivered at 95.8%
+        // on air and 11419 B at 0.0%; `MPDU = payload + 36` puts that boundary exactly on the
+        // 802.11 maximum MPDU of 11454 B. If someone "rounds" this declaration, the guard in
+        // `inject` and the capability drift apart and oversized frames go back to vanishing
+        // silently.
+        assert_eq!(
+            c.max_payload, MAX_MPDU_PAYLOAD,
+            "declared max_payload must equal the guard in inject"
+        );
+        assert_eq!(
+            MAX_MPDU_PAYLOAD + 24 + 6 + 2 + 4,
+            11_454,
+            "MAX_MPDU_PAYLOAD + (802.11 24 + LLC/SNAP 6 + ethertype 2 + FCS 4) is the 802.11 \
+             maximum MPDU — this is the arithmetic the on-air cliff landed on to the byte"
+        );
         assert!(c.rate_rank() > 0.0, "a zero rate rank is never selected");
 
-        // 1x1, HT-only, 20 MHz — the whole point of the declaration.
+        // 1x1, HT rate ceiling, 80 MHz — the whole point of the declaration.
         assert_eq!(c.max_nss(), 1, "MT7610U has ONE chain");
         assert_eq!(c.max_mcs(), 7, "single-stream HT stops at MCS7");
         assert_eq!(
             c.max_bw(),
-            0,
-            "MEASURED: 40/80 MHz wedge this part's MCU (CALIBRATION_OP returns 0 bytes), so the \
-             declaration stays at 20 MHz until an on-air width confirmation says otherwise"
+            2,
+            "MEASURED 2026-08-31: a witness receiver (RTL8812AU, kernel monitor, ch36) read 100% \
+             of our frames as 20/40/80 MHz across three arms — the on-air width confirmation the \
+             old 20 MHz declaration was waiting for"
         );
         assert!(!c.he_cap(), "802.11ac silicon, not ax");
 
@@ -2439,10 +2738,11 @@ mod tests {
         );
         assert!(c.max_nss() < mt7612.max_nss());
         assert!(c.max_mcs() < mt7612.max_mcs());
-        // The MT7612U reaches VHT80 through a captured RF program (MEASURED 133 Mbit/s there);
-        // this part's programmatic wide-width path does not work. Chains and width both separate
-        // them, and both would misroute traffic if wrong.
-        assert!(c.max_bw() < mt7612.max_bw());
+        // ★ Width no longer separates them: the MT7612U reaches VHT80 through a captured RF
+        // program (MEASURED 133 Mbit/s there) and this part now reaches it programmatically
+        // (MEASURED on air 2026-08-31). CHAINS are what still separate them, and chains are what
+        // would misroute traffic — so assert the axis that is real rather than one that lapsed.
+        assert_eq!(c.max_bw(), mt7612.max_bw(), "both mt76 parts reach 80 MHz");
 
         // Nothing declared that set_channel would reject: every channel needs a PLL program,
         // and the declared width must be the one the knob accepts.
@@ -2505,7 +2805,10 @@ mod tests {
         assert_eq!(r.nss, 1, "one chain cannot carry two spatial streams");
 
         // STBC and LDPC are dropped on this part (see mt76_rate_val); short GI is not.
-        let r = decode_rate_word(mt76_rate_val(&McsDescriptor::ht(5).with_stbc().with_ldpc(), 0));
+        let r = decode_rate_word(mt76_rate_val(
+            &McsDescriptor::ht(5).with_stbc().with_ldpc(),
+            0,
+        ));
         assert!(!r.stbc && !r.ldpc);
         let sgi = McsDescriptor {
             short_gi: true,

@@ -11,8 +11,13 @@
 //! MT7612U, and it is the only mt76 part currently healthy on the bench.
 //!
 //!   sudo ./mt7610_txflood [channel] [seconds]
-//! env: NDN_BW=20|40|80, NDN_TX_MCS=<0-7>, NDN_TX_LEN=<bytes>, NDN_TX_QUEUES=<1-4>,
-//!      NDN_AMPDU=<ba_window>  (unset = broadcast, no aggregation)
+//! env: NDN_BW=20|40|80, NDN_TX_MCS=<0-9>, NDN_TX_LEN=<bytes>, NDN_TX_QUEUES=<1-4>,
+//!      NDN_TX_PUMP=<n> pipelined writer threads (0 = old synchronous path),
+//!      NDN_TX_VHT=1, NDN_TX_SGI=1, NDN_AMPDU=<ba_window>  (unset = broadcast, no aggregation)
+//!
+//! ⚠ Every knob here is read from the ENVIRONMENT, and `sudo` strips those. Run it as
+//! `export NDN_BW=80 ...; sudo -E ./mt7610_txflood 36 4` — `NDN_BW=80 sudo ./mt7610_txflood`
+//! silently runs at defaults and quietly turns an A/B into two copies of the control arm.
 use ndn_frame_io::{FrameFormat, FrameIo, InjectFrame, Reliability, TxIntent};
 use ndn_radio_drivers::Mt7610uBackend;
 use ndn_radio_hal::{Bandwidth, McsDescriptor, RadioKnobs};
@@ -109,7 +114,26 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         None => println!("A-MPDU: off (broadcast, wcid 0xff)"),
     }
 
-    // Payload sweep unless pinned: the per-frame cost is ~380 us and only a large MPDU amortises
+    // ★ `NDN_TX_PUMP=<n>` — pipelined TX. MEASURED 2026-08-31: the synchronous one-bulk-at-a-time
+    // path costs ~305 us per PPDU *independent of payload and channel width* (64 B at VHT MCS9 /
+    // 80 MHz is ~1 us of airtime and still took 305 us/frame), capping the part near 3000 PPDU/s.
+    // That width-independent floor is precisely why 20/40/80 MHz measured identically at 1400 B.
+    // 0 disables the pump and restores the old synchronous path for an A/B.
+    let pump_depth: usize = std::env::var("NDN_TX_PUMP")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8);
+    let _pump = (pump_depth > 0).then(|| dev.spawn_tx_pump(pump_depth));
+    println!(
+        "TX pump: {}",
+        if pump_depth > 0 {
+            format!("{pump_depth} threads (pipelined)")
+        } else {
+            "off (synchronous write_bulk per frame)".to_string()
+        }
+    );
+
+    // Payload sweep unless pinned: the per-frame cost is ~305 us and only a large MPDU amortises
     // it. `NDN_TX_LEN` pins a single size.
     let sizes: Vec<usize> = if std::env::var_os("NDN_TX_LEN").is_some() {
         vec![plen]
@@ -122,6 +146,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             body.push(b'#');
         }
         let payload = bytes::Bytes::from(body);
+        let base = dev.tx_count_written();
         let t = Instant::now();
         let (mut sent, mut errs) = (0u64, 0u64);
         while t.elapsed() < Duration::from_secs(secs) {
@@ -137,6 +162,23 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 Ok(()) => sent += 1,
                 Err(_) => errs += 1,
             }
+        }
+        // ⚠ With a pump, `sent` counts ENQUEUES. Let the bounded queue drain so the figure is
+        // what actually reached USB — the MT7921AU once reported a throughput that was really
+        // the speed of a channel send while the radio transmitted for minutes afterwards.
+        if pump_depth > 0 {
+            let (mut prev, mut stable) = (dev.tx_count_written(), 0);
+            while stable < 3 {
+                std::thread::sleep(Duration::from_millis(20));
+                let now = dev.tx_count_written();
+                if now == prev {
+                    stable += 1;
+                } else {
+                    stable = 0;
+                    prev = now;
+                }
+            }
+            sent = dev.tx_count_written().saturating_sub(base);
         }
         let el = t.elapsed().as_secs_f64();
         let fps = sent as f64 / el;

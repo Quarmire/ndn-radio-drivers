@@ -3180,6 +3180,12 @@ impl Ath9kHtcBackend {
 
 #[async_trait]
 impl FrameIo for Ath9kHtcBackend {
+
+    /// This radio's own capability, so a face built from the bare `dyn FrameIo` does not have to
+    /// invent one. Delegates to this type's [`RadioProfile`] — the single source of truth.
+    fn radio_capability(&self) -> Option<ndn_radio_hal::RadioCapability> {
+        Some(<Self as ndn_radio_hal::RadioProfile>::capability(self))
+    }
     async fn inject(&self, frame: InjectFrame) -> Result<(), FaceError> {
         let buf = self.build_tx_frame(&frame)?;
         let handle = self.handle.clone();

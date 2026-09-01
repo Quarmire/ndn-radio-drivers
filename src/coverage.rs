@@ -136,8 +136,8 @@ pub enum Contention {
 /// One row per backend that owns a MAC. Adding a backend without an entry fails the gate below.
 pub const CONTENTION: &[(&str, Contention)] = &[
     ("Mt7610uBackend", Contention::Pinned("bring_up -> mt76::knobs::set_contention(Shared); the radio the 2.5x swing was measured on")),
-    ("Mt7921uBackend", Contention::Pinned("bring_up -> restore_edca(); EDCA is MCU_CE_CMD firmware state no register read reveals")),
-    ("Mt7612uBackend", Contention::Pinned("bring_up -> restore_edca_defaults(); writes the boot window, never below it (mt76x2 window_floor hazard)")),
+    ("Mt7921uBackend", Contention::Pinned("bring_up -> restore_edca(); EDCA is MCU_CE_CMD firmware state no register read reveals. ⚠ 2026-09-01: pin is non-fatal and CONSISTENT with working (no-posture runs 2187/2334/2277 f/s across interleaved aggressive runs) but NOT proven — the contention lever measures only 5.6% on this part (cw_min exp 2 vs 5: 3619 vs 3426 f/s) against a 3.3% run spread, so a leak would look like noise. Underpowered, not passing. Needs a firmware EDCA read-back the MCU does not expose")),
+    ("Mt7612uBackend", Contention::Pinned("bring_up -> restore_edca_defaults(); writes the boot window, never below it (mt76x2 window_floor hazard). ⚠ 2026-09-01: examples/mt7612_edca_probe.rs reads the EDCA block before and after bring_up and IS the definitive test, but the part is in the documented warm-MCU state (-110 on vendor requests) and needs a physical replug before it can run")),
     ("LibUsbRtl88xxBackend", Contention::Pinned("mac_init -> init_edca_cfg(); slot + all four AC params by name")),
     ("Rtl8812auBackend", Contention::Pinned("mac_config -> config_table(MAC_REG); the writes are DATA in an include_bytes! blob, invisible to a source grep — MEASURED identical across five processes")),
     ("Rtl8733buBackend", Contention::PowerCycled("bring_up_monitor -> power_off() then power_on(); every entry point routes through it")),

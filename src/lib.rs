@@ -302,12 +302,19 @@ pub fn open_named_radio(pid: u16, channel: u8) -> Result<OpenRadio, FaceError> {
     if MT7921U_PIDS.contains(&pid) {
         let d = Arc::new(Mt7921uBackend::open_selected(sel.clone())?.with_format(fmt));
         d.bring_up()?;
-        d.setup_monitor_rx()?;
+        // ★ ORDER IS LOAD-BEARING, and this arm had it backwards (fixed 2026-09-01).
+        // `setup_monitor_rx` refuses outright while the channel is still 0 — "the sniffer carries
+        // its own copy of the channel and has nothing to be told" (mt7921/mod.rs:1245-1250) — so
+        // this arm returned an error for EVERY caller and `open_named_radio` was simply broken for
+        // the MT7921AU. Found by trying to use the factory on the part rather than by reading it:
+        // the other five arms tune first, and this one drifted. That is the cost of five
+        // hand-written bring-up sequences with no shared checklist.
         ndn_radio_hal::RadioKnobs::set_channel(
             d.as_ref(),
             channel,
             ndn_radio_hal::Bandwidth::Bw20,
         )?;
+        d.setup_monitor_rx()?;
         apply_bw_override(d.as_ref(), channel);
         start_pump(&d);
         return Ok(OpenRadio {

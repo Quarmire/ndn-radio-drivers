@@ -1152,6 +1152,9 @@ impl Mt7612uBackend {
             if live {
                 eprintln!("mt7612u bring_up: MCU answers — warm re-open (skipping cold replay)");
                 self.start_mcu()?;
+                // ★ The warm path is where contention actually leaks: the chip kept the previous
+                // process's EDCA precisely because it did not power-cycle. Pin here TOO.
+                self.pin_edca();
                 return Ok(());
             }
             if heuristic {
@@ -1280,12 +1283,7 @@ impl Mt7612uBackend {
         // the boot window — which matters here more than anywhere: on mt76x2 a window below boot is
         // the fault that cost two physical replugs, and `window_floor(Mt76x2)` exists because of it.
         // Non-fatal: a contention write failing must not turn a working radio into no radio.
-        if let Err(e) = self.restore_edca_defaults() {
-            eprintln!(
-                "mt7612u: EDCA not pinned ({e}) — contention posture is whatever the previous \
-                 process left; pin NDN_POSTURE before trusting any throughput figure"
-            );
-        }
+        self.pin_edca();
         Ok(())
     }
 
@@ -1593,6 +1591,28 @@ impl Mt7612uBackend {
     /// Any knob that can leave the MAC unable to transmit needs its restore written at the same
     /// time as the setter — the [`crate::mt76::knobs::EdccaSaved`] discipline, which this pair
     /// should adopt.
+    /// Pin EDCA to the boot window, non-fatally — called on **BOTH** bring-up paths.
+    ///
+    /// ☠ MEASURED 2026-09-01, and this is why it is a helper rather than a line at the end of
+    /// `bring_up`: the pin was written into the COLD path only, and the warm re-open returns early
+    /// (`if live { start_mcu(); return Ok(()) }`). The warm path is **exactly** where contention
+    /// leaks — a warm chip is by definition one that kept the previous process's state. So the fix
+    /// was inert in the only case it existed for. Proven on the part: a prior run left
+    /// `NDN_POSTURE=yielding` (AIFSN 0x3333 / CWMIN 0x6666 / AC0 0x000a6300) and a fresh `bring_up`
+    /// read back *the same values*, unchanged.
+    ///
+    /// (`Owned` cannot be used to test this on mt76x2: `window_floor` clamps it to the boot window,
+    /// so `Owned` == `Shared` == boot and the probe would show nothing. `Yielding` sits above the
+    /// floor and is the only posture that moves these registers on this family.)
+    fn pin_edca(&self) {
+        if let Err(e) = self.restore_edca_defaults() {
+            eprintln!(
+                "mt7612u: EDCA not pinned ({e}) — contention posture is whatever the previous \
+                 process left; pin NDN_POSTURE before trusting any throughput figure"
+            );
+        }
+    }
+
     pub fn restore_edca_defaults(&self) -> Result<(), FaceError> {
         self.wr(0x0214, 0x0000_2222)?; // MT_WMM_AIFSN
         self.wr(0x0218, 0x0000_4444)?; // MT_WMM_CWMIN

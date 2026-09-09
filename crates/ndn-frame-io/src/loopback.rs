@@ -25,9 +25,10 @@ struct AirFrame {
     src: [u8; 6],
     /// 802.11 `addr3` (the ephemeral nonce under the Tier-0 layout), if the injector set it.
     addr3: Option<[u8; 6]>,
-    /// Wide-profile `addr4` (extra Blur) and HT Control (fingerprint + marker), when the
-    /// injector emitted a 4-address wide frame. `None` on a base 3-address frame.
-    addr4: Option<[u8; 6]>,
+    /// The extra Blur region (64 bits, `addr4 ‖ QoS Control` on the wire) and HT Control
+    /// (fingerprint + region bitmap), when the injector emitted a 4-address frame. `None` on a base
+    /// 3-address frame.
+    extra: Option<[u8; 8]>,
     htc: Option<[u8; 4]>,
     payload: Bytes,
     /// MCS the sender injected at — surfaced to receivers as the captured MCS,
@@ -87,7 +88,7 @@ impl LoopbackEndpoint {
         dst: [u8; 6],
         src: [u8; 6],
         addr3: Option<[u8; 6]>,
-        addr4: Option<[u8; 6]>,
+        extra: Option<[u8; 8]>,
         htc: Option<[u8; 4]>,
         payload: Bytes,
         mcs_index: u8,
@@ -97,7 +98,7 @@ impl LoopbackEndpoint {
             dst,
             src,
             addr3,
-            addr4,
+            extra,
             htc,
             payload,
             mcs_index,
@@ -119,7 +120,13 @@ impl FrameIo for LoopbackEndpoint {
                     .index
             });
         self.emit(
-            frame.dst, frame.src, frame.addr3, frame.addr4, frame.htc, frame.payload, idx,
+            frame.dst,
+            frame.src,
+            frame.addr3,
+            frame.extra,
+            frame.htc,
+            frame.payload,
+            idx,
         );
         Ok(())
     }
@@ -139,7 +146,7 @@ impl FrameIo for LoopbackEndpoint {
                         addr: Some(air.src),
                         group: Some(air.dst),
                         addr3: air.addr3,
-                        addr4: air.addr4,
+                        extra: air.extra,
                         htc: air.htc,
                         rssi_dbm: Some(self.observed_rssi_dbm),
                         mcs_index: Some(air.mcs_index),
@@ -179,7 +186,7 @@ mod tests {
             dst,
             src,
             addr3: None,
-            addr4: None,
+            extra: None,
             htc: None,
         }
     }

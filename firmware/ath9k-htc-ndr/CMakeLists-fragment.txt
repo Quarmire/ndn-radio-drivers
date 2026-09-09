@@ -51,38 +51,19 @@ ADD_DEFINITIONS(
 	-Wunused-but-set-variable
 	-Wmaybe-uninitialized
 )
-# NDR A/B measurement: both arms build from identical source, the filter is switched on here.
-# Set NDR_FILTER_ON=1 in the environment before ./configure (cmake reads it at configure time).
 # M3: hardware-scheduled TX. Quiet period/duration in TU (1 TU = 1024 us).
 IF(DEFINED ENV{NDR_QUIET})
 	ADD_DEFINITIONS(-DNDR_QUIET_PERIOD_TU=$ENV{NDR_QUIET_PERIOD} -DNDR_QUIET_DURATION_TU=$ENV{NDR_QUIET_DURATION})
 	MESSAGE(STATUS "NDR: quiet-time armed, period=$ENV{NDR_QUIET_PERIOD} TU duration=$ENV{NDR_QUIET_DURATION} TU")
 ENDIF()
 
-# Name-keyed airtime lease: this node owns the slot its prefix hashes to.
-IF(DEFINED ENV{NDR_LEASE_PREFIX})
-	ADD_DEFINITIONS(-DNDR_QUIET_PERIOD_TU=32 -DNDR_LEASE_PREFIX="$ENV{NDR_LEASE_PREFIX}")
-	MESSAGE(STATUS "NDR: named lease for prefix $ENV{NDR_LEASE_PREFIX}")
-ENDIF()
-
-# Bisect aid: compile ndr_ctl.c but never call it from the TX path.
-# Prove the lease tick: remove the RX/TX re-arms so ONLY the timer interrupt can rotate the slot.
 # TimeToken: publish the hardware TX timestamp of the previous frame in the next one.
-IF(DEFINED ENV{NDR_TT_PROBE})
-	ADD_DEFINITIONS(-DNDR_DEFAULT_ENABLED=1 -DNDR_TIMETOKEN=1 -DNDR_TT_PROBE=1)
-	MESSAGE(STATUS "NDR: TimeToken PROBE — frames pass only after a TX timestamp is reported")
-ENDIF()
-
 IF(DEFINED ENV{NDR_TIMETOKEN})
 	ADD_DEFINITIONS(-DNDR_TIMETOKEN=1)
 	MESSAGE(STATUS "NDR: TimeToken enabled (per-frame TX TSF, two-step)")
 ENDIF()
 
-IF(DEFINED ENV{NDR_TICK_PROBE})
-	ADD_DEFINITIONS(-DNDR_DEFAULT_ENABLED=1 -DNDR_TICK_PROBE=1)
-	MESSAGE(STATUS "NDR: tick PROBE — frames pass only after the tick interrupt fires")
-ENDIF()
-
+# Prove the lease tick: rotation driven ONLY by the timer interrupt (remove the RX/TX re-arms).
 IF(DEFINED ENV{NDR_TICK_ONLY})
 	ADD_DEFINITIONS(-DNDR_TICK_ONLY=1)
 	MESSAGE(STATUS "NDR: rotation driven ONLY by the lease-tick interrupt")
@@ -98,20 +79,6 @@ IF(DEFINED ENV{NDR_NO_BACKOFF})
 	MESSAGE(STATUS "NDR: MEASUREMENT MODE — random backoff disabled")
 ENDIF()
 
-IF(DEFINED ENV{NDR_QUIET_PROBE})
-	ADD_DEFINITIONS(-DNDR_DEFAULT_ENABLED=1 -DNDR_QUIET_PROBE=1)
-	MESSAGE(STATUS "NDR: quiet-arm PROBE build")
-ENDIF()
-
-IF(DEFINED ENV{NDR_DROP_ALL})
-	ADD_DEFINITIONS(-DNDR_DEFAULT_ENABLED=1 -DNDR_DROP_ALL=1)
-	MESSAGE(STATUS "NDR: DIAGNOSTIC build -- reject every frame")
-ENDIF()
-
-IF(DEFINED ENV{NDR_FILTER_ON})
-	ADD_DEFINITIONS(-DNDR_DEFAULT_ENABLED=1)
-	MESSAGE(STATUS "NDR: Tier-0 filter ENABLED")
-ENDIF()
 
 ADD_DEFINITIONS(
 	-D_RAM_
@@ -144,8 +111,7 @@ SET(SOURCES
 	wlan/ratectrl_11n_ln.c
 	wlan/if_owl.c
 	wlan/if_ath.c
-	wlan/ndr_tier0.c
-	wlan/ndr_filter.c
+	wlan/ndr_parse.c
 	wlan/ndr_mem.c
 	wlan/ndr_mac.c
 	wlan/ndr_ctl.c

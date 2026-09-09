@@ -26,7 +26,7 @@
 #ifndef _NDR_MAC_H_
 #define _NDR_MAC_H_
 
-#include "ndr_tier0.h"
+#include <adf_os_types.h> /* adf typedefs (a_uint8_t, a_uint32_t, a_int32_t) - was via ndr_tier0.h */
 
 /*
  * The field definitions are present in ar5416reg.h but sit inside an `#if 0` — only the register

@@ -61,7 +61,7 @@
 #ifndef _NDR_TIME_H_
 #define _NDR_TIME_H_
 
-#include "ndr_tier0.h"
+#include <adf_os_types.h> /* adf typedefs (a_uint8_t, a_uint32_t, a_int32_t) - was via ndr_tier0.h */
 
 #define NDR_TT_MAGIC 0x4e445454u /* 'NDTT' */
 #define NDR_TT_OFF   24          /* body offset: just past the 802.11 MAC header */

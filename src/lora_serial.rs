@@ -55,7 +55,7 @@
 //!
 //! ## What is deliberately NOT here
 //!
-//! * **No Tier-0 name filter.** [`RadioKnobs::configure_name_filter`] returns `Unsupported` on this
+//! * **No Tier-0 name filter.** The in-frame filter is retired (relevance = parse the name); this bearer does
 //!   bearer, on purpose — see that method for the keyspace ruling.
 //! * **No fabricated capability numbers.** Where a node's firmware has never told us its power range
 //!   or its scheduling granularity, the profile carries `0` and the corresponding knob reports
@@ -68,8 +68,13 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use ndn_frame_io::{
-    CapturedFrame, ClockDomainId, FrameIo, InjectFrame, LatchPoint, LinkStamp, PhyMetrics,
-    RadioCapability, RadioClockKind, RadioProfile, RadioTime, RadioTimeSource,
+    CapturedFrame, ClockDomainId, ClockReference, ClockReferenceKind, FrameIo, InjectFrame,
+    LatchPoint, LinkStamp, PhyMetrics, RadioCapability, RadioClockKind, RadioProfile, RadioTime,
+    RadioTimeSource, RateMeasurement, RateWitness,
+};
+use ndn_radio_hal::bringup::{
+    AppliedPower, BringUp, Ctx, Fact, Plan, PlanId, PlanRun, PowerRequest, PumpPolicy, RadioState,
+    Role, Stage, Step, StepClass, StepId, StepOutcome,
 };
 use ndn_radio_hal::{
     Band, Bandwidth, DbmRange, HopCapability, HopControl, HopPeriodUnit, PhyMode, PhyModeSet,
@@ -151,6 +156,21 @@ const CMD_SET_HOP: u8 = 0x1E;
 /// pays an extra round trip to learn a "now" that has already moved. Naming the instant removes the
 /// host's latency from the answer entirely.
 const CMD_TX_AT_ABS: u8 = 0x1F;
+/// **`CMD_GET_CLOCK_REF` — what is this node's counter DERIVED FROM?** `[]` -> [`EVT_CLOCK_REF`].
+///
+/// The companion to `CMD_READ_CLOCK`: that one returns the counter, this one says what it is
+/// counting. `EVT_CAP.stamp_kind` answers a THIRD question — where the stamp is *latched* — and the
+/// two are independent, which is the whole reason this opcode exists. The Waveshare is the proof:
+/// it latched in hardware (TIM3 input capture, 95/95 frames) while running on an internal RC
+/// MEASURED at ~-3100 ppm against its peer, and its common view was ~16 us and growing with the fit
+/// span. Moving the same latch onto the board's crystal took it to ~1.1 us and flat. A host reading
+/// only `stamp_kind` cannot tell those two builds apart.
+///
+/// ★ **Past the end of the u32 `cmd_bitmap`** (like `CMD_GET_HOPTRACE` 0x20), so it is discovered by
+/// ASKING, not by a capability bit. A node that does not implement it answers `EVT_UNSUPPORTED` —
+/// or, on the Heltec, acks unknown commands with `EVT_INFO` and this simply times out. Every one of
+/// those outcomes must be read as **unknown**, never as "fine".
+const CMD_GET_CLOCK_REF: u8 = 0x21;
 
 // ---- Node -> host ----
 const EVT_RX: u8 = 0x81; //     payload = [rssi i16 BE, snr i16 BE, ts u32 BE, frame bytes]
@@ -179,6 +199,24 @@ const EVT_SENSE: u8 = 0x8C; //  payload = [activity u16 BE, rssi i16 BE]
 /// calibration it lacks). Both are definite, so both end a command wait immediately.
 const EVT_PHY_ERR: u8 = 0x8D;
 const EVT_UNSUPPORTED: u8 = 0x8F; // payload = [cmd, reason] — the node does not implement `cmd`
+/// **Reply to [`CMD_GET_CLOCK_REF`]** — `[ref_class u8][accuracy_ppm u16 BE]`.
+///
+/// `ref_class`: 0 = unknown, 1 = internal RC, 2 = crystal/TCXO. `accuracy_ppm` is
+/// [`CLOCK_ACCURACY_UNKNOWN`] when the node has not measured itself against a standard — which is
+/// the normal case, and the node refusing to invent a figure rather than a shortfall.
+///
+/// Registered fleet-wide at 0x91 in all four firmwares (`fleet_event_numbering` in
+/// `firmware/lr2021-nrf54l15-rs/src/serial.rs` is the registry that keeps the numbering honest after
+/// `EVT_RX_STAMP` was born on top of `EVT_HOPTRACE`'s 0x8E).
+const EVT_CLOCK_REF: u8 = 0x91;
+/// [`EVT_CLOCK_REF`] `ref_class`: the node does not know what its counter runs on.
+const CLOCK_REF_UNKNOWN: u8 = 0;
+/// [`EVT_CLOCK_REF`] `ref_class`: an internal RC oscillator.
+const CLOCK_REF_RC: u8 = 1;
+/// [`EVT_CLOCK_REF`] `ref_class`: a crystal or TCXO.
+const CLOCK_REF_XTAL: u8 = 2;
+/// [`EVT_CLOCK_REF`] `accuracy_ppm` sentinel: the node has not measured its own accuracy.
+const CLOCK_ACCURACY_UNKNOWN: u16 = 0xFFFF;
 /// **v3.** `[frame_stamp_kind u8, reason u8]` — **this one frame's** `ts` is not the stamp the
 /// node's `EVT_CAP` advertises.
 ///
@@ -1195,6 +1233,165 @@ fn resolve_profile(cap: Option<&[u8]>, hint: Option<RadioKindHint>) -> NodeProfi
     })
 }
 
+/// **Decode [`EVT_CLOCK_REF`] into a [`ClockReference`].** `None` if the payload is short — a
+/// truncated capability is not a capability, exactly as [`NodeProfile::parse`] holds.
+///
+/// The `ref_class` byte is taken at face value and nothing is inferred around it: a node saying
+/// `CLOCK_REF_UNKNOWN` stays unknown here, because "the node looked and could not tell" is a real
+/// answer and is not improved by the host guessing on its behalf.
+///
+/// `accuracy_ppm` is a magnitude the NODE measured about itself. It is carried as
+/// [`RateWitness::NodeReported`] and never mistaken for a figure taken on this side; when it reads
+/// [`CLOCK_ACCURACY_UNKNOWN`] there is simply no measurement, which is the normal case (the
+/// Waveshare deliberately reports the sentinel rather than publishing the -1.6 ppm relative trim
+/// between two of its boards as if it were an accuracy spec).
+fn parse_clock_ref(p: &[u8]) -> Option<ClockReference> {
+    if p.len() < 3 {
+        return None;
+    }
+    let kind = match p[0] {
+        CLOCK_REF_XTAL => ClockReferenceKind::Crystal,
+        CLOCK_REF_RC => ClockReferenceKind::RcOscillator,
+        CLOCK_REF_UNKNOWN => ClockReferenceKind::Unknown,
+        // A class this host does not speak. Refuse it rather than round it to something flattering:
+        // an unrecognised code is not evidence of a good reference.
+        _ => ClockReferenceKind::Unknown,
+    };
+    let r = ClockReference {
+        kind,
+        measured: None,
+    };
+    let ppm = u16::from_be_bytes([p[1], p[2]]);
+    Some(if ppm == CLOCK_ACCURACY_UNKNOWN {
+        r
+    } else {
+        r.measured(RateMeasurement::new(
+            f32::from(ppm),
+            0.0, // the wire carries no observation span
+            RateWitness::NodeReported,
+        ))
+    })
+}
+
+/// **What to assume about a node's clock reference when it will not say.**
+///
+/// The rule: a host-side assumption may only ever WITHHOLD a capability — *unless the device itself
+/// put the deciding fact on the wire*, in which case reading that fact is not an assumption at all.
+///
+/// ## Why there is a fallback at all
+///
+/// [`CMD_GET_CLOCK_REF`] is how a node states this, and it is asked at open. Not every firmware in
+/// the fleet answers it — the Heltec SX1276 replies `EVT_UNSUPPORTED`, and any board still carrying
+/// an older image says nothing — so for those this is the only answer available. It is the same
+/// shape as [`RadioKindHint`]: a written-down fallback, consulted only when the device itself is
+/// silent, and overridden the instant it speaks.
+///
+/// ## Why this takes the whole profile and not just the modem
+///
+/// [`NodeProfile::learned`] is the fact that decides the LR2021 row below: `true` means every field
+/// came out of the device's own `EVT_CAP`, `false` means the host pinned it from a
+/// [`RadioKindHint`] because nothing answered. Keying on `radio_kind` alone threw that away — and on
+/// this fleet it is not decoration, it is the whole answer.
+///
+/// The modem is still not the oscillator: `EVT_CAP[1]` names the *radio chip*, while the counter
+/// belongs to the MCU beside it. So a row may only move in the safe direction on the strength of the
+/// modem byte; the LR2021 row moves on something else, spelled out below.
+///
+/// * [`LoraRadioKind::Sx1262`] -> **RC oscillator.** The only SX1262 node here is the Waveshare
+///   USB-TO-LoRa dongle, whose entire timebase (SysTick, TIM2's deadline, TIM3's capture) descends
+///   from the GD32's 8 MHz **HSI RC** on every build that predates the crystal switch — MEASURED
+///   ~-3100 ppm relative between two dongles, with the two-receiver residual GROWING from 16 to 130
+///   us with the fit span. Wrong here costs a capability the node might have had, which is the
+///   direction to be wrong in. And a dongle carrying the newer firmware answers
+///   [`CMD_GET_CLOCK_REF`] with the crystal it actually probed, so this is never consulted for it.
+/// * [`LoraRadioKind::Sx1276`] -> **unknown.** Nothing in this tree records what an ESP32's
+///   `embassy_time` tick runs on, and this node stamps with a software counter anyway, so it
+///   advertises no `FreeRunRxStamp` and the reference gates nothing.
+/// * [`LoraRadioKind::Lr2021`] -> **crystal iff this profile was LEARNED**, unknown otherwise.
+///
+/// ## ★ Why an `EVT_CAP` from an LR2021 is itself a statement about its oscillator
+///
+/// The XIAO nRF54L15 bridge runs its timebase on the HFXO: `firmware/lr2021-nrf54l15-rs/src/hw.rs`
+/// forces `HfclkSource::ExternalXtal` for every binary that reports a timestamp — precisely because
+/// the internal RC it replaced MEASURED **+2253 / +2019 ppm** against a precise host cadence
+/// (`hw.rs`, two on-air runs), where the same node on the crystal reads **+16.7 ppm**. The
+/// two-receiver residual on that crystal is 0.81-1.86 us and stays FLAT from a 1.4 s fit span to
+/// 10.2 s, against 10.5-20.4 us GROWING to 130 us for two RC-referenced Waveshares.
+///
+/// What was missing was never the evidence — it was a way to tell WHICH BUILD is on the far end,
+/// since the RC build had an identical `stamp_kind` and an identical 16 MHz `stamp_hz`. This file
+/// used to assert that "nothing on the wire separates the two". That is FALSE, and the repository
+/// is the witness (re-run these; they are the whole justification for this row):
+///
+/// ```text
+/// $ git log --oneline -S hfclk_source -- firmware/    # the only commit that ever set the source
+/// 1283b7e feat(lora-family): 7E-A5 v2 - the radio describes itself, and three correctness fixes
+/// $ git show 1283b7e~1:firmware/lr2021-nrf54l15-rs/src/bin/m6_bridge.rs | grep -c EVT_CAP
+/// 0
+/// $ git show 1283b7e:firmware/lr2021-nrf54l15-rs/src/bin/m6_bridge.rs   | grep -c EVT_CAP
+/// 3
+/// ```
+///
+/// The `HfclkSource::ExternalXtal` LINE was added to `src/hw.rs` by 1283b7e — the file itself is
+/// older (added by ade3f4d, five commits earlier), so audit the line and not the file:
+///
+/// ```text
+/// $ git log --oneline -S hfclk_source -- firmware/     # the line, everywhere: one commit
+/// 1283b7e
+/// $ git log --oneline --diff-filter=A -- firmware/lr2021-nrf54l15-rs/src/hw.rs   # the FILE
+/// ade3f4d
+/// ```
+///
+/// The build before 1283b7e opened with `embassy_nrf::init(Default::default())`, i.e. the internal
+/// RC, and speaks 7E-A5 **v1**, which has no `CMD_GET_CAP` and no `EVT_CAP` frame to answer with.
+/// `m6_bridge` is the only binary in that firmware that speaks this protocol at all. (`m1_bare`
+/// still does not boot through `hw::init_peripherals()`, by design — it initialises nothing and
+/// emits no `EVT_CAP`, so nothing here rests on it.) So, on this fleet:
+///
+/// > an LR2021 that ANSWERED `CMD_GET_CAP` is necessarily running a build whose HFXO line is in it.
+///
+/// That is a fact about the far end carried by a frame the far end sent — not a hope about what its
+/// firmware ought to be doing — which is why it may promote where the modem byte may not. A node
+/// that did NOT answer (`learned == false`: [`open_as`](LoraSerialBackend::open_as), a pre-v2 image,
+/// a silent port) is exactly the case that cannot be told apart, and it stays
+/// [`ClockReference::unknown`].
+///
+/// ⚠ The two ways this stops holding, neither of which is this function's to guess: an LR2021 build
+/// that emits `EVT_CAP` while running the RC (nothing in this tree does — and if one is ever built,
+/// give it a `CMD_GET_CLOCK_REF` handler rather than a special case here), and any node that answers
+/// [`CMD_GET_CLOCK_REF`], whose answer is parsed first in `open_inner` so this is never consulted.
+///
+/// ## When this row is reached at all, after 4d01eb1
+///
+/// `m6_bridge` gained a `CMD_GET_CLOCK_REF` handler and both boards on the bench were flashed and
+/// MEASURED answering `02 ff ff` — crystal, accuracy not measured. A board carrying that image never
+/// reaches this function. It stays because a fallback's job is the board that has NOT been reflashed
+/// (and `open_as`, and a port that says nothing), and because the promotion above and the node's own
+/// answer now agree exactly — `ClockReference::crystal()` with `measured: None` — so the two paths
+/// cannot drift into disagreeing about the same board.
+fn assumed_clock_reference(prof: &NodeProfile) -> ClockReference {
+    match prof.radio_kind {
+        LoraRadioKind::Sx1262 => ClockReference::rc_oscillator().measured(RateMeasurement::new(
+            -3100.0,
+            0.0, // "~-3100 ppm relative between two dongles"; the run records no span
+            RateWitness::PeerUnit,
+        )),
+        // The device's own `EVT_CAP` is the witness — see "★" above. The CLASS is what that fact
+        // supports, and only the class is claimed: `measured: None`, deliberately. The +16.7 ppm on
+        // record for this board is one session's comparison and the tree does not agree with itself
+        // on what it was taken against (`README.md:36` reads it as a host cadence, the node's own
+        // firmware commit calls it inter-node), so it is not a rate this host can stand behind.
+        // Note the same choice on the wire: the node's `CMD_GET_CLOCK_REF` handler answers
+        // `[crystal][CLOCK_ACCURACY_UNKNOWN]` rather than publishing that figure — so a reflashed
+        // board and this fallback now produce the IDENTICAL `ClockReference`, which is the shape a
+        // fallback should have.
+        LoraRadioKind::Lr2021 if prof.learned => ClockReference::crystal(),
+        // Everything else: Sx1276 (Heltec/ESP32), an un-learned LR2021, and any modem byte this host
+        // does not recognise. Unknown, for the reasons above, and never promoted from this side.
+        _ => ClockReference::unknown(),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Airtime — the physics that bounds every transmit wait.
 // ---------------------------------------------------------------------------
@@ -1235,8 +1432,9 @@ const TXDONE_MIN_TIMEOUT: Duration = Duration::from_millis(3_000);
 /// How long to wait for a knob to be acknowledged. Each `SET_*` is standby -> apply -> re-arm RX ->
 /// reply, all well under this.
 const INFO_TIMEOUT: Duration = Duration::from_millis(1_000);
-/// How long to wait for the `EVT_CAP` answer at open. One short reply from an idle node; a node that
-/// does not implement `CMD_GET_CAP` costs exactly this once, then falls back.
+/// How long to wait for an open-path self-description probe: `CMD_GET_CAP` -> `EVT_CAP`, and
+/// `CMD_GET_CLOCK_REF` -> `EVT_CLOCK_REF`. One short reply from an idle node; a node that does not
+/// implement the opcode costs exactly this once, then falls back to what the host has written down.
 const CAP_TIMEOUT: Duration = Duration::from_millis(600);
 /// How long to wait for a `CMD_SET_PHY`. Longer than [`INFO_TIMEOUT`] because the node re-programs
 /// its packet engine — standby, `SetPacketType`, re-apply modulation/packet params, re-arm RX —
@@ -1588,6 +1786,18 @@ pub struct LoraSerialBackend {
     lbt_cfg: Mutex<LbtCfg>,
     /// This device's own clock domain (per port — two nodes are two counters).
     device_domain: ClockDomainId,
+    /// **What this node's stamp counter is derived from.** Learned at open from
+    /// [`CMD_GET_CLOCK_REF`] where the firmware implements it, else
+    /// [`assumed_clock_reference`]'s written-down, demote-only fallback.
+    ///
+    /// Not a field of [`NodeProfile`] on purpose: that struct is the `EVT_CAP` record, every field
+    /// of which is on the wire and round-trips through `to_cap_payload`. This is a *separate* wire
+    /// answer (or, failing that, a host assumption), and putting it in the capability record would
+    /// let a fallback ride out of `to_cap_payload` looking like something a node said.
+    ///
+    /// Fixed for the lifetime of the handle: it is a property of the silicon and its boot-time clock
+    /// selection, and unlike `EVT_CAP` no node re-publishes it.
+    clock_reference: ClockReference,
 }
 
 impl LoraSerialBackend {
@@ -1655,6 +1865,29 @@ impl LoraSerialBackend {
         let learned = resolve_profile(cap.as_deref(), hint);
         *profile.lock().unwrap() = learned;
 
+        // ── The second question, and it is a different one. ──
+        //
+        // `EVT_CAP.stamp_kind` said where this node LATCHES a timestamp. This asks what the counter
+        // it latches is DERIVED FROM — the axis that decides whether two nodes' stamps of one frame
+        // can be differenced at all. A node that does not implement the opcode answers
+        // `EVT_UNSUPPORTED` (terminal, so it costs nothing), acks it as an unknown command and
+        // times out once at `CAP_TIMEOUT` (the Heltec), or says nothing. All three are UNKNOWN, and
+        // unknown falls back to `assumed_clock_reference` — which withholds, except where the
+        // node's OWN `EVT_CAP` (already in `learned`, hence the whole profile) is itself the
+        // deciding wire fact. Order matters: a real `EVT_CLOCK_REF` always wins over the fallback.
+        let clock_reference = exec_on(
+            &cmd,
+            CMD_GET_CLOCK_REF,
+            &[],
+            EVT_CLOCK_REF,
+            CAP_TIMEOUT,
+            false,
+        )
+        .ok()
+        .as_deref()
+        .and_then(parse_clock_ref)
+        .unwrap_or_else(|| assumed_clock_reference(&learned));
+
         // Only now program the radio, and only with what this node implements.
         {
             let g = cmd.lock().unwrap();
@@ -1669,6 +1902,7 @@ impl LoraSerialBackend {
             lbt: AtomicBool::new(false),
             lbt_cfg: Mutex::new(LbtCfg::default()),
             device_domain,
+            clock_reference,
         })
     }
 
@@ -1682,6 +1916,16 @@ impl LoraSerialBackend {
     /// The clock domain this node's hardware RX stamps live in (per port).
     pub fn device_clock_domain(&self) -> ClockDomainId {
         self.device_domain
+    }
+
+    /// **What this node's stamp counter runs on** — from its own [`CMD_GET_CLOCK_REF`] answer where
+    /// the firmware implements it, else the demote-only host fallback ([`assumed_clock_reference`]).
+    ///
+    /// Surfaced so a bring-up tool can show the reference beside the latch point, which is the pair
+    /// that decides `FaceTimeProfile::can_common_view`. A `RateWitness::NodeReported` measurement
+    /// means the node measured itself; anything else means this host did.
+    pub fn clock_reference(&self) -> ClockReference {
+        self.clock_reference
     }
 
     /// The effective per-frame payload cap: the smaller of the host's one-packet-per-frame budget
@@ -2020,7 +2264,7 @@ impl LoraSerialBackend {
     /// clears the filter (pass-all). Each prefix is hashed with the SAME [`name_hash`] the firmware's
     /// rolling per-component hash lands on at that boundary, so the keyspaces match (#44).
     ///
-    /// ⚠ This is **not** the HAL's Tier-0 filter — see [`RadioKnobs::configure_name_filter`] on this
+    /// ⚠ This is **not** the retired in-frame name filter; it is this bearer's own body-prefix mechanism on this
     /// type for why the two cannot be bridged.
     pub fn set_name_filter(&self, prefixes: &[&[u8]]) -> Result<(), FaceError> {
         self.exec_idempotent(CMD_SET_NAME_FILTER, &hash_payload(prefixes), EVT_INFO)?;
@@ -2430,7 +2674,7 @@ impl NdnStats {
 /// (which the firmware uses), or the host and node would disagree on which names an entry covers.
 ///
 /// ⚠ **This is not the project's Tier-0 keyspace.** The MAC-layer prefix-set filter hashes keyed
-/// SipHash-2-4; see [`RadioKnobs::configure_name_filter`] on [`LoraSerialBackend`].
+/// SipHash-2-4 (this bearer's own keyspace, distinct from the retired in-frame filter).
 pub fn name_hash(name: &[u8]) -> u64 {
     const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
     const PRIME: u64 = 0x0000_0100_0000_01b3;
@@ -2848,7 +3092,7 @@ fn handle_event(
             addr: None,
             group: None,
             addr3: None,
-            addr4: None, // LoRa has no 802.11 wide-profile fields
+            extra: None, // LoRa has no 802.11 wide-profile fields
             htc: None,
             rssi_dbm: Some(rssi.clamp(i8::MIN as i16, i8::MAX as i16) as i8),
             mcs_index: None,
@@ -2941,7 +3185,6 @@ fn is_unsupported(e: &FaceError) -> bool {
 
 #[async_trait]
 impl FrameIo for LoraSerialBackend {
-
     /// This radio's own capability, so a face built from the bare `dyn FrameIo` does not have to
     /// invent one. Delegates to this type's [`RadioProfile`] — the single source of truth.
     fn radio_capability(&self) -> Option<ndn_radio_hal::RadioCapability> {
@@ -3079,22 +3322,42 @@ impl FrameIo for LoraSerialBackend {
     }
 }
 
-/// The node's named-time surface, **derived from its profile**.
+/// The node's named-time surface, **derived from its profile and its clock reference**.
 ///
 /// This used to be a hard-coded "the LoRa bridge reports no hardware timestamp". That was true of the
 /// Waveshare and false of the LR2021, whose 16 MHz DPPI capture is the single highest-value timing
-/// capability in the rig: a `FreeRunRxStamp` is what makes [`ndn_radio_hal::FaceTimeProfile::can_common_view`]
-/// true, and common view is what a named airtime lease needs.
+/// capability in the rig.
+///
+/// ★ **A `FreeRunRxStamp` is no longer sufficient for
+/// [`can_common_view`](ndn_radio_hal::FaceTimeProfile::can_common_view), and this fleet is why.**
+/// The Waveshare's TIM3 input capture landed and is real — 95/95 frames hardware-stamped, 0
+/// fallbacks, 0 mis-attributions — so it now declares exactly the same `FreeRunRxStamp` at exactly
+/// the same latch point as the LR2021. MEASURED across two receivers of the same frames, they are
+/// not the same at all: 0.81-1.86 us for two LR2021s and FLAT against the fit span, against
+/// 10.5-20.4 us for two Waveshares and GROWING with it. The difference is the reference — a crystal
+/// versus an 8 MHz internal RC — and it lives in [`RadioTimeSource::reference`], asked for over the
+/// wire with [`CMD_GET_CLOCK_REF`] and assumed conservatively when the node will not say.
 impl RadioTime for LoraSerialBackend {
     fn time_sources(&self) -> Vec<RadioTimeSource> {
         let prof = self.profile();
         let mut v = Vec::new();
         // Only a HARDWARE free-running stamp qualifies. `stamp_kind` 1 (host-recv) and 2 (a firmware
-        // software counter) must NOT produce one: `FaceTimeProfile::derive` turns the presence of a
-        // FreeRunRxStamp directly into `can_common_view = true`, so promoting a scheduler tick here
-        // would have two nodes difference their firmware main-loop latencies and call it a clock
-        // offset. There is no `RadioClockKind` for a device software counter, and inventing one of the
-        // existing kinds for it would be worse than reporting only the host stamp.
+        // software counter) must NOT produce one — and note WHY, because the reason changed on
+        // 2026-08-31 and the old one is still quotable and now wrong. A `FreeRunRxStamp` no longer
+        // turns straight into `can_common_view = true`: `FaceTimeProfile::derive` requires the latch
+        // AND a reference that holds a rate, on the same source. What survives that change is this:
+        // `FreeRunRxStamp` is the LATCH HALF, and declaring it is declaring that the counter was
+        // latched by hardware with no software in the path. A firmware scheduler tick is not, so
+        // publishing one here would put two nodes' firmware main-loop latencies into a field whose
+        // whole meaning is "this number did not pass through software", and a later
+        // `EVT_CLOCK_REF` saying `CLOCK_REF_XTAL` — a true statement about the oscillator — would
+        // then complete the predicate and hand a software counter a common view. The reference half
+        // does not rescue a false latch, and it must not be relied on to: keep this gate on
+        // `HardwareFreeRun` alone.
+        //
+        // There is no `RadioClockKind` for a device software counter, and inventing one of the
+        // existing kinds for it would be worse than reporting only the host stamp. (`Bw16SerialBackend`
+        // in `serial_radio.rs` is held to the same rule for the same reason.)
         if prof.stamp_kind == StampKind::HardwareFreeRun
             && let Some(tick_ns) = prof.tick_ns()
         {
@@ -3110,6 +3373,11 @@ impl RadioTime for LoraSerialBackend {
                 tick_ns,
                 monotonic: true,
                 read_now: prof.has_readable_clock(),
+                // The OTHER axis, and the one `stamp_kind` cannot see: what that counter counts.
+                // Note that this is deliberately independent of everything above it — a node can
+                // move its whole timebase from an RC to a crystal without a single byte of `EVT_CAP`
+                // changing, which is exactly what the Waveshare did.
+                reference: self.clock_reference,
             });
         }
         // Always available, always honest, always last: the host clock the serial line is read on.
@@ -3231,13 +3499,31 @@ impl RadioKnobs for LoraSerialBackend {
         Ok(())
     }
 
-    /// The index knob. This bearer's "index" has always been dBm in disguise (the wire byte is an i8
-    /// dBm), so prefer [`set_tx_power_dbm`](Self::set_tx_power_dbm), which reports what was applied.
-    fn set_tx_power(&self, idx: u32) -> Result<(), FaceError> {
-        let dbm = self.profile().clamp_dbm(idx.min(i8::MAX as u32) as i8);
+    /// The index knob. This bearer's "index" has always been dBm in disguise (the wire byte is an
+    /// i8 dBm), so the returned [`AppliedPower`] reports [`PowerReference::AbsoluteDbm`] and a real
+    /// `dbm` — on LoRa the absolute axis is not a fiction, it is the wire format.
+    ///
+    /// ⚠ There is no calibrated/raw split here and no raw axis to reach: `Raw` writes the same
+    /// dBm byte, clamped by the node's declared range like everything else.
+    fn set_tx_power(&self, req: PowerRequest) -> Result<AppliedPower, FaceError> {
+        let want: i8 = match &req {
+            // "as loud as this part will legally go" = the top of the node's declared dBm range.
+            PowerRequest::Ceiling(_) => {
+                self.profile().dbm_range().map(|r| r.max).unwrap_or(i8::MAX)
+            }
+            PowerRequest::Index(i, _) => (*i).min(i8::MAX as u8) as i8,
+            PowerRequest::Raw { idx, .. } => (*idx).min(i8::MAX as u8) as i8,
+            PowerRequest::Dbm(d) => *d,
+            PowerRequest::NoActuator => {
+                return Err(unsupported(
+                    "lora: PowerRequest::NoActuator, but CMD_SET_PWR DOES actuate power.".into(),
+                ));
+            }
+        };
+        let dbm = self.profile().clamp_dbm(want);
         self.exec_idempotent(CMD_SET_PWR, &[dbm as u8], EVT_INFO)?;
         self.params.lock().unwrap().pwr = dbm.max(0) as u8;
-        Ok(())
+        Ok(AppliedPower::absolute_dbm(req.clone(), dbm, dbm != want))
     }
 
     /// **The portable absolute-power knob**, returning the power actually applied.
@@ -3402,46 +3688,315 @@ impl RadioKnobs for LoraSerialBackend {
     fn read_tx_counters(&self) -> Result<Option<(u16, u16)>, FaceError> {
         Ok(None)
     }
+}
 
-    /// **`Unsupported` — and this is a ruling, not a gap.**
+// ─────────────────────────────────────────────────────────────────────────────
+// M6 · §1.4 — THE PLAN.  The 7E-A5 sub-GHz serial fleet (SX1262 / SX1276 / LR2021).
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Specification: `docs/bringup-contract.md` §1.4/§5-M6 — *"LoRa gets its first `OpenRadio`
+// constructor (today the only one is built inside `ndn-phy-lora/examples/lora_face_node.rs`)."*
+//
+// That example is the whole reason this exists. It hand-assembles an `OpenRadio` from four clones
+// of the backend and fills the last field with `BringUpReport::synthetic("LoRa serial node")` —
+// a report that says, correctly, that no ladder in this workspace brought the radio up. It is the
+// only place in the tree that opens a LoRa radio as a full handle, so every other consumer either
+// invents its own four-clone block or throws the knobs, clock and profile away.
+//
+// ⚠ **What this plan honestly is, and is not.** This part DOES have a real bring-up sequence —
+// `CMD_GET_CAP` -> `CMD_GET_CLOCK_REF` -> `configure()` — and it runs inside
+// [`LoraSerialBackend::open_inner`], BEFORE `Self` exists. `run_plan` hands a rung `&Arc<B>`, so
+// those three exchanges cannot be rungs without splitting the constructor, and splitting a
+// working probe order on a radio nobody at this keyboard can test is precisely the unmeasured
+// change the house rules forbid. So they are declared with [`StepClass::OutOfBand`] naming
+// `open_inner` as the establisher, and the rung READS BACK what the exchange concluded:
+// learned-or-fallback profile, the clock reference, the programmed parameters.
+//
+// ★ **This is the one place `OutOfBand` is used for work inside this crate**, and the contract
+// reserves it for `modprobe`/`iw`/`hostapd_s1g`/`morse_cli`. The reason is written above rather
+// than hidden; folding the three probes into rungs is an OPEN ITEM, and it needs `open_inner`
+// split into "construct the handle" and "interrogate the node" first.
+//
+// The one rung that acts is `set_channel`, and it acts only when the caller names a channel.
+
+type Lo = LoraSerialBackend;
+
+fn s_lora_capability(b: &Arc<Lo>, c: &mut Ctx<'_>) -> Result<StepOutcome, FaceError> {
+    let prof = b.profile();
+    if !prof.learned {
+        // ☠ The trap this rung exists to surface. Before `EVT_CAP`, every node in this fleet
+        // claimed to be an SX1262 — and `CMD_SET_MOD`'s bandwidth byte is PER-NODE, so a host
+        // driving an LR2021 on an SX1262 fallback detunes it to 7.81 kHz and produces a
+        // convincing, entirely fake interop failure.
+        c.warn(
+            "the node never answered CMD_GET_CAP: this handle is running on the HOST's written-down \
+             fallback profile, not on anything the node said about itself. Firmware predating the \
+             7E-A5 v2 capability protocol, or a node that acked the opcode as unsupported. Every \
+             rate, power and bandwidth number below is then an ASSUMPTION — and the fallback is a \
+             legacy SX1262, on which CMD_SET_MOD's bandwidth byte means something different from \
+             what an LR2021 or a Heltec SX1276 expects",
+        );
+        return Ok(StepOutcome::Branch("host-fallback-profile"));
+    }
+    Ok(StepOutcome::Branch("node-reported (EVT_CAP)"))
+}
+
+fn s_lora_clock_reference(b: &Arc<Lo>, c: &mut Ctx<'_>) -> Result<StepOutcome, FaceError> {
+    // The pair that decides `FaceTimeProfile::can_common_view` is (latch point, reference), and
+    // the reference is the half that was being inferred until `CMD_GET_CLOCK_REF` existed. Putting
+    // it in the report is what lets a common-view number be read beside the clock it was taken on.
+    let r = b.clock_reference();
+    c.warn(format!(
+        "clock reference: {r:?} (latch point travels per frame; the PAIR is what decides whether \
+         two nodes' stamps of one frame can be differenced at all)"
+    ));
+    Ok(StepOutcome::Done)
+}
+
+fn s_lora_params(b: &Arc<Lo>, c: &mut Ctx<'_>) -> Result<StepOutcome, FaceError> {
+    let p = b.params();
+    let prof = b.profile();
+    // The rate this radio was actually left at, in words as well as codes — §3's `RateState` rule
+    // exists because a bare modulation code has cost this project days.
+    c.state().rate = ndn_radio_hal::RateState::new(
+        u32::from(p.sf),
+        if prof.has_spreading_factor() {
+            format!(
+                "LoRa SF{}/{} kHz CR 4/{} , preamble {} sym",
+                p.sf,
+                p.bw_khz(),
+                4 + p.cr,
+                p.preamble
+            )
+        } else {
+            format!(
+                "no spreading factor on this node (FLRC or FSK) — bw code {}, preamble {} sym",
+                p.bw, p.preamble
+            )
+        },
+    );
+    // ★ The one radio family in the fleet with a REAL absolute dBm axis at bring-up, and the
+    // contract's rule is that `dbm` is populated only where such an axis exists.
+    c.state().power =
+        AppliedPower::absolute_dbm(PowerRequest::Dbm(p.pwr as i8), p.pwr as i8, false);
+    Ok(StepOutcome::Established(Fact::PowerReference(
+        ndn_radio_hal::bringup::PowerReference::AbsoluteDbm,
+    )))
+}
+
+fn s_lora_set_channel(b: &Arc<Lo>, c: &mut Ctx<'_>) -> Result<StepOutcome, FaceError> {
+    let ch = c.state_ref().channel;
+    if ch == 0 {
+        return Ok(StepOutcome::Skipped(
+            "no channel named by the caller — the node stays on the carrier `configure()` \
+             programmed from `LoraParams`, which is what every LoRa opener did before M6",
+        ));
+    }
+    if ch == b.params().tx_ch {
+        return Ok(StepOutcome::Skipped(
+            "already on the requested carrier — `configure()` programmed it from `LoraParams`, so \
+             re-sending CMD_SET_FREQ would cost a retune (MEASURED 82,810 us on the Waveshare) for \
+             no change",
+        ));
+    }
+    RadioKnobs::set_channel(b.as_ref(), ch, c.state_ref().bw)?;
+    Ok(StepOutcome::Done)
+}
+
+const LORA_R_CAPABILITY: Step<Lo> = Step {
+    id: StepId("capability_probe"),
+    stage: Stage::Attach,
+    class: StepClass::OutOfBand {
+        established_by: "LoraSerialBackend::open_inner's CMD_GET_CAP -> EVT_CAP exchange, which \
+                         must complete before the handle exists",
+    },
+    why: "★ The keystone of the 7E-A5 v2 protocol: ask the node what it IS before sending it \
+          anything else. This rung reads back WHICH answer the handle is running on — the node's \
+          own `EVT_CAP`, or the host's written-down fallback. ☠ It matters because before v2 every \
+          node claimed to be an SX1262, and `CMD_SET_MOD`'s bandwidth byte is PER-NODE: driving an \
+          LR2021 on an SX1262 fallback detunes it to 7.81 kHz and fakes a cross-vendor interop \
+          failure. `cmd_bitmap` says 'implemented', NOT 'means the same thing'.",
+    must_follow: &[],
+    must_precede: &[],
+    run: s_lora_capability,
+};
+
+const LORA_R_CLOCK_REFERENCE: Step<Lo> = Step {
+    id: StepId("clock_reference"),
+    stage: Stage::Attach,
+    class: StepClass::OutOfBand {
+        established_by: "LoraSerialBackend::open_inner's CMD_GET_CLOCK_REF -> EVT_CLOCK_REF \
+                         exchange (or the demote-only host fallback when the node does not \
+                         implement the opcode)",
+    },
+    why: "`EVT_CAP.stamp_kind` says where a node LATCHES; this says what the latched counter is \
+          DERIVED FROM, and the PAIR is what decides `can_common_view`. It belongs in the report \
+          because a common-view number is meaningless without the clock it was taken on — the \
+          Waveshare's own history is the argument (1.09 us on the crystal against ~36 us of \
+          software-stamp floor on the HSI RC, same part, same code).",
+    must_follow: &[StepId("capability_probe")],
+    must_precede: &[],
+    run: s_lora_clock_reference,
+};
+
+const LORA_R_PARAMS: Step<Lo> = Step {
+    id: StepId("params_programmed"),
+    stage: Stage::Tune,
+    class: StepClass::OutOfBand {
+        established_by: "LoraSerialBackend::open_inner's `configure()`, which programs only the \
+                         parameters the learned profile says the node implements, clamped into \
+                         the ranges it declares",
+    },
+    why: "reads back the modulation, carrier and power the handle was left on and puts them in the \
+          report as a decoded `RateState` plus a REAL absolute-dBm `AppliedPower`. This fleet is \
+          the one place in the workspace where `AppliedPower::dbm` is honestly `Some`: LoRa power \
+          is an absolute axis the node declares, not a chip index somebody converted.",
+    must_follow: &[StepId("capability_probe")],
+    must_precede: &[],
+    run: s_lora_params,
+};
+
+const LORA_R_SET_CHANNEL: Step<Lo> = Step {
+    id: StepId("set_channel"),
+    stage: Stage::Tune,
+    class: StepClass::Required,
+    why: "the one rung here that puts bytes on the wire, and only when the caller names a channel \
+          that differs from the one `configure()` already programmed. ⚠ A retune is not free on \
+          this bearer — MEASURED 82,810 us on the Waveshare after the CalibrateImage skip, and \
+          160,866 us before it — so a redundant re-send is refused rather than paid for. A node \
+          that cannot retune says so through `RadioKnobs::set_channel`'s own refusal instead of \
+          silently succeeding, which on the LR2021 would break TX for good.",
+    must_follow: &[StepId("params_programmed")],
+    must_precede: &[],
+    run: s_lora_set_channel,
+};
+
+const LORA_STEPS: &[Step<Lo>] = &[
+    LORA_R_CAPABILITY,
+    LORA_R_CLOCK_REFERENCE,
+    LORA_R_PARAMS,
+    LORA_R_SET_CHANNEL,
+];
+
+const LORA_PLAN: Plan<Lo> = Plan {
+    id: PlanId {
+        part: "lora-7ea5",
+        name: "node",
+        ver: 1,
+    },
+    role: Role::TransmitAndReceive,
+    steps: LORA_STEPS,
+    excluded: &[
+        (
+            Stage::Firmware,
+            "the node runs flashed firmware and there is no download path over this wire. The one \
+             reflash mechanism that exists — CMD_ENTER_BOOTLOADER + stm32flash over CH343 — is an \
+             operator action, not a bring-up rung, and it costs a reset round trip.",
+        ),
+        (
+            Stage::PowerOn,
+            "opening the port does NOT reset the MCU (DTR is not wired to nRST). The node free-runs \
+             whatever it booted; `open_inner` flushes 200 ms of boot chatter and interrogates it.",
+        ),
+        (
+            Stage::Calibrate,
+            "no host-driven calibration exists on this bearer. ☠ And image calibration is \
+             deliberately NOT re-run per tune: skipping it is what took the retune from 160,866 us \
+             to 82,810 us, a measured property of the shipped firmware.",
+        ),
+    ],
+};
+
+const _: () = LORA_PLAN.check_or_panic();
+
+/// The 7E-A5 sub-GHz fleet's one plan — see the M6 block above for what it declares and what it
+/// only reads back.
+pub static PLAN_LORA_NODE: Plan<Lo> = LORA_PLAN;
+
+impl BringUp for LoraSerialBackend {
+    fn plan(role: Role) -> Option<&'static Plan<Self>> {
+        match role {
+            Role::TransmitAndReceive => Some(&PLAN_LORA_NODE),
+            // A named refusal. LoRa is half-duplex on one carrier and the firmware returns to RX
+            // after every transmit; a one-way role would be a claim about a radio this crate does
+            // not control.
+            Role::ReceiveOnly | Role::TransmitOnly => None,
+        }
+    }
+
+    fn tx_unprovable_reason() -> Option<&'static str> {
+        Some(
+            "the 7E-A5 protocol has no TX counter to difference. `CMD_TX_AT_ABS` returns the \
+             ACTUAL on-air instant per frame (MEASURED sd 0.7 us on the LR2021), which proves \
+             PLACEMENT of a transmit this host requested — not that a probe burst radiated. \
+             Question (B) on this bearer is answered by a peer, the way the common-view results \
+             were",
+        )
+    }
+}
+
+impl LoraSerialBackend {
+    /// **M6 — the first `OpenRadio` constructor for a LoRa radio.**
     ///
-    /// The HAL's Tier-0 filter and this bearer's on-device filter are two different filters, and there
-    /// is no mapping between them:
+    /// Until now the only place in the workspace that assembled one was
+    /// `ndn-phy-lora/examples/lora_face_node.rs`, by hand, with
+    /// `BringUpReport::synthetic("LoRa serial node")` in the report slot — so every other consumer
+    /// either copied that block or opened the backend as a bare `dyn FrameIo` and threw the knobs,
+    /// the clock and the profile away.
     ///
-    /// * **Different hash family and keying.** Tier-0 hashes keyed **SipHash-2-4**
-    ///   (`ndn-radio/crates/faces/ndn-radio/src/mac/tier0.rs::name_hash`), chosen *because* FNV is not
-    ///   a PRF and its keying is invertible from observed output — the doctrine §8 unforgeability
-    ///   property. This bearer's firmware hashes **FNV-1a-64** (`ndn_embedded::pit::fnv1a64`, mirrored
-    ///   by [`name_hash`] in this file, which must stay byte-identical to it). Re-keying one into the
-    ///   other is not a transformation that exists.
-    /// * **Different objects.** A Tier-0 `mask` is a 126-bit *prefix-set Bloom projection* that the
-    ///   receiver ANDs against a filter the **sender wrote into the frame's address octets**. This
-    ///   bearer's filter is a *set of exact 64-bit prefix hashes* that the firmware recomputes from
-    ///   the name it parses out of the payload. One is a probabilistic set membership over bits the
-    ///   transmitter placed; the other is exact equality over a hash the receiver derives.
-    /// * **No carrier.** A LoRa/FLRC frame has no address octets. There is nowhere in this bearer's
-    ///   frame for the 126-bit filter to ride, so even with a shared hash the receiver would have
-    ///   nothing to AND against.
+    /// All four handles are the same instance: this backend implements `FrameIo`, `RadioKnobs`,
+    /// `RadioTime` and `RadioProfile`, and the whole radio travels to the face.
     ///
-    /// Truncating the 16-byte masks into 8-byte hashes — the only mechanical "conversion" available —
-    /// would install eight arbitrary 64-bit values into the firmware's exact-match filter. Every one
-    /// would miss, and the node would drop **every** frame at the antenna while reporting success:
-    /// a silent, total, receive-side outage, which is the one failure mode a name filter must never
-    /// have. So this refuses, and the bearer's real filter stays reachable through
-    /// [`set_name_filter`](LoraSerialBackend::set_name_filter), which speaks its own keyspace honestly.
-    fn configure_name_filter(
-        &self,
-        _enabled: bool,
-        _key: &[u8; 16],
-        _masks: &[[u8; 16]],
-    ) -> Result<(), FaceError> {
-        Err(unsupported(
-            "this bearer's on-device filter is an FNV-1a-64 exact-prefix-hash set recomputed from \
-             the payload name; Tier-0 masks are keyed-SipHash prefix-set Bloom projections carried \
-             in 802.11 address octets, which a LoRa frame does not have. Use \
-             LoraSerialBackend::set_name_filter for this bearer's filter."
-                .into(),
-        ))
+    /// `channel == 0` leaves the node on the carrier `params` programmed — the pre-M6 behaviour.
+    pub fn open_radio(
+        path: &str,
+        params: LoraParams,
+        channel: u8,
+    ) -> Result<ndn_radio_hal::OpenRadio, FaceError> {
+        let dev = Arc::new(Self::open_with(path, params)?);
+        let run = PlanRun::new(
+            "LoRa 7E-A5 node",
+            ndn_radio_hal::DeviceAddress::Serial(path.to_string()),
+            RadioState {
+                channel: if channel == 0 {
+                    dev.params().tx_ch
+                } else {
+                    channel
+                },
+                // ⚠ `ndn_radio_hal::Bandwidth` enumerates Wi-Fi widths and cannot express a LoRa
+                // 125/250/500 kHz channel at all. `Bw20` here is a placeholder the type forces,
+                // NOT a claim: the real width is in `RateState`, decoded, from `LoraParams::bw`.
+                bw: Bandwidth::Bw20,
+                format: "RawNdn (NDNLPv2/NDN-TLV over the 7E-A5 wire)",
+                role: Role::TransmitAndReceive,
+                power: AppliedPower::no_actuator(PowerRequest::NoActuator),
+                rate: ndn_radio_hal::RateState::unreported(),
+                warm: None,
+                contention: None,
+                pump: PumpPolicy::CallerOwns,
+                facts: Vec::new(),
+            },
+        );
+        let (report, guards) = <Self as BringUp>::bring_up(&dev, &run).map_err(|f| {
+            eprintln!(
+                "LoRa bring-up FAILED at `{}` — the partial report:\n{}",
+                f.failed_at,
+                f.report.render()
+            );
+            f.source
+        })?;
+        debug_assert!(guards.is_empty(), "the LoRa plan produces no guards");
+        // ⚠ No second `emit()`: `run_plan` already emitted this report. The capability is
+        // attached afterwards because the runner is part-agnostic and cannot know it — the same
+        // ordering every other part uses.
+        let report = report.with_capability(ndn_radio_hal::RadioProfile::capability(dev.as_ref()));
+        Ok(ndn_radio_hal::OpenRadio {
+            io: dev.clone(),
+            knobs: Some(dev.clone()),
+            time: Some(dev.clone()),
+            profile: Some(dev),
+            report,
+        })
     }
 }
 
@@ -3741,7 +4296,10 @@ mod tests {
         let (resp, resp_rx) = std::sync::mpsc::channel();
         let stored = Mutex::new(RadioKindHint::Lr2021Flrc.profile());
         let dom = ClockDomainId(0x1234);
-        assert_eq!(stored.lock().unwrap().stamp_kind, StampKind::HardwareFreeRun);
+        assert_eq!(
+            stored.lock().unwrap().stamp_kind,
+            StampKind::HardwareFreeRun
+        );
         let mut pending = None;
 
         // 1. A clean frame: no note, so it is the capture the capability advertises.
@@ -3840,7 +4398,16 @@ mod tests {
             false,
             &mut pending,
         );
-        handle_event(EVT_TXDONE, &[1, 0], &txf, &resp, &stored, dom, false, &mut pending);
+        handle_event(
+            EVT_TXDONE,
+            &[1, 0],
+            &txf,
+            &resp,
+            &stored,
+            dom,
+            false,
+            &mut pending,
+        );
         assert_eq!(pending, None, "the pairing was broken; the note is stale");
         handle_event(
             EVT_RX,
@@ -3956,52 +4523,236 @@ mod tests {
         assert_eq!(rx_stamp(&ws, dom, 1234, None).latch, LatchPoint::HostRecv);
     }
 
+    /// The same `Fake` the fleet's `time_sources` is built from: a node profile decides the LATCH,
+    /// a [`ClockReference`] decides what the counter RUNS ON, and both are varied independently.
+    struct Fake(NodeProfile, ClockDomainId, ClockReference);
+    impl RadioTime for Fake {
+        fn time_sources(&self) -> Vec<RadioTimeSource> {
+            let mut v = Vec::new();
+            if self.0.stamp_kind == StampKind::HardwareFreeRun
+                && let Some(t) = self.0.tick_ns()
+            {
+                v.push(RadioTimeSource {
+                    kind: RadioClockKind::FreeRunRxStamp,
+                    domain: self.1,
+                    latch: LatchPoint::RadioCapture,
+                    precision_ns: t,
+                    tick_ns: t,
+                    monotonic: true,
+                    read_now: self.0.has_readable_clock(),
+                    reference: self.2,
+                });
+            }
+            v.push(RadioTimeSource::host_recv(HOST_CLOCK_DOMAIN));
+            v
+        }
+    }
+
+    /// ★ **The predicate, as a matrix.** A hardware latch alone used to grant common view; it takes
+    /// the latch AND a reference that holds a rate. Every row below was a `true` before this change
+    /// except the first, and the fleet contains a live example of each.
     #[test]
-    fn only_a_hardware_stamp_unlocks_common_view() {
+    fn common_view_needs_the_latch_point_and_the_reference() {
         use ndn_radio_hal::FaceTimeProfile;
 
-        struct Fake(NodeProfile, ClockDomainId);
-        impl RadioTime for Fake {
-            fn time_sources(&self) -> Vec<RadioTimeSource> {
-                let mut v = Vec::new();
-                if self.0.stamp_kind == StampKind::HardwareFreeRun
-                    && let Some(t) = self.0.tick_ns()
-                {
-                    v.push(RadioTimeSource {
-                        kind: RadioClockKind::FreeRunRxStamp,
-                        domain: self.1,
-                        latch: LatchPoint::RadioCapture,
-                        precision_ns: t,
-                        tick_ns: t,
-                        monotonic: true,
-                        read_now: self.0.has_readable_clock(),
-                    });
-                }
-                v.push(RadioTimeSource::host_recv(HOST_CLOCK_DOMAIN));
-                v
-            }
-        }
         let dom = ClockDomainId(9);
+        let hw_node = RadioKindHint::Lr2021Flrc.profile(); // stamp_kind 3, 16 MHz
+        let derive = |p: NodeProfile, r: ClockReference| {
+            FaceTimeProfile::derive(&Fake(p, dom, r), TxDiscipline::BestEffort)
+        };
 
-        let hw = FaceTimeProfile::derive(
-            &Fake(RadioKindHint::Lr2021Flrc.profile(), dom),
-            TxDiscipline::BestEffort,
+        // hardware latch + crystal => TRUE. Two LR2021s on HFXO: 0.81-1.86 us of common view, flat
+        // against the fit span.
+        let f = derive(hw_node, ClockReference::crystal());
+        assert!(f.can_common_view, "a hardware latch on a crystal earns it");
+        assert!(f.hw_rx_stamp);
+        assert_eq!(f.stamp_precision_ns, Some(63));
+        assert_eq!(f.best_clock, Some(RadioClockKind::FreeRunRxStamp));
+
+        // hardware latch + RC => FALSE. Two Waveshares on the 8 MHz HSI: the SAME latch point and
+        // the same 95/95 hardware stamps, 10-20 us of common view GROWING with the fit span.
+        let f = derive(hw_node, ClockReference::rc_oscillator());
+        assert!(
+            !f.can_common_view,
+            "an RC reference cannot hold a common view"
         );
-        assert!(hw.can_common_view, "stamp_kind 3 is the whole point");
-        assert_eq!(hw.stamp_precision_ns, Some(63));
-        assert_eq!(hw.best_clock, Some(RadioClockKind::FreeRunRxStamp));
+        assert!(
+            f.hw_rx_stamp,
+            "and the latch fact survives — it really does stamp in hardware"
+        );
+        assert_eq!(f.best_clock, Some(RadioClockKind::FreeRunRxStamp));
 
+        // hardware latch + unknown => FALSE. Any node that will not answer CMD_GET_CLOCK_REF.
+        let f = derive(hw_node, ClockReference::unknown());
+        assert!(!f.can_common_view, "unknown must not silently qualify");
+        assert!(f.hw_rx_stamp);
+        assert_eq!(
+            f.clock_reference.map(|r| r.kind),
+            Some(ClockReferenceKind::Unknown)
+        );
+
+        // software stamp (or none) + crystal => FALSE. The reference cannot rescue the latch: two
+        // nodes would be differencing their firmware main-loop latencies.
         for kind in [
             StampKind::NoStamp,
             StampKind::HostRecv,
             StampKind::SoftwareCounter,
         ] {
-            let mut p = RadioKindHint::Lr2021Flrc.profile();
+            let mut p = hw_node;
             p.stamp_kind = kind;
-            let f = FaceTimeProfile::derive(&Fake(p, dom), TxDiscipline::BestEffort);
+            let f = derive(p, ClockReference::crystal());
             assert!(!f.can_common_view, "{kind:?} must not claim common view");
+            assert!(!f.hw_rx_stamp, "{kind:?} is not a hardware latch");
             assert_eq!(f.best_clock, Some(RadioClockKind::HostRecv));
         }
+    }
+
+    /// The wire answer, decoded. `ref_class` is taken at face value, the accuracy sentinel means
+    /// "no measurement" rather than "zero ppm", and a short frame is refused.
+    #[test]
+    fn evt_clock_ref_decodes_what_the_node_said() {
+        let unk = CLOCK_ACCURACY_UNKNOWN.to_be_bytes();
+
+        let xtal = parse_clock_ref(&[CLOCK_REF_XTAL, unk[0], unk[1]]).unwrap();
+        assert_eq!(xtal.kind, ClockReferenceKind::Crystal);
+        assert_eq!(xtal.measured, None, "the sentinel is NOT a measurement");
+        assert!(xtal.holds_rate());
+
+        let rc = parse_clock_ref(&[CLOCK_REF_RC, unk[0], unk[1]]).unwrap();
+        assert_eq!(rc.kind, ClockReferenceKind::RcOscillator);
+        assert!(!rc.holds_rate());
+
+        // A node that looked and could not tell stays unknown — the host does not improve on it.
+        let none = parse_clock_ref(&[CLOCK_REF_UNKNOWN, unk[0], unk[1]]).unwrap();
+        assert_eq!(none.kind, ClockReferenceKind::Unknown);
+        assert!(!none.holds_rate());
+
+        // A class this host does not speak is not evidence of a good reference.
+        assert_eq!(
+            parse_clock_ref(&[0x7f, unk[0], unk[1]]).unwrap().kind,
+            ClockReferenceKind::Unknown
+        );
+
+        // A real self-reported figure rides along, labelled as the node's own claim.
+        let m = parse_clock_ref(&[CLOCK_REF_XTAL, 0x00, 0x14])
+            .unwrap()
+            .measured
+            .unwrap();
+        assert_eq!(m.ppm, 20.0);
+        assert_eq!(m.witness, RateWitness::NodeReported);
+
+        // A truncated capability is not a capability.
+        assert_eq!(parse_clock_ref(&[CLOCK_REF_XTAL, 0x00]), None);
+        assert_eq!(parse_clock_ref(&[]), None);
+    }
+
+    /// ★ **The fallback withholds unless the DEVICE supplied the deciding fact.** A profile the host
+    /// pinned (`learned == false`) can never earn common view from this side; the only promotion in
+    /// the table rides on a frame the node actually sent.
+    #[test]
+    fn the_host_side_assumption_may_only_demote_unless_the_node_spoke() {
+        // Nothing the host pinned may hold a rate — including an LR2021, whose pre-v2 image is
+        // exactly the RC build that cannot be told apart any other way.
+        for kind in [
+            LoraRadioKind::Sx1262,
+            LoraRadioKind::Sx1276,
+            LoraRadioKind::Lr2021,
+            LoraRadioKind::Unknown(0x5a),
+        ] {
+            let mut p = NodeProfile::legacy_sx1262();
+            p.radio_kind = kind;
+            p.learned = false;
+            assert!(
+                !assumed_clock_reference(&p).holds_rate(),
+                "{kind:?}: a host-pinned profile must never grant common view"
+            );
+        }
+        // The Waveshare's demotion is not merely "unknown": the RC is named, with its measurement.
+        let mut ws_p = NodeProfile::legacy_sx1262();
+        ws_p.learned = true; // even when it DID answer: the SX1262 row never promotes
+        let ws = assumed_clock_reference(&ws_p);
+        assert_eq!(ws.kind, ClockReferenceKind::RcOscillator);
+        assert_eq!(ws.measured.map(|m| m.ppm), Some(-3100.0));
+        assert_eq!(ws.measured.map(|m| m.witness), Some(RateWitness::PeerUnit));
+        // And the node's own answer overrides it in the direction the host would not go alone.
+        let unk = CLOCK_ACCURACY_UNKNOWN.to_be_bytes();
+        assert!(
+            parse_clock_ref(&[CLOCK_REF_XTAL, unk[0], unk[1]])
+                .unwrap()
+                .holds_rate(),
+            "a reflashed Waveshare earns it back from its own mouth"
+        );
+    }
+
+    /// ★ **LEARNED is not the same node as PINNED, and the LR2021 is where that bites.** An
+    /// `EVT_CAP` from an LR2021 can only have come from a post-1283b7e build, and that build forces
+    /// `HfclkSource::ExternalXtal` (the pre-v2 image speaks 7E-A5 v1 and cannot emit an `EVT_CAP` at
+    /// all) — so the record's origin, not its `radio_kind`, is what decides the reference. The
+    /// regression this pins: `assumed_clock_reference` used to take `radio_kind` alone, and the
+    /// fleet's only part with a this-session-measured common view reported `can_common_view = false`.
+    #[test]
+    fn a_learned_lr2021_cap_is_itself_the_crystal_evidence() {
+        // Pinned from the host (open_as / pre-v2 firmware / silent port): still unknown.
+        let pinned = RadioKindHint::Lr2021Flrc.profile();
+        assert!(
+            !pinned.learned,
+            "the pinned LR2021 profile is a host fallback"
+        );
+        let r = assumed_clock_reference(&pinned);
+        assert_eq!(r.kind, ClockReferenceKind::Unknown);
+        assert!(!r.holds_rate(), "a node that never spoke earns nothing");
+        assert_eq!(r.measured, None);
+
+        // The SAME board, once it answers CMD_GET_CAP: the EVT_CAP is the wire fact.
+        let mut spoke = pinned;
+        spoke.learned = true;
+        let r = assumed_clock_reference(&spoke);
+        assert_eq!(r.kind, ClockReferenceKind::Crystal);
+        assert!(r.holds_rate());
+        // The CLASS is claimed and the RATE is not: the +16.7 ppm on record is one session's
+        // comparison this host cannot stand behind. That is also what the node itself now says, so
+        // the fallback and a reflashed board's own answer are the SAME value.
+        assert_eq!(r.measured, None, "class provable, number not");
+        let unk = CLOCK_ACCURACY_UNKNOWN.to_be_bytes();
+        assert_eq!(
+            parse_clock_ref(&[CLOCK_REF_XTAL, unk[0], unk[1]]),
+            Some(r),
+            "a reflashed LR2021 answers exactly what this fallback assumed"
+        );
+
+        // ...and it is a real capability, not just a field: both halves of the predicate land on the
+        // one source, so the part that MEASURED 0.81/1.55/1.86 us of common view reports it.
+        use ndn_radio_hal::FaceTimeProfile;
+        let f = FaceTimeProfile::derive(
+            &Fake(spoke, ClockDomainId(11), assumed_clock_reference(&spoke)),
+            TxDiscipline::BestEffort,
+        );
+        assert!(f.hw_rx_stamp, "16 MHz DPPI capture, MEASURED 62.5 ns");
+        assert!(
+            f.can_common_view,
+            "a learned LR2021 must not lose the capability it measured"
+        );
+        // And the pinned one does not, on the same latch, from the same code path.
+        let f = FaceTimeProfile::derive(
+            &Fake(pinned, ClockDomainId(11), assumed_clock_reference(&pinned)),
+            TxDiscipline::BestEffort,
+        );
+        assert!(f.hw_rx_stamp, "the latch fact is unchanged by who said it");
+        assert!(!f.can_common_view, "an unstated reference earns nothing");
+    }
+
+    /// The wire answer still outranks the fallback in BOTH directions — including down. A board
+    /// that answers `CLOCK_REF_RC` is an RC node however good its `EVT_CAP` looked.
+    #[test]
+    fn the_nodes_own_answer_outranks_the_learned_inference() {
+        let mut spoke = RadioKindHint::Lr2021Flrc.profile();
+        spoke.learned = true;
+        assert!(assumed_clock_reference(&spoke).holds_rate());
+        let unk = CLOCK_ACCURACY_UNKNOWN.to_be_bytes();
+        // `open_inner` parses this first and only falls back when it is `None`.
+        let said = parse_clock_ref(&[CLOCK_REF_RC, unk[0], unk[1]]).unwrap();
+        assert_eq!(said.kind, ClockReferenceKind::RcOscillator);
+        assert!(!said.holds_rate(), "the node's own word demotes it again");
     }
 
     // ── scheduling ────────────────────────────────────────────────────────────────────────────
@@ -4308,7 +5059,10 @@ mod tests {
         // tuning rather than more than all of it. Still not hop-capable here — the value of the number
         // is that it says so quantitatively instead of by a boolean.
         let overhead = capability_from(&ws, 65).retune_overhead(100_000).unwrap();
-        assert!((overhead - 0.828_10).abs() < 1e-4, "overhead was {overhead}");
+        assert!(
+            (overhead - 0.828_10).abs() < 1e-4,
+            "overhead was {overhead}"
+        );
 
         // An unknown modem code stays unmeasured rather than inheriting a neighbour's number.
         let mut unknown = ws;
@@ -5013,7 +5767,16 @@ mod tests {
         assert_eq!(resp_rx.try_recv().unwrap().0, EVT_CAP);
 
         // …and a payload that does not parse must never blank a good profile.
-        handle_event(EVT_CAP, &[0x03, 0x02], &txf, &resp, &stored, dom, false, &mut None);
+        handle_event(
+            EVT_CAP,
+            &[0x03, 0x02],
+            &txf,
+            &resp,
+            &stored,
+            dom,
+            false,
+            &mut None,
+        );
         assert_eq!(
             stored.lock().unwrap().sched_gran_ns,
             50_000,

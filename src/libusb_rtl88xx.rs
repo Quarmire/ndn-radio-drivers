@@ -60,6 +60,12 @@ use crate::McsDescriptor;
 use crate::frame::LLC_SNAP_PREFIX;
 use crate::{CapturedFrame, FrameFormat, FrameIo, InjectFrame};
 use ndn_frame_io::ClockDomainId;
+use ndn_radio_hal::bringup::{
+    AppliedPower, Assert, BringUp, BringUpFailure, BringUpReport, Ctx, Degradation, Deviation,
+    Fact, Guards, Plan, PlanId, PlanRun, PowerReference, PowerRequest, PowerWrite,
+    ProofRequirement, PumpPolicy, RadioState, Role, Severity, Stage, Step, StepClass, StepId,
+    StepOutcome, TxInstrument, power_unsupported,
+};
 use ndn_radio_hal::{RadioCapability, RadioProfile, RadioTime, RadioTimeSource, RateCapability};
 
 /// Realtek USB vendor request: `bRequest` for register I/O, and the IN/OUT
@@ -256,6 +262,12 @@ pub struct LibUsbRtl88xxBackend {
     /// `RxGain::Auto` restores it, so the posture is always reversible.
     rx_gain_saved: std::sync::atomic::AtomicU8,
 
+    /// The USB topological address (`"<bus>-<port>[.<port>…]"`) this handle was claimed at,
+    /// captured in [`claim`](Self::claim) because a `DeviceHandle` cannot be asked afterwards.
+    /// Reported as [`ndn_radio_hal::DeviceAddress::Usb`] so a [`BringUpReport`] names the physical
+    /// dongle it describes — on a host with two identical `0bda:a81a` that is the difference
+    /// between a report and a guess.
+    usb_addr: String,
     /// `Arc` so blocking USB transfers can be moved onto `spawn_blocking`.
     handle: Arc<DeviceHandle<Context>>,
     /// Bulk OUT endpoint address (frame injection) — the HIGH/MGT queue.
@@ -349,6 +361,8 @@ impl LibUsbRtl88xxBackend {
         // Per-device RX-stamp clock domain (bus<<8 | address) — read before the device is opened.
         let tsf_domain =
             ClockDomainId((u32::from(device.bus_number()) << 8) | u32::from(device.address()));
+        // Read before the device is opened, for the same reason as `tsf_domain`.
+        let usb_addr = crate::usb_select::usb_addr(&device);
         let handle = Arc::new(device.open().map_err(usb_err)?);
         // Take the device from any kernel driver (Linux); harmless elsewhere.
         let _ = handle.set_auto_detach_kernel_driver(true);
@@ -380,6 +394,7 @@ impl LibUsbRtl88xxBackend {
             ndr_contention: crate::realtek_contention::RtlEdcaSaved::new(),
             rx_gain_owned: std::sync::atomic::AtomicBool::new(false),
             rx_gain_saved: std::sync::atomic::AtomicU8::new(0xff),
+            usb_addr,
             handle,
             bulk_out: bulk_out.ok_or_else(no_ep)?,
             bulk_in: bulk_in.ok_or_else(no_ep)?,
@@ -403,18 +418,6 @@ impl LibUsbRtl88xxBackend {
         })
     }
 
-    /// Open the first RTL88xx dongle and bring it up in 5 GHz monitor mode on
-    /// `channel` (20 MHz) — a one-call path to a TX/RX-ready backend that can be
-    /// dropped straight into a `MonitorWifiFace`. This
-    /// is the constructor the named-radio bearer uses; [`open`](Self::open)
-    /// without [`bring_up`](Self::bring_up) yields a device that is claimed but
-    /// not yet transmitting.
-    pub fn open_monitor(channel: u8) -> Result<Self, FaceError> {
-        let backend = Self::open()?;
-        backend.bring_up(channel)?;
-        Ok(backend)
-    }
-
     /// Open a *specific* RTL88xx dongle by product id — for a host with more than one attached
     /// (e.g. an on-air 2-node test with two radios inches apart). Claims the **first** device whose
     /// `product_id` equals `want_pid`. When several identical dongles share the host (e.g. two
@@ -433,29 +436,12 @@ impl LibUsbRtl88xxBackend {
         Self::claim(device)
     }
 
-    /// [`open_pid`](Self::open_pid) + bring up 5 GHz monitor mode on `channel`.
-    pub fn open_monitor_pid(want_pid: u16, channel: u8) -> Result<Self, FaceError> {
-        Self::open_monitor_pid_select(want_pid, &crate::DeviceSelect::First, channel)
-    }
-
-    /// [`open_pid_select`](Self::open_pid_select) + bring up 5 GHz monitor mode on `channel`.
-    pub fn open_monitor_pid_select(
-        want_pid: u16,
-        sel: &crate::DeviceSelect,
-        channel: u8,
-    ) -> Result<Self, FaceError> {
-        let backend = Self::open_pid_select(want_pid, sel)?;
-        backend.bring_up(channel)?;
-        Ok(backend)
-    }
-
     /// Spawn the **dynamic-mechanism watchdog** on a background thread: every
     /// ~2 s it runs [`watchdog_tick`](Self::watchdog_tick) (thermal TX-power
     /// tracking + RX DIG) for the life of the backend. The thread holds a
     /// [`Weak`](std::sync::Weak) reference and exits on its own once the
     /// `Arc<Self>` is dropped, so the returned `JoinHandle` can be ignored.
-    /// Call once after [`open_monitor`](Self::open_monitor) for a self-
-    /// maintaining link.
+    /// Call once after `open_radio` for a self-maintaining link.
     pub fn spawn_watchdog(self: &Arc<Self>) -> std::thread::JoinHandle<()> {
         let weak = Arc::downgrade(self);
         std::thread::spawn(move || {
@@ -498,103 +484,102 @@ impl LibUsbRtl88xxBackend {
             .store(code.unwrap_or(0xFF), Ordering::Relaxed);
     }
 
-    /// Run the full monitor-mode bring-up on an already-[`open`](Self::open)ed
-    /// device: power on, download NIC firmware, init the MAC + monitor RCR, load
-    /// the BB/RF tables and calibrate (DACK + FW IQK/DPK), tune to `channel`, and
-    /// bring up the BB transmit datapath ([`bb_tx_datapath_init`] — the on-air
-    /// gate). After this the backend transmits and receives. This is the library
-    /// equivalent of the `usb_probe --inject` bring-up.
+    /// **The full bring-up — [`PLAN_A81A`], `Role::TransmitAndReceive`.** A thin wrapper over
+    /// [`bring_up_planned`](Self::bring_up_planned); the sequence lives in the plan, where every
+    /// rung states why it is there and a reviewer sees the whole ladder at once.
+    ///
+    /// Power on, download NIC firmware, init the MAC + monitor RCR, load the BB/RF tables and
+    /// calibrate (FW IQK/DPK, LCK, kfree, TXGAPK), tune to `channel`, and bring up the BB transmit
+    /// datapath ([`bb_tx_datapath_init`] — the on-air gate). After this the backend transmits and
+    /// receives.
+    ///
+    /// ⚠ **`self: &Arc<Self>`, not `&self`** (M4). [`Step::run`] takes `&Arc<B>` because a rung may
+    /// hand back a live guard; this part produces none today, but the runner's signature is shared
+    /// with the part that does (the 8733b `PowerTracker`). Five call sites gained an `Arc::new`.
+    ///
+    /// ⚠ **`NDN_RADIO_MINIMAL` / `NDN_RADIO_SKIP_CAL` / `NDN_RADIO_NO_EFEM` are no longer read
+    /// inside the ladder** (LAW 1). They are read once, here, at the wrapper boundary, and become a
+    /// self-labelling [`Deviation`] that lands in the report and changes `plan_digest`. See
+    /// [`a81a_env_deviation`], which `BringUpRequest::from_env` also calls — so a bench run
+    /// through this wrapper and a production run through `open_radio` cannot disagree about them.
+    ///
+    /// ⚠ **This is a bench convenience, not the production door.** `open_radio(pid, &sel, &req)`
+    /// is (M8), and this signature still cannot carry two things
+    /// [`bring_up_planned`](Self::bring_up_planned) can: the partial report of a FAILED bring-up
+    /// (emitted and printed here, then dropped, because `FaceError` cannot hold it) and the
+    /// [`Guards`] a plan produces (none, for this part).
     ///
     /// [`bb_tx_datapath_init`]: Self::bb_tx_datapath_init
-    pub fn bring_up(&self, channel: u8) -> Result<(), FaceError> {
-        self.power_on()?;
-        self.download_firmware(Self::firmware_nic())?;
-        self.mac_init()?;
-        self.monitor_cfg()?;
-        self.send_general_info()?;
-        // The kernel sends two register-based HMEBOX H2C commands at init that
-        // our packet-H2C path never issues — documented prime suspect for the
-        // firmware TX-state. NDN_RADIO_HMEBOX_H2C=1 replays them.
-        if std::env::var("NDN_RADIO_HMEBOX_H2C").is_ok() {
-            self.send_hmebox_h2c()?;
+    pub fn bring_up(self: &Arc<Self>, channel: u8) -> Result<BringUpReport, FaceError> {
+        self.bring_up_planned(
+            channel,
+            Role::TransmitAndReceive,
+            a81a_env_deviation(),
+            ProofRequirement::BestAvailable,
+        )
+        .map(|(report, guards)| {
+            debug_assert!(guards.is_empty(), "this plan produces no guards");
+            report
+        })
+        .map_err(drop_partial_report)
+    }
+
+    /// **The one entry point** for this part. M8 deleted the three `open_monitor*` wrappers;
+    /// `open_radio`'s RTL8822E arm and every bench instrument call this.
+    ///
+    /// The role selects the plan ([`BringUp::plan`]); the deviation, if any, is resolved against
+    /// that plan before the first register write and lands in the report's digest; the proof
+    /// requirement is validated against the role and this part's (empty) instrument set, also
+    /// before the first register write.
+    // The `Err` is large BECAUSE it carries the partial report — the whole point of §3, a failed
+    // bring-up that says how far it got instead of a bare `FaceError`. Same allow, same reason, as
+    // `run_plan`'s.
+    #[allow(clippy::result_large_err)]
+    pub fn bring_up_planned(
+        self: &Arc<Self>,
+        channel: u8,
+        role: Role,
+        deviation: Option<Deviation>,
+        proof: ProofRequirement,
+    ) -> Result<(BringUpReport, Guards), BringUpFailure> {
+        let mut run = PlanRun::new(
+            "RTL8822E",
+            ndn_radio_hal::DeviceAddress::Usb(self.usb_addr.clone()),
+            self.initial_state(channel, role),
+        )
+        .with_proof(proof);
+        if let Some(d) = deviation {
+            run = run.with_deviation(d);
         }
-        // NDN_RADIO_MINIMAL: skip our full direct BB/RF table load and let the
-        // firmware configure+enable the PHY itself (the kernel's offload path).
-        // Give the fw a settle window after general_info to apply its config.
-        let minimal = std::env::var("NDN_RADIO_MINIMAL").is_ok();
-        if minimal {
-            std::thread::sleep(Duration::from_millis(200));
-            eprintln!("NDN_RADIO_MINIMAL: skipping phy_init + cal, fw-configured PHY");
-        } else {
-            self.phy_init()?;
+        // UFCS: the inherent `bring_up(channel)` above shadows the trait method of the same name.
+        let (report, guards) = <Self as BringUp>::bring_up(self, &run)?;
+        // The runner is part-agnostic and cannot know this part's PHY capability; the driver does.
+        Ok((
+            report.with_capability(RadioProfile::capability(self.as_ref())),
+            guards,
+        ))
+    }
+
+    /// The regime a plan starts from. Not a claim about the radio: it is what the caller asked
+    /// for, and the rungs fill in what they establish.
+    ///
+    /// ⚠ `power` starts at `no_actuator`, **not** at the fused base the M2 hand-filled report
+    /// asserted up front. No power has been written when a plan begins; `calibrate_tx_power` is the
+    /// rung that establishes the reference, and claiming it before it ran is the shape of defect
+    /// this contract exists to remove.
+    fn initial_state(&self, channel: u8, role: Role) -> RadioState {
+        RadioState {
+            channel,
+            bw: ndn_radio_hal::Bandwidth::Bw20,
+            format: "RawNdn (see with_format)",
+            role,
+            power: AppliedPower::no_actuator(PowerRequest::NoActuator),
+            rate: ndn_radio_hal::RateState::unreported(),
+            warm: None,
+            contention: None,
+            pump: PumpPolicy::CallerOwns,
+            facts: Vec::new(),
         }
-        self.set_channel_bw20(channel)?;
-        // NOTE: do NOT force the BT-coex grant before the cal chain. It was tried
-        // (the theory: cals should run with GNT_WL=1 so TXGAPK fits against a
-        // full-power chain) and it BROKE TX outright — empirically verified via the
-        // OPi reciprocal link: grant-before-cal → 0 frames decoded; grant only at
-        // the end (below) → ~850 frames. Forcing the BTC indirect grant before
-        // calibration corrupts the cal/BB state. The grant stays at the END only,
-        // exactly as in the S11–S13 working driver. (2026-06-14 bisection.)
-        // FW + driver RF calibration (channel-dependent → after set_channel).
-        // Not the on-air gate, but tunes TX power/EVM. NDN_RADIO_SKIP_CAL=1 bypasses it.
-        if !minimal && std::env::var("NDN_RADIO_SKIP_CAL").is_err() {
-            self.fw_iqk(false, false)?;
-            // LO calibration (the kernel's `HAL_RF_LCK`).
-            if let Err(e) = self.lck() {
-                tracing::warn!(error = %e, "LCK calibration failed");
-            }
-            self.fw_dpk()?;
-            // DPK is force-bypassed for our RFE type (21), matching the kernel.
-            if let Err(e) = self.dpk_force_bypass() {
-                tracing::warn!(error = %e, "DPK force-bypass failed");
-            }
-            // Factory power/thermal/PA-bias trim from EFUSE — must run before
-            // TX Gain-K so the gain correction sits on the trimmed base.
-            if let Err(e) = self.kfree() {
-                tracing::warn!(error = %e, "kfree trim failed; TX power uncalibrated");
-            }
-            // TX Gain-K: rewrite the RF gain table so the modulated TX gain
-            // tracks the target curve (the kernel's `HAL_RF_TXGAPK`).
-            if let Err(e) = self.txgapk(channel) {
-                tracing::warn!(error = %e, "TXGAPK calibration failed; TX gain uncalibrated");
-            }
-        } else {
-            eprintln!("NDN_RADIO_SKIP_CAL: bypassing FW IQK/DPK + LCK/kfree/TXGAPK");
-        }
-        // External-FEM pinmux (GPIO_MUXCFG 0x40 + LED_CFG 0x4c + PAD_CTRL1 0x64):
-        // route the FEM control signals (PA-enable / LNA / TX-RX switch) onto their
-        // GPIO pins. The kernel does this for this board REGARDLESS of the phydm
-        // rfe field (golden writes 0x40/0x4c/0x64 even though phydm_info reports
-        // rfe=0) — it's board-level (the BL-M8812EU2 has external FEMs).
-        // Skippable via NDN_RADIO_NO_EFEM for A/B.
-        if RFE_TYPE == 21 && std::env::var("NDN_RADIO_NO_EFEM").is_err() {
-            self.efem_pinmux_config()?;
-        }
-        // The on-air gate: configure the BB transmit datapath and the RF
-        // receive path, then re-tune (the datapath init touches RF 0x18).
-        self.bb_tx_datapath_init()?;
-        self.rx_path_init()?;
-        // Override the reference unit's captured TXAGC refs with this dongle's own
-        // EFUSE power-by-rate base (per-device calibration).
-        match self.calibrate_tx_power(channel) {
-            Ok((a, b)) => tracing::debug!(base_a = a, base_b = b, "TX power calibrated from EFUSE"),
-            Err(e) => {
-                tracing::warn!(error = %e, "TX power calibration failed; using captured refs")
-            }
-        }
-        self.set_channel_bw20(channel)?;
-        // Re-assert the Wi-Fi grant after the post-cal RF re-tune (set_channel /
-        // calibrate_tx_power touch RF state). It was already forced before the cal
-        // chain; this keeps the steady-state grant pinned for TX.
-        if let Err(e) = self.btc_grant_wl() {
-            tracing::warn!(error = %e, "btc_grant_wl failed; TX power ~50 dB low");
-        }
-        // Capture the thermal reference for runtime power tracking.
-        if let Ok(t) = self.read_thermal(RfPath::A) {
-            self.cal_thermal.store(t, Ordering::Relaxed);
-        }
-        Ok(())
     }
 
     /// Wait for the BTC indirect-register port to be ready (`0x1700[29]`
@@ -1040,51 +1025,53 @@ impl LibUsbRtl88xxBackend {
     // MAC power domain and the EFUSE/analog clocks are up — the physical EFUSE
     // read works, firmware download becomes possible.
 
-    /// Full power-on: `pre_init_system_cfg_8822e` + `mac_pwr_switch_usb_8822e`
-    /// (POWER_ON) + `init_system_cfg_8822e`. If the chip reports it is already
-    /// powered, it is power-cycled first (the kernel's warm-reboot recovery
-    /// path), so repeated runs land in the same state.
-    pub fn power_on(&self) -> Result<(), FaceError> {
-        let info = self.chip_info()?;
-        // `REG_SYS_CFG2[7:0]` reports the 8822E id (0x17) once the system-cfg/power
-        // domain is up; a cold read can show a placeholder (e.g. 0x04). Setting
-        // `NDN_RADIO_FORCE_8822E=1` bypasses the pre-power gate and re-reads after
-        // `pre_init_system_cfg` for diagnosis.
-        let force = std::env::var("NDN_RADIO_FORCE_8822E").is_ok();
-        if info.chip_id != CHIP_ID_8822E && !force {
-            return Err(init_err(format!(
-                "rtl88xx: chip id {:#04x} is not 8822E ({CHIP_ID_8822E:#04x}); refusing to run \
-                 the 8822E power sequence (set NDN_RADIO_FORCE_8822E=1 to override)",
-                info.chip_id
-            )));
-        }
-        if info.chip_id != CHIP_ID_8822E {
-            tracing::warn!(
-                chip_id = format!("{:#04x}", info.chip_id),
-                "NDN_RADIO_FORCE_8822E: running the 8822E power sequence on a non-0x17 chip id"
-            );
-        }
+    rung! {
+        /// Full power-on: `pre_init_system_cfg_8822e` + `mac_pwr_switch_usb_8822e`
+        /// (POWER_ON) + `init_system_cfg_8822e`. If the chip reports it is already
+        /// powered, it is power-cycled first (the kernel's warm-reboot recovery
+        /// path), so repeated runs land in the same state.
+        fn power_on(&self) -> Result<(), FaceError> {
+            let info = self.chip_info()?;
+            // `REG_SYS_CFG2[7:0]` reports the 8822E id (0x17) once the system-cfg/power
+            // domain is up; a cold read can show a placeholder (e.g. 0x04). Setting
+            // `NDN_RADIO_FORCE_8822E=1` bypasses the pre-power gate and re-reads after
+            // `pre_init_system_cfg` for diagnosis.
+            let force = std::env::var("NDN_RADIO_FORCE_8822E").is_ok();
+            if info.chip_id != CHIP_ID_8822E && !force {
+                return Err(init_err(format!(
+                    "rtl88xx: chip id {:#04x} is not 8822E ({CHIP_ID_8822E:#04x}); refusing to run \
+                     the 8822E power sequence (set NDN_RADIO_FORCE_8822E=1 to override)",
+                    info.chip_id
+                )));
+            }
+            if info.chip_id != CHIP_ID_8822E {
+                tracing::warn!(
+                    chip_id = format!("{:#04x}", info.chip_id),
+                    "NDN_RADIO_FORCE_8822E: running the 8822E power sequence on a non-0x17 chip id"
+                );
+            }
 
-        self.pre_init_system_cfg()?;
-        if force {
-            let post = self.chip_info()?;
-            tracing::warn!(
-                chip_id_after_precfg = format!("{:#04x}", post.chip_id),
-                "chip id re-read after pre_init_system_cfg"
-            );
-        }
+            self.pre_init_system_cfg()?;
+            if force {
+                let post = self.chip_info()?;
+                tracing::warn!(
+                    chip_id_after_precfg = format!("{:#04x}", post.chip_id),
+                    "chip id re-read after pre_init_system_cfg"
+                );
+            }
 
-        self.leave_32k()?;
-        if self.mac_power_is_on()? {
-            // Warm state (e.g. a previous probe run) — cycle through power-off
-            // so the enable sequence starts from CARDEMU like the kernel does.
-            self.run_pwr_seq(CARD_DISABLE_FLOW_8822E, info.cut_msk())?;
-        }
-        self.run_pwr_seq(CARD_ENABLE_FLOW_8822E, info.cut_msk())?;
-        // halmac clears the software power-off marker after a successful enable.
-        self.clr8(REG_SYS_STATUS1 + 1, 1 << 0)?;
+            self.leave_32k()?;
+            if self.mac_power_is_on()? {
+                // Warm state (e.g. a previous probe run) — cycle through power-off
+                // so the enable sequence starts from CARDEMU like the kernel does.
+                self.run_pwr_seq(CARD_DISABLE_FLOW_8822E, info.cut_msk())?;
+            }
+            self.run_pwr_seq(CARD_ENABLE_FLOW_8822E, info.cut_msk())?;
+            // halmac clears the software power-off marker after a successful enable.
+            self.clr8(REG_SYS_STATUS1 + 1, 1 << 0)?;
 
-        self.init_system_cfg(&info)
+            self.init_system_cfg(&info)
+        }
     }
 
     /// Power the MAC off (`card_dis_flow_8822e`): ACT→CARDEMU→CARDDIS.
@@ -1406,56 +1393,58 @@ impl LibUsbRtl88xxBackend {
         include_bytes!("../fw/rtl8822e_fw_nic.bin")
     }
 
-    /// Download `fw` to the WLAN CPU and wait until it boots (faithful port of
-    /// `download_firmware_88xx`, USB interface). Requires
-    /// [`power_on`](Self::power_on). On success the firmware is alive:
-    /// `REG_MCUFW_CTRL == 0xC078` and the parsed [`FwVersion`] is returned.
-    pub fn download_firmware(&self, fw: &[u8]) -> Result<FwVersion, FaceError> {
-        let hdr = FwHeader::parse(fw)?;
+    rung! {
+        /// Download `fw` to the WLAN CPU and wait until it boots (faithful port of
+        /// `download_firmware_88xx`, USB interface). Requires
+        /// [`power_on`](Self::power_on). On success the firmware is alive:
+        /// `REG_MCUFW_CTRL == 0xC078` and the parsed [`FwVersion`] is returned.
+        fn download_firmware(&self, fw: &[u8]) -> Result<FwVersion, FaceError> {
+            let hdr = FwHeader::parse(fw)?;
 
-        let lte_backup = self.ltecoex_read(0x38)?;
-        self.wlan_cpu_en(false)?;
+            let lte_backup = self.ltecoex_read(0x38)?;
+            self.wlan_cpu_en(false)?;
 
-        // Backup the registers the download temporarily repurposes, then map
-        // HIQ to high priority and leave only the TX DMA engines running.
-        let bk_pq_map = self.read8(REG_TXDMA_PQ_MAP + 1)?;
-        self.write8(REG_TXDMA_PQ_MAP + 1, DMA_MAPPING_HIGH << 6)?;
-        let bk_cr = self.read8(REG_CR)?;
-        let bk_h2cq_csr = 1u32 << 31;
-        self.write8(REG_CR, 0x05)?; // BIT_HCI_TXDMA_EN | BIT_TXDMA_EN
-        self.write32(REG_H2CQ_CSR, 1 << 31)?;
-        let bk_fifo_info1 = self.read16(REG_FIFOPAGE_INFO_1)?;
-        let bk_rqpn2 = self.read32(REG_RQPN_CTRL_2)? | (1 << 31);
-        self.write16(REG_FIFOPAGE_INFO_1, 0x200)?;
-        self.write32(REG_RQPN_CTRL_2, bk_rqpn2)?;
-        let bk_bcn_ctrl = self.read8(REG_BCN_CTRL)?;
-        self.write8(REG_BCN_CTRL, (bk_bcn_ctrl & !(1 << 3)) | (1 << 4))?;
+            // Backup the registers the download temporarily repurposes, then map
+            // HIQ to high priority and leave only the TX DMA engines running.
+            let bk_pq_map = self.read8(REG_TXDMA_PQ_MAP + 1)?;
+            self.write8(REG_TXDMA_PQ_MAP + 1, DMA_MAPPING_HIGH << 6)?;
+            let bk_cr = self.read8(REG_CR)?;
+            let bk_h2cq_csr = 1u32 << 31;
+            self.write8(REG_CR, 0x05)?; // BIT_HCI_TXDMA_EN | BIT_TXDMA_EN
+            self.write32(REG_H2CQ_CSR, 1 << 31)?;
+            let bk_fifo_info1 = self.read16(REG_FIFOPAGE_INFO_1)?;
+            let bk_rqpn2 = self.read32(REG_RQPN_CTRL_2)? | (1 << 31);
+            self.write16(REG_FIFOPAGE_INFO_1, 0x200)?;
+            self.write32(REG_RQPN_CTRL_2, bk_rqpn2)?;
+            let bk_bcn_ctrl = self.read8(REG_BCN_CTRL)?;
+            self.write8(REG_BCN_CTRL, (bk_bcn_ctrl & !(1 << 3)) | (1 << 4))?;
 
-        // pltfm_reset_88xx — pulse the platform reset (no 8822B/8821C quirk).
-        self.clr8(REG_CPU_DMEM_CON + 2, 1 << 0)?;
-        self.set8(REG_CPU_DMEM_CON + 2, 1 << 0)?;
+            // pltfm_reset_88xx — pulse the platform reset (no 8822B/8821C quirk).
+            self.clr8(REG_CPU_DMEM_CON + 2, 1 << 0)?;
+            self.set8(REG_CPU_DMEM_CON + 2, 1 << 0)?;
 
-        let dl_result = self.start_dlfw(fw, &hdr);
+            let dl_result = self.start_dlfw(fw, &hdr);
 
-        // restore_mac_reg_88xx — always, even on a failed download.
-        self.write8(REG_TXDMA_PQ_MAP + 1, bk_pq_map)?;
-        self.write8(REG_CR, bk_cr)?;
-        self.write32(REG_H2CQ_CSR, bk_h2cq_csr)?;
-        self.write16(REG_FIFOPAGE_INFO_1, bk_fifo_info1)?;
-        self.write32(REG_RQPN_CTRL_2, bk_rqpn2)?;
-        self.write8(REG_BCN_CTRL, bk_bcn_ctrl)?;
+            // restore_mac_reg_88xx — always, even on a failed download.
+            self.write8(REG_TXDMA_PQ_MAP + 1, bk_pq_map)?;
+            self.write8(REG_CR, bk_cr)?;
+            self.write32(REG_H2CQ_CSR, bk_h2cq_csr)?;
+            self.write16(REG_FIFOPAGE_INFO_1, bk_fifo_info1)?;
+            self.write32(REG_RQPN_CTRL_2, bk_rqpn2)?;
+            self.write8(REG_BCN_CTRL, bk_bcn_ctrl)?;
 
-        let end_result = dl_result.and_then(|()| self.dlfw_end_flow());
-        if let Err(e) = end_result {
-            // DLFW_FAIL: drop FWDL_EN, re-enable the CPU block, restore coex.
-            self.clr8(REG_MCUFW_CTRL, 1 << 0)?;
-            self.set8(REG_SYS_FUNC_EN + 1, 1 << 2)?;
+            let end_result = dl_result.and_then(|()| self.dlfw_end_flow());
+            if let Err(e) = end_result {
+                // DLFW_FAIL: drop FWDL_EN, re-enable the CPU block, restore coex.
+                self.clr8(REG_MCUFW_CTRL, 1 << 0)?;
+                self.set8(REG_SYS_FUNC_EN + 1, 1 << 2)?;
+                self.ltecoex_write(0x38, lte_backup)?;
+                return Err(e);
+            }
+
             self.ltecoex_write(0x38, lte_backup)?;
-            return Err(e);
+            Ok(hdr.version)
         }
-
-        self.ltecoex_write(0x38, lte_backup)?;
-        Ok(hdr.version)
     }
 
     /// `start_dlfw_88xx`: enable FWDL, then stream the DMEM, IMEM, and (when
@@ -1812,7 +1801,14 @@ impl LibUsbRtl88xxBackend {
     /// via `REG_HMEBOX_0` 0x1d0 + ext box `REG_HMEBOX_EXT0` 0x1f0; write ext
     /// first, then the box to trigger). usbmon golden 2026-06-14:
     /// `0x1f0=0x11 / 0x1d0=0x0100004c`, then `0x1f4=0 / 0x1d4=0x000001c3`.
-    fn send_hmebox_h2c(&self) -> Result<(), FaceError> {
+    ///
+    /// ⚠ **Not a rung, and no longer reachable through `NDN_RADIO_HMEBOX_H2C`.** It is an
+    /// ADDITIVE experiment — a documented prime suspect for the firmware TX state, cmd_ids
+    /// 0x4c/0x6d, *"not yet decoded"* — and §1.4 says a `Deviation` may only subtract. See
+    /// [`PLAN_A81A`]'s `Stage::Firmware` exclusion for the full ruling. `pub` so the question
+    /// stays askable from an instrument (call it after `bring_up`, or between two of your own
+    /// steps) until §1.6's `bench::run_with` exists to place it properly.
+    pub fn send_hmebox_h2c(&self) -> Result<(), FaceError> {
         self.write32(0x01f0, 0x0000_0011)?;
         self.write32(0x01d0, 0x0100_004c)?;
         std::thread::sleep(Duration::from_millis(5));
@@ -1927,15 +1923,17 @@ impl LibUsbRtl88xxBackend {
     const RSVD_H2CQ_ADDR: u16 = Self::TX_FIFO_PG_NUM - 50 - 4 - 8; // 1986
     const RSVD_CSIBUF_ADDR: u16 = Self::TX_FIFO_PG_NUM - 50; // 1998
 
-    /// Full MAC config: `init_trx_cfg` → `init_protocol_cfg` → `init_edca_cfg`
-    /// → `init_wmac_cfg` (each the 8822E flavour, 20 MHz / normal mode).
-    /// Requires [`power_on`](Self::power_on); run after
-    /// [`download_firmware`](Self::download_firmware) like the kernel does.
-    pub fn mac_init(&self) -> Result<(), FaceError> {
-        self.init_trx_cfg()?;
-        self.init_protocol_cfg()?;
-        self.init_edca_cfg()?;
-        self.init_wmac_cfg()
+    rung! {
+        /// Full MAC config: `init_trx_cfg` → `init_protocol_cfg` → `init_edca_cfg`
+        /// → `init_wmac_cfg` (each the 8822E flavour, 20 MHz / normal mode).
+        /// Requires [`power_on`](Self::power_on); run after
+        /// [`download_firmware`](Self::download_firmware) like the kernel does.
+        fn mac_init(&self) -> Result<(), FaceError> {
+            self.init_trx_cfg()?;
+            self.init_protocol_cfg()?;
+            self.init_edca_cfg()?;
+            self.init_wmac_cfg()
+        }
     }
 
     /// `init_trx_cfg_8822e` (NORMAL mode): queue→DMA mapping, MAC engine
@@ -2346,44 +2344,46 @@ impl LibUsbRtl88xxBackend {
         include_bytes!("../fw/rtl8822e_radiob.bin")
     }
 
-    /// Full PHY bring-up: BB/RF block enable, PHY_REG + AGC_TAB + RadioA/B
-    /// table loads, crystal cap from EFUSE. Follow with
-    /// [`set_channel_bw20`](Self::set_channel_bw20).
-    pub fn phy_init(&self) -> Result<(), FaceError> {
-        self.enable_bb_rf(true)?;
+    rung! {
+        /// Full PHY bring-up: BB/RF block enable, PHY_REG + AGC_TAB + RadioA/B
+        /// table loads, crystal cap from EFUSE. Follow with
+        /// [`set_channel_bw20`](Self::set_channel_bw20).
+        fn phy_init(&self) -> Result<(), FaceError> {
+            self.enable_bb_rf(true)?;
 
-        let info = self.chip_info()?;
-        let sel = HeadlineSel {
-            cut: info.cut as u32,
-            rfe: RFE_TYPE,
-        };
+            let info = self.chip_info()?;
+            let sel = HeadlineSel {
+                cut: info.cut as u32,
+                rfe: RFE_TYPE,
+            };
 
-        self.load_table(Self::table_phy_reg(), sel, &mut |s, a, d| {
-            s.bb_cfg_write(a, d)
-        })?;
-        self.load_table(Self::table_agc_tab(), sel, &mut |s, a, d| {
-            s.bb_cfg_write(a, d)
-        })?;
+            self.load_table(Self::table_phy_reg(), sel, &mut |s, a, d| {
+                s.bb_cfg_write(a, d)
+            })?;
+            self.load_table(Self::table_agc_tab(), sel, &mut |s, a, d| {
+                s.bb_cfg_write(a, d)
+            })?;
 
-        // Crystal cap from logical EFUSE 0x110 → 0x1040\[23:10\] = cap‖cap.
-        let physical = self.efuse_dump_physical()?;
-        let logical = Self::efuse_decode_logical(&physical)?;
-        let cap = (logical[0x110] & 0x7f) as u32;
-        self.bb_write(0x1040, 0x00ff_fc00, cap | (cap << 7))?;
+            // Crystal cap from logical EFUSE 0x110 → 0x1040\[23:10\] = cap‖cap.
+            let physical = self.efuse_dump_physical()?;
+            let logical = Self::efuse_decode_logical(&physical)?;
+            let cap = (logical[0x110] & 0x7f) as u32;
+            self.bb_write(0x1040, 0x00ff_fc00, cap | (cap << 7))?;
 
-        // RF init (kernel `_init_rf_reg`): cal-init table, then the RF tables.
-        self.rf_cal_init()?;
-        self.load_table(Self::table_radioa(), sel, &mut |s, a, d| {
-            s.rf_cfg_write(RfPath::A, a, d)
-        })?;
-        self.load_table(Self::table_radiob(), sel, &mut |s, a, d| {
-            s.rf_cfg_write(RfPath::B, a, d)
-        })?;
+            // RF init (kernel `_init_rf_reg`): cal-init table, then the RF tables.
+            self.rf_cal_init()?;
+            self.load_table(Self::table_radioa(), sel, &mut |s, a, d| {
+                s.rf_cfg_write(RfPath::A, a, d)
+            })?;
+            self.load_table(Self::table_radiob(), sel, &mut |s, a, d| {
+                s.rf_cfg_write(RfPath::B, a, d)
+            })?;
 
-        // RF calibration (kernel `halrf_init`): DACK is the first cal and is
-        // channel-independent. The heavier cals (IQK/LCK/DPK/TSSI) are not yet
-        // ported — see the module header.
-        self.dack()
+            // RF calibration (kernel `halrf_init`): DACK is the first cal and is
+            // channel-independent. The heavier cals (IQK/LCK/DPK/TSSI) are not yet
+            // ported — see the module header.
+            self.dack()
+        }
     }
 
     /// Bring up the BB transmit datapath. This is the on-air gate that the
@@ -3478,14 +3478,58 @@ impl LibUsbRtl88xxBackend {
         Ok(())
     }
 
-    /// Set the TX-AGC reference power index (`config_phydm_write_txagc_ref_
-    /// 8822e` for OFDM + CCK, both paths). **First clears `0x1c90` bit 15** —
-    /// the "bbrstb TX-AGC report" bit that write-protects the TXAGC table; with
-    /// it set, writes to the power-reference registers (`0x18e8`/`0x41e8` OFDM,
-    /// `0x18a0`/`0x41a0` CCK) are ignored by the BB. `idx` is a 0–0x3f power
-    /// index (higher = more TX power). Per-rate diffs in the `0x3a00` table are
-    /// left at 0, so every rate transmits at this reference power.
-    pub fn set_tx_power(&self, idx: u32) -> Result<(), FaceError> {
+    /// **Set the TX power, and say what that meant.** ([`PowerRequest`] in, [`AppliedPower`] out.)
+    ///
+    /// The TX-AGC reference power index (`config_phydm_write_txagc_ref_8822e` for OFDM + CCK, both
+    /// paths). **First clears `0x1c90` bit 15** — the "bbrstb TX-AGC report" bit that
+    /// write-protects the TXAGC table; with it set, writes to the power-reference registers
+    /// (`0x18e8`/`0x41e8` OFDM, `0x18a0`/`0x41a0` CCK) are ignored by the BB. Higher index = more
+    /// TX power. Per-rate diffs in the `0x3a00` table are left at 0, so every rate transmits at
+    /// this reference power.
+    ///
+    /// ★ **This part does NOT have the RTL8812AU's calibrated/raw split** — it has one reference
+    /// path with no calibration-conditional branch, which is why the bring-up contract calls it
+    /// evidence the contract is *meetable* rather than aspirational. It nonetheless returns
+    /// [`AppliedPower`] so a report can say which axis it was on, and so `clamped` is visible.
+    /// Reference is [`PowerReference::DriverReference`], **not** `FusedBase`: `write_txagc` reads
+    /// this dongle's EFUSE separately, but this knob writes a vendor reference index.
+    pub fn set_tx_power(&self, req: PowerRequest) -> Result<AppliedPower, FaceError> {
+        let want = match &req {
+            PowerRequest::Ceiling(_) => 63u32,
+            PowerRequest::Index(i, _) => *i as u32,
+            PowerRequest::Raw { idx, authority } => {
+                // ⚠ This part's reference register IS the only power axis it has; there is no
+                // separate raw path to reach. Honour the authority by skipping the 20..=63 clamp
+                // (that is the one thing "raw" can mean here) and say so in the reference.
+                tracing::warn!(
+                    target: "radio", part = "rtl8822e", idx = *idx,
+                    granted_by = authority.granted_by(), reason = authority.reason(),
+                    "TX power reference below the characterised floor — the gain chain INVERTS \
+                     below ~20 to ~11 dB ABOVE the calibrated maximum (B210-measured)"
+                );
+                let idx = (*idx).min(63) as u32;
+                let writes = self.write_txagc_ref(idx)?;
+                return Ok(AppliedPower::from_writes(
+                    req.clone(),
+                    PowerReference::ChipRaw,
+                    idx as u8,
+                    false,
+                    writes,
+                ));
+            }
+            PowerRequest::Dbm(d) => {
+                return Err(power_unsupported(format!(
+                    "rtl8822e: PowerRequest::Dbm({d}) — this part has no absolute dBm axis \
+                     (RadioCapability::tx_power_dbm is None). The index scale is monotone over \
+                     20..=63 at ~0.22 dB/step (B210-measured); use PowerRequest::Index.",
+                )));
+            }
+            PowerRequest::NoActuator => {
+                return Err(power_unsupported(
+                    "rtl8822e: PowerRequest::NoActuator, but this part DOES actuate power.",
+                ));
+            }
+        };
         // **B210-measured transfer curve (2026-08-13, ch149, legacy 6M, certified instrument —
         // linearity 0.98–0.99 dB/dB):** the radiated response to this reference is monotone ONLY
         // over idx 20..=63, spanning ~9.6 dB (~0.22 dB/step; 63 = calibrated top, 20 ≈ −9.6 dB).
@@ -3493,14 +3537,46 @@ impl LibUsbRtl88xxBackend {
         // calibrated maximum — a flat −7.3 dBFS plateau at idx 0/8/12/16, replicated across three
         // scrambled passes at ±0.1 dB. A caller asking for "very low power" with a small index
         // would radiate the loudest signal this chip can make; clamp into the sane region instead.
-        let idx = idx.clamp(20, 63);
+        //
+        // ★ The clamp is now REPORTED (`AppliedPower::clamped`) rather than applied in silence —
+        // a back-off that was quietly refused used to look identical to one that was honoured.
+        let idx = want.clamp(20, 63);
+        let clamped = idx != want;
+        let writes = self.write_txagc_ref(idx)?;
+        Ok(AppliedPower::from_writes(
+            req.clone(),
+            PowerReference::DriverReference {
+                source: "8822E TXAGC reference 0x18e8/0x41e8 + 0x18a0/0x41a0 (no per-adapter fuse read)",
+                // MEASURED on a B210, ch149, legacy 6M, three scrambled passes.
+                slope_db_per_idx: Some(0.22),
+            },
+            idx as u8,
+            clamped,
+            writes,
+        ))
+    }
+
+    /// The register half of [`set_tx_power`](Self::set_tx_power): OFDM + CCK reference on both
+    /// paths, plus the watchdog anchor. Returns what it wrote.
+    fn write_txagc_ref(&self, idx: u32) -> Result<Vec<PowerWrite>, FaceError> {
         if self.bb_read(0x1c90, 1 << 15)? != 0 {
             self.bb_write(0x1c90, 1 << 15, 0)?; // enable TXAGC table writes
         }
-        self.bb_write(0x18e8, 0x0001_fc00, idx)?; // OFDM ref, path A
-        self.bb_write(0x41e8, 0x0001_fc00, idx)?; // OFDM ref, path B
-        self.bb_write(0x18a0, 0x007f_0000, idx)?; // CCK ref, path A
-        self.bb_write(0x41a0, 0x007f_0000, idx)?; // CCK ref, path B
+        let mut writes = Vec::with_capacity(4);
+        for (reg, mask, group, path) in [
+            (0x18e8u16, 0x0001_fc00u32, "OFDM ref", 0u8),
+            (0x41e8, 0x0001_fc00, "OFDM ref", 1),
+            (0x18a0, 0x007f_0000, "CCK ref", 0),
+            (0x41a0, 0x007f_0000, "CCK ref", 1),
+        ] {
+            self.bb_write(reg, mask, idx)?;
+            writes.push(PowerWrite {
+                reg: reg as u32,
+                value: idx as u8,
+                group,
+                path,
+            });
+        }
         // **Anchor the watchdog to the requested power, or it undoes this within ~2 s.**
         // `thermal_track` (spawn_watchdog, every ~2 s) rewrites these same reference registers
         // from `tx_ref_base` + the thermal delta — so a set_tx_power that only wrote the registers
@@ -3510,7 +3586,7 @@ impl LibUsbRtl88xxBackend {
         // which is the correct semantics for a user-set index) instead of fighting it.
         self.tx_ref_base
             .store(idx.min(0x3f) as u8, Ordering::Relaxed);
-        Ok(())
+        Ok(writes)
     }
 
     /// **Per-device TX-power calibration** — a port of the halrf power-by-rate
@@ -5017,7 +5093,7 @@ impl LibUsbRtl88xxBackend {
             dst,
             src,
             addr3: None,
-            addr4: None,
+            extra: None,
             htc: None,
         };
         let buf = self.build_tx_body(&frame, mcs, None, Some(body))?;
@@ -5063,7 +5139,7 @@ impl LibUsbRtl88xxBackend {
             dst,
             src,
             addr3: None,
-            addr4: None,
+            extra: None,
             htc: None,
         };
         let mut buf = Vec::new();
@@ -5146,33 +5222,31 @@ impl LibUsbRtl88xxBackend {
     }
 
     /// Build the bare 802.11 frame (no radiotap — the hardware TX descriptor
-    /// carries the rate). Mirrors `frame::build` minus the radiotap prefix.
+    /// carries the rate) by delegating to `frame::build_dot11`, then stamping this chip's own
+    /// sequence number into SeqCtrl.
+    ///
+    /// ☠ **This used to hand-roll a 3-address frame for `RawNdn` and delegate only for other
+    /// formats** — and it read neither `frame.extra` nor `frame.htc`. So the a81a/8822E, the
+    /// fleet's primary NDR radio and the one carrying live Interest/Data through `ForwarderEngine`,
+    /// **physically could not emit a filter frame**: it would have failed silently and correctly
+    /// (base region intact, zero false negatives, zero benefit). That is `with_wide_bloom`'s failure
+    /// mode a second time in a second place, and worse — it fires *after* someone has done the right
+    /// thing upstream. The fix is to delete the divergent builder, not to teach it the new field.
+    ///
+    /// SeqCtrl sits at bytes 22..24 of an 802.11 header in **every** shape (it follows addr3, before
+    /// addr4/QoS/HTC), so stamping it after the fact is layout-independent.
     fn build_80211(&self, frame: &InjectFrame) -> Result<Vec<u8>, FaceError> {
-        let ethertype = match self.format {
-            FrameFormat::RawNdn { ethertype } => ethertype,
-            // ESP-NOW (and any other non-`RawNdn` format) reuses the canonical
-            // platform-neutral 802.11 builder so the on-air bytes match exactly
-            // what a stock `esp-wifi` peer keys on — and what `AfPacketBackend`
-            // injects. The chip's TX descriptor (built by `build_tx_body`)
-            // carries the rate, so we want the frame *without* radiotap: that is
-            // `frame::build_dot11`, not `frame::build`. ESP-NOW must be injected
-            // at a basic rate the C5 will decode — 1 Mbps on 2.4 GHz, or 6 Mbps
-            // OFDM on 5 GHz (DESC_RATE 0x04, via `NDN_RADIO_TX_RATE=4`).
-            other => return crate::frame::build_dot11(other, frame),
-        };
-        let seq = self.seq.fetch_add(1, Ordering::Relaxed) & 0x0fff;
-        let mut out = Vec::with_capacity(24 + 8 + frame.payload.len());
-        out.extend_from_slice(&[0x08, 0x00]); // FC: type=Data, subtype=0
-        out.extend_from_slice(&[0x00, 0x00]); // Duration
-        out.extend_from_slice(&frame.dst); // addr1 (RA/DA) = group / Tier-0 filter hi
-        out.extend_from_slice(&frame.src); // addr2 (TA/SA) = source / filter lo
-        // addr3: the ephemeral nonce under the Tier-0 layout (addr1‖addr2 = filter), else the
-        // legacy BSSID copy of dst. Matches `frame::build_dot11`.
-        out.extend_from_slice(&frame.addr3.unwrap_or(frame.dst)); // addr3 (BSSID / nonce)
-        out.extend_from_slice(&(seq << 4).to_le_bytes()); // SeqCtrl (frag 0)
-        out.extend_from_slice(&LLC_SNAP_PREFIX);
-        out.extend_from_slice(&ethertype.to_be_bytes());
-        out.extend_from_slice(&frame.payload);
+        // ESP-NOW (and any other non-`RawNdn` format) uses the canonical platform-neutral 802.11
+        // builder so the on-air bytes match exactly what a stock `esp-wifi` peer keys on — and what
+        // `AfPacketBackend` injects. The chip's TX descriptor (built by `build_tx_body`) carries the
+        // rate, so we want the frame *without* radiotap: that is `frame::build_dot11`, not
+        // `frame::build`. ESP-NOW must be injected at a basic rate the C5 will decode — 1 Mbps on
+        // 2.4 GHz, or 6 Mbps OFDM on 5 GHz (DESC_RATE 0x04, via `NDN_RADIO_TX_RATE=4`).
+        let mut out = crate::frame::build_dot11(self.format, frame)?;
+        if matches!(self.format, FrameFormat::RawNdn { .. }) && out.len() >= 24 {
+            let seq = self.seq.fetch_add(1, Ordering::Relaxed) & 0x0fff;
+            out[22..24].copy_from_slice(&(seq << 4).to_le_bytes()); // SeqCtrl (frag 0)
+        }
         Ok(out)
     }
 
@@ -5317,11 +5391,12 @@ impl LibUsbRtl88xxBackend {
                 a.copy_from_slice(s);
                 a
             });
-            // Wide profile: addr4 (extra Blur) @24 when four_addr; HT Control (fingerprint + marker)
-            // immediately after the QoS Control that precedes it.
-            let addr4 = if four_addr {
-                frame.get(24..30).map(|s| {
-                    let mut a = [0u8; 6];
+            // The extra Blur region: `addr4` (@24 when four_addr) ‖ QoS Control (immediately after).
+            // Both or neither — half a projection is a different filter, not a coarser one. Same
+            // mapping as `frame::parse_dot11`, which is the arbiter.
+            let extra = if four_addr && qos {
+                frame.get(24..32).map(|s| {
+                    let mut a = [0u8; 8];
                     a.copy_from_slice(s);
                     a
                 })
@@ -5367,7 +5442,7 @@ impl LibUsbRtl88xxBackend {
                             addr: Some(sa),
                             group: Some(da),
                             addr3,       // outer-header nonce, shared by all A-MSDU subframes
-                            addr4: None, // A-MSDU is a 3-address QoS frame, never the wide profile
+                            extra: None, // A-MSDU is a 3-address QoS frame — never the filter shape
                             htc: None,
                             rssi_dbm,
                             mcs_index,
@@ -5393,7 +5468,7 @@ impl LibUsbRtl88xxBackend {
                 addr: Some(addr2),
                 group: Some(addr1),
                 addr3,
-                addr4,
+                extra,
                 htc,
                 rssi_dbm,
                 mcs_index,
@@ -5407,7 +5482,6 @@ impl LibUsbRtl88xxBackend {
 
 #[async_trait]
 impl FrameIo for LibUsbRtl88xxBackend {
-
     /// This radio's own capability, so a face built from the bare `dyn FrameIo` does not have to
     /// invent one. Delegates to this type's [`RadioProfile`] — the single source of truth.
     fn radio_capability(&self) -> Option<ndn_radio_hal::RadioCapability> {
@@ -5637,4 +5711,800 @@ impl LibUsbRtl88xxBackend {
         }
         Ok(())
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// M4 · §1.4 — THE PLAN.  One sequence, executed by the shared runner.
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Specification: `docs/bringup-contract.md` §1.4/§1.5/§4/§5-M4.
+//
+// This is the radio the forwarder actually runs on, which is why the contract migrates it second:
+// the machinery was proven on the 8733b (M3) before it was pointed at the production part.
+//
+// ★ **Every rung below is transcribed VERBATIM, IN ORDER, from `bring_up`** — the single ladder all
+// five openers (`open_monitor`, `open_monitor_pid`, `open_monitor_pid_select`, and
+// `open_pid`/`open_pid_select` + an explicit `bring_up`) already shared. Not one register write
+// moved, was added, or was reordered. A plan that "improves" a ladder is an unmeasured change to a
+// radio nobody at the keyboard can test. Four things did change, each named where it happens:
+//
+//   1. the composite `cal_chain` StepRecord of M2 is now SIX named rungs — `fw_iqk`, `lck`,
+//      `fw_dpk`, `dpk_force_bypass`, `kfree`, `txgapk` — in exactly the order the ladder ran them.
+//      No sequence moved; four `tracing::warn!` swallows became `StepClass::BestEffort` with a
+//      written `Degradation`, which is the only way `NDN_RADIO_SKIP_CAL` can name what it skipped
+//      and the only way `txgapk`'s swallowed error becomes visible (see `ASSERTS_A81A`);
+//   2. `NDN_RADIO_MINIMAL` / `NDN_RADIO_SKIP_CAL` / `NDN_RADIO_NO_EFEM` no longer live INSIDE the
+//      ladder (LAW 1) — they are read once at the wrapper boundary and become a self-labelling
+//      `Deviation` that lands in the report and the digest (see `env_deviation`);
+//   3. `set_channel_bw20` is called twice, so the two calls are two rungs with two ids
+//      (`tune_channel`, `retune_channel`) and the ordering that separates them is DECLARED;
+//   4. `NDN_RADIO_HMEBOX_H2C` left the ladder and is written into `Plan::excluded` — it is an
+//      ADDITIVE experiment, and a deviation may only subtract (§1.4).
+//
+// ⚠ **No on-air behaviour change.** This part declares no `TxInstrument` (§4: `0x2DE0` is not a
+// TX-OK counter here, MEASURED), so `run_plan` takes no transmit probe and the plan puts nothing on
+// the air that `bring_up` did not already put there. That is the opposite of M3, where wiring the
+// 8733b's working counter added eight probe frames to every bring-up.
+
+/// Shorthand for the step tables below — `Step<LibUsbRtl88xxBackend>` twenty times is unreadable.
+type A81a = LibUsbRtl88xxBackend;
+
+// ── the rungs ────────────────────────────────────────────────────────────────
+
+fn s_power_on(b: &Arc<A81a>, _c: &mut Ctx<'_>) -> Result<StepOutcome, FaceError> {
+    b.power_on()?;
+    Ok(StepOutcome::Done)
+}
+
+fn s_download_firmware(b: &Arc<A81a>, _c: &mut Ctx<'_>) -> Result<StepOutcome, FaceError> {
+    let v = b.download_firmware(A81a::firmware_nic())?;
+    tracing::debug!(version = %v, "rtl8822e NIC firmware booted");
+    Ok(StepOutcome::Established(Fact::Firmware {
+        name: "rtl8822e NIC (embedded)",
+        ready: true,
+    }))
+}
+
+fn s_mac_init(b: &Arc<A81a>, _c: &mut Ctx<'_>) -> Result<StepOutcome, FaceError> {
+    b.mac_init()?;
+    Ok(StepOutcome::Done)
+}
+
+fn s_monitor_cfg(b: &Arc<A81a>, _c: &mut Ctx<'_>) -> Result<StepOutcome, FaceError> {
+    b.monitor_cfg()?;
+    Ok(StepOutcome::Done)
+}
+
+fn s_send_general_info(b: &Arc<A81a>, _c: &mut Ctx<'_>) -> Result<StepOutcome, FaceError> {
+    b.send_general_info()?;
+    Ok(StepOutcome::Done)
+}
+
+fn s_phy_init(b: &Arc<A81a>, _c: &mut Ctx<'_>) -> Result<StepOutcome, FaceError> {
+    b.phy_init()?;
+    Ok(StepOutcome::Done)
+}
+
+fn s_tune_channel(b: &Arc<A81a>, c: &mut Ctx<'_>) -> Result<StepOutcome, FaceError> {
+    b.set_channel_bw20(c.state_ref().channel)?;
+    Ok(StepOutcome::Done)
+}
+
+fn s_fw_iqk(b: &Arc<A81a>, _c: &mut Ctx<'_>) -> Result<StepOutcome, FaceError> {
+    b.fw_iqk(false, false)?;
+    Ok(StepOutcome::Done)
+}
+
+fn s_lck(b: &Arc<A81a>, _c: &mut Ctx<'_>) -> Result<StepOutcome, FaceError> {
+    b.lck()?;
+    Ok(StepOutcome::Done)
+}
+
+fn s_fw_dpk(b: &Arc<A81a>, _c: &mut Ctx<'_>) -> Result<StepOutcome, FaceError> {
+    b.fw_dpk()?;
+    Ok(StepOutcome::Done)
+}
+
+fn s_dpk_force_bypass(b: &Arc<A81a>, _c: &mut Ctx<'_>) -> Result<StepOutcome, FaceError> {
+    b.dpk_force_bypass()?;
+    Ok(StepOutcome::Done)
+}
+
+fn s_kfree(b: &Arc<A81a>, _c: &mut Ctx<'_>) -> Result<StepOutcome, FaceError> {
+    b.kfree()?;
+    Ok(StepOutcome::Done)
+}
+
+fn s_txgapk(b: &Arc<A81a>, c: &mut Ctx<'_>) -> Result<StepOutcome, FaceError> {
+    b.txgapk(c.state_ref().channel)?;
+    Ok(StepOutcome::Done)
+}
+
+fn s_efem_pinmux(b: &Arc<A81a>, _c: &mut Ctx<'_>) -> Result<StepOutcome, FaceError> {
+    // The plan's own judgement, from a value the plan can see — NOT the environment. Transcribed
+    // from the ladder's `if RFE_TYPE == 21 && …`; `RFE_TYPE` is a compile-time constant here
+    // (0x15 = 21), so today this branch never fires. It is written as a `Skipped` rather than
+    // deleted because the condition is the board fact, and a board whose RFE type differs must see
+    // the skip in its own report instead of silently getting a pinmux meant for the BL-M8812EU2.
+    if RFE_TYPE != 21 {
+        return Ok(StepOutcome::Skipped(
+            "RFE_TYPE != 21 — the external-FEM pinmux is board-level for the BL-M8812EU2 and does \
+             not apply to this front end",
+        ));
+    }
+    b.efem_pinmux_config()?;
+    Ok(StepOutcome::Done)
+}
+
+fn s_bb_tx_datapath_init(b: &Arc<A81a>, _c: &mut Ctx<'_>) -> Result<StepOutcome, FaceError> {
+    b.bb_tx_datapath_init()?;
+    Ok(StepOutcome::Done)
+}
+
+fn s_rx_path_init(b: &Arc<A81a>, _c: &mut Ctx<'_>) -> Result<StepOutcome, FaceError> {
+    b.rx_path_init()?;
+    Ok(StepOutcome::Done)
+}
+
+fn s_calibrate_tx_power(b: &Arc<A81a>, c: &mut Ctx<'_>) -> Result<StepOutcome, FaceError> {
+    let ch = c.state_ref().channel;
+    let (base_a, base_b) = b.calibrate_tx_power(ch)?;
+    tracing::debug!(base_a, base_b, "TX power calibrated from EFUSE");
+    // LAW 6 — this rung decides what a later `set_tx_power` is referenced to, so it says so, and
+    // the runner hoists the fact into `RadioState::facts`. `load_tx_power_info` is the founding
+    // case of a rung that changed a later API's meaning invisibly; this is the same shape, written
+    // down. ⚠ The ladder never calls `set_tx_power`: what is in force after a bring-up is the
+    // FUSED base this rung computed, and the report says so rather than implying a caller chose it.
+    let reference = PowerReference::FusedBase {
+        base_index: base_a,
+        channel: ch,
+    };
+    let refw = |reg: u32, group: &'static str, path: u8| PowerWrite {
+        reg,
+        value: base_a,
+        group,
+        path,
+    };
+    c.state().power = AppliedPower::from_writes(
+        // `Ceiling` is the honest request here: `write_txagc` writes
+        // `min(power-by-rate, regulatory limit)` per rate, which IS "as much as this part is
+        // allowed on this channel". Nobody asked for an index; the fuse and the region decided.
+        PowerRequest::ceiling(),
+        reference,
+        base_a,
+        false,
+        vec![
+            refw(0x18e8, "OFDM ref (calibrate_tx_power)", 0),
+            refw(0x41e8, "OFDM ref (calibrate_tx_power)", 1),
+            refw(0x18a0, "CCK ref (calibrate_tx_power)", 0),
+            refw(0x41a0, "CCK ref (calibrate_tx_power)", 1),
+        ],
+    );
+    Ok(StepOutcome::Established(Fact::PowerReference(reference)))
+}
+
+fn s_retune_channel(b: &Arc<A81a>, c: &mut Ctx<'_>) -> Result<StepOutcome, FaceError> {
+    b.set_channel_bw20(c.state_ref().channel)?;
+    Ok(StepOutcome::Done)
+}
+
+fn s_btc_grant_wl(b: &Arc<A81a>, _c: &mut Ctx<'_>) -> Result<StepOutcome, FaceError> {
+    b.btc_grant_wl()?;
+    Ok(StepOutcome::Done)
+}
+
+fn s_thermal_reference(b: &Arc<A81a>, _c: &mut Ctx<'_>) -> Result<StepOutcome, FaceError> {
+    let t = b.read_thermal(RfPath::A)?;
+    b.cal_thermal.store(t, Ordering::Relaxed);
+    Ok(StepOutcome::Done)
+}
+
+// ── the rungs, as reviewable constants ───────────────────────────────────────
+
+const R_POWER_ON: Step<A81a> = Step {
+    id: StepId("power_on"),
+    stage: Stage::PowerOn,
+    class: StepClass::Required,
+    why: "the halmac power-on sequence (`pltfm`/`pwrseq` cards-enable). Until it completes the MAC \
+          is card-disabled: register writes are accepted and dropped, so every later readback is \
+          fiction. **LAW 5**: the sequence polls each pwrseq entry to its wanted value and already \
+          returns Err on `pwrseq: polling timeout`.",
+    must_follow: &[],
+    must_precede: &[],
+    run: s_power_on,
+};
+
+const R_DOWNLOAD_FIRMWARE: Step<A81a> = Step {
+    id: StepId("download_firmware"),
+    stage: Stage::Firmware,
+    class: StepClass::Required,
+    why: "the MAC CPU runs vendor firmware; the H2C path, `send_general_info` and the FW IQK/DPK \
+          cals all speak to it. **LAW 5**: it polls BCN_VALID for the reserved-page write and then \
+          `REG_MCUFW_CTRL` for the 0xC078 fw-ready magic, and a timed-out boot that continued would \
+          leave a radio whose every later readback is fiction.",
+    must_follow: &[StepId("power_on")],
+    must_precede: &[],
+    run: s_download_firmware,
+};
+
+const R_MAC_INIT: Step<A81a> = Step {
+    id: StepId("mac_init"),
+    stage: Stage::MacInit,
+    class: StepClass::Required,
+    why: "`init_trx_cfg` (NORMAL mode) + protocol/EDCA/WMAC defaults: it takes the MAC out of the \
+          download-mode page/RQPN layout `download_firmware` left it in, so the data path can run \
+          at all. **LAW 5**: `init_trx_cfg` sets BIT_AUTO_INIT_LLT_V1 and polls REG_AUTO_LLT_V1 \
+          until it self-clears — the hardware link-list init, which is why this crate needs no \
+          `init_llt` of its own.\n\n\
+          ☠ REFUTED, recorded here so it is not re-tried: `usb_probe --txfix` set REG_CR bit 9 \
+          (MAC_SEC_EN — the theory that plaintext frames must still traverse the TX security \
+          engine) and cleared REG_FWHW_TXQ_CTRL+2 bit 6, to match the working kernel driver's \
+          end-of-init MAC TX-control state. It did not put a frame on the air. `--forcemac`, \
+          which forced 26 MAC protocol/WMAC/scheduler registers to the captured values, did \
+          not either. Both flags are DELETED (M8, §5).",
+    must_follow: &[StepId("download_firmware")],
+    must_precede: &[],
+    run: s_mac_init,
+};
+
+const R_MONITOR_CFG: Step<A81a> = Step {
+    id: StepId("monitor_cfg"),
+    stage: Stage::RxEnable,
+    class: StepClass::Required,
+    why: "promiscuous RX: REG_RCR accepts every frame including CRC/ICV errors and appends the PHY \
+          status, and the RXFLTMAP filter maps are opened. This is what makes the part a monitor \
+          rather than a station, and it is what the named-radio bearer's whole RX path depends on.",
+    must_follow: &[StepId("mac_init")],
+    must_precede: &[],
+    run: s_monitor_cfg,
+};
+
+const R_SEND_GENERAL_INFO: Step<A81a> = Step {
+    id: StepId("send_general_info"),
+    stage: Stage::Firmware,
+    class: StepClass::Required,
+    why: "the H2C `general_info` the kernel sends at init — it tells the firmware the chip/RFE/board \
+          context the FW IQK and DPK commands are computed against. Sent before `phy_init` exactly \
+          as the golden kernel trace does (`golden/opi-usbmon-2026-06-14/H2C_SEQUENCE_DECODE.md`).\n\n\
+          ☠ REFUTED, recorded here so it is not re-tried: `usb_probe --replayh2c` replayed the \
+          kernel's ENTIRE captured H2C init stream (`/tmp/h2c_seq.txt`) on top of this bring-up, \
+          testing whether a missing firmware TX-state command was the on-air gate. It was not. The \
+          gate is `bb_tx_datapath_init`, and the silent power-regime split is what made the factory \
+          path and the bench paths look different. The flag is DELETED (M8, §5), not left live.",
+    must_follow: &[StepId("download_firmware")],
+    must_precede: &[],
+    run: s_send_general_info,
+};
+
+const R_PHY_INIT: Step<A81a> = Step {
+    id: StepId("phy_init"),
+    stage: Stage::PhyInit,
+    class: StepClass::Required,
+    why: "our direct BB/RF/AGC table load (`RF 0x18 = 0x531a1`, 509/512 BB registers matching the \
+          golden kernel dump). Everything above the PHY — tune, cal, the TX datapath — is addressed \
+          through what this writes.\n\n\
+          ☠ REFUTED, twice, recorded here so neither is re-tried. `usb_probe --replayinit` \
+          replayed the working kernel driver's FULL captured BB/RF/cal init (every vendor write \
+          with addr >= 0x800, in the kernel's own order, bisectable by REPLAY_LO/REPLAY_HI) on top \
+          of this rung, testing whether our abbreviated PHY init was what blocked on-air TX; \
+          `--useinit` swapped this rung for the captured `cal_init` table wholesale. Neither \
+          unblocked TX. What did: `bb_tx_datapath_init`, plus the power regime. Both flags are \
+          DELETED (M8, §5). ⚠ `--forcebb`, the out-of-order variant of the same idea, additionally \
+          CRASHED the dongle off USB (a CCX trigger such as 0x1e5c): the zeros this driver leaves \
+          in 0x1e40-0x1e60 / 0x1e80 / 0x1ed4 are phydm RX-AGC and channel-measurement registers \
+          its runtime watchdog fills in, NOT the TX datapath, so forcing them is both useless and \
+          unsafe.",
+    must_follow: &[StepId("mac_init")],
+    must_precede: &[],
+    run: s_phy_init,
+};
+
+const R_TUNE_CHANNEL: Step<A81a> = Step {
+    id: StepId("tune_channel"),
+    stage: Stage::Tune,
+    class: StepClass::Required,
+    why: "puts the synth on the requested 5 GHz channel at 20 MHz. It must come BEFORE the cal \
+          chain: FW IQK/DPK, kfree and TXGAPK are all channel-dependent (`txgapk` takes the channel \
+          as an argument and writes the per-band gain table for it), so calibrating first and \
+          tuning after would characterise a channel the radio does not end up on.",
+    must_follow: &[StepId("phy_init")],
+    must_precede: &[StepId("fw_iqk"), StepId("txgapk")],
+    run: s_tune_channel,
+};
+
+const R_FW_IQK: Step<A81a> = Step {
+    id: StepId("fw_iqk"),
+    stage: Stage::Calibrate,
+    class: StepClass::Required,
+    why: "the firmware IQ-imbalance calibration (the kernel's `HAL_RF_IQK`, run by the MAC CPU, not \
+          by us). Required — and NOT the on-air gate: skipping the whole cal chain still transmits \
+          (MEASURED), the gate is `bb_tx_datapath_init`. It is Required because it is the one cal \
+          the old ladder propagated with `?` rather than swallowing, and demoting it would be an \
+          unmeasured change.",
+    must_follow: &[StepId("tune_channel")],
+    must_precede: &[],
+    run: s_fw_iqk,
+};
+
+const R_LCK: Step<A81a> = Step {
+    id: StepId("lck"),
+    stage: Stage::Calibrate,
+    class: StepClass::BestEffort(Degradation::new(
+        "the LO calibration did not run, so the synth's local oscillator sits at its table default \
+         — carrier leakage and EVM are uncharacterised for this part on this channel",
+        "RX capture and link-level work at the robust low rates; NOT an EVM, a spectral-mask or a \
+         high-order-MCS delivery number",
+    )),
+    why: "LO calibration, the kernel's `HAL_RF_LCK`. Best effort with a named loss, transcribed \
+          from the old ladder's `if let Err(e) = self.lck()` warning — the sequence is unchanged, \
+          what changed is that the loss is now stated instead of discarded into a log line.",
+    must_follow: &[StepId("fw_iqk")],
+    must_precede: &[],
+    run: s_lck,
+};
+
+const R_FW_DPK: Step<A81a> = Step {
+    id: StepId("fw_dpk"),
+    stage: Stage::Calibrate,
+    class: StepClass::Required,
+    why: "the firmware digital-pre-distortion calibration (`HAL_RF_DPK`). Required for the same \
+          reason as `fw_iqk`: the old ladder propagated it with `?`. ⚠ Its result is then \
+          force-bypassed by the next rung for this RFE type, exactly as the kernel does — the \
+          command still runs, because that is what the golden trace does.",
+    must_follow: &[StepId("fw_iqk")],
+    must_precede: &[StepId("dpk_force_bypass")],
+    run: s_fw_dpk,
+};
+
+const R_DPK_FORCE_BYPASS: Step<A81a> = Step {
+    id: StepId("dpk_force_bypass"),
+    stage: Stage::Calibrate,
+    class: StepClass::BestEffort(Degradation::new(
+        "both paths' DPK is left at whatever `fw_dpk` produced instead of the kernel's known \
+         force-bypass state for RFE type 21/22 — the PA linearisation is in an unknown regime",
+        "register-level work; NOT a high-order-MCS or EVM number, since DPK regime is exactly what \
+         those depend on",
+    )),
+    why: "`_dpk_force_bypass_8822e` — what the kernel `do_dpk_8822e` does for RFE type 21/22 (our \
+          dongles): it skips the full DPK and force-bypasses it, so a faithful bring-up sets the \
+          same known state rather than leaving the table default. Best effort with a named loss, \
+          transcribed from the old ladder's `if let Err(e) = self.dpk_force_bypass()` warning.",
+    must_follow: &[],
+    must_precede: &[],
+    run: s_dpk_force_bypass,
+};
+
+const R_KFREE: Step<A81a> = Step {
+    id: StepId("kfree"),
+    stage: Stage::Calibrate,
+    class: StepClass::BestEffort(Degradation::new(
+        "the factory per-device power/thermal/PA-bias trim from EFUSE is not applied, so this \
+         dongle runs on the reference unit's numbers — TX power is uncalibrated by an unknown \
+         per-device offset, and the thermal reference `thermal_track` offsets from is wrong",
+        "RX work and same-channel link bring-up; NOT an absolute power, RSSI or range number, and \
+         NOT a comparison against a run where the trim did apply",
+    )),
+    why: "`phydm_do_new_kfree` — the per-device thermal-K reference (RF 0x43), per-gain-index power \
+          trim and PA bias (RF 0x60) read from the raw physical EFUSE. Best effort with a named \
+          loss, transcribed from the old ladder's `if let Err(e) = self.kfree()` warning.",
+    must_follow: &[],
+    // Vendor ordering, and the driver's own doc says why: the gain-K correction must sit on the
+    // TRIMMED base, so a run that gain-K's first and trims after corrects the wrong reference.
+    must_precede: &[StepId("txgapk")],
+    run: s_kfree,
+};
+
+const R_TXGAPK: Step<A81a> = Step {
+    id: StepId("txgapk"),
+    stage: Stage::Calibrate,
+    class: StepClass::BestEffort(Degradation::new(
+        "the RF gain table is not rewritten to track the target gain curve, so the modulated TX \
+         gain follows the factory table's shape rather than the measured one",
+        "link bring-up at the robust low rates; NOT a TX-power-vs-index linearity claim",
+    )),
+    why: "TX Gain-K, the kernel's `HAL_RF_TXGAPK` (`halrf_txgapk_8822e`). Best effort with a named \
+          loss, transcribed from the old ladder's `if let Err(e) = self.txgapk(channel)` warning. \
+          ☠ **That swallow is why `ASSERTS_A81A` exists**: this routine's second act is \
+          `txgapk_tx_pause`, which writes `REG_TXPAUSE = 0xff`, and the resume sits at the tail of \
+          the same function — an error anywhere in between returns early, past the restore, and the \
+          old ladder turned that into a `tracing::warn!` and carried on with the MAC transmit \
+          queues held. The contract's answer is to READ THE GATE BACK, not to add a clear.",
+    must_follow: &[],
+    must_precede: &[],
+    run: s_txgapk,
+};
+
+const R_EFEM_PINMUX: Step<A81a> = Step {
+    id: StepId("efem_pinmux"),
+    stage: Stage::Posture,
+    class: StepClass::Required,
+    why: "external-FEM pinmux (GPIO_MUXCFG 0x40 + LED_CFG 0x4c + PAD_CTRL1 0x64): routes the FEM \
+          control signals (PA-enable / LNA / TX-RX switch) onto their GPIO pins. The kernel does \
+          this for this board REGARDLESS of the phydm rfe field — the golden trace writes \
+          0x40/0x4c/0x64 even though `phydm_info` reports rfe=0 — because it is board-level: the \
+          BL-M8812EU2 has external FEMs. Required, because that is how the old ladder ran it (`?`, \
+          not a warning): with the FEM unswitched the PA is not enabled and there is no link.",
+    must_follow: &[],
+    must_precede: &[StepId("bb_tx_datapath_init")],
+    run: s_efem_pinmux,
+};
+
+const R_BB_TX_DATAPATH_INIT: Step<A81a> = Step {
+    id: StepId("bb_tx_datapath_init"),
+    stage: Stage::TxEnable,
+    class: StepClass::Required,
+    why: "★ **THE ON-AIR GATE.** Configures the 0x1800-0x1fff BB pages (TXAGC / TX-RX filter / \
+          OFDM-CCK datapath / DIG) that our static phy_reg/agc tables and abbreviated init never \
+          set. Without it the MAC accepts and queues frames and the BB never modulates them; with \
+          it a peer in monitor mode decodes every injected frame (MEASURED end-to-end at \
+          MCS1/20 MHz, ethertype 0x8624). The 65 values were reduced from the working kernel \
+          driver's usbmon capture (`golden/opi-usbmon-2026-06-13/`). Calibration was a red herring: \
+          single-tone always radiated and skipping IQK/DPK still transmits — this is the gate.\n\n\
+          ☠ REFUTED, recorded here so it is not re-tried: `usb_probe --bbfix` wrote a further\
+          list of BB datapath registers taken from the kernel capture ON TOP of this rung, on\
+          the theory that this rung's 65 values were an incomplete subset. It did not change\
+          on-air behaviour. `--txblock` (the golden TX DFIR / TSSI / gain-by-rate sub-block)\
+          and `--ofdm` / `--clearcal` (0x1c3c[0], the BB cal-mode bits) were the same shape of\
+          guess and are likewise gone. The flag is DELETED (M8, §5).",
+    must_follow: &[StepId("phy_init")],
+    must_precede: &[],
+    run: s_bb_tx_datapath_init,
+};
+
+const R_RX_PATH_INIT: Step<A81a> = Step {
+    id: StepId("rx_path_init"),
+    stage: Stage::RxEnable,
+    class: StepClass::Required,
+    why: "the RF receive path, run immediately after the TX datapath because the datapath init \
+          touches RF 0x18 (which is also why `retune_channel` follows below). Transcribed in place.",
+    must_follow: &[StepId("bb_tx_datapath_init")],
+    must_precede: &[],
+    run: s_rx_path_init,
+};
+
+const R_CALIBRATE_TX_POWER: Step<A81a> = Step {
+    id: StepId("calibrate_tx_power"),
+    stage: Stage::Power,
+    class: StepClass::BestEffort(Degradation::new(
+        "this dongle keeps the REFERENCE UNIT's captured TXAGC values that `bb_tx_datapath_init` \
+         bakes in, instead of its own EFUSE power-by-rate base — TX power is off by an unknown \
+         per-device offset and `thermal_track` has no base to compensate around",
+        "link bring-up and RX work; NOT an absolute power, RSSI, range or per-rate delivery number",
+    )),
+    why: "★ the per-device power axis, and the rung that decides what `set_tx_power` is referenced \
+          to (LAW 6). It must run AFTER `bb_tx_datapath_init`, whose 65 golden values include the \
+          reference unit's TXAGC: this rung overwrites them with THIS dongle's EFUSE power-by-rate \
+          base. Best effort with a named loss, transcribed from the old ladder's `match … Err(e) => \
+          warn!(\"TX power calibration failed; using captured refs\")`.\n\n\
+          ⚠ **OPEN QUESTION, unresolved because it needs a witness (contract §5-M4).** \
+          `ndn-radio/crates/faces/ndn-phy-wifi/examples/named_radio_face.rs:103-121` clears \
+          `0x1c90[15]` and writes the per-rate TXAGC table `0x3a04…0x3a3c` by hand (under \
+          `RADIO_PERRATE=1`) because *\"our `bb_tx_datapath_init` never does, so OFDM/HT rates \
+          likely TX at near-zero per-rate power\"*. `set_tx_power`'s doc on this backend says the \
+          opposite: *\"Per-rate diffs in the `0x3a00` table are left at 0, so every rate transmits \
+          at this reference power\"*. Both citations are in the tree and they cannot both be the \
+          whole truth. What the SOURCE says, and it does not settle it: `bb_tx_datapath_init` \
+          indeed never writes 0x3a00, and `set_tx_power` indeed never writes 0x3a00 — but \
+          `write_txagc`, which THIS rung calls, clears `0x1c90[15]` and writes all eleven \
+          `0x3a04…0x3a3c` diff words from the factory power-by-rate curve capped by the regulatory \
+          limit. So the example's premise is true of the function it names and false of the ladder \
+          as a whole, and the live question is narrower: do the example's fixed diffs and this \
+          rung's computed diffs put DIFFERENT power on the air per rate? Only a witness answers \
+          that. **The workaround is NOT migrated into this plan and NOT deleted from the example.** \
+          Settle it at the witness (§6.5) and write the answer here.",
+    must_follow: &[StepId("bb_tx_datapath_init")],
+    must_precede: &[StepId("retune_channel")],
+    run: s_calibrate_tx_power,
+};
+
+const R_RETUNE_CHANNEL: Step<A81a> = Step {
+    id: StepId("retune_channel"),
+    stage: Stage::Tune,
+    class: StepClass::Required,
+    why: "the SECOND `set_channel_bw20`, and it is a second rung rather than a repeat because the \
+          ladder genuinely calls it twice: `bb_tx_datapath_init` touches RF 0x18 and \
+          `calibrate_tx_power` rewrites the TXAGC references, so the synth is re-asserted on top of \
+          both. Distinct id, distinct `why`, distinct line in the report — a plan may not contain \
+          two rungs with one name.",
+    must_follow: &[StepId("tune_channel")],
+    must_precede: &[],
+    run: s_retune_channel,
+};
+
+const R_BTC_GRANT_WL: Step<A81a> = Step {
+    id: StepId("btc_grant_wl"),
+    stage: Stage::Posture,
+    class: StepClass::BestEffort(Degradation::new(
+        "the shared RF front end is not granted to Wi-Fi, which MEASURED as TX power ~50 dB low — \
+         the radio comes up, injects, reports Ok, and is inaudible",
+        "nothing on air. A run that lost this rung is a register-level run only",
+    )),
+    why: "★ `phy_set_rf_path_switch`: GNT_WL=1 / GNT_BT=0 on the BT-coex shared front end, at the \
+          END of the ladder and nowhere else. ☠ MEASURED, 2026-06-14 bisection on the reciprocal \
+          OPi link: forcing the grant BEFORE the cal chain corrupts the cal/BB state and gives \
+          **0 frames decoded**; granting only here gives **~850**. That is why this rung declares \
+          `must_follow` on the cal chain and the re-tune instead of sitting where it looks tidier. \
+          Best effort with a named loss, transcribed from the old ladder's `if let Err(e) = \
+          self.btc_grant_wl()` warning.",
+    must_follow: &[StepId("fw_iqk"), StepId("txgapk"), StepId("retune_channel")],
+    must_precede: &[],
+    run: s_btc_grant_wl,
+};
+
+const R_THERMAL_REFERENCE: Step<A81a> = Step {
+    id: StepId("thermal_reference"),
+    stage: Stage::Verify,
+    class: StepClass::BestEffort(Degradation::new(
+        "no thermal reference is captured, so `thermal_track` (the ~2 s watchdog) has nothing to \
+         compare against and runtime TX-power tracking silently does nothing — the PA sags as it \
+         heats and the link fades over a long transmit",
+        "short transmits and RX work; NOT a sustained-throughput or long-session delivery number",
+    )),
+    why: "reads the RF thermal meter once and stores it as the calibration reference the runtime DM \
+          offsets from. Best effort with a named loss, transcribed from the old ladder's `if let \
+          Ok(t) = self.read_thermal(RfPath::A)` — which discarded the failure entirely, with no log \
+          line at all. It must follow `calibrate_tx_power`, whose `tx_ref_base` is the other half \
+          of the pair `thermal_track` compensates around.",
+    must_follow: &[StepId("calibrate_tx_power")],
+    must_precede: &[],
+    run: s_thermal_reference,
+};
+
+// ── the plan ─────────────────────────────────────────────────────────────────
+
+/// The one sequence, in the order `bring_up` ran it.
+const A81A_STEPS: &[Step<A81a>] = &[
+    R_POWER_ON,
+    R_DOWNLOAD_FIRMWARE,
+    R_MAC_INIT,
+    R_MONITOR_CFG,
+    R_SEND_GENERAL_INFO,
+    R_PHY_INIT,
+    R_TUNE_CHANNEL,
+    R_FW_IQK,
+    R_LCK,
+    R_FW_DPK,
+    R_DPK_FORCE_BYPASS,
+    R_KFREE,
+    R_TXGAPK,
+    R_EFEM_PINMUX,
+    R_BB_TX_DATAPATH_INIT,
+    R_RX_PATH_INIT,
+    R_CALIBRATE_TX_POWER,
+    R_RETUNE_CHANNEL,
+    R_BTC_GRANT_WL,
+    R_THERMAL_REFERENCE,
+];
+
+const A81A_PLAN: Plan<A81a> = Plan {
+    id: PlanId {
+        part: "rtl8822e",
+        name: "monitor",
+        ver: 2,
+    },
+    role: Role::TransmitAndReceive,
+    steps: A81A_STEPS,
+    excluded: &[
+        (
+            Stage::Attach,
+            "the device is selected and claimed BEFORE the plan runs — `open_pid_select` takes a \
+             `DeviceSelect` (first / Nth / `\"<bus>-<port>\"`) and runs the live-link guard, and \
+             `claim` records the USB topological address. So there is no attach rung, and unlike \
+             the 8733b there is no missing capability either: the report carries \
+             `DeviceAddress::Usb(\"<bus>-<port>\")` and names the physical dongle it describes.",
+        ),
+        (
+            Stage::Firmware,
+            "⚠ **`NDN_RADIO_HMEBOX_H2C` is deliberately absent, and it is the one knob M4 could not \
+             convert.** The ladder used to replay, when that variable was set, the two register-based \
+             HMEBOX H2C commands (0x1d0/0x1d4, cmd_ids 0x4c/0x6d) the kernel sends at init and our \
+             packet-H2C path never issues — a documented prime suspect for the firmware TX state \
+             (`golden/opi-usbmon-2026-06-14/H2C_MAPPING.md`: \"not yet decoded\"). That is an \
+             ADDITIVE experiment, and §1.4 is explicit that steps may be subtracted from outside \
+             the crate but NEVER added: there is no `Plan::then`, and `DeviationOp` has no insert. \
+             Putting the rung in the canonical plan instead would invert the default and start \
+             replaying two undecoded firmware commands on every production node, which is an \
+             unmeasured on-air change nobody here can test. Its home is §1.6's typed \
+             `bench::run_with` under `feature = \"bench\"`, which is not built yet. Until then \
+             `send_hmebox_h2c` is `pub` and the variable is refused LOUDLY at the wrapper \
+             boundary (see `env_deviation`) rather than silently doing nothing — the `ndn_env` \
+             `Unrecognised` lesson.",
+        ),
+        (
+            Stage::Verify,
+            "no Verify-stage rung. The one readback this ladder owes — `REG_TXPAUSE` after \
+             `txgapk`'s swallowed error path — is a part-wide `Assert` (`ASSERTS_A81A`), which the \
+             runner takes after the last rung; and §4's transmit question is answered \
+             `Unprovable` with a quoted measurement, because this part has no MAC->BB counter. \
+             `thermal_reference` carries the Verify label as the last thing the ladder reads back \
+             from the RF, which is a rendering label only (Appendix A.2) and not a claim that it \
+             verifies anything.",
+        ),
+    ],
+};
+
+// ★ **A malformed plan is a compile error, not a runtime one.** In particular, moving
+// `R_BTC_GRANT_WL` above the cal chain stops the crate building — the 2026-06-14 bisection
+// (0 frames decoded vs ~850) is now enforced by the compiler rather than by a paragraph nobody
+// re-reads.
+const _: () = A81A_PLAN.check_or_panic();
+
+/// The RTL8822E / a81a plan — the single ladder all five `open_*` openers run.
+pub static PLAN_A81A: Plan<A81a> = A81A_PLAN;
+
+/// §1.5 — read back every gate you write.
+///
+/// ★ **This is the assert the contract wrote this part's name next to.** `txgapk_tx_pause` writes
+/// `REG_TXPAUSE = 0xff` to stop the TX scheduler for the gain-K sweep, and the resume sits at the
+/// TAIL of `txgapk` — so any error in between returns early past the restore, and the ladder
+/// swallowed that error with a `tracing::warn!` and carried on. The MAC transmit queues would then
+/// be held for the life of the handle: frames queue, `inject` returns Ok, nothing reaches the air,
+/// and the host is never told. One control read makes that visible.
+///
+/// ⚠ It is an assert and **not** a `write8(0x0522, 0x00)` rung. The hand-rolled clear on the
+/// sibling 8812au was A/B'd INERT (2789 / 4508 / 4588 / 4406 frames — run-to-run noise, no
+/// direction) and reverted, and REG_TXPAUSE MEASURED 0x00 over three bring-ups there. Adding a
+/// clear here would paper over exactly the failure this reads back.
+///
+/// ⚠ `Warn` on introduction, per §5/M-hazards. Promotion to `Fatal` is per part and needs a
+/// measurement; a readback nobody has watched fail is not allowed to refuse the radio the
+/// forwarder runs on.
+const ASSERTS_A81A: &[Assert<A81a>] = &[Assert {
+    id: StepId("txpause_released"),
+    reg: 0x0522,
+    read: |b: &A81a| b.read8(0x0522).map(u32::from),
+    want: 0x00,
+    mask: 0xff,
+    why: "REG_TXPAUSE. `txgapk_tx_pause` writes 0xff and the restore sits at the tail of `txgapk`, \
+          whose error the ladder swallowed with a warning — so a failed gain-K leaves the MAC \
+          transmit queues HELD and every later inject queues and dies silently. 0x3f is the \
+          aborted-IQK residue on the sibling parts, 0xff the aborted-LCK/TXGAPK one.",
+    severity: Severity::Warn,
+}];
+
+/// §4 — what this part can prove about its own transmitter: **nothing, and it says why.**
+///
+/// ☠ Ruled out BY MEASUREMENT, quoted from this file's own header: `0x2DE0` is NOT a TX-OK counter
+/// here — it stays 0 even on the working kernel driver mid-transmit. And `examples/tx_liveness.rs`
+/// printing `0x2d08` as "TX activity" is reading an **RX false-alarm** counter. Both are recorded so
+/// the next person does not wire either one up again.
+const TX_UNPROVABLE_A81A: &str = "no MAC->BB transmit counter is ported for this part, and the two obvious candidates are ruled \
+     out by measurement: 0x2DE0 is NOT a TX-OK counter here (it stays 0 on the working kernel \
+     driver mid-transmit) and 0x2d08 is an RX false-alarm counter. Question (A) is unanswerable \
+     on-chip; prove (B) with a witness.";
+
+impl BringUp for LibUsbRtl88xxBackend {
+    fn plan(role: Role) -> Option<&'static Plan<Self>> {
+        match role {
+            Role::TransmitAndReceive => Some(&PLAN_A81A),
+            // ★ Named refusals, not silent downgrades. **One plan** (contract §5-M4), because one
+            // ladder is all this part has ever run: all five openers reach the same sequence, and
+            // `monitor_cfg` (the promiscuous RCR) sits in the middle of the sequence the TX path is
+            // built on. An RX-only variant would mean deleting `bb_tx_datapath_init` and the cal
+            // chain, and a TX-only variant would mean deleting `monitor_cfg` — neither has ever
+            // been run on this silicon, and inventing one here would be exactly the unmeasured
+            // ladder this contract exists to remove. A caller that only wants to listen asks for
+            // TransmitAndReceive and does not inject; that costs it nothing.
+            Role::ReceiveOnly | Role::TransmitOnly => None,
+        }
+    }
+
+    fn asserts() -> &'static [Assert<Self>] {
+        ASSERTS_A81A
+    }
+
+    /// Empty, and that is the measured answer — see [`TX_UNPROVABLE_A81A`].
+    fn tx_instruments() -> &'static [TxInstrument] {
+        &[]
+    }
+
+    fn tx_unprovable_reason() -> Option<&'static str> {
+        Some(TX_UNPROVABLE_A81A)
+    }
+}
+
+/// LAW 1 lives at the wrapper boundary, not in a rung.
+///
+/// `NDN_RADIO_MINIMAL`, `NDN_RADIO_SKIP_CAL` and `NDN_RADIO_NO_EFEM` are read HERE — once, at the
+/// caller boundary, where §1.1's `BringUpRequest::from_env` will read them for good — and become a
+/// **self-labelling [`Deviation`]** that lands in the report and changes `plan_digest`. Inside a
+/// plan step they would be exactly `load_tx_power_info` one level up: hidden state deciding what a
+/// later call means, with two runs that look identical in their own output.
+///
+/// ⚠ **One thing is lost, and it is written down rather than hidden.** The old `NDN_RADIO_MINIMAL`
+/// branch also slept 200 ms after `send_general_info` — a settle window for the firmware to apply
+/// its own PHY config, since that mode's whole point is to let the fw configure the PHY instead of
+/// loading our tables. A `Deviation` subtracts rungs; it cannot insert a sleep. So a MINIMAL run is
+/// now the canonical ladder minus `phy_init` and the cal chain, and nothing else. If that settle
+/// turns out to matter it must come back as a rung with a measurement behind it, not as a sleep
+/// inside a debug branch.
+///
+/// ⚠ **`NDN_RADIO_HMEBOX_H2C` is refused, loudly.** It was additive and a deviation may only
+/// subtract (see `PLAN_A81A`'s `Stage::Firmware` exclusion). A knob that silently does nothing is
+/// worse than no knob — that is the `ndn_env` `Unrecognised` lesson — so it says so on stderr and
+/// on the tracing tree, and the bring-up continues canonically.
+pub fn a81a_env_deviation() -> Option<Deviation> {
+    if std::env::var_os("NDN_RADIO_HMEBOX_H2C").is_some() {
+        let msg = "NDN_RADIO_HMEBOX_H2C is set and is NOT honoured any more: replaying the two \
+                   register HMEBOX H2C commands is an ADDITIVE step, and a Deviation may only \
+                   subtract (bringup-contract §1.4). The bring-up ran CANONICALLY. The question \
+                   moves to `bench::run_with` (§1.6); until that exists, call \
+                   `send_hmebox_h2c()` yourself from an instrument.";
+        tracing::warn!(target: "radio", part = "rtl8822e", "{msg}");
+        eprintln!("{msg}");
+    }
+
+    let minimal = std::env::var_os("NDN_RADIO_MINIMAL").is_some();
+    let skip_cal = minimal || std::env::var_os("NDN_RADIO_SKIP_CAL").is_some();
+    let no_efem = std::env::var_os("NDN_RADIO_NO_EFEM").is_some();
+    if !minimal && !skip_cal && !no_efem {
+        return None;
+    }
+
+    // The question is assembled from the knobs that are actually set, because a Deviation's whole
+    // job is to say — in the report, forever — what this run was asking.
+    let mut asking: Vec<&str> = Vec::new();
+    if minimal {
+        asking.push("NDN_RADIO_MINIMAL: can the firmware configure the PHY on its own?");
+    }
+    if skip_cal && !minimal {
+        asking.push("NDN_RADIO_SKIP_CAL: what does this link do with an uncalibrated transmitter?");
+    }
+    if no_efem {
+        asking.push("NDN_RADIO_NO_EFEM: is the external-FEM pinmux load-bearing on this board?");
+    }
+    let mut d = Deviation::new(asking.join(" · "));
+
+    if minimal {
+        d = d.skip(
+            "phy_init",
+            "NDN_RADIO_MINIMAL — the firmware configures the PHY and our BB/RF tables are NOT \
+             loaded. ⚠ The 200 ms fw settle window the old branch added after `send_general_info` \
+             is NOT reproduced: a Deviation subtracts rungs and cannot insert a sleep.",
+        );
+    }
+    if skip_cal {
+        // One skip per rung, because M4 split the M2 `cal_chain` record into its six real steps —
+        // which is also the first time this knob's report says WHICH cals it dropped.
+        for id in [
+            "fw_iqk",
+            "lck",
+            "fw_dpk",
+            "dpk_force_bypass",
+            "kfree",
+            "txgapk",
+        ] {
+            d = d.skip(
+                id,
+                "NDN_RADIO_SKIP_CAL / NDN_RADIO_MINIMAL — FW IQK/DPK, LCK, kfree and TXGAPK all \
+                 bypassed; TX gain and EVM are uncalibrated. NOT the on-air gate (that is \
+                 `bb_tx_datapath_init`): a skipped cal chain still transmits, MEASURED. Any power, \
+                 RSSI, range or per-rate number from this run is uncalibrated.",
+            );
+        }
+    }
+    if no_efem {
+        d = d.skip(
+            "efem_pinmux",
+            "NDN_RADIO_NO_EFEM — the FEM control signals (PA-enable / LNA / TX-RX switch) are not \
+             routed onto their GPIO pins. The A/B this exists for; expect no usable link.",
+        );
+    }
+    Some(d)
+}
+
+/// The cost of the pre-M8 wrapper signatures: `FaceError` cannot carry a partial report.
+///
+/// So it is **emitted before it is dropped** — a failed bring-up that says how far it got is the
+/// entire point of §3, and losing it silently here would put the old defect back one level up.
+/// `emit()` puts it on the tracing span tree; the `eprintln!` is for the bench runs that have no
+/// subscriber, which is most of them.
+fn drop_partial_report(f: BringUpFailure) -> FaceError {
+    f.report.emit();
+    eprintln!(
+        "rtl8822e bring-up FAILED at `{}` — the partial report:\n{}",
+        f.failed_at,
+        f.report.render()
+    );
+    f.source
 }

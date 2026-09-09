@@ -1,3 +1,12 @@
+> # ⚠ The in-frame name filter is RETIRED (see `../NDR_MAC_SPEC.md`).
+> The `ndr_tier0.c` / `ndr_filter.c` **in-frame name filter** described below has been **removed**
+> from this firmware. Relevance is now decided by **parsing the NDN name** (`ndr_parse.c`, off-host
+> where the AR9271 keeps up, host-fallback at higher rates — spec §6). **What remains on the dongle
+> is the hardware-scheduled TX / named airtime lease** (`ndr_mac.c` + the `ndr_ctl.c` lease control),
+> which is unchanged. When integrating against the upstream tree, the `ath_tgt_rx_tasklet()` hook
+> must call the parser (or drop the pre-parse gate entirely), **not** the deleted `ndr_rx_accept()`.
+> Sections below that describe Tier-0 filtering are historical.
+
 # ath9k-htc-ndr — the named-data-radio MAC in Wi-Fi firmware (AR9271)
 
 Patches to [`qca/open-ath9k-htc-firmware`](https://github.com/qca/open-ath9k-htc-firmware) that put

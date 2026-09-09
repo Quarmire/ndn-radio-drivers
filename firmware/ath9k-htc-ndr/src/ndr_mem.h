@@ -41,7 +41,7 @@
 #ifndef _NDR_MEM_H_
 #define _NDR_MEM_H_
 
-#include "ndr_tier0.h"
+#include <adf_os_types.h> /* adf typedefs (a_uint8_t, a_uint32_t, a_int32_t) - was via ndr_tier0.h */
 
 /* Read/write. */
 #define NDR_MEM_FLAG_WRITE   0x0001
@@ -63,7 +63,7 @@
  * Address windows the AR9271 (k2) firmware actually occupies, from `ram-k2.ld`:
  *
  *   lit_seg  org 0x004E5200 len 0x1DE00   (literals / read-only)
- *   dram_seg org 0x0050CB40 len 0x1800    (data + bss — where ndr_cfg and ndr_stats live)
+ *   dram_seg org 0x0050CB40 len 0x1800    (data + bss — where ndr_mac_state and the lease config live)
  *   iram_seg org 0x00903000 len 0x9B40    (text)
  *
  * The bounds below are a deliberately generous union of those, widened to the region boundaries

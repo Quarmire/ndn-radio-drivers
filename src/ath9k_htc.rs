@@ -25,7 +25,7 @@
 //! this module only for what the kernel driver cannot express.
 //!
 //! **The thing it is actually for** is the config/telemetry channel: reading and writing
-//! `ndr_cfg` / `ndr_stats` in target RAM so the Tier-0 filter can be reconfigured and its drop
+//! target RAM (e.g. reading counters over WMI_ACCESS_MEMORY) — the pre-parse-everywhere Tier-0 filter
 //! counters read without a firmware rebuild. One caveat, discovered by reading the firmware rather
 //! than assuming: **`WMI_ACCESS_MEMORY_CMDID` is dispatched but its handler body is empty**
 //! (`magpie.c:88`, and the same handler is wired in `if_ath.c`'s table). The wire format exists;
@@ -39,6 +39,12 @@ use async_trait::async_trait;
 use rusb::{Context, DeviceHandle, UsbContext};
 
 use ndn_frame_io::{ClockDomainId, LatchPoint, LinkStamp};
+use ndn_radio_hal::bringup::{
+    AppliedPower, Assert, BringUp, BringUpFailure, BringUpReport, Ctx, Degradation, Deviation,
+    Fact, Guards, Plan, PlanId, PlanRun, PowerReference, PowerRequest, PowerWrite,
+    ProofRequirement, PumpPolicy, RadioState, Role, Severity, Stage, Step, StepClass, StepId,
+    StepOutcome, TxInstrument,
+};
 use ndn_radio_hal::{
     Bandwidth, RadioCapability, RadioKnobs, RadioProfile, RadioTime, RadioTimeSource,
 };
@@ -66,6 +72,13 @@ pub const ATHEROS_VID: u16 = 0x0cf3;
 
 /// AR9271 product IDs. `0x9271` is the reference part (the one on o5p-1); the others are
 /// vendor-rebadged AR9271 dongles carried by `ath9k_htc`'s id table.
+/// A product id that selects the AR9271 arm of [`open_radio`](crate::open_radio).
+///
+/// The arm keys on membership of [`AR9271_IDS`] and `Ath9kHtcBackend::open` then scans the whole
+/// set, so any member names the part; this is the one to write when a caller has no PID of its own
+/// (a bench instrument that just wants "the AR9271 on this host").
+pub const AR9271_PID: u16 = 0x9271;
+
 pub const AR9271_IDS: &[(u16, u16)] = &[
     (0x0cf3, 0x9271), // Atheros reference
     (0x0cf3, 0x1006),
@@ -266,22 +279,6 @@ fn ndr_mem_status(code: u16) -> &'static str {
     }
 }
 
-/// Tier-0 filter counters (`struct ndr_stats`). `dropped_filter` is the headline number: USB
-/// transfers and host wakeups that did not happen — the quantity design §8.2 says is unreachable
-/// on every other Wi-Fi part we own.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct NdrStats {
-    pub seen: u32,
-    pub passed: u32,
-    pub dropped_filter: u32,
-    pub dropped_foreign: u32,
-    pub short_frame: u32,
-    /// Frames rejected because `addr1||addr2` had more bits set than any legitimate Tier-0 sender
-    /// could produce (> K*D = 32). Exact, not heuristic — and it is what rejects the all-ones
-    /// broadcast address, which satisfies every Bloom mask by construction.
-    pub dropped_popcount: u32,
-}
-
 /// Max `{addr,val}` pairs in one batched `WMI_REG_WRITE`. Bounded by the 64-byte
 /// register pipe: `HTC(8) + WMI(4) + n*8 ≤ 64` ⇒ `n ≤ 6`. The reply is empty
 /// (the firmware's `ath_hal_reg_write_tgt` answers `wmi_cmd_rsp(..., NULL, 0)`),
@@ -410,20 +407,20 @@ pub struct Ath9kHtcBackend {
     /// EDCCA, occupancy — drive the register path.
     seq: std::sync::Mutex<u16>,
     /// Endpoint the target assigned to `WMI_CONTROL_SVC` during the handshake.
-    wmi_endpoint: u8,
+    wmi_endpoint: std::sync::atomic::AtomicU8,
     /// Credits the target offered in its READY message — the HTC flow-control budget.
-    credits: u16,
-    credit_size: u16,
+    credits: std::sync::atomic::AtomicU16,
+    credit_size: std::sync::atomic::AtomicU16,
     /// Endpoint ids the target assigns to the data services in [`connect_data_services`]
     /// (`Ath9kHtcBackend::connect_data_services`); 0 = not yet connected. The RX path (M1) rides
     /// these; the WMI-control endpoint stays [`wmi_endpoint`](Self::wmi_endpoint).
-    mgmt_ep: u8,
-    data_be_ep: u8,
-    beacon_ep: u8,
+    mgmt_ep: std::sync::atomic::AtomicU8,
+    data_be_ep: std::sync::atomic::AtomicU8,
+    beacon_ep: std::sync::atomic::AtomicU8,
     /// MAC clock rate in MHz used by `ath9k_hw_mac_to_clks` (timing math in
     /// `init_global_settings`). Computed by [`Ath9kHtcBackend::set_clockrate`];
     /// 44 for 2.4 GHz OFDM (the value the golden trace's SIFS/SLOT writes imply).
-    clockrate: u32,
+    clockrate: std::sync::atomic::AtomicU32,
     /// Per-device RX-stamp clock domain (`bus << 8 | address`). The AR9271's per-frame
     /// `rs_tstamp` is a µs hardware RX timestamp on this domain — a common-view `FreeRunRxStamp`
     /// (M2 / design §15). Mirrors the Realtek `tsf_domain`.
@@ -458,6 +455,14 @@ pub struct Ath9kHtcBackend {
     /// carried in the repurposed `tidno` byte of our mgmt header and honoured by our firmware's
     /// `ath_tgt_send_mgt`. Set via [`RadioKnobs::set_tx_power`]/`set_tx_power_dbm`. Atomic for `&self`.
     cur_power: std::sync::atomic::AtomicU8,
+    /// Was the EEPROM board + OLPC power cal applied at open? See [`Self::reapply_power_state`] —
+    /// a width change re-streams the gain tables and wipes it, so we have to know whether to
+    /// re-run it or whether this dongle deliberately came up on the initval defaults.
+    cal_applied: std::sync::atomic::AtomicBool,
+    /// The peak target power `set_txpower_4k` reported, in dBm, or `i16::MIN` if never run.
+    /// Previously this was printed and thrown away — it is the only per-chip absolute anchor the
+    /// EEPROM gives us, and `set_tx_power_dbm` has to caveat itself for want of it.
+    cal_peak_dbm: std::sync::atomic::AtomicI16,
     /// Whether the PHY was brought up in HT40 (40 MHz) mode — set by [`hw_reset`](Self::hw_reset) from
     /// its bandwidth argument. Injected frames then carry the `HAL_RATESERIES_2040` flag (keytype
     /// bit1) so the MCS rate is transmitted at 40 MHz. `false` = HT20 (the default).
@@ -467,6 +472,11 @@ pub struct Ath9kHtcBackend {
     /// `set_txpower_4k` = a NORMAL ~+12 dBm link (max −18 dBm at 1 ft); NORMAL table left it ~50 dB low.
     /// Set from the EEPROM in `open_ath9k`; `NDN_ATH9K_HIGHPWR` forces it on regardless.
     high_power: std::sync::atomic::AtomicBool,
+    /// ★ **LAW 1's caller boundary.** Everything the plan (M6) depends on that is not the channel,
+    /// the width or the role: the firmware bytes and the two policy choices the old ladder read
+    /// out of `NDN_ATH9K_*` inline. Filled once by [`bring_up_planned`](Self::bring_up_planned)'s
+    /// caller; no rung reads the environment. Same arrangement as `Mt7610uBackend::force_cold_fw`.
+    bringup_opts: std::sync::Mutex<Ath9kBringUpOpts>,
 }
 
 fn usb_err<E: std::fmt::Display>(what: &str, e: E) -> FaceError {
@@ -541,13 +551,15 @@ impl Ath9kHtcBackend {
         Ok(Self {
             handle: Arc::new(handle),
             seq: std::sync::Mutex::new(0),
-            wmi_endpoint: 0,
-            credits: 0,
-            credit_size: 0,
-            mgmt_ep: 0,
-            data_be_ep: 0,
-            beacon_ep: 0,
-            clockrate: crate::ath9k_reg::ATH9K_CLOCK_RATE_2GHZ_OFDM,
+            wmi_endpoint: std::sync::atomic::AtomicU8::new(0),
+            credits: std::sync::atomic::AtomicU16::new(0),
+            credit_size: std::sync::atomic::AtomicU16::new(0),
+            mgmt_ep: std::sync::atomic::AtomicU8::new(0),
+            data_be_ep: std::sync::atomic::AtomicU8::new(0),
+            beacon_ep: std::sync::atomic::AtomicU8::new(0),
+            clockrate: std::sync::atomic::AtomicU32::new(
+                crate::ath9k_reg::ATH9K_CLOCK_RATE_2GHZ_OFDM,
+            ),
             tsf_domain,
             format: FrameFormat::RawNdn {
                 ethertype: crate::NDN_ETHERTYPE,
@@ -557,8 +569,11 @@ impl Ath9kHtcBackend {
             rx_pump: crate::rx_pump::RxPumpState::new(),
             channel: std::sync::atomic::AtomicU8::new(0),
             cur_power: std::sync::atomic::AtomicU8::new(0),
+            cal_applied: std::sync::atomic::AtomicBool::new(false),
+            cal_peak_dbm: std::sync::atomic::AtomicI16::new(i16::MIN),
             ht40: std::sync::atomic::AtomicBool::new(false),
             high_power: std::sync::atomic::AtomicBool::new(false),
+            bringup_opts: std::sync::Mutex::new(Ath9kBringUpOpts::default()),
         })
     }
 
@@ -620,17 +635,35 @@ impl Ath9kHtcBackend {
         Err(err("ath9k_htc: no AR9271 found".to_string()))
     }
 
-    /// Download a firmware image to target RAM and start it.
-    ///
-    /// There is no flash on this part — the image is written to RAM at [`AR9271_FIRMWARE`] and the
-    /// completion request hands the target [`AR9271_FIRMWARE_TEXT`] as its entry point. That is
-    /// what makes the AR9271 unbrickable and worth iterating on: a bad image costs a replug.
-    ///
-    /// `wValue` carries `addr >> 8`, which is why the target address must be 256-byte aligned.
-    pub fn download_firmware(&mut self, fw: &[u8]) -> Result<(), FaceError> {
-        let mut addr = AR9271_FIRMWARE;
+    rung! {
+        /// Download a firmware image to target RAM and start it.
+        ///
+        /// There is no flash on this part — the image is written to RAM at [`AR9271_FIRMWARE`] and the
+        /// completion request hands the target [`AR9271_FIRMWARE_TEXT`] as its entry point. That is
+        /// what makes the AR9271 unbrickable and worth iterating on: a bad image costs a replug.
+        ///
+        /// `wValue` carries `addr >> 8`, which is why the target address must be 256-byte aligned.
+        fn download_firmware(&self, fw: &[u8]) -> Result<(), FaceError> {
+            let mut addr = AR9271_FIRMWARE;
 
-        for chunk in fw.chunks(FW_CHUNK) {
+            for chunk in fw.chunks(FW_CHUNK) {
+                self.handle
+                    .write_control(
+                        rusb::request_type(
+                            rusb::Direction::Out,
+                            rusb::RequestType::Vendor,
+                            rusb::Recipient::Device,
+                        ),
+                        FIRMWARE_DOWNLOAD,
+                        (addr >> 8) as u16,
+                        0,
+                        chunk,
+                        USB_TIMEOUT,
+                    )
+                    .map_err(|e| usb_err(&format!("fw chunk at {addr:#x}"), e))?;
+                addr += chunk.len() as u32;
+            }
+
             self.handle
                 .write_control(
                     rusb::request_type(
@@ -638,32 +671,16 @@ impl Ath9kHtcBackend {
                         rusb::RequestType::Vendor,
                         rusb::Recipient::Device,
                     ),
-                    FIRMWARE_DOWNLOAD,
-                    (addr >> 8) as u16,
+                    FIRMWARE_DOWNLOAD_COMP,
+                    (AR9271_FIRMWARE_TEXT >> 8) as u16,
                     0,
-                    chunk,
+                    &[],
                     USB_TIMEOUT,
                 )
-                .map_err(|e| usb_err(&format!("fw chunk at {addr:#x}"), e))?;
-            addr += chunk.len() as u32;
+                .map_err(|e| usb_err("fw download complete", e))?;
+
+            Ok(())
         }
-
-        self.handle
-            .write_control(
-                rusb::request_type(
-                    rusb::Direction::Out,
-                    rusb::RequestType::Vendor,
-                    rusb::Recipient::Device,
-                ),
-                FIRMWARE_DOWNLOAD_COMP,
-                (AR9271_FIRMWARE_TEXT >> 8) as u16,
-                0,
-                &[],
-                USB_TIMEOUT,
-            )
-            .map_err(|e| usb_err("fw download complete", e))?;
-
-        Ok(())
     }
 
     // ── HTC ──────────────────────────────────────────────────────────────────
@@ -743,7 +760,7 @@ impl Ath9kHtcBackend {
     ///
     /// Must follow [`download_firmware`](Self::download_firmware) — the target sends READY
     /// unprompted once the image is running, which doubles as proof the download took.
-    pub fn htc_init(&mut self) -> Result<(), FaceError> {
+    pub fn htc_init(&self) -> Result<(), FaceError> {
         // 1. READY, unsolicited from the target.
         let (_ep, msg) = self.htc_recv(Duration::from_millis(3000))?;
         if msg.len() < 8 || u16::from_be_bytes([msg[0], msg[1]]) != HtcMsg::Ready as u16 {
@@ -751,14 +768,25 @@ impl Ath9kHtcBackend {
                 "ath9k_htc: expected HTC READY, got {msg:02x?}"
             )));
         }
-        self.credits = u16::from_be_bytes([msg[2], msg[3]]);
-        self.credit_size = u16::from_be_bytes([msg[4], msg[5]]);
+        self.credits.store(
+            u16::from_be_bytes([msg[2], msg[3]]),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        self.credit_size.store(
+            u16::from_be_bytes([msg[4], msg[5]]),
+            std::sync::atomic::Ordering::Relaxed,
+        );
 
         // 2. CONNECT_SERVICE for WMI control (interrupt reg pipes, dl=3/ul=4).
-        self.wmi_endpoint =
-            self.connect_service(HtcService::WmiControl, PIPE_REG_IN, PIPE_REG_OUT)?;
+        self.wmi_endpoint.store(
+            self.connect_service(HtcService::WmiControl, PIPE_REG_IN, PIPE_REG_OUT)?,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         if std::env::var_os("NDR_ATH9K_DEBUG").is_some() {
-            eprintln!("[ath9k] WMI endpoint assigned: {}", self.wmi_endpoint);
+            eprintln!(
+                "[ath9k] WMI endpoint assigned: {}",
+                self.wmi_endpoint.load(std::sync::atomic::Ordering::Relaxed)
+            );
         }
 
         // 3. SETUP_COMPLETE.
@@ -783,7 +811,7 @@ impl Ath9kHtcBackend {
     /// pipes (dl=3, ul=4); every data service uses the bulk WLAN pipes (dl=2, ul=1) — the exact
     /// split `service_to_dlpipe`/`service_to_ulpipe` encode in mainline `htc_hst.c`.
     fn connect_service(
-        &mut self,
+        &self,
         service: HtcService,
         dl_pipe: u8,
         ul_pipe: u8,
@@ -819,10 +847,19 @@ impl Ath9kHtcBackend {
     /// This is prerequisite plumbing for FrameIo. No PHY is up yet, so nothing arrives on the RX
     /// pipe until the M1 bring-up (reset → initvals → cal → RX enable) completes — the point of
     /// doing it first is to prove the data-service handshake and pipe claim in isolation.
-    pub fn connect_data_services(&mut self) -> Result<(), FaceError> {
-        self.mgmt_ep = self.connect_service(HtcService::Mgmt, PIPE_WLAN_RX, PIPE_WLAN_TX)?;
-        self.data_be_ep = self.connect_service(HtcService::DataBe, PIPE_WLAN_RX, PIPE_WLAN_TX)?;
-        self.beacon_ep = self.connect_service(HtcService::Beacon, PIPE_WLAN_RX, PIPE_WLAN_TX)?;
+    pub fn connect_data_services(&self) -> Result<(), FaceError> {
+        self.mgmt_ep.store(
+            self.connect_service(HtcService::Mgmt, PIPE_WLAN_RX, PIPE_WLAN_TX)?,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        self.data_be_ep.store(
+            self.connect_service(HtcService::DataBe, PIPE_WLAN_RX, PIPE_WLAN_TX)?,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        self.beacon_ep.store(
+            self.connect_service(HtcService::Beacon, PIPE_WLAN_RX, PIPE_WLAN_TX)?,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         // Allocate the target's flow-control credits to the WLAN-TX pipe so it has TX buffers to
         // accept injected frames (best-effort — RX doesn't need it).
         let _ = self.config_wlan_tx_credits();
@@ -834,8 +871,13 @@ impl Ath9kHtcBackend {
     /// bulk-OUT pipe blocks after the first injected frame (MEASURED: 2nd `write_bulk` times out).
     /// `struct htc_config_pipe_msg` = `message_id(be16=5) pipe_id(u8=USB_WLAN_TX_PIPE) credits(u8)`,
     /// on ENDPOINT0.
-    fn config_wlan_tx_credits(&mut self) -> Result<(), FaceError> {
-        let msg = [0x00u8, 0x05, PIPE_WLAN_TX, self.credits as u8];
+    fn config_wlan_tx_credits(&self) -> Result<(), FaceError> {
+        let msg = [
+            0x00u8,
+            0x05,
+            PIPE_WLAN_TX,
+            self.credits.load(std::sync::atomic::Ordering::Relaxed) as u8,
+        ];
         self.htc_send(HTC_ENDPOINT_CTRL, &msg)?;
         match self.htc_recv(Duration::from_millis(1000)) {
             Ok((_ep, resp))
@@ -855,7 +897,11 @@ impl Ath9kHtcBackend {
     /// The data-service endpoint ids from [`connect_data_services`](Self::connect_data_services),
     /// as `(mgmt, data_be, beacon)`. Zero until connected.
     pub fn data_endpoints(&self) -> (u8, u8, u8) {
-        (self.mgmt_ep, self.data_be_ep, self.beacon_ep)
+        (
+            self.mgmt_ep.load(std::sync::atomic::Ordering::Relaxed),
+            self.data_be_ep.load(std::sync::atomic::Ordering::Relaxed),
+            self.beacon_ep.load(std::sync::atomic::Ordering::Relaxed),
+        )
     }
 
     /// Read one raw transfer from the bulk WLAN-RX pipe ([`EP_WLAN_RX`]).
@@ -913,7 +959,7 @@ impl Ath9kHtcBackend {
         buf.extend_from_slice(&seq.to_be_bytes());
         buf.extend_from_slice(payload);
 
-        let ep = self.wmi_endpoint;
+        let ep = self.wmi_endpoint.load(std::sync::atomic::Ordering::Relaxed);
         self.htc_send(ep, &buf)?;
 
         // Skip events until the matching reply arrives.
@@ -979,7 +1025,10 @@ impl Ath9kHtcBackend {
     /// HTC credits the target advertised, and their size. Populated by
     /// [`htc_init`](Self::htc_init); useful mainly as evidence the READY message parsed sanely.
     pub fn credits(&self) -> (u16, u16) {
-        (self.credits, self.credit_size)
+        (
+            self.credits.load(std::sync::atomic::Ordering::Relaxed),
+            self.credit_size.load(std::sync::atomic::Ordering::Relaxed),
+        )
     }
 
     /// Query the target's RX-buffer accounting via `WMI_RX_STATS` → `(nobuf, send, done)`:
@@ -1096,81 +1145,9 @@ impl Ath9kHtcBackend {
     ///
     /// The target's handler frees its own softc, so no further command may be issued afterwards.
     /// Errors are worth logging but not worth failing on — we are on the way out either way.
-    pub fn detach(&mut self) -> Result<(), FaceError> {
+    pub fn detach(&self) -> Result<(), FaceError> {
         self.wmi_cmd(WmiCmd::TgtDetach, &[])?;
         Ok(())
-    }
-
-    /// Read the Tier-0 filter's counters.    /// Read the Tier-0 filter's counters.
-    ///
-    /// `addr` is `ndr_stats`, which **moves between firmware builds** — take it from the image you
-    /// actually loaded rather than hardcoding it:
-    ///
-    /// ```sh
-    /// xtensa-elf-nm build/k2/fw.elf | grep ndr_stats
-    /// ```
-    pub fn read_ndr_stats(&self, addr: u32) -> Result<NdrStats, FaceError> {
-        let w = self.read_target_u32s(addr, 6)?;
-        Ok(NdrStats {
-            seen: w[0],
-            passed: w[1],
-            dropped_filter: w[2],
-            dropped_foreign: w[3],
-            short_frame: w[4],
-            dropped_popcount: w[5],
-        })
-    }
-
-    // ── Tier-0 name filter control (#2 / §8.2) — the pre-USB drop that no other Wi-Fi part we own can
-    // do, live on the libusb path. `struct ndr_cfg` at NDR_CFG_ADDR (from `xtensa-nm fw.elf`):
-    //   magic(u32) enabled(u32) drop_foreign(u32) n_masks(u32) key[16] masks[8]×16B  = 160 B.
-    // Rewritten in place via WMI_ACCESS_MEMORY — no firmware rebuild. Masks are the 16-byte prefix-set
-    // Bloom filters (`ndr_filter_t`) the cognition layer derives (SipHash-2-4, key = group context).
-    /// Symbol addresses in the current fw build (re-extract via `xtensa-elf-nm build/k2/fw.elf` if the
-    /// firmware is rebuilt — text/data layout can shift).
-    pub const NDR_CFG_ADDR: u32 = 0x0050_cf40;
-    pub const NDR_STATS_ADDR: u32 = 0x0050_dc18;
-    const NDR_CFG_MAGIC: u32 = 0x4E44_5230; // "NDR0"
-
-    /// Enable/disable the Tier-0 filter and the `drop_foreign` (non-group addr1) rule, leaving the
-    /// configured masks/key intact. `enabled=false` = stock (every frame crosses USB).
-    pub fn set_name_filter(&self, enabled: bool, drop_foreign: bool) -> Result<(), FaceError> {
-        // words 0..3 = magic, enabled, drop_foreign  (n_masks left as-is at word 3).
-        self.write_target_u32s(
-            Self::NDR_CFG_ADDR,
-            &[Self::NDR_CFG_MAGIC, enabled as u32, drop_foreign as u32],
-        )?;
-        Ok(())
-    }
-
-    /// Load the full filter config: the 16-byte group `key` and up to 8 `masks` (16-byte prefix-set
-    /// Bloom filters derived by cognition), then enable. This is the §8.2 name-filter proper — a frame
-    /// whose name-hash isn't in the mask set is dropped on the dongle before the USB transfer.
-    pub fn configure_name_filter(
-        &self,
-        drop_foreign: bool,
-        key: &[u8; 16],
-        masks: &[[u8; 16]],
-    ) -> Result<(), FaceError> {
-        let n = masks.len().min(8);
-        // Pack the whole struct as u32 words (LE — the host↔target ACCESS_MEMORY path is byte-exact).
-        let mut words = vec![Self::NDR_CFG_MAGIC, 1, drop_foreign as u32, n as u32];
-        for chunk in key.chunks(4) {
-            words.push(u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
-        }
-        for m in &masks[..n] {
-            for chunk in m.chunks(4) {
-                words.push(u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
-            }
-        }
-        self.write_target_u32s(Self::NDR_CFG_ADDR, &words)?;
-        Ok(())
-    }
-
-    /// Read the Tier-0 counters (frames seen / passed to host / dropped by filter/foreign/popcount) —
-    /// the §8.2 evidence: `seen - passed` USB transfers and host wakeups that did not happen.
-    pub fn ndr_stats(&self) -> Result<NdrStats, FaceError> {
-        self.read_ndr_stats(Self::NDR_STATS_ADDR)
     }
 
     // ── Register access (WMI_REG_READ / WMI_REG_WRITE) ────────────────────────
@@ -1275,7 +1252,7 @@ impl Ath9kHtcBackend {
     /// The firmware CPU and USB/HIF block are untouched by an RTC MAC reset, so WMI
     /// keeps servicing register I/O throughout — which is exactly why `ath9k_htc`
     /// drives the whole PHY from the host over these same commands.
-    pub fn phy_reset(&mut self) -> Result<ResetStatus, FaceError> {
+    pub fn phy_reset(&self) -> Result<ResetStatus, FaceError> {
         use crate::ath9k_reg::*;
 
         // AR9271 first-reset only: assert the radio RF reset just before the chip
@@ -1435,8 +1412,14 @@ impl Ath9kHtcBackend {
         // cal; applied standalone it misconfigures the drive. The real fix for the low output is the
         // OLPC/PDADC `set_board_values` port (per-rate target power) — the flag stays only to document
         // the dead end. Default (NORMAL) is the better of the two here.
-        let high_power = self.high_power.load(std::sync::atomic::Ordering::Relaxed)
-            || std::env::var_os("NDN_ATH9K_HIGHPWR").is_some();
+        // ★ M8 / LAW 1: the flag, and ONLY the flag. This line used to `||` in a direct
+        // `NDN_ATH9K_HIGHPWR` read, so the gain table could differ from what
+        // `select_gain_table` established and therefore from what the report SAYS the table is —
+        // the exact shape of the defect this contract exists to remove, on the one knob that
+        // moves this part by ~12 dB. The variable still works: `BringUpRequest::from_env` maps it
+        // to `GainTableChoice::ForceHigh`, `select_gain_table` sets this flag, and the report
+        // then names the table.
+        let high_power = self.high_power.load(std::sync::atomic::Ordering::Relaxed);
         let tx_gain = if high_power {
             AR9271MODES_HIGH_POWER_TX_GAIN_9271
         } else {
@@ -1626,6 +1609,10 @@ impl Ath9kHtcBackend {
         if ht40 {
             self.reg_set_bit(AR_PHY_TURBO, AR_PHY_FC_DYN2040_EN)?;
         }
+        // ★ `apply_initvals` above re-streamed the TX gain tables and wiped both the commanded gain
+        // level and the board/OLPC cal. Put them back, or every width change is a silent, permanent
+        // power reset. See `reapply_power_state`.
+        self.reapply_power_state(chan_mhz)?;
         Ok(status)
     }
 
@@ -1792,6 +1779,49 @@ impl Ath9kHtcBackend {
     /// table, and writes the per-rate target power to `AR_PHY_POWER_TX_RATE1..9`. **Scoped to ch1/HT20**
     /// (the AR9271's use): ch1 == cal pier 0, so no cross-pier interpolation; HT40/CTL-regulatory caps
     /// are omitted (the EEPROM targets are already the regulatory targets). Call after apply_initvals.
+    /// Note that the board + OLPC cal has been applied, and remember its peak target.
+    /// Called by `open_ath9k` after a successful cal so [`Self::reapply_power_state`] knows to
+    /// restore it after a width change.
+    pub fn note_cal_applied(&self, peak_dbm: i16) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.cal_applied.store(true, Relaxed);
+        self.cal_peak_dbm.store(peak_dbm, Relaxed);
+    }
+
+    /// The EEPROM peak target power in dBm, if the cal ran.
+    pub fn cal_peak_dbm(&self) -> Option<i16> {
+        let v = self.cal_peak_dbm.load(std::sync::atomic::Ordering::Relaxed);
+        (v != i16::MIN).then_some(v)
+    }
+
+    /// ★ **Restore the power state that a width change just destroyed.**
+    ///
+    /// [`Self::set_bandwidth`] calls `apply_initvals`, which re-streams
+    /// `AR9271MODES_{NORMAL,HIGH}_POWER_TX_GAIN_9271` — including the `0xa334..0xa354` rows that
+    /// [`Self::set_tx_gain_level`] writes and that the EEPROM board/OLPC cal programs. So after any
+    /// HT20↔HT40 change the radio silently reverted to the initval default gain and **never came
+    /// back**, because `apply_knobs` dedupes on the request: cognition had already recorded that
+    /// power index as applied and would not re-push it.
+    ///
+    /// This is a live regression rather than a missing feature — the cal is worth ~50 dB on a
+    /// high-power module — so it runs at the tail of every path that re-streams the tables.
+    pub fn reapply_power_state(&self, chan_mhz: u16) -> Result<(), FaceError> {
+        use std::sync::atomic::Ordering::Relaxed;
+        if self.cal_applied.load(Relaxed) {
+            // Non-fatal, exactly as at open: a bad EEPROM read must not take the radio down, but
+            // it must not be silent either.
+            if let Err(e) = self.set_board_values() {
+                eprintln!("ath9k: board cal re-apply after retune failed: {e}");
+            }
+            match self.set_txpower_4k(chan_mhz) {
+                Ok(peak) => self.cal_peak_dbm.store(peak, Relaxed),
+                Err(e) => eprintln!("ath9k: power cal re-apply after retune failed: {e}"),
+            }
+        }
+        // Then the commanded level, on top of the cal — the order the open path uses.
+        self.set_tx_gain_level(Self::level_for_idx(self.cur_power.load(Relaxed)))
+    }
+
     pub fn set_txpower_4k(&self, chan_mhz: u16) -> Result<i16, FaceError> {
         use crate::ath9k_reg::AR_PHY_BASE;
         // M1 read + validate (retry).
@@ -2117,7 +2147,7 @@ impl Ath9kHtcBackend {
     /// `ath9k_hw_setpower(ATH9K_PM_AWAKE)` → `ath9k_hw_set_power_awake` — the force-wake
     /// that opens `ath9k_hw_reset` (step 1). On this USB part it is just the
     /// FORCE_WAKE_EN write; the WA-register poking is 9300-only.
-    pub fn setpower_awake(&mut self) -> Result<(), FaceError> {
+    pub fn setpower_awake(&self) -> Result<(), FaceError> {
         use crate::ath9k_reg::*;
         self.reg_write(
             AR_RTC_FORCE_WAKE,
@@ -2128,7 +2158,7 @@ impl Ath9kHtcBackend {
 
     /// `ath9k_hw_mark_phy_inactive` — write `AR_PHY_ACTIVE = AR_PHY_ACTIVE_DIS` (0).
     /// Golden trace line 1: 0x981c = 0. ✓
-    pub fn mark_phy_inactive(&mut self) -> Result<(), FaceError> {
+    pub fn mark_phy_inactive(&self) -> Result<(), FaceError> {
         use crate::ath9k_reg::*;
         self.reg_write(AR_PHY_ACTIVE, AR_PHY_ACTIVE_DIS)?;
         Ok(())
@@ -2137,14 +2167,14 @@ impl Ath9kHtcBackend {
     /// `ar9002_hw_enable_async_fifo` (ar9002_hw.c:371). **No-op on AR9271** — the body
     /// is gated behind `AR_SREV_9287_13_OR_LATER`, which the AR9271 is not. Kept as a
     /// faithful placeholder so the call sits in its ath9k_hw_reset() slot.
-    pub fn enable_async_fifo(&mut self) -> Result<(), FaceError> {
+    pub fn enable_async_fifo(&self) -> Result<(), FaceError> {
         // AR9271 is not 9287 → nothing to do.
         Ok(())
     }
 
     /// `ath9k_hw_init_mfp` (hw.c:1680), AR9280_20_OR_LATER branch: RMW the FC_MGMT
     /// field of `AR_AES_MUTE_MASK1` to 0xc7ff (mask Retry/PwrMgt/MoreData in CCMP AAD).
-    pub fn init_mfp(&mut self) -> Result<(), FaceError> {
+    pub fn init_mfp(&self) -> Result<(), FaceError> {
         use crate::ath9k_reg::*;
         self.reg_rmw(
             AR_AES_MUTE_MASK1,
@@ -2160,7 +2190,7 @@ impl Ath9kHtcBackend {
     /// half-GI (`AR_PHY_HALFGI`, 0.9× coefficient). `coef = (100 MHz << 24) /
     /// synth_center`. Uses [`delta_slope_vals`] (ath9k_hw_get_delta_slope_vals,
     /// hw.c:1297, transcribed exactly).
-    pub fn set_delta_slope(&mut self, chan_mhz: u16) -> Result<(), FaceError> {
+    pub fn set_delta_slope(&self, chan_mhz: u16) -> Result<(), FaceError> {
         use crate::ath9k_reg::*;
         let coef_scaled = DELTA_SLOPE_CLOCK_MHZ_SCALED / chan_mhz as u32;
         let (man, exp) = delta_slope_vals(coef_scaled);
@@ -2196,7 +2226,7 @@ impl Ath9kHtcBackend {
     /// MRC_MUX bit and return. (The full spur-mask programming needs an EEPROM spur
     /// frequency, which we do not have; documented so the bench knows why the spur
     /// registers stay untouched.)
-    pub fn spur_mitigate_freq(&mut self, _chan_mhz: u16) -> Result<(), FaceError> {
+    pub fn spur_mitigate_freq(&self, _chan_mhz: u16) -> Result<(), FaceError> {
         use crate::ath9k_reg::*;
         self.reg_clr_bit(AR_PHY_FORCE_CLKEN_CCK, AR_PHY_FORCE_CLKEN_CCK_MRC_MUX)?;
         Ok(())
@@ -2207,11 +2237,7 @@ impl Ath9kHtcBackend {
     /// the ISR, seeds the RSSI threshold, then applies the operating mode (monitor ⇒
     /// KSRCH_MODE only, both AP/ADHOC opmode bits cleared). `mac_sta_id1` is the
     /// `AR_STA_ID1 & BASE_RATE_11B` saved before the chip reset.
-    pub fn reset_opmode(
-        &mut self,
-        mac_sta_id1: u32,
-        save_def_antenna: u32,
-    ) -> Result<(), FaceError> {
+    pub fn reset_opmode(&self, mac_sta_id1: u32, save_def_antenna: u32) -> Result<(), FaceError> {
         use crate::ath9k_reg::*;
         // REG_RMW(AR_STA_ID1, macStaId1 | RTS_USE_DEF | sta_id1_defaults, ~SADH_MASK).
         // sta_id1_defaults is 0 for our config.
@@ -2240,9 +2266,12 @@ impl Ath9kHtcBackend {
     /// `ath9k_hw_set_clockrate` (hw.c:39) — computes `common->clockrate` and writes
     /// **no register**. For a 2.4 GHz OFDM channel the rate is 44 MHz (confirmed by
     /// the golden trace: SIFS write 0x1030=0x160=8×44). Stored for `init_global_settings`.
-    pub fn set_clockrate(&mut self) {
+    pub fn set_clockrate(&self) {
         use crate::ath9k_reg::*;
-        self.clockrate = ATH9K_CLOCK_RATE_2GHZ_OFDM;
+        self.clockrate.store(
+            ATH9K_CLOCK_RATE_2GHZ_OFDM,
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
 
     /// `ath9k_hw_init_queues` (hw.c:1729): write the DCU→QCU mask for all 10 DCUs,
@@ -2255,7 +2284,7 @@ impl Ath9kHtcBackend {
     /// data ACs (QCU 0-3) with USEDEFAULT parameters. This is the TX-queue plumbing —
     /// not RX-gating — and the golden trace of these registers is itself partial
     /// (buffered REGWRITE flushes). Data queues 0-3 are transcribed in full.
-    pub fn init_queues(&mut self) -> Result<(), FaceError> {
+    pub fn init_queues(&self) -> Result<(), FaceError> {
         use crate::ath9k_reg::*;
         // for i in 0..AR_NUM_DCU: REG_WRITE(AR_DQCUMASK(i), 1<<i)
         let masks: Vec<(u32, u32)> = (0..AR_NUM_DCU)
@@ -2273,7 +2302,7 @@ impl Ath9kHtcBackend {
     /// USEDEFAULT parameters (cwmin auto=15, cwmax=1023, aifs=2, shretry=10). Writes
     /// `AR_DLCL_IFS`, `AR_DRETRY_LIMIT`, `AR_QMISC`, `AR_DMISC`, `AR_DCHNTIME` for the
     /// queue. Verified: LCL_IFS=0x002ffc0f, RETRY=0x0008200a match the golden trace.
-    fn reset_tx_queue(&mut self, q: u32) -> Result<(), FaceError> {
+    fn reset_tx_queue(&self, q: u32) -> Result<(), FaceError> {
         use crate::ath9k_reg::*;
         // cwMin: USEDEFAULT ⇒ round INIT_CWMIN up to 2^n-1 (15 → stays 15).
         let mut cw_min = 1u32;
@@ -2306,7 +2335,7 @@ impl Ath9kHtcBackend {
     /// into IMR_S2, and programs the INTR_SYNC cause/enable/mask. The **final** host
     /// IMR arming (the 0x81800964 value) is `ath9k_hw_set_interrupts`, done later in
     /// [`wmi_start`](Self::wmi_start) — this is only the reset-time base.
-    pub fn init_interrupt_masks(&mut self) -> Result<(), FaceError> {
+    pub fn init_interrupt_masks(&self) -> Result<(), FaceError> {
         use crate::ath9k_reg::*;
         let imr_reg = AR_IMR_TXERR
             | AR_IMR_TXURN
@@ -2328,12 +2357,12 @@ impl Ath9kHtcBackend {
     /// `ath9k_hw_ani_cache_ini_regs` — caches a set of ANI/PHY registers into the
     /// driver's `ah->ani` state by **reading** them. It writes nothing, and we do not
     /// use the cache, so this is a faithful no-op for bring-up.
-    pub fn ani_cache_ini_regs(&mut self) -> Result<(), FaceError> {
+    pub fn ani_cache_ini_regs(&self) -> Result<(), FaceError> {
         Ok(())
     }
 
     /// `ath9k_hw_init_qos` (hw.c:714). Golden trace: 0x8118=0x100aa, 0x811c=0x3210. ✓
-    pub fn init_qos(&mut self) -> Result<(), FaceError> {
+    pub fn init_qos(&self) -> Result<(), FaceError> {
         use crate::ath9k_reg::*;
         self.reg_write(AR_MIC_QOS_CONTROL, 0x100aa)?;
         self.reg_write(AR_MIC_QOS_SELECT, 0x3210)?;
@@ -2353,9 +2382,9 @@ impl Ath9kHtcBackend {
     /// 2.4 GHz HT20 channel: SIFS/slot/ACK/CTS timeouts, EIFS and USEC. Uses the
     /// stored `clockrate` (44) via `mac_to_clks`. Golden trace: SIFS 0x1030=0x160,
     /// SLOT 0x1070=0x18c, EIFS 0x10b0=0x3e38. ✓
-    pub fn init_global_settings(&mut self, _chan_mhz: u16) -> Result<(), FaceError> {
+    pub fn init_global_settings(&self, _chan_mhz: u16) -> Result<(), FaceError> {
         use crate::ath9k_reg::*;
-        let clk = self.clockrate;
+        let clk = self.clockrate.load(std::sync::atomic::Ordering::Relaxed);
         let mac_to_clks = |usecs: u32| usecs * clk;
 
         let sifstime = 10u32; // 2.4 GHz
@@ -2409,7 +2438,7 @@ impl Ath9kHtcBackend {
     /// read/write bursts, and the RX FIFO threshold. (AR9271 skips the PCU_TXBUF_CTRL
     /// write.) This is the RX-DMA config the old `rx_enable` carried inline; here it
     /// sits in its faithful reset slot.
-    pub fn set_dma(&mut self) -> Result<(), FaceError> {
+    pub fn set_dma(&self) -> Result<(), FaceError> {
         use crate::ath9k_reg::*;
         self.reg_set_bit(AR_AHB_MODE, AR_AHB_PREFETCH_RD_EN)?;
         self.reg_rmw(AR_TXCFG, AR_TXCFG_DMASZ_128B, AR_TXCFG_DMASZ_MASK)?;
@@ -2421,14 +2450,14 @@ impl Ath9kHtcBackend {
     /// `ath9k_hw_restore_chainmask` (hw.c:2048). **No-op for the 1-chain AR9271**: the
     /// reference only writes `AR_PHY_RX_CHAINMASK`/`AR_PHY_CAL_CHAINMASK` when the RX
     /// chainmask is 0x3 or 0x5. Faithful placeholder kept in its reset slot.
-    pub fn restore_chainmask(&mut self) -> Result<(), FaceError> {
+    pub fn restore_chainmask(&self) -> Result<(), FaceError> {
         // rxchainmask == 1 ⇒ neither 0x3 nor 0x5 ⇒ nothing written.
         Ok(())
     }
 
     /// `ath9k_hw_init_desc` (hw.c:1748), AR9271 USB branch: descriptor byte-swap
     /// `AR_CFG = AR_CFG_SWRB | AR_CFG_SWTB` (= 0x0a). Golden trace line 112: 0x0014=0x0a. ✓
-    pub fn init_desc(&mut self) -> Result<(), FaceError> {
+    pub fn init_desc(&self) -> Result<(), FaceError> {
         use crate::ath9k_reg::*;
         self.reg_write(AR_CFG, AR_CFG_SWRB | AR_CFG_SWTB)?;
         Ok(())
@@ -2451,88 +2480,90 @@ impl Ath9kHtcBackend {
     /// 2G_HT40 column + keeps DYN2040 and [`rf_set_freq`](Self::rf_set_freq) offsets the synth centre;
     /// injected MCS frames then carry the `2040` rate flag. Otherwise identical to [`hw_reset`].
     /// ⚠ EXPERIMENTAL: 40 MHz cal convergence on this HT20-class part is unverified.
-    pub fn hw_reset_ht40(&mut self, chan_mhz: u16) -> Result<(), FaceError> {
+    pub fn hw_reset_ht40(&self, chan_mhz: u16) -> Result<(), FaceError> {
         self.ht40.store(true, std::sync::atomic::Ordering::Relaxed);
         self.hw_reset(chan_mhz)
     }
 
-    pub fn hw_reset(&mut self, chan_mhz: u16) -> Result<(), FaceError> {
-        use crate::ath9k_reg::*;
+    rung! {
+        fn hw_reset(&self, chan_mhz: u16) -> Result<(), FaceError> {
+            use crate::ath9k_reg::*;
 
-        // Save state a cold reset would clear (macStaId1 = AR_STA_ID1 & BASE_RATE_11B;
-        // saveDefAntenna, min 1; saveLedState). Read before the reset.
-        let mac_sta_id1 = self.reg_read(AR_STA_ID1)? & AR_STA_ID1_BASE_RATE_11B;
-        let mut save_def_antenna = self.reg_read(AR_DEF_ANTENNA)?;
-        if save_def_antenna == 0 {
-            save_def_antenna = 1;
-        }
-        let save_led_state = self.reg_read(AR_CFG_LED)?
-            & (AR_CFG_LED_ASSOC_CTL
-                | AR_CFG_LED_MODE_SEL
-                | AR_CFG_LED_BLINK_THRESH_SEL
-                | AR_CFG_LED_BLINK_SLOW);
+            // Save state a cold reset would clear (macStaId1 = AR_STA_ID1 & BASE_RATE_11B;
+            // saveDefAntenna, min 1; saveLedState). Read before the reset.
+            let mac_sta_id1 = self.reg_read(AR_STA_ID1)? & AR_STA_ID1_BASE_RATE_11B;
+            let mut save_def_antenna = self.reg_read(AR_DEF_ANTENNA)?;
+            if save_def_antenna == 0 {
+                save_def_antenna = 1;
+            }
+            let save_led_state = self.reg_read(AR_CFG_LED)?
+                & (AR_CFG_LED_ASSOC_CTL
+                    | AR_CFG_LED_MODE_SEL
+                    | AR_CFG_LED_BLINK_THRESH_SEL
+                    | AR_CFG_LED_BLINK_SLOW);
 
-        // 1. setpower AWAKE (force-wake).
-        self.setpower_awake()?;
-        // 2. mark_phy_inactive.
-        self.mark_phy_inactive()?;
-        // 3. AR9271 RADIO_RF_RST + ath9k_hw_chip_reset (reset regs + init_pll) +
-        //    GATE_MAC_CTL — all inside phy_reset().
-        self.phy_reset()?;
-        // AR9280_20_OR_LATER: disable JTAG on the shared GPIO (hw.c:1958).
-        self.reg_set_bit(AR_GPIO_INPUT_EN_VAL, AR_GPIO_JTAG_DISABLE)?;
-        // 4. ar9002_hw_enable_async_fifo (no-op on AR9271).
-        self.enable_async_fifo()?;
-        // 5. process_ini (analog-shift + MODES/COMMON/ANI/TX-gain + override_ini + TURBO).
-        self.apply_initvals()?;
-        // 6. set_rfmode (AR_PHY_MODE).
-        self.set_rfmode()?;
-        // 7. init_mfp.
-        self.init_mfp()?;
-        // 8. set_delta_slope.
-        self.set_delta_slope(chan_mhz)?;
-        // 9. spur_mitigate_freq (no-spur path).
-        self.spur_mitigate_freq(chan_mhz)?;
-        // (eep_ops->set_board_values — SKIPPED: EEPROM TX-power/gain, not RX-gating.)
-        // 10. reset_opmode (STA_ID/BSSID/opmode).
-        self.reset_opmode(mac_sta_id1, save_def_antenna)?;
-        // 11. rf_set_freq (the synth).
-        self.rf_set_freq(chan_mhz)?;
-        // 12. set_clockrate (computes the MAC clock; writes nothing).
-        self.set_clockrate();
-        // 13. init_queues.
-        self.init_queues()?;
-        // 14. init_interrupt_masks.
-        self.init_interrupt_masks()?;
-        // 15. ani_cache_ini_regs (read-only no-op).
-        self.ani_cache_ini_regs()?;
-        // 16. init_qos.
-        self.init_qos()?;
-        // 17. init_global_settings.
-        self.init_global_settings(chan_mhz)?;
-        // REG_SET_BIT(AR_STA_ID1, PRESERVE_SEQNUM) (hw.c:2015).
-        self.reg_set_bit(AR_STA_ID1, AR_STA_ID1_PRESERVE_SEQNUM)?;
-        // 18. set_dma.
-        self.set_dma()?;
-        // 19. REG_WRITE(AR_OBS, 8).
-        self.reg_write(AR_OBS, 8)?;
-        // 20. init_bb (AR_PHY_ACTIVE).
-        self.init_bb()?;
-        // 21. init_cal — ★ runs LAST, after the full PHY/MAC setup.
-        self.init_cal(chan_mhz)?;
-        // 21b. HT40: the HT20 CL-cal (ar9271_cl_cal_ht20, run by init_cal) clears DYN2040 at its end.
-        // Re-assert it so the PHY actually operates 40 MHz — the streamed 2G_HT40 initvals and the
-        // +10 MHz synth centre are already in place; DYN2040 is the enable that ties them together.
-        if self.ht40.load(std::sync::atomic::Ordering::Relaxed) {
-            self.reg_set_bit(AR_PHY_TURBO, AR_PHY_FC_DYN2040_EN)?;
+            // 1. setpower AWAKE (force-wake).
+            self.setpower_awake()?;
+            // 2. mark_phy_inactive.
+            self.mark_phy_inactive()?;
+            // 3. AR9271 RADIO_RF_RST + ath9k_hw_chip_reset (reset regs + init_pll) +
+            //    GATE_MAC_CTL — all inside phy_reset().
+            self.phy_reset()?;
+            // AR9280_20_OR_LATER: disable JTAG on the shared GPIO (hw.c:1958).
+            self.reg_set_bit(AR_GPIO_INPUT_EN_VAL, AR_GPIO_JTAG_DISABLE)?;
+            // 4. ar9002_hw_enable_async_fifo (no-op on AR9271).
+            self.enable_async_fifo()?;
+            // 5. process_ini (analog-shift + MODES/COMMON/ANI/TX-gain + override_ini + TURBO).
+            self.apply_initvals()?;
+            // 6. set_rfmode (AR_PHY_MODE).
+            self.set_rfmode()?;
+            // 7. init_mfp.
+            self.init_mfp()?;
+            // 8. set_delta_slope.
+            self.set_delta_slope(chan_mhz)?;
+            // 9. spur_mitigate_freq (no-spur path).
+            self.spur_mitigate_freq(chan_mhz)?;
+            // (eep_ops->set_board_values — SKIPPED: EEPROM TX-power/gain, not RX-gating.)
+            // 10. reset_opmode (STA_ID/BSSID/opmode).
+            self.reset_opmode(mac_sta_id1, save_def_antenna)?;
+            // 11. rf_set_freq (the synth).
+            self.rf_set_freq(chan_mhz)?;
+            // 12. set_clockrate (computes the MAC clock; writes nothing).
+            self.set_clockrate();
+            // 13. init_queues.
+            self.init_queues()?;
+            // 14. init_interrupt_masks.
+            self.init_interrupt_masks()?;
+            // 15. ani_cache_ini_regs (read-only no-op).
+            self.ani_cache_ini_regs()?;
+            // 16. init_qos.
+            self.init_qos()?;
+            // 17. init_global_settings.
+            self.init_global_settings(chan_mhz)?;
+            // REG_SET_BIT(AR_STA_ID1, PRESERVE_SEQNUM) (hw.c:2015).
+            self.reg_set_bit(AR_STA_ID1, AR_STA_ID1_PRESERVE_SEQNUM)?;
+            // 18. set_dma.
+            self.set_dma()?;
+            // 19. REG_WRITE(AR_OBS, 8).
+            self.reg_write(AR_OBS, 8)?;
+            // 20. init_bb (AR_PHY_ACTIVE).
+            self.init_bb()?;
+            // 21. init_cal — ★ runs LAST, after the full PHY/MAC setup.
+            self.init_cal(chan_mhz)?;
+            // 21b. HT40: the HT20 CL-cal (ar9271_cl_cal_ht20, run by init_cal) clears DYN2040 at its end.
+            // Re-assert it so the PHY actually operates 40 MHz — the streamed 2G_HT40 initvals and the
+            // +10 MHz synth centre are already in place; DYN2040 is the enable that ties them together.
+            if self.ht40.load(std::sync::atomic::Ordering::Relaxed) {
+                self.reg_set_bit(AR_PHY_TURBO, AR_PHY_FC_DYN2040_EN)?;
+            }
+            // 22. restore_chainmask (no-op for 1-chain).
+            self.restore_chainmask()?;
+            // 23. REG_WRITE(AR_CFG_LED, saveLedState | AR_CFG_SCLK_32KHZ).
+            self.reg_write(AR_CFG_LED, save_led_state | AR_CFG_SCLK_32KHZ)?;
+            // 24. init_desc (AR_CFG descriptor byte-swap).
+            self.init_desc()?;
+            Ok(())
         }
-        // 22. restore_chainmask (no-op for 1-chain).
-        self.restore_chainmask()?;
-        // 23. REG_WRITE(AR_CFG_LED, saveLedState | AR_CFG_SCLK_32KHZ).
-        self.reg_write(AR_CFG_LED, save_led_state | AR_CFG_SCLK_32KHZ)?;
-        // 24. init_desc (AR_CFG descriptor byte-swap).
-        self.init_desc()?;
-        Ok(())
     }
 
     /// **Start receive** — the host register side of `ath9k_hw_startpcureceive` +
@@ -2541,7 +2572,7 @@ impl Ath9kHtcBackend {
     /// multicast hash, clears the RX-disable/abort diag bits, and enables RX DMA
     /// (`AR_CR_RXE`). Opmode/STA and the RX-DMA burst config were already applied by
     /// `hw_reset` (reset_opmode / set_dma).
-    pub fn start_receive(&mut self) -> Result<(), FaceError> {
+    pub fn start_receive(&self) -> Result<(), FaceError> {
         use crate::ath9k_reg::*;
         // ath9k_hw_setrxfilter: RX_FILTER then AR_PHY_ERR (0 = no PHY-err filtering).
         self.reg_write(AR_RX_FILTER, 0x0000_c03f)?;
@@ -2564,7 +2595,7 @@ impl Ath9kHtcBackend {
     /// (0/0). `mac` is the vif/node address (locally-administered); the injected `addr2` need not
     /// match it — injection sets addr2 per frame; the node is only the rate-control lookup at
     /// `node_idx`.
-    pub fn create_monitor_vif_node(&mut self, mac: [u8; 6]) -> Result<(), FaceError> {
+    pub fn create_monitor_vif_node(&self, mac: [u8; 6]) -> Result<(), FaceError> {
         const HTC_M_MONITOR: u8 = 8; // htc.h enum htc_opmode
 
         // struct ath9k_htc_target_vif (htc.h, __packed, 12 B):
@@ -2601,7 +2632,7 @@ impl Ath9kHtcBackend {
     ///
     /// `struct ieee80211com_target` (wlan_hdr.h, 8 B): `ic_ampdu_limit(be32) ic_ampdu_subframes(1)
     /// ic_enable_coex(1) ic_tx_chainmask(1) pad(1)`. The AR9271 is 1×1 → tx chainmask = 1 (chain 0).
-    pub fn send_ic_update(&mut self) -> Result<(), FaceError> {
+    pub fn send_ic_update(&self) -> Result<(), FaceError> {
         const AR9271_TX_CHAINMASK: u8 = 1; // 1×1 part → chain 0 only
         let mut ic = [0u8; 8];
         // ic_ampdu_limit (0..4) = 0 — we send single (non-aggregated) frames, so the AMPDU limit is
@@ -2621,7 +2652,7 @@ impl Ath9kHtcBackend {
     /// via a golden trace of the kernel's own `WMI_RC_STATE_CHANGE` before wiring this in. Kept as
     /// documentation of the exact remaining gap; NOT called (it would break `wmi_start`).
     #[allow(dead_code)]
-    pub fn set_node_rate_table(&mut self) -> Result<(), FaceError> {
+    pub fn set_node_rate_table(&self) -> Result<(), FaceError> {
         let mut trate = [0u8; 70];
         trate[1] = 1; // isnew (sta_index/vif 0, capflags 0 = legacy)
         let legacy: [u8; 12] = [2, 4, 11, 22, 12, 18, 24, 36, 48, 72, 96, 108]; // 500 kbps units
@@ -2631,41 +2662,43 @@ impl Ath9kHtcBackend {
         Ok(())
     }
 
-    /// **WMI RX-start verbs** — the HTC target-side trigger, called after
-    /// [`hw_reset`](Self::hw_reset) + [`start_receive`](Self::start_receive), matching
-    /// `ath9k_htc_start`'s order: `WMI_ATH_INIT` → `WMI_SET_MODE(11NG)` →
-    /// `WMI_START_RECV` → `WMI_ENABLE_INTR`. Then the host arms `AR_IMR/S0/S1/S2`
-    /// (`ath9k_hw_set_interrupts`) with the golden-trace values, written AFTER
-    /// ENABLE_INTR so they stick — without this the target's RX ISR stays dormant.
-    ///
-    /// `connect_data_services()` must have run first (the RX endpoints must exist
-    /// before `START_RECV`).
-    pub fn wmi_start(&mut self) -> Result<(), FaceError> {
-        use crate::ath9k_reg::*;
-        self.wmi_cmd(WmiCmd::AthInit, &[])?;
-        self.wmi_cmd(WmiCmd::SetMode, &IEEE80211_MODE_11NG.to_be_bytes())?;
-        // Push the IC capability block so `sc_ic.ic_tx_chainmask` is set BEFORE any TX — the target
-        // copies it into every frame's rate-series ChSel. Without it ChSel=0 → no TX chain radiates
-        // (MEASURED: TXOK completes but 0 frames on air). Must precede the first injected frame.
-        self.send_ic_update()?;
-        // Create the monitor vif + self-station so injected data frames (tx_frame_hdr.node_idx=0,
-        // vif_idx=0) have a valid target node for rate control — without it the target drops TX.
-        self.create_monitor_vif_node(SELF_MAC)?;
-        self.wmi_cmd(WmiCmd::StartRecv, &[])?;
-        self.wmi_cmd(WmiCmd::EnableIntr, &[])?;
-        // ath9k_hw_set_interrupts — host-side final AR_IMR arming (golden trace).
-        self.reg_write(AR_IMR, 0x8180_0964)?;
-        // AR_IMR_S0 gates per-QCU TX completion interrupts: TXOK = bits[9:0], TXDESC = bits[25:16].
-        // ★ The golden-trace value (0x0001_0000 = TXDESC q0 only) was a RX-focused monitor capture and
-        // enables NO TXOK for the data queues — so queue 1 (the one `ath_tgt_send_mgt` uses) never
-        // raises a completion interrupt, the target's TX tasklet never reaps, and its WLAN-endpoint
-        // buffers never recycle → injection blocks at the ring depth (~33 credits). Enable TXOK for
-        // the four data ACs (q0-3) so completions fire and sustained TX works. MEASURED: without this
-        // the 34th injected frame's bulk-OUT NAKs forever.
-        self.reg_write(AR_IMR_S0, 0x0001_000f)?;
-        self.reg_write(AR_IMR_S1, 0x0001_0000)?;
-        self.reg_write(AR_IMR_S2, 0x0080_0000)?;
-        Ok(())
+    rung! {
+        /// **WMI RX-start verbs** — the HTC target-side trigger, called after
+        /// [`hw_reset`](Self::hw_reset) + [`start_receive`](Self::start_receive), matching
+        /// `ath9k_htc_start`'s order: `WMI_ATH_INIT` → `WMI_SET_MODE(11NG)` →
+        /// `WMI_START_RECV` → `WMI_ENABLE_INTR`. Then the host arms `AR_IMR/S0/S1/S2`
+        /// (`ath9k_hw_set_interrupts`) with the golden-trace values, written AFTER
+        /// ENABLE_INTR so they stick — without this the target's RX ISR stays dormant.
+        ///
+        /// `connect_data_services()` must have run first (the RX endpoints must exist
+        /// before `START_RECV`).
+        fn wmi_start(&self) -> Result<(), FaceError> {
+            use crate::ath9k_reg::*;
+            self.wmi_cmd(WmiCmd::AthInit, &[])?;
+            self.wmi_cmd(WmiCmd::SetMode, &IEEE80211_MODE_11NG.to_be_bytes())?;
+            // Push the IC capability block so `sc_ic.ic_tx_chainmask` is set BEFORE any TX — the target
+            // copies it into every frame's rate-series ChSel. Without it ChSel=0 → no TX chain radiates
+            // (MEASURED: TXOK completes but 0 frames on air). Must precede the first injected frame.
+            self.send_ic_update()?;
+            // Create the monitor vif + self-station so injected data frames (tx_frame_hdr.node_idx=0,
+            // vif_idx=0) have a valid target node for rate control — without it the target drops TX.
+            self.create_monitor_vif_node(SELF_MAC)?;
+            self.wmi_cmd(WmiCmd::StartRecv, &[])?;
+            self.wmi_cmd(WmiCmd::EnableIntr, &[])?;
+            // ath9k_hw_set_interrupts — host-side final AR_IMR arming (golden trace).
+            self.reg_write(AR_IMR, 0x8180_0964)?;
+            // AR_IMR_S0 gates per-QCU TX completion interrupts: TXOK = bits[9:0], TXDESC = bits[25:16].
+            // ★ The golden-trace value (0x0001_0000 = TXDESC q0 only) was a RX-focused monitor capture and
+            // enables NO TXOK for the data queues — so queue 1 (the one `ath_tgt_send_mgt` uses) never
+            // raises a completion interrupt, the target's TX tasklet never reaps, and its WLAN-endpoint
+            // buffers never recycle → injection blocks at the ring depth (~33 credits). Enable TXOK for
+            // the four data ACs (q0-3) so completions fire and sustained TX works. MEASURED: without this
+            // the 34th injected frame's bulk-OUT NAKs forever.
+            self.reg_write(AR_IMR_S0, 0x0001_000f)?;
+            self.reg_write(AR_IMR_S1, 0x0001_0000)?;
+            self.reg_write(AR_IMR_S2, 0x0080_0000)?;
+            Ok(())
+        }
     }
 
     /// `ar9285_hw_cl_cal` for an HT20 channel (the AR9271 offset + AGC calibration path). Returns
@@ -2785,7 +2818,7 @@ impl Ath9kHtcBackend {
     ///
     /// [`connect_data_services`](Self::connect_data_services) must already have run so the
     /// Mgmt/DataBE/Beacon endpoints exist before `START_RECV`.
-    pub fn rx_enable(&mut self) -> Result<(), FaceError> {
+    pub fn rx_enable(&self) -> Result<(), FaceError> {
         use crate::ath9k_reg::*;
 
         // ── ath9k_hw_set_dma (reset tail we had skipped) ──
@@ -2900,8 +2933,24 @@ impl Ath9kHtcBackend {
 /// default `None` — the AR_TSF register is readable but read-now would need `&mut self` (a WMI
 /// round-trip); the per-frame latch is what common-view uses, and it is the honest best clock.
 impl RadioTime for Ath9kHtcBackend {
+    /// Reference: **crystal**, established by measurement rather than by assuming an 802.11 part
+    /// has one. `firmware/ath9k-htc-ndr/src/ndr_time.h` records a two-node run (ch13, 20 s, 17869
+    /// frames, 16699 exact pairings): the two TSFs differ by **+0.98 ppm**, and removing that linear
+    /// rate leaves a residual of sd 1.05 us / max 3.5 us — flat, not growing, which is what a
+    /// reference that holds its rate looks like. An RC reference is percent-class; 0.98 ppm is not
+    /// one, and the firmware note calls it "the ~1 ppm the crystals have on their own".
     fn time_sources(&self) -> Vec<RadioTimeSource> {
-        vec![RadioTimeSource::free_run_rx_stamp(self.tsf_domain, 1_000)]
+        vec![
+            RadioTimeSource::free_run_rx_stamp(self.tsf_domain, 1_000).with_reference(
+                ndn_radio_hal::ClockReference::crystal().measured(
+                    ndn_radio_hal::RateMeasurement::new(
+                        0.98,
+                        20.0,
+                        ndn_radio_hal::RateWitness::PeerUnit,
+                    ),
+                ),
+            ),
+        ]
     }
 
     /// Read the hardware TSF (µs) — `AR_TSF_U32`/`AR_TSF_L32` (0x8050/0x804c), the same free-running
@@ -3157,7 +3206,7 @@ impl Ath9kHtcBackend {
         // other backend applies. See `TxIntent::needs_basic_rate`.
         if frame.tx.needs_basic_rate() {
             return build_tx_frame_bytes(
-                self.mgmt_ep,
+                self.mgmt_ep.load(std::sync::atomic::Ordering::Relaxed),
                 self.format,
                 frame,
                 LegacyRate::Ofdm6 as u8,
@@ -3183,7 +3232,7 @@ impl Ath9kHtcBackend {
         }
         let tx_power = self.cur_power.load(Relaxed);
         build_tx_frame_bytes(
-            self.mgmt_ep,
+            self.mgmt_ep.load(std::sync::atomic::Ordering::Relaxed),
             self.format,
             frame,
             rate_code,
@@ -3195,7 +3244,6 @@ impl Ath9kHtcBackend {
 
 #[async_trait]
 impl FrameIo for Ath9kHtcBackend {
-
     /// This radio's own capability, so a face built from the bare `dyn FrameIo` does not have to
     /// invent one. Delegates to this type's [`RadioProfile`] — the single source of truth.
     fn radio_capability(&self) -> Option<ndn_radio_hal::RadioCapability> {
@@ -3487,6 +3535,13 @@ fn fill_vpd_table(pwr_min: u8, pwr_max: u8, pwr_list: &[u8], vpd_list: &[u8], re
 impl Ath9kHtcBackend {
     /// Write the top TX-gain LUT registers to ladder `level` (0 = min power, `LADDER.len()-1` = max /
     /// the reset default) — the AR9271's actual TX-power actuator. See [`TX_GAIN_LADDER`].
+    /// The TXAGC index → gain-ladder level map, shared by [`RadioKnobs::set_tx_power`] and
+    /// [`Self::reapply_power_state`] so a retune restores the level the caller actually asked for
+    /// rather than a recomputation that could drift from it.
+    pub fn level_for_idx(idx: u8) -> usize {
+        (idx.min(63) as usize * (TX_GAIN_LADDER.len() - 1)) / 63
+    }
+
     fn set_tx_gain_level(&self, level: usize) -> Result<(), FaceError> {
         let v = TX_GAIN_LADDER[level.min(TX_GAIN_LADDER.len() - 1)];
         for &a in &TX_GAIN_LUT_TOP {
@@ -3563,11 +3618,56 @@ impl RadioKnobs for Ath9kHtcBackend {
     /// all 11 levels (< 1 dB); an OFDM 6 Mbps flood spans ~12.5 dB (levels 10→5 = 20→7.5 dBm, anchor
     /// L10 = datasheet max; levels 4-0 fall below the SDR noise floor). So this knob only bites when the
     /// frame goes out OFDM ([`set_legacy_rate`] ≥ Ofdm6, or an HT MCS) — see [`MEASURED_DBM_BY_LEVEL`].
-    fn set_tx_power(&self, idx: u32) -> Result<(), FaceError> {
-        let level = (idx.min(63) as usize * (TX_GAIN_LADDER.len() - 1)) / 63;
+    fn set_tx_power(&self, req: PowerRequest) -> Result<AppliedPower, FaceError> {
+        // ⚠ There is no calibrated/raw split on this part: the gain LUT is the only PA lever, so
+        // `Raw` reaches the same ladder. `Dbm` routes to the B210-measured curve below.
+        let idx = match &req {
+            PowerRequest::Ceiling(_) => 63u32,
+            PowerRequest::Index(i, _) => *i as u32,
+            PowerRequest::Raw { idx, .. } => *idx as u32,
+            PowerRequest::Dbm(d) => {
+                let applied = RadioKnobs::set_tx_power_dbm(self, *d)?;
+                return Ok(AppliedPower::absolute_dbm(
+                    req.clone(),
+                    applied,
+                    applied != *d,
+                ));
+            }
+            PowerRequest::NoActuator => {
+                return Err(ndn_radio_hal::bringup::power_unsupported(
+                    "ar9271: PowerRequest::NoActuator, but the gain LUT DOES actuate power \
+                     (~12.5 dB MEASURED on OFDM).",
+                ));
+            }
+        };
+        let want = idx;
+        let idx = idx.min(63);
+        let level = Self::level_for_idx(idx as u8);
         self.cur_power
-            .store(idx.min(63) as u8, std::sync::atomic::Ordering::Relaxed);
-        self.set_tx_gain_level(level)
+            .store(idx as u8, std::sync::atomic::Ordering::Relaxed);
+        self.set_tx_gain_level(level)?;
+        Ok(AppliedPower::from_writes(
+            req.clone(),
+            PowerReference::DriverReference {
+                source: "AR9271 OFDM gain LUT (AR9271MODES_NORMAL_POWER_TX_GAIN); B210-measured \
+                         ~12.5 dB over 11 levels — CCK does NOT move with it",
+                // The ladder is measured but the level->index map is a rescale of 11 discrete
+                // levels onto 0..63, so a per-index dB slope would be fiction.
+                slope_db_per_idx: None,
+            },
+            idx as u8,
+            idx != want,
+            vec![PowerWrite {
+                reg: 0,
+                value: level as u8,
+                group: "tx gain LUT level",
+                path: 0,
+            }],
+        ))
+        // ⚠ `dbm` is left `None` on this path deliberately: `MEASURED_DBM_BY_LEVEL` is real, but it
+        // is OFDM-only and anchored on ONE chip, so folding it into an index request would put a
+        // per-chip absolute claim into a report that a link budget would believe. Ask with
+        // `PowerRequest::Dbm` to get the measured value back.
     }
 
     /// TX power on the dBm scale, from the **B210-measured** OFDM power curve ([`MEASURED_DBM_BY_LEVEL`]):
@@ -3633,23 +3733,7 @@ impl RadioKnobs for Ath9kHtcBackend {
     /// today they are two unrelated slot maps (µs here, TU there).
     fn tx_discipline(&self) -> ndn_radio_hal::TxDiscipline {
         ndn_radio_hal::TxDiscipline::BestEffort
-    }
-    fn configure_name_filter(
-        &self,
-        enabled: bool,
-        key: &[u8; 16],
-        masks: &[[u8; 16]],
-    ) -> Result<(), FaceError> {
-        // The AR9271 firmware re-derives each frame's prefix filter from its NAME via ndr_name_hash(key,…),
-        // so the key is load-bearing here (unlike the C5). Enable = load key+masks with drop-foreign;
-        // disable = restore the stock pass-all filter.
-        if enabled {
-            Ath9kHtcBackend::configure_name_filter(self, true, key, masks)
-        } else {
-            self.set_name_filter(false, false)
-        }
-    }
-}
+    }}
 
 /// The AR9271 IQ-mismatch fixed-point correction (`ar9002_hw_iqcalibrate`,
 /// ar9002_calib.c:192-267), for one chain. Inputs are the accumulated
@@ -3728,6 +3812,664 @@ fn delta_slope_vals(coef_scaled: u32) -> (u32, u32) {
     let coef_mantissa = coef_man >> (COEF_SCALE_S - coef_exp);
     let coef_exponent = coef_exp.wrapping_sub(16);
     (coef_mantissa, coef_exponent)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// M6 · §1.4 — THE PLAN.  AR9271 / ath9k_htc.
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Specification: `docs/bringup-contract.md` §1.4/§1.5/§4/§5-M6.
+//
+// ★ **Transcribed VERBATIM, IN ORDER, from `open_ath9k`** — the one place in the tree that knew
+// this ladder. Not one call moved, was added, or was reordered. §5-M6 names three rungs that
+// **none of this part's ~20 example callers perform**, and they are the reason a plan is worth
+// having here at all:
+//
+//   1. `select_gain_table` — the EEPROM `txGainType` read BEFORE `hw_reset`, so `apply_initvals`
+//      streams the HIGH-power table. MEASURED: a high-power module on the NORMAL table radiates
+//      ~50 dB low; HIGH + the board/OLPC cal gives a normal ~+12 dBm link (max −18 dBm at 1 ft,
+//      4500x the frames).
+//   2. `board_cal` + `power_cal` — `set_board_values` (antCtrl RF switch + XPA + ob/db bias) and
+//      `set_txpower_4k` (PDADC target->gain map + per-rate target power).
+//
+// Two things changed, each named where it happens:
+//
+//   1. `NDN_ATH9K_FW`, `NDN_ATH9K_HIGHPWR`, `NDN_ATH9K_NORMPWR`, `NDN_ATH9K_HT40`,
+//      `NDN_ATH9K_SETBOARD`, `NDN_ATH9K_NO_CAL` and `NDN_ATH9K_SETPOWER` no longer live INSIDE the
+//      ladder (LAW 1). They are read ONCE at the wrapper boundary (`open_ath9k`) and become
+//      [`Ath9kBringUpOpts`] fields plus [`RadioState::bw`]. Nothing below calls `std::env`.
+//   2. `rx_enable` — the M1.4 combined RX path — is now the **`Role::ReceiveOnly` plan's** RX rung
+//      and nothing else. §5-M6: "`rx_enable` gets `Role::ReceiveOnly` and stops being reachable by
+//      accident." It is a genuine alternative to `wmi_start` + `start_receive`, not a companion:
+//      it re-does the RX-DMA config and the opmode, and it arms `AR_IMR_S0 = 0x0001_0000`, i.e.
+//      **no TXOK for the data queues** — correct for a receiver, and a transmitter that took this
+//      rung would block at the ring depth on its 34th frame.
+
+/// Shorthand for the step tables below.
+type Ath = Ath9kHtcBackend;
+
+/// Which TX gain table `apply_initvals` should stream.
+///
+/// ★ This is the fleet's clearest case of a bring-up step whose absence is invisible: the NORMAL
+/// table on a high-power module transmits, reports `Ok`, and lands ~50 dB low.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum GainTableChoice {
+    /// Read `txGainType` out of the EEPROM and pick. The production answer.
+    #[default]
+    FromEeprom,
+    /// `NDN_ATH9K_HIGHPWR` — force the HIGH table regardless of what the EEPROM says.
+    ForceHigh,
+    /// `NDN_ATH9K_NORMPWR` — force the NORMAL table, i.e. skip the fix. A bench arm.
+    ForceNormal,
+}
+
+/// Whether the EEPROM board + OLPC power cal runs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Ath9kCalPolicy {
+    /// Default-ON for a high-power module (where it IS the fix), off otherwise — exactly what
+    /// `open_ath9k` did with `high_power || NDN_ATH9K_SETBOARD`.
+    #[default]
+    WhenHighPower,
+    /// `NDN_ATH9K_SETBOARD` — run it even on a normal-power module.
+    Always,
+    /// `NDN_ATH9K_NO_CAL` / `NDN_ATH9K_NORMPWR` — leave the PA on the initval-default gain.
+    Never,
+}
+
+/// **Everything the AR9271 plan depends on that is not the channel, the width or the role.**
+///
+/// LAW 1: a rung may not read the process environment, so every `NDN_ATH9K_*` the old ladder read
+/// inline becomes a field here, filled once at the wrapper boundary where the caller can see it.
+/// This is §1.1's `BringUpRequest::part_opts` in the shape available before that type exists —
+/// the same arrangement `Mt7610uBackend` uses for `NDN_RADIO_FORCE_FW`.
+#[derive(Clone, Debug, Default)]
+pub struct Ath9kBringUpOpts {
+    /// The `htc_9271-1.4.0.fw` image. **Not embedded** — it lives on the node at
+    /// `~/ath9k-fw/target_firmware/build/k2/htc_9271.fw`, which is why the caller reads the file
+    /// and hands the bytes in rather than the plan opening a path.
+    pub firmware: Vec<u8>,
+    pub gain_table: GainTableChoice,
+    pub cal: Ath9kCalPolicy,
+}
+
+fn s_download_firmware(b: &Arc<Ath>, _c: &mut Ctx<'_>) -> Result<StepOutcome, FaceError> {
+    let fw = b.bringup_opts.lock().unwrap().firmware.clone();
+    if fw.is_empty() {
+        return Err(err(
+            "ath9k: no firmware supplied to the bring-up. The AR9271 image is NOT embedded — set \
+             NDN_ATH9K_FW=<path to htc_9271-1.4.0.fw> (it lives at \
+             ~/ath9k-fw/target_firmware/build/k2/htc_9271.fw on the node) so `open_ath9k` can read \
+             it and hand the bytes to `Ath9kBringUpOpts::firmware`"
+                .to_string(),
+        ));
+    }
+    b.download_firmware(&fw)?;
+    Ok(StepOutcome::Established(Fact::Firmware {
+        name: "htc_9271 (NDR Tier-0 build, loaded from NDN_ATH9K_FW)",
+        ready: true,
+    }))
+}
+
+fn s_htc_init(b: &Arc<Ath>, _c: &mut Ctx<'_>) -> Result<StepOutcome, FaceError> {
+    b.htc_init()?;
+    Ok(StepOutcome::Done)
+}
+
+fn s_select_gain_table(b: &Arc<Ath>, c: &mut Ctx<'_>) -> Result<StepOutcome, FaceError> {
+    let choice = b.bringup_opts.lock().unwrap().gain_table;
+    let high = match choice {
+        GainTableChoice::ForceHigh => true,
+        GainTableChoice::ForceNormal => false,
+        GainTableChoice::FromEeprom => b.eeprom_tx_gain_type() == 1,
+    };
+    b.set_high_power(high);
+    let table = if high { "high" } else { "normal" };
+    // LAW 6 — this rung decides what every later power statement about this radio means, so it
+    // says so and the runner hoists the fact into `RadioState::facts`. The report then names the
+    // TABLE rather than an index, which is the honest answer: this ladder never calls
+    // `set_tx_power`.
+    c.state().power = AppliedPower::from_writes(
+        PowerRequest::ceiling(),
+        PowerReference::DriverReference {
+            source: if high {
+                "AR9271 HIGH-power gain table (EEPROM txGainType=1) — the board/OLPC cal composes on top"
+            } else {
+                "AR9271 NORMAL gain table (initval defaults)"
+            },
+            slope_db_per_idx: None,
+        },
+        63,
+        false,
+        Vec::new(),
+    );
+    Ok(StepOutcome::Established(Fact::GainTable(table)))
+}
+
+fn s_hw_reset(b: &Arc<Ath>, c: &mut Ctx<'_>) -> Result<StepOutcome, FaceError> {
+    let mhz = ath9k_channel_to_mhz(c.state_ref().channel);
+    if c.state_ref().bw == Bandwidth::Bw40 {
+        b.hw_reset_ht40(mhz)?;
+        return Ok(StepOutcome::Branch("ht40"));
+    }
+    b.hw_reset(mhz)?;
+    Ok(StepOutcome::Branch("ht20"))
+}
+
+fn s_connect_data_services(b: &Arc<Ath>, _c: &mut Ctx<'_>) -> Result<StepOutcome, FaceError> {
+    b.connect_data_services()?;
+    Ok(StepOutcome::Done)
+}
+
+fn s_wmi_start(b: &Arc<Ath>, _c: &mut Ctx<'_>) -> Result<StepOutcome, FaceError> {
+    b.wmi_start()?;
+    Ok(StepOutcome::Done)
+}
+
+fn s_start_receive(b: &Arc<Ath>, _c: &mut Ctx<'_>) -> Result<StepOutcome, FaceError> {
+    b.start_receive()?;
+    Ok(StepOutcome::Done)
+}
+
+fn s_rx_enable(b: &Arc<Ath>, _c: &mut Ctx<'_>) -> Result<StepOutcome, FaceError> {
+    b.rx_enable()?;
+    Ok(StepOutcome::Done)
+}
+
+fn s_note_channel(b: &Arc<Ath>, c: &mut Ctx<'_>) -> Result<StepOutcome, FaceError> {
+    b.note_channel(c.state_ref().channel);
+    Ok(StepOutcome::Done)
+}
+
+fn s_board_cal(b: &Arc<Ath>, c: &mut Ctx<'_>) -> Result<StepOutcome, FaceError> {
+    let Some(why) = b.cal_wanted() else {
+        return Ok(StepOutcome::Skipped(
+            "cal policy Never, or WhenHighPower on a normal-power module — the PA stays on the \
+             initval-default gain, which is what this dongle deliberately came up on",
+        ));
+    };
+    let bv = b.set_board_values()?;
+    c.warn(format!(
+        "board cal applied ({why}): txGainType={} ob={:?}",
+        bv.tx_gain_type, bv.ob
+    ));
+    Ok(StepOutcome::Done)
+}
+
+fn s_power_cal(b: &Arc<Ath>, c: &mut Ctx<'_>) -> Result<StepOutcome, FaceError> {
+    if b.cal_wanted().is_none() {
+        return Ok(StepOutcome::Skipped(
+            "cal policy Never, or WhenHighPower on a normal-power module — see board_cal",
+        ));
+    }
+    let peak = b.set_txpower_4k(ath9k_channel_to_mhz(c.state_ref().channel))?;
+    // ★ Remember it. A later HT20<->HT40 change re-streams the gain tables and wipes this cal, and
+    // `reapply_power_state` needs to know whether to put it back. The peak is the only per-chip
+    // ABSOLUTE anchor the EEPROM gives us, and before M2 it was printed and discarded.
+    b.note_cal_applied(peak);
+    c.state().power = AppliedPower::from_writes(
+        PowerRequest::ceiling(),
+        PowerReference::DriverReference {
+            source: "AR9271 HIGH-power gain table + EEPROM board values + OLPC 4k power cal",
+            slope_db_per_idx: None,
+        },
+        63,
+        false,
+        Vec::new(),
+    )
+    // ⚠ The ONE place this part has an absolute number, and it is a **target**, not a measured
+    // radiated power. `RadioCapability::tx_power_dbm`'s own rule — "an invented figure is worse
+    // than None" — is why nothing else on this part reports dBm.
+    .with_measured_dbm(peak.clamp(i16::from(i8::MIN), i16::from(i8::MAX)) as i8);
+    Ok(StepOutcome::Done)
+}
+
+// ── the rungs, as reviewable constants ───────────────────────────────────────
+//
+// Each rung is a `const` so the prefix the two roles share is LITERALLY shared rather than
+// copy-pasted. Two ladders that were "the same except…" is the defect this contract removes;
+// writing the prefix twice here would reintroduce it inside the fix.
+
+const A_DOWNLOAD_FIRMWARE: Step<Ath> = Step {
+    id: StepId("download_firmware"),
+    stage: Stage::Firmware,
+    class: StepClass::Required,
+    why: "the AR9271 has no flash: its firmware is downloaded to target RAM at every open, and \
+          nothing above the USB endpoints exists until it boots. **LAW 5** — it polls the target's \
+          own completion handshake, so a timed-out boot that continued would make every later \
+          readback fiction. ★ This part is the one Wi-Fi radio in the fleet whose firmware is \
+          OURS (the parse-everywhere NDR build).",
+    must_follow: &[],
+    must_precede: &[],
+    run: s_download_firmware,
+};
+
+const A_HTC_INIT: Step<Ath> = Step {
+    id: StepId("htc_init"),
+    stage: Stage::MacInit,
+    class: StepClass::Required,
+    why: "the HTC READY/CONNECT_SERVICE/SETUP_COMPLETE handshake. It assigns the WMI control \
+          endpoint and the credit budget, so the register path (`reg_read`/`reg_write` ride WMI) \
+          does not exist before it — which is why `select_gain_table`, an EEPROM read, must come \
+          after.",
+    must_follow: &[StepId("download_firmware")],
+    must_precede: &[],
+    run: s_htc_init,
+};
+
+const A_SELECT_GAIN_TABLE: Step<Ath> = Step {
+    id: StepId("select_gain_table"),
+    stage: Stage::PhyInit,
+    class: StepClass::Required,
+    why: "★ THE TX-POWER FIX, and a rung NONE of this part's ~20 example callers perform. Read the \
+          EEPROM `txGainType` BEFORE `hw_reset` so `apply_initvals` streams the right TX gain \
+          table. MEASURED: a high-power module (txGainType==1) on the NORMAL table radiates ~50 dB \
+          low; the HIGH table plus the full board/OLPC cal gives a normal ~+12 dBm link (max \
+          −18 dBm at 1 ft, 4500x the frames). It must PRECEDE `hw_reset`, which is the rung that \
+          streams the initvals — after it, the table is already on the chip.",
+    must_follow: &[StepId("htc_init")],
+    must_precede: &[StepId("hw_reset")],
+    run: s_select_gain_table,
+};
+
+const A_HW_RESET: Step<Ath> = Step {
+    id: StepId("hw_reset"),
+    stage: Stage::PhyInit,
+    class: StepClass::Required,
+    why: "the faithful `ath9k_hw_reset`: chip reset, initvals, PHY/MAC/queue init, RF tune to the \
+          requested channel and the reset-time calibration kick. The HT20/HT40 fork is INSIDE this \
+          rung and reported as a `Branch`, per §1.4 — branching between rungs is deliberately not \
+          expressible. ⚠ HT40 (`NDN_ATH9K_HT40`) is EXPERIMENTAL on this HT20-class part: cal \
+          convergence at 40 MHz is unverified.",
+    must_follow: &[],
+    must_precede: &[],
+    run: s_hw_reset,
+};
+
+const A_CONNECT_DATA_SERVICES: Step<Ath> = Step {
+    id: StepId("connect_data_services"),
+    stage: Stage::MacInit,
+    class: StepClass::Required,
+    why: "connects the Mgmt / DataBE / Beacon HTC services and records the endpoint ids the target \
+          assigns. Both the RX path and every injected frame ride these, and `WMI_START_RECV` \
+          requires them to exist first — so it cannot follow the RX rung.",
+    must_follow: &[StepId("hw_reset")],
+    must_precede: &[],
+    run: s_connect_data_services,
+};
+
+const A_WMI_START: Step<Ath> = Step {
+    id: StepId("wmi_start"),
+    stage: Stage::TxEnable,
+    class: StepClass::Required,
+    why: "the target-side start verbs — `WMI_ATH_INIT` -> `SET_MODE(11NG)` -> `IC_UPDATE` -> the \
+          monitor vif+node create -> `START_RECV` -> `ENABLE_INTR` -> the host `AR_IMR` arming. \
+          ★ Two of those are TRANSMIT prerequisites measured the hard way: without \
+          `WMI_TARGET_IC_UPDATE` the rate-series ChSel is 0 and no chain radiates (TXOK completes, \
+          0 frames on air), and without the created node the target DROPS injected frames. \
+          `AR_IMR_S0` also enables TXOK for the four data ACs, without which the 34th injected \
+          frame NAKs forever.",
+    must_follow: &[StepId("connect_data_services")],
+    must_precede: &[StepId("start_receive")],
+    run: s_wmi_start,
+};
+
+const A_START_RECEIVE: Step<Ath> = Step {
+    id: StepId("start_receive"),
+    stage: Stage::RxEnable,
+    class: StepClass::Required,
+    why: "★ ORDER IS LOAD-BEARING, and this is the constraint that used to be a paragraph. The \
+          target's `WMI_START_RECV` (inside `wmi_start`) programs `AR_RXDP`, the RX descriptor \
+          ring — so the host RX-DMA enable (`AR_CR_RXE`) must come AFTER it, or it latches a \
+          stale/zero pointer and the ring never advances (MEASURED: seen=0). Proven in \
+          `examples/ath9k_hw_reset.rs`; now checked at plan construction.",
+    must_follow: &[StepId("wmi_start")],
+    must_precede: &[],
+    run: s_start_receive,
+};
+
+const A_RX_ENABLE: Step<Ath> = Step {
+    id: StepId("rx_enable"),
+    stage: Stage::RxEnable,
+    class: StepClass::Required,
+    why: "★ §5-M6: the M1.4 combined RX path, now reachable ONLY through `Role::ReceiveOnly`. It \
+          is an ALTERNATIVE to `wmi_start` + `start_receive`, not a companion: it re-does the \
+          RX-DMA burst config and the monitor opmode itself, and it arms `AR_IMR_S0 = 0x0001_0000` \
+          — TXDESC on q0 and **no TXOK for the data queues**. Correct for a receiver; a \
+          transmitter that took this rung would block at the ring depth on its 34th frame. It also \
+          never sends `IC_UPDATE` or creates the monitor vif/node, so this role genuinely cannot \
+          transmit — which is the point of giving it a role rather than leaving it a public method \
+          any example could call by accident.",
+    must_follow: &[StepId("connect_data_services")],
+    must_precede: &[],
+    run: s_rx_enable,
+};
+
+const A_NOTE_CHANNEL: Step<Ath> = Step {
+    id: StepId("note_channel"),
+    stage: Stage::Tune,
+    class: StepClass::Required,
+    why: "records the channel the PHY actually came up on, so `RadioKnobs::set_channel` can answer \
+          a same-channel apply with `Ok` and a different-channel request with an honest \
+          `Unsupported` — a live retune is still `hw_reset`, and a knob that silently ignores a \
+          retune is the failure this contract is about. Host-side bookkeeping, no bus traffic.",
+    must_follow: &[StepId("hw_reset")],
+    must_precede: &[],
+    run: s_note_channel,
+};
+
+const A_BOARD_CAL: Step<Ath> = Step {
+    id: StepId("board_cal"),
+    stage: Stage::Calibrate,
+    class: StepClass::BestEffort(Degradation::new(
+        "the EEPROM board values — antCtrl RF-switch routing, the XPA external-PA enable and the \
+         ob/db bias — are not applied, so the external PA may not be enabled at all and the RF may \
+         be routed to the wrong antenna port",
+        "RX, and register-level TX work; NOT a range, RSSI, delivery-ratio or link-budget number",
+    )),
+    why: "★ A rung NONE of this part's ~20 example callers perform. `set_board_values` composes \
+          with the HIGH gain table to give a normal ~+12 dBm link. Best effort with a named loss, \
+          transcribed from `open_ath9k`'s `Err(e) => eprintln!(\"board cal skipped\")` — the \
+          difference is that the loss is now in the report instead of on somebody's terminal.",
+    must_follow: &[StepId("select_gain_table")],
+    must_precede: &[],
+    run: s_board_cal,
+};
+
+const A_POWER_CAL: Step<Ath> = Step {
+    id: StepId("power_cal"),
+    stage: Stage::Power,
+    class: StepClass::BestEffort(Degradation::new(
+        "the OLPC power cal (PDADC target->gain map + per-rate target power from the EEPROM) is \
+         not programmed, leaving the PA on the initval-default gain — and with it the only \
+         per-chip ABSOLUTE dBm anchor this part has",
+        "RX and relative TX comparisons within one run; NOT an absolute power claim",
+    )),
+    why: "★ A rung NONE of this part's ~20 example callers perform. `set_txpower_4k` programs the \
+          real per-rate target power and returns the peak target in dBm — the only per-chip \
+          absolute anchor the EEPROM gives us. It must FOLLOW `board_cal`, whose XPA/bias writes \
+          it is calibrating against, and it runs after `wmi_start`/`start_receive` because that is \
+          the order `open_ath9k` ran and no other order has been measured on air.",
+    must_follow: &[StepId("board_cal")],
+    must_precede: &[],
+    run: s_power_cal,
+};
+
+// ── the two plans ────────────────────────────────────────────────────────────
+
+// ⚠ The six rungs below `A_TX_STEPS` and `A_RX_STEPS` have in common are shared as individual
+// `const A_*: Step<Ath>` items — which IS the sharing that matters, since a rung's `run`, its
+// `why` and its ordering constraints all live in one place. An `A_SHARED: &[Step<Ath>]` slice
+// stood here until M8 with **one definition and zero uses**: Rust cannot concatenate `const`
+// slices, so both step lists always spelled the six out, and the slice was a claim of sharing that
+// nothing checked. Deleted rather than left to read as if it were load-bearing. The guard that
+// actually bites is `tests/plan_shape_m6.rs`, which holds an independently written ladder list.
+const A_TX_STEPS: &[Step<Ath>] = &[
+    A_DOWNLOAD_FIRMWARE,
+    A_HTC_INIT,
+    A_SELECT_GAIN_TABLE,
+    A_HW_RESET,
+    A_CONNECT_DATA_SERVICES,
+    A_WMI_START,
+    A_START_RECEIVE,
+    A_NOTE_CHANNEL,
+    A_BOARD_CAL,
+    A_POWER_CAL,
+];
+
+const A_RX_STEPS: &[Step<Ath>] = &[
+    A_DOWNLOAD_FIRMWARE,
+    A_HTC_INIT,
+    A_SELECT_GAIN_TABLE,
+    A_HW_RESET,
+    A_CONNECT_DATA_SERVICES,
+    A_RX_ENABLE,
+    A_NOTE_CHANNEL,
+];
+
+/// The exclusion both plans share: this part has no device selector.
+const A_EXCLUDED_ATTACH: (Stage, &str) = (
+    Stage::Attach,
+    "`Ath9kHtcBackend::open` claims the FIRST AR9271 on the bus and has no `open_select` sibling, \
+     so there is nothing to attach and no address to report (`DeviceAddress::Unknown`, stated \
+     rather than invented). ⛔ And it must NOT grow a `handle.reset()`: MEASURED on o5p-1, a port \
+     reset of a running AR9271 dropped it off the USB bus entirely and needed a physical replug.",
+);
+
+const A_TX_PLAN: Plan<Ath> = Plan {
+    id: PlanId {
+        part: "ar9271",
+        name: "monitor",
+        ver: 1,
+    },
+    role: Role::TransmitAndReceive,
+    steps: A_TX_STEPS,
+    excluded: &[A_EXCLUDED_ATTACH],
+};
+
+const A_RX_PLAN: Plan<Ath> = Plan {
+    id: PlanId {
+        part: "ar9271",
+        name: "receive-only",
+        ver: 1,
+    },
+    role: Role::ReceiveOnly,
+    steps: A_RX_STEPS,
+    excluded: &[
+        A_EXCLUDED_ATTACH,
+        (
+            Stage::TxEnable,
+            "ReceiveOnly by construction, not by convention: `rx_enable` sends no `IC_UPDATE`, \
+             creates no monitor vif/node, and arms no TXOK. An instrument that wants to transmit \
+             asks for TransmitAndReceive and gets `wmi_start`.",
+        ),
+        (
+            Stage::Calibrate,
+            "the board/OLPC power cal is a TRANSMIT calibration; running it would put energy \
+             questions into a plan that has no transmitter. The gain TABLE is still selected \
+             (`select_gain_table`) because `apply_initvals` streams it either way.",
+        ),
+    ],
+};
+
+// ★ A malformed plan is a compile error, not a runtime one. In particular, moving
+// `A_SELECT_GAIN_TABLE` after `A_HW_RESET`, or `A_START_RECEIVE` before `A_WMI_START`, stops the
+// crate building — the ~50 dB gain-table fix and the `AR_RXDP`-before-`AR_CR_RXE` ordering are now
+// enforced by the compiler rather than by paragraphs nobody re-reads.
+const _: () = A_TX_PLAN.check_or_panic();
+const _: () = A_RX_PLAN.check_or_panic();
+
+/// The AR9271's `Role::TransmitAndReceive` plan — the old `open_ath9k` ladder.
+pub static PLAN_AR9271_MONITOR: Plan<Ath> = A_TX_PLAN;
+/// The AR9271's `Role::ReceiveOnly` plan — the old `rx_enable` path, now behind a role.
+pub static PLAN_AR9271_RX: Plan<Ath> = A_RX_PLAN;
+
+/// §1.5, part-wide: the readbacks that hold for **both** roles, so neither plan warns on a healthy
+/// bring-up. Both roles open the same RX filter and clear the same diagnostic gates — by different
+/// rungs, which is exactly why reading them back is worth a bus round trip.
+///
+/// ⚠ `Warn` on introduction, per §5/M-hazards. Promotion to `Fatal` needs a measurement; a
+/// readback nobody has watched fail is not allowed to refuse a radio.
+const ASSERTS_AR9271: &[Assert<Ath>] = &[
+    Assert {
+        id: StepId("rx_filter_open"),
+        reg: crate::ath9k_reg::AR_RX_FILTER,
+        read: |b: &Ath| b.reg_read(crate::ath9k_reg::AR_RX_FILTER),
+        want: 0x0000_c03f,
+        mask: 0x0000_ffff,
+        why: "0xc03f is the kernel driver's own monitor value from the golden trace, and the two \
+              bits our earlier 0xBF lacked are the ones that matter: MCAST_BCAST_ALL (0x8000) plus \
+              0x4000. Without them broadcast frames — every beacon, and every NDN broadcast this \
+              stack sends — are dropped at the HARDWARE filter, before RX DMA, and the radio reads \
+              as deaf (MEASURED seen=0). Written by `start_receive` in one role and by `rx_enable` \
+              in the other, which is precisely why it is asserted once here instead of trusted \
+              twice.",
+        severity: Severity::Warn,
+    },
+    Assert {
+        id: StepId("rx_not_disabled"),
+        reg: crate::ath9k_reg::AR_DIAG_SW,
+        read: |b: &Ath| b.reg_read(crate::ath9k_reg::AR_DIAG_SW),
+        want: 0,
+        mask: crate::ath9k_reg::AR_DIAG_RX_DIS | crate::ath9k_reg::AR_DIAG_RX_ABORT,
+        why: "`ath9k_hw_startpcureceive` clears RX_DIS|RX_ABORT; a chip reset sets them. This is \
+              the ath9k analogue of the Realtek TXPAUSE assert — a gate a ladder WRITES, read back \
+              rather than written a second time. Set here means the MAC is holding the receiver \
+              down while every rung above returned `Ok`.",
+        severity: Severity::Warn,
+    },
+];
+
+impl BringUp for Ath9kHtcBackend {
+    fn plan(role: Role) -> Option<&'static Plan<Self>> {
+        match role {
+            Role::TransmitAndReceive => Some(&PLAN_AR9271_MONITOR),
+            Role::ReceiveOnly => Some(&PLAN_AR9271_RX),
+            // A named refusal, not a silent downgrade. There is no transmit-only ladder here:
+            // `wmi_start` bundles `START_RECV` with the TX prerequisites (`IC_UPDATE`, the vif +
+            // node create), and splitting them has never been measured on this part.
+            Role::TransmitOnly => None,
+        }
+    }
+
+    fn asserts() -> &'static [Assert<Self>] {
+        ASSERTS_AR9271
+    }
+
+    /// ☠ **This part is the fleet's own counterexample, and it is why §4 separates (A) from (B).**
+    /// Empty is a real answer here: HTC credit reclaim and the TX counters answer (A) — *did the
+    /// MAC key the transmitter?* — and on THIS part (A) was MEASURED insufficient for (B):
+    /// `TFCNT` advanced and `TXOK` completed while a witness at inches decoded 0 frames.
+    fn tx_instruments() -> &'static [TxInstrument] {
+        &[]
+    }
+
+    fn tx_unprovable_reason() -> Option<&'static str> {
+        Some(
+            "HTC credit reclaim answers (A) only — a credit returning proves the host handed the \
+             frame over, never that the RF was keyed. Prove radiation with a witness receiver, \
+             never with a counter on this chip. \
+             ⚠ The observation that used to justify this line — \"TFCNT advanced while a witness at \
+             inches decoded 0 frames\" — is SUPERSEDED and should not be requoted: on 2026-09-04 \
+             this part TRANSMITTED 1100 frames, byte-exact 1100, decoded by an RTL8812AU on our own \
+             libusb stack at bench range (`wide_profile_onair`, ch6). The earlier zero was almost \
+             certainly the same broken-witness fault that produced a bogus \"the bench link is \
+             marginal\" conclusion the day before — see docs/bringup-root-cause-2026-09-03.md. \
+             The RULE stands on its own logic; the anecdote does not.",
+        )
+    }
+}
+
+
+/// 2.4 GHz Wi-Fi channel number -> centre frequency (MHz). Ch14 is the 2484 special case; the rest
+/// are `2407 + 5*ch` (ch1 = 2412, ch6 = 2437, ch11 = 2462).
+///
+/// Public since M8: the plan takes a channel NUMBER (`RadioState::channel`) while this part's own
+/// `hw_reset` takes MHz, and the bench instruments that used to spell the ladder out took MHz on
+/// the command line. One conversion, in one place, rather than `2407 + 5*ch` re-derived per file —
+/// which is how ch14 gets forgotten.
+pub fn ath9k_channel_to_mhz(ch: u8) -> u16 {
+    if ch == 14 {
+        2484
+    } else {
+        2407 + 5 * (ch as u16)
+    }
+}
+
+/// The inverse: 2.4 GHz centre frequency (MHz) -> channel number. `None` for a frequency that is
+/// not a 2.4 GHz channel centre.
+///
+/// M8. The bench instruments took MHz on the command line because `hw_reset` does; the plan takes
+/// a channel number, because that is what a `RadioState` and every other part in the fleet speak.
+pub fn ath9k_mhz_to_channel(mhz: u16) -> Option<u8> {
+    if mhz == 2484 {
+        return Some(14);
+    }
+    if mhz < 2412 || mhz > 2472 || (mhz - 2407) % 5 != 0 {
+        return None;
+    }
+    Some(((mhz - 2407) / 5) as u8)
+}
+
+impl Ath9kHtcBackend {
+    /// Stash the caller-boundary options the plan reads (LAW 1). Called by `open_ath9k` before the
+    /// first rung; nothing inside a rung reads the environment.
+    pub fn with_bringup_opts(&self, opts: Ath9kBringUpOpts) {
+        *self.bringup_opts.lock().unwrap() = opts;
+    }
+
+    /// Whether the board/OLPC cal should run, and the reason — `None` = skip. The `high_power ||
+    /// NDN_ATH9K_SETBOARD` / `NDN_ATH9K_NO_CAL` decision `open_ath9k` made inline, moved to one
+    /// place both cal rungs consult so they cannot disagree.
+    fn cal_wanted(&self) -> Option<&'static str> {
+        match self.bringup_opts.lock().unwrap().cal {
+            Ath9kCalPolicy::Never => None,
+            Ath9kCalPolicy::Always => Some("policy Always"),
+            Ath9kCalPolicy::WhenHighPower => self
+                .high_power
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .then_some("high-power module — this cal IS the fix"),
+        }
+    }
+
+    /// **The one entry point** for this part. M8 deleted `open_ath9k`, which was a wrapper over
+    /// this; `open_radio`'s AR9271 arm calls it directly, and a bench instrument that needs the
+    /// concrete backend calls it here.
+    ///
+    /// The role selects the plan ([`BringUp::plan`]); the deviation, if any, is resolved against
+    /// that plan before the first register write and lands in the report's digest; the proof
+    /// requirement is validated against the role and this part's (deliberately empty) instrument
+    /// set, also before the first register write.
+    // The `Err` is large BECAUSE it carries the partial report — the whole point of §3. Same
+    // allow, same reason, as `run_plan`'s.
+    #[allow(clippy::result_large_err)]
+    pub fn bring_up_planned(
+        self: &Arc<Self>,
+        channel: u8,
+        bw: Bandwidth,
+        role: Role,
+        opts: Ath9kBringUpOpts,
+        deviation: Option<Deviation>,
+        proof: ProofRequirement,
+    ) -> Result<(BringUpReport, Guards), BringUpFailure> {
+        self.with_bringup_opts(opts);
+        let mut run = PlanRun::new(
+            "AR9271",
+            ndn_radio_hal::DeviceAddress::Unknown,
+            self.initial_state(channel, bw, role),
+        )
+        .with_proof(proof);
+        if let Some(d) = deviation {
+            run = run.with_deviation(d);
+        }
+        let (report, guards) = <Self as BringUp>::bring_up(self, &run)?;
+        // The runner is part-agnostic and cannot know this part's PHY capability; the driver does.
+        Ok((
+            report.with_capability(RadioProfile::capability(self.as_ref())),
+            guards,
+        ))
+    }
+
+    /// The regime a plan starts from. Not a claim about the radio: it is what the caller asked
+    /// for, and the rungs fill in what they establish.
+    fn initial_state(&self, channel: u8, bw: Bandwidth, role: Role) -> RadioState {
+        RadioState {
+            channel,
+            bw,
+            format: "RawNdn(0x8624)",
+            role,
+            // ⚠ This ladder never calls `set_tx_power`: power on this part comes from the gain
+            // TABLE `select_gain_table` picks, plus (optionally) the OLPC cal. Both rungs
+            // overwrite this with a `DriverReference` naming the table. `NoActuator` would be a
+            // lie — the per-frame `AR_XmitPower` knob works — so this says the bring-up has not
+            // touched it yet, which is the truth at rung zero.
+            power: AppliedPower::no_actuator(PowerRequest::NoActuator),
+            rate: ndn_radio_hal::RateState::unreported(),
+            warm: None,
+            contention: None,
+            pump: PumpPolicy::CallerOwns,
+            facts: Vec::new(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -3989,7 +4731,7 @@ mod tests {
             dst: DST,
             src: SRC,
             addr3: None,
-            addr4: None,
+            extra: None,
             htc: None,
         };
         let mgmt_ep = 0x07;
@@ -4063,7 +4805,7 @@ mod tests {
             dst: DST,
             src: SRC,
             addr3: None,
-            addr4: None,
+            extra: None,
             htc: None,
         };
         let mpdu = crate::frame::build_dot11(ndn_fmt(), &frame).unwrap();

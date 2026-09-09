@@ -4,7 +4,6 @@
 
 #include "ar5416reg.h"
 #include "ndr_mac.h"
-#include "ndr_filter.h"
 #include "ndr_ctl.h"
 #include "ndr_time.h"
 
@@ -129,27 +128,23 @@ void ndr_quiet_rearm(void)
 		 * every name preserves their relative offsets, so two names that hash to the same
 		 * slot still collide — for that they need different hashes, or the within-slot CCLF
 		 * election. What rotation buys is that no name is permanently stuck in a particular
-		 * slot, which matters because slots are not interchangeable: §5 of the filter/MAC
-		 * redesign reserves every R-th slot, and a fixed assignment would permanently
+		 * slot, which matters because slots are not interchangeable: the MAC reserves every
+		 * R-th slot for latency-class leases, and a fixed assignment would permanently
 		 * advantage or starve whoever landed there.
 		 */
-		static const char lease_prefix[] = NDR_LEASE_PREFIX;
 		a_uint32_t base = 0, slots = 0, slot_us = 0, per_us = 0;
 
+		/*
+		 * The host supplies the BASE slot the name hashes to (it runs the shared keyspace hash —
+		 * ndn_frame_io::siphash24 — in cognition and pushes the result via NDR_OP_LEASE). The
+		 * epoch term is still applied here so both nodes rotate identically. The on-device
+		 * name-hash path went away with the retired filter's siphash (see NDR_MAC_SPEC.md); the
+		 * host-supplied slot is the doctrine-clean, production lease path.
+		 */
 		if (ndr_ctl_lease_override) {
-			/* Runtime lease over the control path: the host supplies the BASE slot (what
-			 * the name would hash to); the epoch term is still applied here so both nodes
-			 * rotate identically. */
 			base    = ndr_ctl_lease_slot;
 			slots   = ndr_ctl_lease_slots;
 			slot_us = ndr_ctl_lease_slot_tu * 1024u;
-		} else if (sizeof(lease_prefix) > 1) {
-			base = (a_uint32_t)ndr_name_hash(ndr_cfg.key,
-							 (const a_uint8_t *)lease_prefix,
-							 (a_uint32_t)(sizeof(lease_prefix) - 1))
-			       & NDR_LEASE_SLOT_MASK;
-			slots   = NDR_LEASE_SLOTS;
-			slot_us = NDR_LEASE_SLOT_US;
 		}
 
 		if (slots) {

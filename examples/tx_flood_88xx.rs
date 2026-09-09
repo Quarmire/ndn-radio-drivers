@@ -21,7 +21,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .enable_all()
         .build()?;
     rt.block_on(async move {
-        let d = LibUsbRtl88xxBackend::open_monitor_pid(pid, ch)?;
+        let d = {
+            // M8: `open_monitor*` is deleted. Claim, then run the ONE plan (`PLAN_A81A`)
+            // with the role named at the call site — and keep the report instead of
+            // discarding it, which is the thing those openers got wrong.
+            let d = std::sync::Arc::new(LibUsbRtl88xxBackend::open_pid(pid)?);
+            d.bring_up_planned(
+                ch,
+                ndn_radio_hal::bringup::Role::TransmitAndReceive,
+                ndn_radio_drivers::a81a_env_deviation(),
+                ndn_radio_hal::bringup::ProofRequirement::BestAvailable,
+            )?;
+            d
+        };
         println!("88xx flood ch{ch} pid {pid:04x} for {secs}s (rate via NDN_RADIO_TX_RATE)");
         // addr3: None = the legacy layout (no Tier-0 filter in addr1‖addr2, so no displaced nonce).
         let frame = InjectFrame {
@@ -30,7 +42,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             dst: BROADCAST,
             src: DEFAULT_SRC,
             addr3: None,
-            addr4: None,
+            extra: None,
             htc: None,
         };
         let end = Instant::now() + Duration::from_secs(secs);

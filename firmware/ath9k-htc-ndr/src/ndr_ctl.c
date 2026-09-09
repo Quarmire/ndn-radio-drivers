@@ -1,7 +1,6 @@
 /* Runtime configuration over the transmit path -- see ndr_ctl.h. */
 
 #include "ndr_ctl.h"
-#include "ndr_filter.h"
 #include "ndr_mac.h"
 
 a_uint32_t ndr_ctl_lease_override;
@@ -46,46 +45,8 @@ a_int32_t ndr_ctl_intercept(const a_uint8_t *data, a_uint32_t len)
 	b += 6;
 
 	switch (op) {
-	case NDR_OP_ENABLE:
-		if (oplen >= 1)
-			ndr_cfg.enabled = b[0];
-		break;
-
-	case NDR_OP_DROP_FOREIGN:
-		if (oplen >= 1)
-			ndr_cfg.drop_foreign = b[0];
-		break;
-
-	case NDR_OP_KEY:
-		if (oplen >= NDR_KEY_LEN) {
-			a_uint32_t i;
-			for (i = 0; i < NDR_KEY_LEN; i++)
-				ndr_cfg.key[i] = b[i];
-		}
-		break;
-
-	case NDR_OP_NMASKS:
-		if (oplen >= 1 && b[0] <= NDR_MAX_MASKS)
-			ndr_cfg.n_masks = b[0];
-		break;
-
-	case NDR_OP_MASK:
-		if (oplen >= 13 && b[0] < NDR_MAX_MASKS) {
-			a_uint32_t i;
-			for (i = 0; i < 12; i++)
-				ndr_cfg.masks[b[0]].b[i] = b[1 + i];
-		}
-		break;
-
-	case NDR_OP_CLEAR_STATS:
-		ndr_stats.seen = 0;
-		ndr_stats.passed = 0;
-		ndr_stats.dropped_filter = 0;
-		ndr_stats.dropped_foreign = 0;
-		ndr_stats.short_frame = 0;
-		ndr_stats.dropped_popcount = 0;
-		break;
-
+	/* Ops 0x01..0x06 (the retired in-frame name filter) are gone; only the lease/quiet
+	 * control survives here — see firmware/NDR_MAC_SPEC.md. */
 	case NDR_OP_LEASE:
 		if (oplen >= 3) {
 			ndr_ctl_lease_slots = 1u << b[0]; /* log2, so the mask stays a mask */

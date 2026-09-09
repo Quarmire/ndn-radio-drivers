@@ -17,6 +17,57 @@ pub use ndn_frame_io::{
 // aggregate — a driver crate builds one and a face crate consumes one, so neither should need a
 // dependency on the other to name it.
 pub use ndn_radio_hal::{OpenRadio, RadioKnobs, RadioProfile, RadioTime};
+// ★ M8: the bring-up contract's own vocabulary, re-exported.
+//
+// `bring_up_planned` — the one entry point on every part — takes a `Role`, a `PowerRequest`, a
+// `Deviation` and a `ProofRequirement`, and `open_radio` takes a `BringUpRequest` built from them.
+// A caller that cannot NAME those types cannot use the API, so a crate depending on the drivers
+// had to add a second dependency on the HAL to say `Role::ReceiveOnly`. The types still LIVE in
+// the HAL (a face crate consumes a report without knowing this crate exists); this is a
+// re-export, not a second home.
+pub use ndn_radio_hal::bringup;
+pub use ndn_radio_hal::bringup::{
+    AppliedPower, BringUpFailure, BringUpReport, Deviation, Guards, PowerReference, PowerRequest,
+    ProofRequirement, PumpPolicy, RateGroupPolicy, RfAuthority, Role, WitnessId, WitnessOracle,
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// §5-M8 — the ladder rungs are not public API
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// **Declare one bring-up rung.** `pub` under `feature = "bench"`, `pub(crate)` without it.
+///
+/// ★ The contract's §5-M8: *"sub-steps drop `pub` → `pub(crate)`, re-exported only under
+/// `feature = "bench"`."* The sequence belongs to the part's [`Plan`](ndn_radio_hal::Plan); a
+/// consumer composes a bring-up by naming a [`Role`], not by calling rungs in an order it
+/// remembers. Sixteen private ladders assembled from these very methods is how a silent power-regime
+/// regime stayed invisible for months — see `docs/bringup-root-cause-2026-09-03.md`.
+///
+/// After this, `tests/no_hand_rolled_ladder.rs` becomes a **belt over a compiler brace**: a
+/// production crate that tries to compose its own ladder does not build, and the source-level test
+/// remains only to catch a rung re-exported under `bench` being used outside a bench example.
+///
+/// ⚠ It does not hide anything from an operator. `bench` is enabled for this crate's own
+/// `examples/` and `tests/` (by a dev-dependency on ourselves) and for `ndn-phy-wifi`'s
+/// `dev-examples`, because a bench instrument that pokes exactly one rung is a legitimate and
+/// necessary thing. What it stops is a *production* path composing a bring-up.
+#[cfg(feature = "bench")]
+macro_rules! rung {
+    ($(#[$m:meta])* fn $($rest:tt)*) => {
+        $(#[$m])*
+        pub fn $($rest)*
+    };
+}
+#[cfg(not(feature = "bench"))]
+macro_rules! rung {
+    ($(#[$m:meta])* fn $($rest:tt)*) => {
+        $(#[$m])*
+        pub(crate) fn $($rest)*
+    };
+}
+// ⚠ NO `pub(crate) use rung;` — the macro reaches the backend modules by macro_rules' TEXTUAL
+// scoping, which is why it is declared HERE, immediately above the `mod` declarations. Moving it
+// below them silently puts every rung back to `pub`, so keep it first.
 
 pub mod mt76;
 /// Shared MediaTek mt76x02 layer: the register map, USB transport and the MEASURED knob
@@ -37,14 +88,23 @@ mod realtek_rx;
 /// Shared async-URB RX pump (bulk-IN pipelining) used by the USB backends.
 pub mod rx_pump;
 pub use freq_discipline::{FreqAction, FreqDiscipline};
+/// **The caller-boundary reader for the a81a's `NDN_RADIO_MINIMAL` / `NDN_RADIO_SKIP_CAL` /
+/// `NDN_RADIO_NO_EFEM`**, assembled into a self-labelling `Deviation` by the module that owns the
+/// rung ids it names. `BringUpRequest::from_env` calls it; a bench instrument that drives
+/// `bring_up_planned` directly should too, or those three knobs silently stop working for it.
+pub use libusb_rtl88xx::a81a_env_deviation;
 pub use libusb_rtl88xx::{
-    CHIP_ID_8822E, ChannelBw, FwVersion, LibUsbRtl88xxBackend, REALTEK_VID, REG_SYS_CFG,
+    CHIP_ID_8822E, ChannelBw, FwVersion, LibUsbRtl88xxBackend, PLAN_A81A, REALTEK_VID, REG_SYS_CFG,
     RTL88XX_PIDS, RfPath,
 };
 // AR9271 (ath9k_htc) — the one Wi-Fi part whose FIRMWARE is ours, so Tier-0 can reject a frame
 // before it crosses USB (design §8.2) and TX can be scheduled off the hardware TSF (§8.5).
 // L1: USB transport + firmware download + HTC handshake + WMI. Does not yet replace ath9k_htc.
 mod ath9k_htc;
+/// **The bring-up coverage table** (contract §6.3): one cell per part × [`Role`], `Provided` or
+/// `Excluded` in writing. The sibling of [`coverage`] one layer down — that table makes a missing
+/// trait impl a visible row, this one makes a missing *sequence* a visible row.
+pub mod bringup_coverage;
 pub mod coverage;
 // PHY-init data for the M1 bring-up port, transcribed verbatim from mainline ath9k v6.12.33:
 // AR9271 initval tables (ar9002_initvals.h), the register offsets/bits the reset+cal path writes
@@ -53,20 +113,25 @@ mod ath9k_htc_structs;
 mod ath9k_initvals;
 mod ath9k_reg;
 pub use ath9k_htc::{
-    AR9271_FIRMWARE, AR9271_FIRMWARE_TEXT, AR9271_IDS, ATHEROS_VID, Ath9kHtcBackend, BoardValues,
-    CalStatus, FW_NAME, HTC_RX_STATUS_LEN, HtcService, IEEE80211_MODE_11NG, IniVerify, LegacyRate,
-    NDR_MEM_MAX_TUPLES, NdrStats, REG_WRITE_MAX_PAIRS, ResetStatus, RxFrame, WmiCmd,
+    AR9271_FIRMWARE, AR9271_FIRMWARE_TEXT, AR9271_IDS, AR9271_PID, ATHEROS_VID, Ath9kBringUpOpts,
+    Ath9kCalPolicy, Ath9kHtcBackend, BoardValues, CalStatus, FW_NAME, GainTableChoice,
+    HTC_RX_STATUS_LEN, HtcService, IEEE80211_MODE_11NG, IniVerify, LegacyRate, NDR_MEM_MAX_TUPLES,
+    PLAN_AR9271_MONITOR, PLAN_AR9271_RX, REG_WRITE_MAX_PAIRS,
+    ResetStatus, RxFrame, WmiCmd, ath9k_channel_to_mhz, ath9k_mhz_to_channel,
 };
 mod rtl8821c;
-pub use rtl8821c::{RTL8821CU_PIDS, Rtl8821cuBackend};
+pub use rtl8821c::{
+    PLAN_8821CU_FW_STA, PLAN_8821CU_IBSS, PLAN_8821CU_MONITOR, PLAN_8821CU_NO_TXEN,
+    PLAN_8821CU_STATION_REGS, RTL8821CU_PIDS, Rtl8821cVariant, Rtl8821cuBackend,
+};
 mod mt7612;
-pub use mt7612::{MT7612U_PIDS, Mt7612uBackend};
+pub use mt7612::{MT7612U_PIDS, Mt7612uBackend, PLAN_MT7612U};
 // MT7610U (mt76x0u, 1x1 dual-band 802.11ac) — the sibling port. Shares `mt76x02_regs.h` with the
 // MT7612U above, so the two share `crate::mt76`'s register map, transport and knob layer; what
 // differs is the firmware (no ROM patch), the RF programming model (host-programmable via
 // MT_RF_CSR_CFG, MEASURED working over USB) and the 1x1 chain configuration.
 mod mt76x0;
-pub use mt76x0::{MT7610U_PIDS, Mt7610uBackend};
+pub use mt76x0::{MT7610U_PIDS, Mt7610uBackend, PLAN_MT7610U};
 /// Shared MediaTek **connac2** layer (MT7921/MT792x): a different architecture from `mt76`, not a
 /// newer revision of one — extended vendor requests, a composite BT+WLAN device, patch+RAM
 /// firmware, and a variable-length RX descriptor whose group 2 carries a per-frame hardware
@@ -75,9 +140,12 @@ pub mod connac2;
 // MT7921AU (connac2, 2x2 802.11ax) — the only Wi-Fi part in this crate that can actuate the HAL's
 // HE levers, and the only MediaTek one that can source common view.
 mod mt7921;
-pub use mt7921::{MT7921U_PIDS, Mt7921uBackend};
+pub use mt7921::{MT7921U_PIDS, Mt7921uBackend, PLAN_MT7921AU};
 mod rtl8812au;
-pub use rtl8812au::{ChipInfo, IqkResult, PhySense, RTL8812AU_PIDS, Rtl8812auBackend};
+pub use rtl8812au::{
+    ChipInfo, IqkResult, PLAN_8812AU_MONITOR, PhySense, RTL8812AU_PID, RTL8812AU_PIDS,
+    Rtl8812auBackend,
+};
 // RTL8731BU / RTL8733BU (halmac_87xx, 1x1 802.11n, dual-band, 20/40) — ground-up port, complete
 // against the HAL: power-on,
 // firmware download, MAC/BB/RF init, 1x1 calibration (IQK/TXGAPK/DPK), channel/power, RX capture and
@@ -85,8 +153,12 @@ pub use rtl8812au::{ChipInfo, IqkResult, PhySense, RTL8812AU_PIDS, Rtl8812auBack
 // implementation (both link clocks: free-run RX stamp + port TSF). Open it through `open_named_radio`.
 // REALTEK_VID is already re-exported above.
 mod libusb_rtl8733b;
+/// **The caller-boundary reader for the 8733b's `NDN_8733B_NO_TSSI`.** See
+/// [`a81a_env_deviation`].
+pub use libusb_rtl8733b::rtl8733b_env_deviation;
 pub use libusb_rtl8733b::{
-    ChipVersion, FW_NIC_8733B, FwHeader, PowerTracker, RTL8733B_PIDS, Rtl8733buBackend,
+    ChipVersion, FW_NIC_8733B, FwHeader, PLAN_8733B_MONITOR, PLAN_8733B_TX, PowerTracker,
+    RTL8733B_PIDS, Rtl8733buBackend,
 };
 
 // Serial-bridged 802.11 backend — a raw injector/capturer driven over USB-serial (the ND wire protocol),
@@ -96,8 +168,8 @@ pub use libusb_rtl8733b::{
 mod serial_radio;
 #[cfg(feature = "serial-radio")]
 pub use serial_radio::{
-    Bw16SerialBackend, ChannelProfile, Esp32SerialBackend, SERIAL_RADIO_BAUD, SerialRadioBackend,
-    bw16_clock_domain,
+    Bw16SerialBackend, ChannelProfile, Esp32SerialBackend, PLAN_SERIAL_BRIDGE, SERIAL_RADIO_BAUD,
+    SerialRadioBackend, bw16_clock_domain,
 };
 
 // The 7E-A5 serial sub-GHz fleet — Waveshare SX1262, Heltec SX1276, and the nRF54L15+LR2021 bridge —
@@ -114,7 +186,8 @@ mod lora_serial;
 #[cfg(feature = "lora")]
 pub use lora_serial::{
     HOP_LIST_MAX, LORA_BAUD, LoraParams, LoraRadioKind, LoraSerialBackend, MAX_LORA_PAYLOAD,
-    NdnStats, NodeProfile, PROTO_VER, RadioKindHint, StampKind, lora_clock_domain, name_hash,
+    NdnStats, NodeProfile, PLAN_LORA_NODE, PROTO_VER, RadioKindHint, StampKind, lora_clock_domain,
+    name_hash,
 };
 
 // Newracom NRC7292 (802.11ah/S1G) read-now clock. The AF_PACKET monitor backend surfaces this
@@ -151,6 +224,21 @@ pub mod nrc7292;
 // See src/halow.rs.
 pub mod halow;
 
+// The named airtime lease's bearer-side geometry: name -> owned slot -> absolute target instant,
+// sized to the MEASURED placement floor of this bearer (p99.9 = 896 us => 1 ms guard, 2 ms minimum
+// slot) and refusing any geometry that floor cannot hold. No association, no AP, no host identity,
+// no AID: the grant is computed from the name and a shared clock by everyone who holds the name.
+// It hashes with `ndn_frame_io::prefix_hash` — the control plane's canonical name key, moved down to
+// that crate so driver and decider share ONE implementation. See src/lease.rs.
+pub mod lease;
+
+/// **§1.1 + §1.7 of the bring-up contract: `BringUpRequest` and `open_radio` — the one door.**
+/// M8. See `src/open_radio.rs`; in particular its list of the behaviour changes a deployed node
+/// will see, which the contract's §5-M8 asked to be said out loud rather than discovered.
+pub mod open_radio;
+pub use lease::{GridError, LeaseGrid, MIN_GUARD_US, MIN_SLOT_US};
+pub use open_radio::{BringUpRequest, PartOpts, open_radio};
+
 /// The canonical named-data-over-802.11 EtherType — the LLC/SNAP protocol id every backend uses so a
 /// payload injected on one radio de-frames identically on any other. (Matches `FrameFormat::default()`.)
 pub const NDN_ETHERTYPE: u16 = 0x8624;
@@ -172,427 +260,40 @@ pub fn rx_raw_frames() -> u64 {
     RX_RAW_FRAMES.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// **The standardized way to open a named-data radio.** Dispatches by USB product id to the right
-/// chip-specific backend, runs *that* chip's own power-on / monitor / calibration sequence beneath, sets
-/// the **one canonical on-air format** (`RawNdn { ethertype: 0x8624 }`) so any two radios opened this way
-/// interoperate on air by construction, brings up monitor on `channel`, and starts the RX pump. Returns
-/// an [`ndn_radio_hal::FrameIo`] — the caller holds one uniform handle and never touches chip specifics
-/// (the leak that made "both implement FrameIo" not mean "they interoperate"). Broadcast rate is legacy
-/// 6 Mbps by default (universally decodable); override per-driver with `NDN_RADIO_TX_RATE`.
+/// **The `tracing::warn!` the bring-up contract requires (§2.5.3)** whenever the resolved power
+/// reference is the raw/chip-max axis, plus the INFO block every open prints.
 ///
-/// Chip family from the PID: the AR9271 set = **ath9k_htc** (via [`open_ath9k`]); `0xf72b`/`0xb733` =
-/// **RTL8731BU/8733BU** (halmac_87xx, 1×1); `0xa81a`/`0xa811`/`0x8814` = **RTL8822E** (chip 0x17, the
-/// 88xx backend); everything else in the 8812au PID set (`0x8812`/`0x881a`/…, chip 0x04) = **RTL8812AU**.
-/// (The 8812au and 8733bu backends open the first matching device; for several identical ones on a host
-/// the 8812au/88xx arms honour `NDN_USB_ADDR`/`NDN_USB_INDEX`, the 8733bu arm does not yet.)
-pub fn open_named_radio(pid: u16, channel: u8) -> Result<OpenRadio, FaceError> {
-    use std::sync::Arc;
-    let fmt = FrameFormat::RawNdn {
-        ethertype: NDN_ETHERTYPE,
-    };
-    // Which dongle to claim when several identical ones share the host — `NDN_USB_ADDR="<bus>-<port>"`
-    // (stable) or `NDN_USB_INDEX=<n>` (enumeration order). Both branches honour it, so a node with two
-    // `0bda:a81a` can pin the spare and leave the kernel mesh on the other (see the multi-radio note).
-    // AR9271 (ath9k_htc) — the one Wi-Fi part whose firmware is ours (M3 FrameIo). Its firmware is
-    // NOT embedded (it lives at `~/ath9k-fw/...` on the node), so `open_ath9k` is gated behind the
-    // `NDN_ATH9K_FW` env var pointing at `htc_9271-1.4.0.fw`. Keyed on the AR9271 PID set.
-    if AR9271_IDS.iter().any(|&(_, p)| p == pid) {
-        return open_ath9k(channel);
+/// The two lines are the whole point of M2: an operator reading a run's own output can now tell a
+/// calibrated transmitter from one running on the raw axis, which on 2026-09-03 took a day of
+/// bisection and a witness receiver.
+pub(crate) fn emit_bringup(report: &ndn_radio_hal::BringUpReport) {
+    if report.state.power.reference.is_off_scale() {
+        tracing::warn!(
+            target: "named_radio",
+            part = report.part,
+            device = %report.device,
+            plan_digest = format_args!("{:#018x}", report.plan_digest),
+            power = %report.state.power.render(),
+            "RF OFF THE REGULATORY SCALE — this radio is transmitting on the raw chip TXAGC axis \
+             (calibration bypassed); it may exceed licensed EIRP, and no measurement taken here is \
+             comparable with one taken on the calibrated scale"
+        );
     }
-    // RTL8731BU/8733BU (halmac_87xx, 1×1 802.11n) — the ground-up port. Its bring-up is the one that does
-    // NOT collapse into "monitor mode and you're done": `bring_up_monitor` gets RX + inject-to-MAC, but
-    // *radiating* additionally needs `enable_tx`'s full cal (IQK → TXGAPK → DPK, then the datapath TXAGC
-    // block the cal zeroes) plus a background power-tracking loop that trims the OFDM swing off the die
-    // thermal so output doesn't fade as the PA heats. `bring_up_tx_tracked` is that whole path, and its
-    // `PowerTracker` guard is leaked deliberately so tracking outlives this function — the same lifetime
-    // discipline `start_pump` uses for the RX pump.
-    //
-    // ⚠ RETRACTED: this used to warn that "only ~62% of cold bring-ups radiate" and treat that as
-    // per-boot analog variance in the silicon. It is not a property of this chip. MEASURED 2026-08-24
-    // on a healthy bus, scored against a real receiver (a81a, not an airtime proxy): **20/20 sequential
-    // bring-ups radiated**, 98.9% delivery (77080/77964 frames) at -71.4 dBm, zero USB re-enumerations,
-    // and no downward trend across the run. The old figure was produced while a failing AX88179
-    // USB-Ethernet NIC on the same host was resetting the whole USB tree, and while the harness issued
-    // a `usbreset` before every boot. Remove both and bring-up is reliable.
-    // `bring_up_tx_until` / `scripts/supervise_tx.sh` are kept as insurance, not as a required
-    // workaround. See [[rtl8733b-port]] and [[lab-node-inventory]].
-    if RTL8733B_PIDS.contains(&pid) {
-        // No `DeviceSelect` arm: `Rtl8733buBackend::open` claims the first match and has no
-        // `open_select` sibling. Fine while a host carries one f72b; a second would need it added.
-        let d = Arc::new(Rtl8733buBackend::open()?.with_format(fmt));
-        // `NDN_8733B_RX_ONLY=1` stops at monitor RX and skips the cal — a witness/receiver node
-        // doesn't need the TX path, and the cal is both the slow part and the variable part.
-        if std::env::var_os("NDN_8733B_RX_ONLY").is_some() {
-            d.bring_up_monitor(channel)?;
-        } else {
-            std::mem::forget(d.bring_up_tx_tracked(channel)?);
-        }
-        // Same `NDN_TX_PWR` contract as the other Realtek arms — here it is the per-rate TXAGC index.
-        if let Some(p) = std::env::var("NDN_TX_PWR")
-            .ok()
-            .and_then(|s| s.parse::<u32>().ok())
-        {
-            let _ = d.set_tx_power(p);
-        }
-        apply_bw_override(d.as_ref(), channel);
-        start_pump(&d);
-        return Ok(OpenRadio {
-            io: d.clone(),
-            knobs: Some(d.clone()),
-            time: Some(d.clone()),
-            profile: Some(d),
-        });
-    }
-    let sel = crate::DeviceSelect::from_env();
-    // MT7610U (mt76x0u, 1×1 dual-band 11ac). Unlike the MT7612U beside it, this port programs the
-    // RF itself — no captured channel replay — so `set_channel` reaches any channel the frequency
-    // plan covers, and the caller's `channel` is honoured rather than snapped to a captured one.
-    if MT7610U_PIDS.contains(&pid) {
-        let d = Arc::new(Mt7610uBackend::open_selected(sel.clone())?.with_format(fmt));
-        d.bring_up()?;
-        d.setup_monitor_rx()?;
-        // 2.4 GHz below 15, else 5 GHz; both are in this part's plan. A tune failure is fatal
-        // here on purpose: an untuned monitor receives nothing, and returning a working-looking
-        // handle that hears silence is the failure this repo keeps paying for.
-        ndn_radio_hal::RadioKnobs::set_channel(
-            d.as_ref(),
-            channel,
-            ndn_radio_hal::Bandwidth::Bw20,
-        )?;
-        apply_bw_override(d.as_ref(), channel);
-        // ★★ Pipelined TX — the difference between this radio's benchmark and its real traffic.
-        //
-        // MEASURED 2026-08-31: `inject`'s synchronous `write_bulk` costs `≈295 + 0.031·B µs` per
-        // PPDU — a width-INDEPENDENT constant plus USB bus time — capping the part near
-        // 3000 PPDU/s and pinning every channel width to the same period. Frames confirmed on air
-        // by a witness reading MCS 9 / 80 MHz on 100% of them; the pumped period tracks airtime
-        // per width (294/194/142 µs at 20/40/80), which no host-side artifact could do.
-        //
-        // Worth in context (posture PINNED, 3 reps): ~+24% at 1400 B under `Shared`, within noise
-        // at 11400 B under `Shared` (there the medium binds, not USB), and the full lever under an
-        // aggressive posture — peak ~250 Mbit/s at `Owned` + 11400 B + Bw80 + VHT MCS9. Kept on by
-        // default because it costs nothing when the medium is the limit and is worth 2x when USB
-        // is.
-        //
-        // This is spawned HERE, in the factory, and not only in the flood example, because that
-        // asymmetry is this repo's characteristic defect: a lever that is measured, documented and
-        // reaches no actuator. Before this line the benchmark had the fix and production did not.
-        // `NDN_TX_PUMP=0` restores the synchronous path for an A/B.
-        //
-        // ⚠ Frames may be reordered across pump threads. That is acceptable for connectionless
-        // NDN broadcast (and the MT7612U's pump already made the same trade), but it is the reason
-        // the knob exists rather than being unconditional.
-        let tx_depth = std::env::var("NDN_TX_PUMP")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(8);
-        if tx_depth > 0 {
-            std::mem::forget(d.spawn_tx_pump(tx_depth));
-        }
-        start_pump(&d);
-        return Ok(OpenRadio {
-            io: d.clone(),
-            knobs: Some(d.clone()),
-            time: Some(d.clone()),
-            profile: Some(d),
-        });
-    }
-    // MT7921AU (connac2, 2x2 802.11ax). The only radio this opener returns that can source
-    // common view from a per-frame hardware RX stamp *and* actuate the HAL's HE levers.
-    if MT7921U_PIDS.contains(&pid) {
-        let d = Arc::new(Mt7921uBackend::open_selected(sel.clone())?.with_format(fmt));
-        d.bring_up()?;
-        // ★ ORDER IS LOAD-BEARING, and this arm had it backwards (fixed 2026-09-01).
-        // `setup_monitor_rx` refuses outright while the channel is still 0 — "the sniffer carries
-        // its own copy of the channel and has nothing to be told" (mt7921/mod.rs:1245-1250) — so
-        // this arm returned an error for EVERY caller and `open_named_radio` was simply broken for
-        // the MT7921AU. Found by trying to use the factory on the part rather than by reading it:
-        // the other five arms tune first, and this one drifted. That is the cost of five
-        // hand-written bring-up sequences with no shared checklist.
-        ndn_radio_hal::RadioKnobs::set_channel(
-            d.as_ref(),
-            channel,
-            ndn_radio_hal::Bandwidth::Bw20,
-        )?;
-        d.setup_monitor_rx()?;
-        apply_bw_override(d.as_ref(), channel);
-        start_pump(&d);
-        return Ok(OpenRadio {
-            io: d.clone(),
-            knobs: Some(d.clone()),
-            time: Some(d.clone()),
-            profile: Some(d),
-        });
-    }
-    let radio: Arc<dyn FrameIo> = if matches!(pid, 0xa81a | 0xa811 | 0x8814) {
-        // RTL8822E: `open_monitor_pid_select` claims the selected device + BB/RF-inits + monitors +
-        // channel in one call, and its default format is already the canonical RawNdn(0x8624).
-        let d = Arc::new(LibUsbRtl88xxBackend::open_monitor_pid_select(
-            pid, &sel, channel,
-        )?);
-        // `NDN_TX_PWR=<idx>` lowers this radio's TX power (e.g. to dial an RX peer out of front-end
-        // overload for a clean-RSSI measurement); the 88xx set_tx_power is a per-rate TXAGC index.
-        if let Some(p) = std::env::var("NDN_TX_PWR")
-            .ok()
-            .and_then(|s| s.parse::<u32>().ok())
-        {
-            let _ = d.set_tx_power(p);
-        }
-        apply_bw_override(d.as_ref(), channel);
-        start_pump(&d); // async (NDN_ASYNC_PUMP) or sync pump, lives for the process
-        return Ok(OpenRadio {
-            io: d.clone(),
-            knobs: Some(d.clone()),
-            time: Some(d.clone()),
-            profile: Some(d),
-        });
-    } else {
-        // Dispatch by PID, don't silently fall through: an unknown/unsupported pid (e.g. an
-        // MT7612U's 0x7612) must NOT open the first 8812au on the bus. Only pids in the 8812au set
-        // reach this branch; anything else is a caller error, named as such. (mt7612 has no arm here
-        // on purpose — it's ch6-only and needs separate design; #110.)
-        if !RTL8812AU_PIDS.contains(&pid) {
-            return Err(FaceError::Io(std::io::Error::other(format!(
-                "open_named_radio: pid 0x{pid:04x} is not a dispatchable radio \
-                 (supported: 8822E 0xa81a/0xa811/0x8814, 8812AU {RTL8812AU_PIDS:#06x?})"
-            ))));
-        }
-        // RTL8812AU: force the canonical format (its own default is Raw80211 for the NAN path), then
-        // bring up monitor (MAC/BB/RF + IQK/LCK) on the channel. `sel` (NDN_USB_ADDR / NDN_USB_INDEX)
-        // selects which adapter when several identical 8812au dongles share the host.
-        let d = Arc::new(Rtl8812auBackend::open_select(&sel)?.with_format(fmt));
-        d.bring_up_monitor(channel)?;
-        // `NDN_NO_PUMP=1` skips the RX pump — a pure TX-blast node needs no RX, and the pump's bulk-IN
-        // threads otherwise contend with inject for USB bandwidth on a busy channel (measured: an 8812au
-        // TX collapses to ~250 f/s under heavy RX while the pump drains thousands of frames/s).
-        // ★ The power knob must be applied BEFORE the no-pump early return (moved 2026-09-01).
-        // `NDN_TX_PWR` exists for the USB brownout: a full-power 2-chain TX can brown the PA out so
-        // the FIFO never drains. It was read *after* the `NDN_NO_PUMP` return below — so on the one
-        // path built for a pure TX-blast node, the mitigation for a TX-induced fault was
-        // unreachable. Same shape as the other bugs this audit found: the step exists, the path
-        // that needs it does not reach it.
-        if let Some(p) = std::env::var("NDN_TX_PWR")
-            .ok()
-            .and_then(|s| s.parse::<u8>().ok())
-        {
-            let _ = d.set_tx_power(p.min(63));
-        }
-        if std::env::var_os("NDN_NO_PUMP").is_some() {
-            if std::env::var_os("NDN_CCA_OFF").is_some() {
-                let _ = d.set_cca_ignore(true);
-            }
-            // Same full handle on the no-pump path — a TX-only node still has knobs, a clock and a
-            // profile, and the earlier code silently returned a bare FrameIo here too.
-            return Ok(OpenRadio {
-                io: d.clone(),
-                knobs: Some(d.clone()),
-                time: Some(d.clone()),
-                profile: Some(d),
-            });
-        }
-        // `NDN_CCA_OFF=1` forces full carrier-sense off (EDCCA + OFDM packet CCA) so this radio blasts
-        // regardless of a busy medium — the doctrine's monitor-mode-without-CSMA sender for the token
-        // test, where the slot (not CSMA) is the only collision-avoidance.
-        if std::env::var_os("NDN_CCA_OFF").is_some() {
-            let _ = d.set_cca_ignore(true);
-        }
-        start_pump(&d);
-        return Ok(OpenRadio {
-            io: d.clone(),
-            knobs: Some(d.clone()),
-            time: Some(d.clone()),
-            profile: Some(d),
-        });
-    };
-}
-
-/// 2.4 GHz Wi-Fi channel number → centre frequency (MHz). Ch14 is the 2484 special case; the rest
-/// are `2407 + 5·ch` (ch1 = 2412, ch6 = 2437, ch11 = 2462).
-fn ath9k_channel_to_mhz(ch: u8) -> u16 {
-    if ch == 14 {
-        2484
-    } else {
-        2407 + 5 * (ch as u16)
-    }
-}
-
-/// Open the AR9271 as a full [`OpenRadio`] (M3): download firmware, HTC/WMI handshake, the faithful
-/// `ath9k_hw_reset` PHY/MAC bring-up on `channel`, connect the data services, start receive, and
-/// start the RX pump. Returns the backend cloned into `io` / `time` / `profile`.
-///
-/// **Firmware is not embedded.** The AR9271 image lives on the node at `~/ath9k-fw/...`, so this is
-/// gated behind `NDN_ATH9K_FW=<path to htc_9271-1.4.0.fw>`. Without it, this errors with that
-/// instruction rather than half-wiring the dispatch.
-///
-/// `knobs = Some` (M3): the AR9271 impls `RadioKnobs`, so cognition binds it as an actuator. Only
-/// `set_channel` is wired (validates a same-channel apply; a live retune is still `hw_reset(&mut self)`
-/// — re-open to change channel); power/EDCCA/occupancy keep the trait defaults pending the `&self` WMI
-/// path. TX (`FrameIo::inject`) is on-air proven (needs `WMI_TARGET_IC_UPDATE` + queue-1 TXOK, both in
-/// `wmi_start`); RX + the RX-stamp common-view clock are the proven halves.
-pub fn open_ath9k(channel: u8) -> Result<OpenRadio, FaceError> {
-    use std::sync::Arc;
-    let fw_path = std::env::var("NDN_ATH9K_FW").map_err(|_| {
-        FaceError::Io(std::io::Error::other(
-            "open_ath9k: set NDN_ATH9K_FW=<path to htc_9271-1.4.0.fw> — the AR9271 firmware is not \
-             embedded (it lives at ~/ath9k-fw/target_firmware/build/k2/htc_9271.fw on the node)",
-        ))
-    })?;
-    let fw = std::fs::read(&fw_path).map_err(|e| {
-        FaceError::Io(std::io::Error::other(format!(
-            "open_ath9k: cannot read firmware {fw_path}: {e}"
-        )))
-    })?;
-    let chan_mhz = ath9k_channel_to_mhz(channel);
-
-    let mut dev = Ath9kHtcBackend::open()?;
-    dev.download_firmware(&fw)?;
-    dev.htc_init()?;
-    // ★ TX-POWER FIX: read the EEPROM `txGainType` BEFORE hw_reset so `apply_initvals` streams the right
-    // gain table. A high-power module (txGainType==1) on the NORMAL table radiates ~50 dB low; the HIGH
-    // table + the full board/OLPC cal (applied after wmi_start) = a normal ~+12 dBm link (MEASURED: max
-    // −18 dBm at 1 ft, 4500× the frames). `NDN_ATH9K_HIGHPWR` forces high; `NDN_ATH9K_NORMPWR` forces
-    // normal (skips the fix). The reg path is up after htc_init (hw_reset itself uses it).
-    let high_power = std::env::var_os("NDN_ATH9K_HIGHPWR").is_some()
-        || (std::env::var_os("NDN_ATH9K_NORMPWR").is_none() && dev.eeprom_tx_gain_type() == 1);
-    dev.set_high_power(high_power);
-    // Faithful ath9k_hw_reset (reset + initvals + cal) on the requested channel, then the post-reset
-    // RX-start steps, matching `ath9k_htc_start`'s order. `NDN_ATH9K_HT40=1` brings the PHY up at
-    // 40 MHz (HT40+) — EXPERIMENTAL, cal convergence unverified on this HT20-class part.
-    if std::env::var_os("NDN_ATH9K_HT40").is_some() {
-        dev.hw_reset_ht40(chan_mhz)?;
-    } else {
-        dev.hw_reset(chan_mhz)?;
-    }
-    dev.connect_data_services()?;
-    // Disable the NDR Tier-0 name filter so broadcast/ambient frames aren't dropped in firmware
-    // before the USB handoff (the proven RX path in `examples/ath9k_hw_reset.rs` does this). Best
-    // effort: on a build where the symbol has moved the write is harmless (the filter defaults off).
-    let _ = dev.write_target_u32s(0x0050_cf44, &[0]);
-    // Order is load-bearing (proven in `examples/ath9k_hw_reset.rs`): the target's `WMI_START_RECV`
-    // (inside `wmi_start`) programs `AR_RXDP` — the RX descriptor ring — so the host RX-DMA enable
-    // (`AR_CR_RXE` in `start_receive`) must come AFTER it, or it latches a stale/zero pointer and the
-    // ring never advances (seen=0). `wmi_start` also sends `WMI_TARGET_IC_UPDATE` + arms queue-1 TXOK,
-    // both required for the injected-TX path to actually radiate and sustain.
-    dev.wmi_start()?;
-    dev.start_receive()?;
-    // Record the channel the PHY came up on so `RadioKnobs::set_channel` can validate cognition's
-    // fixed-channel applies (a live retune is `hw_reset(&mut self)`, not yet on the `&self` path).
-    dev.note_channel(channel);
-    // `NDN_ATH9K_SETPOWER=1`: apply the OLPC power cal (`set_txpower_4k` — PDADC target→gain map +
-    // per-rate target power from the EEPROM). hw_reset skips the EEPROM cal, leaving the PA on the
-    // initval-default gain; this programs the real target. Opt-in (still proving its on-air effect via
-    // the two-radio link RSSI); a bad EEPROM read is non-fatal (leaves the default).
-    // ★ Apply the full board + OLPC power cal — the AR9271 TX-power fix. `set_board_values` (antCtrl RF
-    // switch + XPA external-PA enable + ob/db bias) and `set_txpower_4k` (PDADC target→gain map +
-    // per-rate power) compose with the HIGH gain table to give a normal ~+12 dBm link. Default-ON for a
-    // high-power module (where it's the fix); `NDN_ATH9K_NORMPWR` / `NDN_ATH9K_NO_CAL` skip it.
-    if (high_power || std::env::var_os("NDN_ATH9K_SETBOARD").is_some())
-        && std::env::var_os("NDN_ATH9K_NO_CAL").is_none()
-    {
-        match dev.set_board_values() {
-            Ok(bv) => eprintln!(
-                "open_ath9k: board cal applied (txGainType={} ob={:?})",
-                bv.tx_gain_type, bv.ob
-            ),
-            Err(e) => eprintln!("open_ath9k: board cal skipped: {e}"),
-        }
-        match dev.set_txpower_4k(chan_mhz) {
-            Ok(peak) => {
-                eprintln!("open_ath9k: power cal applied (peak target {peak} dBm)");
-                // ★ Remember it. A later HT20<->HT40 change re-streams the gain tables and wipes
-                // this cal; `reapply_power_state` needs to know whether to put it back, or whether
-                // this dongle deliberately came up on the initval defaults. The peak itself is the
-                // only per-chip absolute anchor the EEPROM gives us and used to be printed and
-                // discarded.
-                dev.note_cal_applied(peak);
-            }
-            Err(e) => eprintln!("open_ath9k: power cal skipped: {e}"),
-        }
-    }
-
-    let dev = Arc::new(dev);
-    // RX delivery: default to the on-demand path (`FrameIo::recv_frame` does a single blocking
-    // bulk-IN read when no pump is marked) — proven to read 802.11 on this HTC pipe (the M2 oracle:
-    // `ndr_stats.seen` climbing, dozens of frames/s). `NDN_ATH9K_PUMP=1` opts into the concurrent
-    // submit-ahead pump for higher throughput; it uses the same `parse_transfer` and is the standard
-    // Realtek path, but the 8-reader HTC bulk-IN pattern isn't yet load-tested here, so it stays
-    // opt-in. Either path surfaces only NDN frames (`parse_dot11` filters to ethertype 0x8624), so a
-    // channel with only ambient Wi-Fi yields no `recv_frame` output by design — that is correct, not
-    // a fault; RX-of-NDN needs an on-channel NDN sender to observe.
-    if std::env::var_os("NDN_ATH9K_PUMP").is_some() {
-        start_pump(&dev); // async (NDN_ASYNC_PUMP) or sync pump, lives for the process
-    }
-    Ok(OpenRadio {
-        io: dev.clone(),
-        // `knobs` is now populated (M3): the AR9271 impls `RadioKnobs` (`set_channel` wired; power /
-        // EDCCA / occupancy keep the trait defaults pending the `&self` WMI-register path). This is
-        // what lets `RadioControl::libusb_actuator` bind it and cognition drive it like the 8812au.
-        knobs: Some(dev.clone()),
-        time: Some(dev.clone()),
-        profile: Some(dev),
-    })
-}
-
-/// `NDN_RADIO_BW` — bring a radio up at a non-default channel width: `5` / `10` (narrowband),
-/// `20` (default), `40`. Applied through `RadioKnobs::set_channel` after the chip's own bring-up,
-/// which is the ordering the narrowband path requires: on the 8733b the 5/10 MHz BB registers must
-/// be written AFTER the RF registers or, in the vendor's words, the MAC rate is right but nothing
-/// comes out of the RF.
-///
-/// Narrowband trades rate for link budget — a quarter-clocked 5 MHz channel puts the same energy in
-/// a quarter of the bandwidth, so the noise floor drops ~6 dB. Both the RTL8733BU and the
-/// RTL8812EU/8822E implement it; the 8812au path does not, and an unsupported width surfaces as the
-/// backend's own error rather than being silently ignored.
-fn apply_bw_override(knobs: &dyn RadioKnobs, channel: u8) {
-    use ndn_radio_hal::Bandwidth;
-    let Some(v) = std::env::var("NDN_RADIO_BW").ok() else {
-        return;
-    };
-    let bw = match v.trim() {
-        "5" => Bandwidth::Nb5,
-        "10" => Bandwidth::Nb10,
-        "20" => Bandwidth::Bw20,
-        "40" => Bandwidth::Bw40,
-        // ★ 80 was missing entirely, so no caller could ask for it even on a part that supports
-        // it. MEASURED on the MT7610U 2026-08-31: Bw80 is real on air (witness radiotap) and worth
-        // +84% at 7000 B over Bw20. A radio refusing a width it can actuate is the same
-        // declaration/actuator gap as declaring a width it cannot.
-        "80" => Bandwidth::Bw80,
-        other => {
-            tracing::warn!("NDN_RADIO_BW={other}: expected 5|10|20|40|80, ignoring");
-            return;
-        }
-    };
-    // `eprintln!`, NOT `tracing`: an operator running a bring-up binary that never installs a
-    // subscriber would see NOTHING — and this message exists precisely to stop a narrowband run
-    // from silently measuring 20 MHz twice. (Learned the hard way on 2026-08-24: the first attempt
-    // at this experiment ran both arms at 20 MHz because the override was not deployed, and the
-    // tracing-based confirmation could not have reported that either way.)
-    match knobs.set_channel(channel, bw) {
-        Ok(()) => eprintln!("NDN_RADIO_BW: channel {channel} set to {bw:?}"),
-        Err(e) => eprintln!("NDN_RADIO_BW={v} NOT APPLIED: {e}"),
-    }
-}
-
-/// RX-pump reader-thread / transfer-pool count. Default 8; `NDN_RX_PUMP_DEPTH` overrides.
-fn pump_depth() -> usize {
-    std::env::var("NDN_RX_PUMP_DEPTH")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .filter(|&n| n > 0)
-        .unwrap_or(8)
-}
-
-/// Start the RX pump for a backend. `NDN_ASYNC_PUMP=1` uses the libusb async submit-ahead pump (keeps
-/// the transfer pool continuously in flight — matches the kernel driver's throughput, ~2× the sync
-/// pump on the 8812au); default is the synchronous read_bulk pump. The pump lives for the process.
-fn start_pump<B: rx_pump::Pumpable>(backend: &std::sync::Arc<B>) {
-    let depth = pump_depth();
-    if std::env::var_os("NDN_ASYNC_PUMP").is_some() {
-        std::mem::forget(rx_pump::spawn_rx_pump_async(backend, depth));
-    } else {
-        std::mem::forget(rx_pump::spawn_rx_pump(backend, depth));
-    }
+    // Also `emit()` — the HAL's own off-scale stderr line. It duplicates the warn above ONLY in
+    // the dangerous case, and deliberately: a bench run started without a `tracing` subscriber
+    // would otherwise see nothing at all about a transmitter that is off the regulatory
+    // scale.
+    report.emit();
+    tracing::info!(
+        target: "named_radio",
+        part = report.part,
+        plan = %report.plan,
+        plan_digest = format_args!("{:#018x}", report.plan_digest),
+        power_reference = report.state.power.reference.tag(),
+        channel = report.state.channel,
+        "\n{}",
+        report.render()
+    );
 }
 
 // The control-plane `RadioKnobs` impls for the driver backends. These live with
@@ -667,8 +368,11 @@ mod radio_knobs {
             };
             crate::LibUsbRtl88xxBackend::set_channel(self, channel, cbw)
         }
-        fn set_tx_power(&self, idx: u32) -> Result<(), FaceError> {
-            crate::LibUsbRtl88xxBackend::set_tx_power(self, idx)
+        fn set_tx_power(
+            &self,
+            req: ndn_radio_hal::PowerRequest,
+        ) -> Result<ndn_radio_hal::AppliedPower, FaceError> {
+            crate::LibUsbRtl88xxBackend::set_tx_power(self, req)
         }
         fn set_tx_csd(&self, on: bool) -> Result<(), FaceError> {
             crate::LibUsbRtl88xxBackend::set_tx_csd(self, on)
@@ -877,11 +581,15 @@ mod radio_knobs {
                 ))))
             }
         }
-        fn set_tx_power(&self, idx: u32) -> Result<(), FaceError> {
-            // Per-rate TXAGC index (0.5 dB/step) — the devourer jaguar1 power knob,
-            // validated monotone on air (#38). This is the actuator behind the
-            // cognition policy's reciprocity `decide_power` backoff.
-            crate::Rtl8812auBackend::set_tx_power(self, idx.min(63) as u8)
+        /// Per-rate TXAGC index — the devourer jaguar1 power knob, validated monotone on air
+        /// (#38). This is the actuator behind the cognition policy's reciprocity `decide_power`
+        /// backoff, and the one whose two meanings the bring-up contract exists to separate: see
+        /// [`Rtl8812auBackend::set_tx_power`](crate::Rtl8812auBackend::set_tx_power).
+        fn set_tx_power(
+            &self,
+            req: ndn_radio_hal::PowerRequest,
+        ) -> Result<ndn_radio_hal::AppliedPower, FaceError> {
+            crate::Rtl8812auBackend::set_tx_power(self, req)
         }
         /// ★ **Hold or release transmissions at the MAC** — the hardware half of a slot MAC.
         ///

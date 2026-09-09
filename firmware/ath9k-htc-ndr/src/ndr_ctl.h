@@ -3,7 +3,7 @@
  *
  * ## Why this exists
  *
- * Every experiment so far cost a firmware rebuild, because the two ways to reach `ndr_cfg` are
+ * Every experiment so far cost a firmware rebuild, because the two ways to reach the lease/quiet config are
  * mutually exclusive: `ath9k_htc` must own the device to bring the PHY up, and our userspace WMI
  * driver must own the device to reach target memory. So the radio can be *configured* or it can be
  * *receiving*, never both.
@@ -30,7 +30,7 @@
 #ifndef _NDR_CTL_H_
 #define _NDR_CTL_H_
 
-#include "ndr_tier0.h"
+#include <adf_os_types.h> /* adf typedefs (a_uint8_t, a_uint32_t, a_int32_t) - was via ndr_tier0.h */
 
 /* Reserved control address: locally-administered group, "NDRCT". */
 #define NDR_CTL_A0 0x03
@@ -45,14 +45,13 @@
 /* Body offset of the control header: past the 24-byte 802.11 MAC header. */
 #define NDR_CTL_BODY 24
 
+/*
+ * Op codes 0x01..0x06 were the retired in-frame name filter (enable / drop-foreign / key / masks /
+ * clear-stats); they are gone with the filter (see firmware/NDR_MAC_SPEC.md). The values are kept
+ * reserved so a stale host tool cannot alias them onto the lease ops.
+ */
 enum {
 	NDR_OP_NOP        = 0x00,
-	NDR_OP_ENABLE     = 0x01, /* u8 enabled */
-	NDR_OP_DROP_FOREIGN = 0x02, /* u8 */
-	NDR_OP_KEY        = 0x03, /* 16-byte group key */
-	NDR_OP_NMASKS     = 0x04, /* u8 count */
-	NDR_OP_MASK       = 0x05, /* u8 index, then 12 mask bytes */
-	NDR_OP_CLEAR_STATS = 0x06,
 	NDR_OP_LEASE      = 0x07, /* u8 slots_log2, u8 slot_tu, u8 slot -- re-arms the schedule */
 	NDR_OP_QUIET_OFF  = 0x08, /* disarm the quiet schedule entirely */
 };

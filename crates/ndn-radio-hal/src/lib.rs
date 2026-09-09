@@ -17,10 +17,31 @@ use bytes::Bytes;
 /// on `ndn-transport` directly.
 pub use ndn_transport::{FaceError, FaceId};
 
+/// **The bring-up contract** (`ndn-radio-drivers/docs/bringup-contract.md`): the power vocabulary
+/// ([`PowerRequest`] in, [`AppliedPower`] out, [`PowerReference`] saying what the number is
+/// referenced to) and the [`BringUpReport`] every `bring_up_*` now returns.
+///
+/// It lives in the HAL for the same reason [`OpenRadio`] does: a driver *constructs* a report, a
+/// face and a bench harness *consume* one, and neither should need the other to name the types.
+pub mod bringup;
+
+pub use bringup::{
+    AppliedPower, Assert, BringUp, BringUpFailure, BringUpReport, Ctx, Degradation, Deviation,
+    DeviationOp, DeviceAddress, Difference, Fact, Guards, Plan, PlanEdit, PlanEdits, PlanError,
+    PlanId, PlanRun, PowerReference, PowerRequest, PowerWrite, ProofRequirement, Provenance,
+    PumpPolicy, RadioState, RateGroupPolicy, RateState, RequestError, RfAuthority, Role, Severity,
+    Stage, Step, StepClass, StepId, StepOutcome, StepOutcomeRecord, StepRecord, TX_PROBE_COUNT,
+    TxInstrument, TxProbe, TxProof, Warning, WitnessId, WitnessOracle, WitnessReport,
+    power_unsupported, run_plan,
+};
+
 /// Re-exported link-timestamp vocabulary (from the named-time core). A backend
 /// stamps a [`CapturedFrame`] with a [`LinkStamp`] carrying its clock domain and
 /// honest precision; the generic time layer consumes it. See ADR 0007.
-pub use ndn_time::{ClockDomainId, LatchPoint, LinkStamp, RadioClockKind, RadioTimeSource};
+pub use ndn_time::{
+    ClockDomainId, ClockReference, ClockReferenceKind, LatchPoint, LinkStamp, RadioClockKind,
+    RadioTimeSource, RateMeasurement, RateWitness,
+};
 
 /// The 802.11 broadcast address — the default destination when no name-group is
 /// configured (every monitor receiver keeps the frame).
@@ -415,6 +436,100 @@ pub fn mcs_phy_rate_bps(mcs_index: u8) -> u32 {
     }
 }
 
+/// PHY data rate (bits/s) of an **802.11ah (S1G / HaLow)** MCS at a given channel width — the
+/// sub-GHz counterpart of [`mcs_phy_rate_bps`], which is the 11n 20 MHz table and is wrong here by
+/// roughly 5–30×.
+///
+/// `bw_mhz` is the received/transmitted width (1/2/4/8/16) as the S1G radiotap TLV reports it
+/// (`ndn_frame_io::radiotap::S1gInfo::bandwidth_mhz`); `short_gi` selects the 4 µs guard interval
+/// over the 8 µs one. Returns `None` for a combination S1G does not define — **MCS 9 at 1 MHz *and*
+/// at 2 MHz**, and **MCS 10 at anything other than 1 MHz** — because a rate that does not exist must
+/// not be answered with a number. The 2 MHz exclusion is *derived* from the rate equation (a
+/// fractional bits-per-symbol result is the standard's own reason for the hole); the 1 MHz one has
+/// to be named, because it divides evenly. Both are pinned by an exhaustive test.
+///
+/// # How this is derived, so it can be audited rather than trusted
+///
+/// S1G is 802.11ac downclocked by 10, so nothing here is a memorised table: it is computed from
+/// the same three quantities the OFDM rate equation always uses.
+///
+/// ```text
+///   rate = N_sd × N_bpscs × R / T_sym
+///
+///   N_sd    data subcarriers:  24 (1 MHz), 52 (2), 108 (4), 234 (8), 468 (16)
+///   N_bpscs bits per subcarrier per stream: 1 (BPSK) 2 (QPSK) 4 (16-QAM) 6 (64-QAM) 8 (256-QAM)
+///   R       coding rate: 1/2, 2/3, 3/4, 5/6
+///   T_sym   40 µs long GI / 36 µs short GI  (802.11ac's 4 µs/3.6 µs × 10)
+/// ```
+///
+/// Cross-check: 2 MHz MCS0 long GI = 52 × 1 × 1/2 ÷ 40 µs = **650 kbit/s**, which is 802.11ac's
+/// 20 MHz MCS0 (6.5 Mbit/s) divided by 10 — the downclocking relationship, recovered rather than
+/// assumed. Single spatial stream only (`N_ss = 1`); both HaLow parts in this rig are 1×1.
+///
+/// ★ **MCS10 is below MCS0, not above MCS9.** It is 1 MHz-only BPSK 1/2 with **2× repetition**, so
+/// it is half of MCS0 — the reach rate. Any code that treats the S1G MCS index as a monotone
+/// ladder (as `mcs_for_rssi` does for 11n) is wrong at its top end; that is why
+/// `RadioCapability::rate.max_mcs` must be 7 for these radios and MCS10 reached by name.
+///
+/// ⚠ **UNVERIFIED on hardware.** These are the standard's own numbers as derived above; nothing in
+/// this rig has metered an S1G link against them. What *is* measured is the ordering they imply —
+/// on the MM6108, walking injected MCS 0 → 7 took delivered throughput 2.15 → 7.06 Mbit/s.
+pub fn s1g_phy_rate_bps(mcs: u8, bw_mhz: u8, short_gi: bool) -> Option<u32> {
+    // (data subcarriers) per channel width.
+    let n_sd: u32 = match bw_mhz {
+        1 => 24,
+        2 => 52,
+        4 => 108,
+        8 => 234,
+        16 => 468,
+        _ => return None,
+    };
+    // (bits per subcarrier, coding numerator, coding denominator) per MCS.
+    let (bpscs, num, den): (u32, u32, u32) = match mcs {
+        0 => (1, 1, 2),  // BPSK   1/2
+        1 => (2, 1, 2),  // QPSK   1/2
+        2 => (2, 3, 4),  // QPSK   3/4
+        3 => (4, 1, 2),  // 16-QAM 1/2
+        4 => (4, 3, 4),  // 16-QAM 3/4
+        5 => (6, 2, 3),  // 64-QAM 2/3
+        6 => (6, 3, 4),  // 64-QAM 3/4
+        7 => (6, 5, 6),  // 64-QAM 5/6
+        8 => (8, 3, 4),  // 256-QAM 3/4
+        9 => (8, 5, 6),  // 256-QAM 5/6
+        10 => (1, 1, 2), // BPSK 1/2 with 2x repetition — handled below
+        _ => return None,
+    };
+    // The two NAMED holes, which must stay named — neither is recoverable from arithmetic.
+    // MCS9 is undefined at 1 MHz for Nss=1; MCS10 exists only at 1 MHz.
+    if (mcs == 9 && bw_mhz == 1) || (mcs == 10 && bw_mhz != 1) {
+        return None;
+    }
+    // ★ ...and one hole that IS derivable, which the named list had missed. If
+    // `n_sd * bpscs * num` does not divide by `den` the mode yields a fractional number of coded
+    // bits per OFDM symbol, which is the standard's own reason for excluding it — so a
+    // non-integer result means "undefined", not "round it".
+    //
+    // ⚠ The case this exists for: **MCS9 at 2 MHz**. S1G MCS9 is 11ac 20 MHz MCS9 downclocked, and
+    // 11ac excludes MCS9 at 20 MHz for Nss=1 *and* Nss=2 — at S1G, 1 MHz and 2 MHz. Only the 1 MHz
+    // half was written down, so `s1g_phy_rate_bps(9, 2, false)` computed 52*8*5/6 = 346 (truncated
+    // from 346.67) and returned a confident 8.65 Mbit/s for a mode no radio can transmit.
+    //
+    // Note the asymmetry, because it is why the named list cannot be deleted: 1 MHz MCS9 is
+    // 24*8*5/6 = 160 exactly, so divisibility does NOT catch it. The two rules are complementary,
+    // not redundant, and `the_derived_holes_are_exactly_the_standards_holes` pins the union.
+    let prod = u64::from(n_sd) * u64::from(bpscs) * u64::from(num);
+    let den = u64::from(den);
+    if prod % den != 0 {
+        return None;
+    }
+    // Symbol time in nanoseconds: 802.11ac's 4 µs / 3.6 µs downclocked by 10.
+    let t_sym_ns: u64 = if short_gi { 36_000 } else { 40_000 };
+    let bits_per_symbol = prod / den;
+    // MCS10 repeats each symbol twice, halving the rate.
+    let reps: u64 = if mcs == 10 { 2 } else { 1 };
+    Some((bits_per_symbol * 1_000_000_000 / (t_sym_ns * reps)) as u32)
+}
+
 /// One frame as injected: the (LP-framed) NDN payload, the PHY rate, and the
 /// 802.11 address fields. Under the Tier-0 layout `dst`/`src` are the two halves of the
 /// name's prefix-set filter (`addr1 ‖ addr2`) and `addr3` the ephemeral nonce; otherwise
@@ -436,14 +551,21 @@ pub struct InjectFrame {
     /// filter (which consumes the source field), preserving per-transmitter RSSI keying
     /// (mac-addressing-doctrine §2). Never a host MAC.
     pub addr3: Option<[u8; 6]>,
-    /// **Wide-profile `addr4`** (802.11 4-address layout): the additive *extra* Blur
-    /// projection (48 bits) that layers on top of the base 126-bit filter in `dst‖src‖addr3[0:4]`.
-    /// `None` ⇒ the base 3-address frame every bearer shares. Only the `RawNdn` arm of
-    /// `build_dot11` consumes it; setting it flips the frame to ToDS=FromDS=1 QoS-Data+HTC.
-    pub addr4: Option<[u8; 6]>,
-    /// **Wide-profile HT Control** (4 bytes): the exact-match fingerprint (24 bits, little-endian)
-    /// plus the wide-profile marker byte. Rides the +HTC/Order bit. `None` ⇒ base layout. Set
-    /// together with [`addr4`](Self::addr4) — the two are the wide profile's pushed-header fields.
+    /// **The extra Blur region** (64 bits): the additive second projection that layers on top of the
+    /// base 126-bit filter in `dst‖src‖addr3[0:4]`, giving the 190-bit Wi-Fi filter.
+    ///
+    /// ★ It is `extra`, not `addr4`, **on purpose**: there is exactly ONE wire mapping
+    /// (`extra[0..6] → addr4`, `extra[6..8] → QoS Control`) and it lives in
+    /// `ndn_frame_io::frame::build_dot11`. Naming the seam after a header field is what let two
+    /// backends grow their own 3-address builder and silently drop the region; naming it after the
+    /// *filter* means a backend cannot map it without going through the one builder.
+    ///
+    /// `None` ⇒ the base 3-address frame every bearer shares. Only the `RawNdn` arm of `build_dot11`
+    /// consumes it; setting it flips the frame to ToDS=FromDS=1 QoS-Data+HTC.
+    pub extra: Option<[u8; 8]>,
+    /// **HT Control** (4 bytes): the exact-match fingerprint (24 bits, little-endian) plus the
+    /// extra-region bitmap byte (`tier0::WIDE_PROFILE_MARKER`). Rides the +HTC/Order bit. `None` ⇒
+    /// base layout. Set together with [`extra`](Self::extra) — the two are the pushed-header fields.
     pub htc: Option<[u8; 4]>,
 }
 
@@ -457,7 +579,7 @@ impl InjectFrame {
             dst: BROADCAST,
             src: DEFAULT_SRC,
             addr3: None,
-            addr4: None,
+            extra: None,
             htc: None,
         }
     }
@@ -481,13 +603,15 @@ pub struct CapturedFrame {
     /// source nonce (`addr1 ‖ addr2` being the prefix-set filter); `None` if the backend
     /// did not surface it (the legacy layout duplicates `dst` here, carrying no new info).
     pub addr3: Option<[u8; 6]>,
-    /// **Wide-profile `addr4`** as received (802.11 4-address QoS-Data+HTC frame): the extra
-    /// Blur projection layered on the base filter. `None` on a base 3-address frame or a backend
-    /// that does not surface it — a base receiver simply never reads the extra bits (over-accept,
-    /// never a false negative), which is what lets wide and base senders share one airspace.
-    pub addr4: Option<[u8; 6]>,
-    /// **Wide-profile HT Control** as received: the exact-match fingerprint + profile marker.
-    /// `None` unless the frame carried the +HTC/Order bit with the wide-profile marker.
+    /// **The extra Blur region** as received, reassembled from `addr4 ‖ QoS Control` (64 bits) by
+    /// the one wire mapping in `ndn_frame_io::frame::parse_dot11`. `None` on a base 3-address frame
+    /// or a backend that does not surface it — such a receiver simply never reads the extra bits
+    /// (over-accept, never a false negative), which is what lets a 190-bit sender and a base-only
+    /// receiver share one airspace.
+    pub extra: Option<[u8; 8]>,
+    /// **HT Control** as received: the exact-match fingerprint + the extra-region bitmap. `None`
+    /// unless the frame carried the +HTC/Order bit. Whether the `extra` bytes may be *tested* is the
+    /// bitmap's answer, not `extra.is_some()` — see `tier0::extra_regions_usable`.
     pub htc: Option<[u8; 4]>,
     /// Per-frame RSSI in dBm from radiotap, if measured.
     pub rssi_dbm: Option<i8>,
@@ -665,8 +789,27 @@ pub trait FrameIo: Send + Sync + 'static {
     /// of the same on-air event, restricted to *mesh* transmitters (a locally-administered BSSID — our
     /// ephemeral nonces, not infrastructure APs), plus the emitter's advertised network-time belief if
     /// the beacon carried one (for multi-hop composition). `count` increments per observation so a
-    /// consumer can poll for a fresh one. Default `None` — only a backend that latches a hardware RX TSF
-    /// and parses beacon timestamps returns anything.
+    /// consumer can poll for a fresh one. Default `None` — only a backend that latches a hardware RX
+    /// TSF and parses beacon timestamps returns anything.
+    ///
+    /// ## ⚠ A hardware latch is NOT sufficient, and this seam does not enforce that
+    ///
+    /// "latches a hardware RX TSF" was the whole common-view test until 2026-08-31, when two
+    /// receivers of the same frames MEASURED it wrong: same latch point, 0.81-1.86 us and FLAT
+    /// against the fit span on a crystal, 10.5-20.4 us and GROWING on an RC. The test is now BOTH
+    /// halves — see [`FaceTimeProfile::can_common_view`], which ANDs the latch with
+    /// [`ClockReference::holds_rate`] on one source.
+    ///
+    /// This method predates that and still carries only the latch half. **A backend may return
+    /// observations while its own [`FaceTimeProfile::can_common_view`] is `false`** — that is not a
+    /// contradiction to fix here, because the two answer different questions: this one is "did I
+    /// pair a peer stamp with my own?", the profile's is "may anyone difference my counter with
+    /// someone else's?". The second is the one a discipline loop needs, and it is the CONSUMER's to
+    /// ask: a caller feeding these into a scheduler's clock (`FaceScheduler::ingest_common_view`)
+    /// should gate on `FaceTimeProfile::derive(...).can_common_view` for the same radio first, and
+    /// today no caller does. `Rtl8812auBackend` is the live instance — it serves this seam with an
+    /// `Unknown` reference; see the ⚠ block on `impl RadioTime for Rtl8812auBackend` in
+    /// `ndn-radio-drivers`.
     fn mesh_common_view(&self) -> Option<MeshCv> {
         None
     }
@@ -805,9 +948,15 @@ mod tx_intent_predicate {
     /// one thing to agree with.
     #[test]
     fn only_most_robust_demands_the_basic_rate() {
-        assert!(TxIntent::ROBUST.needs_basic_rate(), "discovery/control must be universally decodable");
+        assert!(
+            TxIntent::ROBUST.needs_basic_rate(),
+            "discovery/control must be universally decodable"
+        );
         for r in [Reliability::Balanced, Reliability::Throughput] {
-            let i = TxIntent { reliability: r, reach: Reach::Broadcast };
+            let i = TxIntent {
+                reliability: r,
+                reach: Reach::Broadcast,
+            };
             assert!(
                 !i.needs_basic_rate(),
                 "{r:?} must NOT be forced to the basic rate — that would cap the link at 6 Mbps"
@@ -904,13 +1053,35 @@ pub trait RadioKnobs: Send + Sync {
     /// reach that channel/width (e.g. a port that has only captured one channel).
     fn set_channel(&self, channel: u8, bw: Bandwidth) -> Result<(), FaceError>;
 
-    /// Set the TXAGC reference index (a back-off below the regulatory ceiling;
-    /// never used to exceed it).
+    /// **Set TX power, and say what that meant.** ([`PowerRequest`] in, [`AppliedPower`] out.)
     ///
-    /// This is an **opaque, chip-specific, nonlinear** scale: index N on one part
-    /// is not index N on another, and equal index steps are not equal dB steps.
-    /// Prefer [`set_tx_power_dbm`](Self::set_tx_power_dbm) when the radio
-    /// advertises a [`RadioCapability::tx_power_dbm`] range.
+    /// ☠ **This signature is the 2026-09-03 fix.** It used to be `set_tx_power(idx: u32) ->
+    /// Result<(), FaceError>`, and on the RTL8812AU that one call meant **two different physical
+    /// powers** — decided by whether `load_tx_power_info()` had run three calls earlier:
+    ///
+    /// * calibration loaded → `index_base(path, rate, ch) + (idx − 63)` ≈ **27** on the ch6 adapter;
+    /// * not loaded → the function fell through to `set_tx_power_raw(idx)` → a flat **63**.
+    ///
+    /// Same call, same argument, same `Ok(())`, **two different power regimes**. ⚠ The size of the gap is channel-dependent and UNVERIFIED (base 27 on ch6, 44 on ch149; ~0 dB measured at ch149, 2026-09-04). The figures below came from a KERNEL witness later shown to be broken:
+    /// raw 63 → 2301 frames at −85.6 dBm, raw 55 → **0**. The bench examples ran hot and the node
+    /// binary ran at the fused base, so *they were not the same transmitter* — and nothing in the
+    /// code, the logs or the capability declaration said so.
+    ///
+    /// **LAW 2 — no power knob may fall through to another regime.** With the calibrated scale
+    /// asked for and no calibration resolved, an implementation returns `Err`
+    /// ([`bringup::NO_CALIBRATION_MSG`]) **naming [`PowerRequest::Raw`]**. It never silently
+    /// becomes raw.
+    ///
+    /// **LAW 3 — a knob may not branch on the environment.** Everything that used to be read from
+    /// inside an implementation (`NDN_AU_TXAGC12`, which silently turned 10 register writes into
+    /// 24) is a field on the request ([`RateGroupPolicy`]) and is echoed in the returned
+    /// [`AppliedPower`].
+    ///
+    /// The scale is **not renumbered**: on a fused part `max_tx_power` *is* the regulatory base on
+    /// the calibrated scale, and `RadioPolicy::decide_power` (`max − backoff`) stays untouched. The
+    /// physical point is reported in [`PowerReference::FusedBase`], which is a fact rather than a
+    /// renumbering — see the contract's §2.1 for why the tempting `max_tx_power = 27` reintroduces
+    /// the same defect via the cure.
     ///
     /// ★ **Default: `Unsupported`, not `Ok(())`.** It used to be a silent success, which made this
     /// the single most misleading seam in the crate: the MT7612U and MT7921AU have **no power
@@ -918,12 +1089,16 @@ pub trait RadioKnobs: Send + Sync {
     /// recorded the request as applied, the contextual bandit's footprint term was rewarded for a
     /// spatial reuse that never physically happened, and nothing upstream could tell. A knob that
     /// cannot act must say so — that is the whole point of a capability seam. See
-    /// [`RadioCapability::power_actuated`] for the declarative half of the same fact.
-    fn set_tx_power(&self, _idx: u32) -> Result<(), FaceError> {
-        Err(FaceError::Io(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
+    /// [`RadioCapability::power_actuated`] for the declarative half of the same fact, and
+    /// [`PowerRequest::NoActuator`] for the request that states it.
+    ///
+    /// ⚠ **Any on-air A/B spanning this change is invalid.** `apply_knobs` now records the
+    /// *applied* power (what the radio said it did) where it used to record the *requested* index.
+    /// Re-baseline rather than comparing across it.
+    fn set_tx_power(&self, _req: PowerRequest) -> Result<AppliedPower, FaceError> {
+        Err(bringup::power_unsupported(
             "radio exposes no TX-power control",
-        )))
+        ))
     }
 
     /// Set TX power on the **absolute dBm scale**, returning the power actually
@@ -1199,26 +1374,6 @@ pub trait RadioKnobs: Send + Sync {
     fn read_channel_activity(&self) -> Result<Option<u16>, FaceError> {
         Ok(None)
     }
-
-    /// Load the **Tier-0 name pre-filter** onto the radio (§8.2): `enabled`, the 16-byte siphash `key`
-    /// the masks were built with, and up to 8 prefix-set Bloom `masks` (16 bytes each, one per registered
-    /// prefix, computed by cognition). A frame whose name-prefix set matches none of the masks is dropped
-    /// **on the radio, before it reaches the host** — the pre-USB / pre-serial drop that saves a transfer
-    /// and a host wakeup. This is the uniform seam: a face holding `dyn RadioKnobs` pushes the same masks to
-    /// any backend, with a no-op default for radios that do no on-device filtering (host filters in software).
-    ///
-    /// The `key` is used only by backends whose firmware re-derives the frame's filter from the packet
-    /// **name** (the ath9k, `ndr_name_hash(key, …)`); a backend where the transmitter pre-encodes the
-    /// prefix-set into the frame's **address octets** (the ESP32-C5) matches masks directly and ignores it.
-    /// No-op default. Implemented on the two bearers whose firmware is ours (ath9k + the serial radios).
-    fn configure_name_filter(
-        &self,
-        _enabled: bool,
-        _key: &[u8; 16],
-        _masks: &[[u8; 16]],
-    ) -> Result<(), FaceError> {
-        Ok(())
-    }
 }
 
 /// How hard a radio should compete for the medium — the input to
@@ -1335,6 +1490,12 @@ pub enum TxDiscipline {
 /// timekeeping yet is honest about having none.
 pub trait RadioTime: Send + Sync {
     /// The link clocks this radio exposes, best-first (the per-frame RX-stamp clock first).
+    ///
+    /// ★ Each source states **two** independent things: where it latches (`kind`/`latch`, and
+    /// `precision_ns` as the per-stamp half-width) and what its counter runs on
+    /// ([`RadioTimeSource::reference`]). The second defaults to [`ClockReference::unknown`] and must
+    /// be stated deliberately, with the evidence in a comment beside the call — a hardware latch on
+    /// an unestablished oscillator earns nothing, by design.
     fn time_sources(&self) -> Vec<RadioTimeSource> {
         Vec::new()
     }
@@ -1376,6 +1537,12 @@ pub trait RadioTime: Send + Sync {
 /// Populate from MEASUREMENT, not from a datasheet: both fields feed a discipline loop that will
 /// believe them. In particular `range_ppm` should be the span actually swept and verified — a trim
 /// register's full range is usually wider than the part of it anyone has characterised.
+///
+/// ⚠ This describes the **actuator**, never the plant. It says how far and how finely the rate can
+/// be MOVED; it says nothing about where the rate is, how far it wanders, or what the counter is
+/// derived from. `None` therefore covers both "no trim, excellent crystal" (the NRC7292, MEASURED
+/// -35 ppm and unsteerable) and "no trim, RC oscillator" — which is why the reference is a separate
+/// declaration on each source ([`ClockReference`]) and not inferred from this.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ClockSteering {
     /// Usable steering range, +-ppm about the power-on calibration.
@@ -1392,8 +1559,8 @@ pub struct ClockSteering {
 /// clocks and its [`RadioTime`]/[`RadioKnobs::tx_discipline`] transmit discipline. A new radio
 /// gains a correct time profile the moment it reports its clocks and discipline — nothing here
 /// needs editing. The timekeeper reads this to decide what a face may contribute: whether it can
-/// source common-view (needs a shared-counter RX stamp), how tightly it stamps arrivals, and how
-/// bounded its transmit timing is.
+/// source common-view (needs a shared-counter RX stamp **on a reference that holds a rate**), how
+/// tightly it stamps arrivals, and how bounded its transmit timing is.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct FaceTimeProfile {
     /// The best (tightest, best-first) link clock the face exposes, or `None` if it stamps
@@ -1405,10 +1572,37 @@ pub struct FaceTimeProfile {
     pub stamp_precision_ns: Option<u32>,
     /// The transmit-timing discipline the face can promise (Cut 2).
     pub tx_discipline: TxDiscipline,
-    /// Whether the face can contribute common-view observations: it needs a per-frame RX stamp on a
-    /// stable shared counter (a [`RadioClockKind::FreeRunRxStamp`]), so two receivers' stamps of one
-    /// event are differenced meaningfully. A host-recv-only face cannot (its stamp jitter swamps the
-    /// inter-receiver offset).
+    /// The face latches a per-frame free-running RX stamp in hardware — the LATCH half of the
+    /// common-view test, on its own.
+    ///
+    /// Its own field because it is a real and separately useful fact: a consumer that wanted "does
+    /// this radio stamp arrivals in silicon" must still be able to ask exactly that. Losing that
+    /// question would only move the lie — a part that latches in hardware on a bad reference is a
+    /// thing the fleet contains, and both halves of it are true.
+    ///
+    /// This is precisely what `can_common_view` used to mean, and on its own it MEASURED wrong: two
+    /// Waveshare SX1262 nodes both satisfy it and their common view is 10-20 us and growing with
+    /// the fit span, against 1 us and flat for two LR2021s. See [`ClockReference`].
+    pub hw_rx_stamp: bool,
+    /// What the best clock's counter is DERIVED FROM, or `None` if the face stamps nothing —
+    /// the second axis, and the one the latch point cannot see. `None` and
+    /// `Some(ClockReferenceKind::Unknown)` are different facts: "no clock at all" versus "a clock
+    /// whose oscillator nobody has established".
+    pub clock_reference: Option<ClockReference>,
+    /// Whether the face can contribute common-view observations. **Both halves are required, on the
+    /// same source:**
+    ///
+    /// * a per-frame RX stamp on a free-running counter ([`RadioClockKind::FreeRunRxStamp`]) — a
+    ///   gated port TSF or a host stamp does not qualify, because the stamp's own jitter swamps the
+    ///   inter-receiver offset; **and**
+    /// * a reference that actually holds a rate ([`ClockReference::holds_rate`]) — because two
+    ///   receivers' stamps are differenced with the offset and the fitted drift removed, and on a
+    ///   wandering reference the fit does not stay fitted, so the residual grows with the span
+    ///   instead of settling at the stamp precision.
+    ///
+    /// An [`ClockReferenceKind::Unknown`] reference does **not** qualify. That is the point: the
+    /// capability is earned by evidence, and a radio that has never had its oscillator established
+    /// says so rather than defaulting into a claim.
     pub can_common_view: bool,
     /// What the face can do to its own clock RATE, if anything. A face that can both observe
     /// common-view offsets AND steer its rate can hold a correction rather than re-applying it.
@@ -1424,15 +1618,26 @@ impl FaceTimeProfile {
         let best = sources.first();
         let best_clock = best.map(|s| s.kind);
         let stamp_precision_ns = best.map(|s| s.precision_ns);
-        // Common-view needs a per-frame RX stamp on a shared free-running counter; a gated TSF or a
-        // host stamp does not qualify (design §M3 / measure::common_view).
-        let can_common_view = sources
+        let clock_reference = best.map(|s| s.reference);
+        // The LATCH half, kept separately answerable: a per-frame free-running hardware stamp.
+        let hw_rx_stamp = sources
             .iter()
             .any(|s| s.kind == RadioClockKind::FreeRunRxStamp);
+        // Common view needs the latch half AND the REFERENCE half, and — this is why it is one
+        // predicate over one source rather than two `any()`s — it needs them **on the same clock**.
+        // A radio with a hardware-stamped RC counter and a crystal-referenced port TSF satisfies
+        // both conditions separately and can still not difference anything with anyone.
+        // (design §M3 / measure::common_view; the reference half is the 2026-08-31 two-receiver
+        // measurement recorded on `ClockReference`.)
+        let can_common_view = sources
+            .iter()
+            .any(|s| s.kind == RadioClockKind::FreeRunRxStamp && s.reference.holds_rate());
         Self {
             best_clock,
             stamp_precision_ns,
             tx_discipline,
+            hw_rx_stamp,
+            clock_reference,
             can_common_view,
             steering: time.clock_steering(),
         }
@@ -2496,6 +2701,16 @@ pub struct OpenRadio {
     pub time: Option<std::sync::Arc<dyn RadioTime>>,
     /// Declared capability + calibration, for the cognition layer.
     pub profile: Option<std::sync::Arc<dyn RadioProfile>>,
+    /// ★ **NOT an `Option`.** A handle with no account of how it was brought up is exactly what the
+    /// bring-up contract removes: on 2026-09-03 the node binary and every bench example held
+    /// indistinguishable handles to transmitters ~20 dB apart. Read it with
+    /// [`report`](Self::report); build a hardware-free one with [`BringUpReport::synthetic`].
+    ///
+    /// ⚠ The other four fields stay `pub` in this pass. The contract's §1.7 makes them private
+    /// behind accessors as part of the `open_radio` factory (M8), which is out of scope here —
+    /// named rather than quietly skipped. What *is* enforced already: an `OpenRadio` cannot be
+    /// constructed without a report.
+    pub report: bringup::BringUpReport,
 }
 
 impl OpenRadio {
@@ -2505,6 +2720,23 @@ impl OpenRadio {
     /// capability leak over again; reach for it only when the narrowing is the actual intent.
     pub fn io(&self) -> std::sync::Arc<dyn FrameIo> {
         std::sync::Arc::clone(&self.io)
+    }
+
+    /// **How this radio was brought up, and into which power regime.** The answer to "which
+    /// bring-up did you use?" — the question that had no answer on 2026-09-03.
+    pub fn report(&self) -> &bringup::BringUpReport {
+        &self.report
+    }
+
+    /// A loopback / simulation handle: real `io`, an honest synthetic report, no hardware.
+    pub fn synthetic(io: std::sync::Arc<dyn FrameIo>, part: &'static str) -> Self {
+        Self {
+            io,
+            knobs: None,
+            time: None,
+            profile: None,
+            report: bringup::BringUpReport::synthetic(part),
+        }
     }
 }
 
@@ -2790,5 +3022,209 @@ mod phy_capability {
                 other => panic!("expected an Unsupported refusal, got {other:?}"),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod face_time_profile_tests {
+    use super::*;
+
+    /// A radio with exactly one clock, so a test can vary one axis at a time.
+    struct OneClock(Vec<RadioTimeSource>);
+    impl RadioTime for OneClock {
+        fn time_sources(&self) -> Vec<RadioTimeSource> {
+            self.0.clone()
+        }
+    }
+
+    fn hw(reference: ClockReference) -> OneClock {
+        OneClock(vec![
+            RadioTimeSource::free_run_rx_stamp(ClockDomainId(1), 1_000).with_reference(reference),
+        ])
+    }
+
+    fn derive(r: &OneClock) -> FaceTimeProfile {
+        FaceTimeProfile::derive(r, TxDiscipline::BestEffort)
+    }
+
+    /// ★ The matrix the whole change exists for. `can_common_view` is the AND of the latch point
+    /// and the reference; three of these four rows used to come out `true`.
+    #[test]
+    fn common_view_needs_the_latch_point_and_the_reference() {
+        // hardware latch + crystal => true. The only row that earns it.
+        let p = derive(&hw(ClockReference::crystal()));
+        assert!(p.can_common_view);
+        assert!(p.hw_rx_stamp);
+        assert_eq!(p.best_clock, Some(RadioClockKind::FreeRunRxStamp));
+
+        // hardware latch + RC => false. MEASURED: two Waveshare SX1262s, both stamping 95/95 frames
+        // in silicon, 10-20 us of common view GROWING with the fit span.
+        let p = derive(&hw(ClockReference::rc_oscillator()));
+        assert!(
+            !p.can_common_view,
+            "an RC reference cannot hold a common view"
+        );
+        assert!(
+            p.hw_rx_stamp,
+            "and the latch fact must survive: it still stamps in hardware"
+        );
+
+        // hardware latch + unknown => false. An unestablished reference earns nothing; this is the
+        // default a bare `free_run_rx_stamp` gives, so forgetting withholds rather than grants.
+        let p = derive(&hw(ClockReference::unknown()));
+        assert!(!p.can_common_view, "unknown must not silently qualify");
+        assert!(p.hw_rx_stamp);
+        assert_eq!(
+            p.clock_reference.map(|r| r.kind),
+            Some(ClockReferenceKind::Unknown)
+        );
+
+        // software stamp + crystal => false. The reference half cannot rescue the latch half
+        // either; the host clock's own reference is fine and its jitter is the problem.
+        let p = derive(&OneClock(vec![
+            RadioTimeSource::host_recv(ClockDomainId(0)).with_reference(ClockReference::crystal()),
+        ]));
+        assert!(!p.can_common_view, "a host-recv stamp is not a common view");
+        assert!(!p.hw_rx_stamp);
+        assert_eq!(p.best_clock, Some(RadioClockKind::HostRecv));
+    }
+
+    /// Both conditions on the SAME clock. A radio whose hardware stamp runs on an RC while a
+    /// *different* counter is crystal-referenced satisfies each half separately and can still not
+    /// difference anything with anyone — two `any()`s would have passed this.
+    #[test]
+    fn the_two_halves_must_meet_on_one_clock() {
+        let r = OneClock(vec![
+            RadioTimeSource::free_run_rx_stamp(ClockDomainId(1), 1_000)
+                .with_reference(ClockReference::rc_oscillator()),
+            RadioTimeSource::port_tsf(ClockDomainId(2)).with_reference(ClockReference::crystal()),
+        ]);
+        assert!(!derive(&r).can_common_view);
+    }
+
+    /// A radio that stamps nothing says `None`, which is a different fact from "a clock whose
+    /// oscillator nobody established".
+    #[test]
+    fn no_clock_at_all_is_not_an_unknown_reference() {
+        let p = FaceTimeProfile::derive(&OneClock(Vec::new()), TxDiscipline::BestEffort);
+        assert_eq!(p.clock_reference, None);
+        assert_eq!(p.best_clock, None);
+        assert!(!p.hw_rx_stamp);
+        assert!(!p.can_common_view);
+    }
+
+    /// The measured figure rides along, so a report can show the evidence next to the verdict.
+    #[test]
+    fn the_measurement_survives_the_derivation() {
+        let m = RateMeasurement::new(-0.338, 0.0, RateWitness::PeerUnit);
+        let p = derive(&hw(ClockReference::crystal().measured(m)));
+        assert_eq!(p.clock_reference.and_then(|r| r.measured), Some(m));
+        assert!(p.can_common_view);
+    }
+}
+
+#[cfg(test)]
+mod s1g_rate_tests {
+    use super::*;
+
+    /// The anchor that makes the whole derivation checkable: S1G is 802.11ac downclocked by 10,
+    /// so every 2 MHz S1G rate must be exactly a tenth of the corresponding 11ac 20 MHz rate.
+    #[test]
+    fn two_mhz_is_exactly_a_tenth_of_11ac_20mhz() {
+        // 802.11ac 20 MHz 1SS long GI, MCS0..7 (bits/s) — the same ladder `mcs_phy_rate_bps` has.
+        for mcs in 0..=7u8 {
+            let ac = mcs_phy_rate_bps(mcs);
+            let s1g = s1g_phy_rate_bps(mcs, 2, false).expect("MCS0-7 exist at 2 MHz");
+            assert_eq!(s1g, ac / 10, "S1G 2 MHz MCS{mcs} must be 11ac/10");
+        }
+    }
+
+    /// ★ The reason `RadioCapability::rate.max_mcs` must be 7 and not 10 on these radios: the S1G
+    /// ladder is NOT monotone at its top. MCS10 is the most robust mode, at half of MCS0.
+    #[test]
+    fn mcs10_is_the_slowest_rate_not_the_fastest() {
+        let mcs0 = s1g_phy_rate_bps(0, 1, false).unwrap();
+        let mcs7 = s1g_phy_rate_bps(7, 1, false).unwrap();
+        let mcs10 = s1g_phy_rate_bps(10, 1, false).unwrap();
+        assert!(mcs10 < mcs0, "MCS10 ({mcs10}) is below MCS0 ({mcs0})");
+        assert_eq!(mcs10 * 2, mcs0, "2x repetition ⇒ exactly half");
+        assert!(mcs7 > mcs0);
+    }
+
+    /// ★ The audit that lets the divisibility rule stand in for the standard's exclusion list.
+    ///
+    /// Walks every (width, MCS) pair the table can express and asserts the derived rule rejects
+    /// **exactly** MCS9 at 1 and 2 MHz, plus the one named hole (MCS10 off 1 MHz). If a future edit
+    /// to `n_sd` or the coding table made the rule reject something else, this fails rather than
+    /// silently pruning a real rate.
+    #[test]
+    fn the_derived_holes_are_exactly_the_standards_holes() {
+        let mut missing = Vec::new();
+        for &bw in &[1u8, 2, 4, 8, 16] {
+            for mcs in 0u8..=10 {
+                if s1g_phy_rate_bps(mcs, bw, false).is_none() {
+                    missing.push((mcs, bw));
+                }
+            }
+        }
+        missing.sort_unstable();
+        assert_eq!(
+            missing,
+            vec![(9, 1), (9, 2), (10, 2), (10, 4), (10, 8), (10, 16)],
+            "the rate table's holes drifted"
+        );
+    }
+
+    /// A combination the standard does not define must be `None`, never a plausible number.
+    #[test]
+    fn undefined_combinations_are_none() {
+        assert_eq!(s1g_phy_rate_bps(9, 1, false), None, "no MCS9 at 1 MHz");
+        // ★ The regression this test did not previously cover. S1G MCS9 is 11ac 20 MHz MCS9
+        // downclocked, and 11ac excludes it for Nss=1 — at S1G that is 1 MHz *and* 2 MHz. This
+        // used to return Some(8_650_000) from a truncated 346.67 bits/symbol.
+        assert_eq!(
+            s1g_phy_rate_bps(9, 2, false),
+            None,
+            "no MCS9 at 2 MHz either"
+        );
+        assert_eq!(s1g_phy_rate_bps(10, 2, false), None, "MCS10 is 1 MHz only");
+        assert_eq!(s1g_phy_rate_bps(11, 2, false), None, "no MCS above 10");
+        assert_eq!(
+            s1g_phy_rate_bps(0, 20, false),
+            None,
+            "20 MHz is not an S1G width"
+        );
+        assert_eq!(
+            s1g_phy_rate_bps(0, 3, false),
+            None,
+            "3 MHz is not an S1G width"
+        );
+    }
+
+    /// Monotone in width, and short GI is faster than long by exactly 40/36.
+    #[test]
+    fn rate_scales_with_width_and_guard_interval() {
+        let widths = [1u8, 2, 4, 8, 16];
+        let mut last = 0;
+        for w in widths {
+            let r = s1g_phy_rate_bps(0, w, false).unwrap();
+            assert!(r > last, "wider must be faster: {w} MHz");
+            last = r;
+        }
+        let long = s1g_phy_rate_bps(7, 8, false).unwrap();
+        let short = s1g_phy_rate_bps(7, 8, true).unwrap();
+        // 40 µs -> 36 µs symbol time.
+        assert_eq!(short as u64 * 36, long as u64 * 40);
+    }
+
+    /// The headline numbers a reader can look up: 1 MHz MCS0 = 300 kbit/s, 2 MHz MCS0 = 650 kbit/s,
+    /// 8 MHz MCS7 = 29.25 Mbit/s (all long GI, 1 spatial stream — the last being 802.11ac's
+    /// 80 MHz 292.5 Mbit/s downclocked by 10, the same relationship checked above).
+    #[test]
+    fn spot_values_match_the_standard_table() {
+        assert_eq!(s1g_phy_rate_bps(0, 1, false), Some(300_000));
+        assert_eq!(s1g_phy_rate_bps(10, 1, false), Some(150_000));
+        assert_eq!(s1g_phy_rate_bps(0, 2, false), Some(650_000));
+        assert_eq!(s1g_phy_rate_bps(7, 8, false), Some(29_250_000));
     }
 }

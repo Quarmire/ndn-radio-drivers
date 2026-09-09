@@ -278,28 +278,37 @@ pub fn build_dot11(format: FrameFormat, frame: &InjectFrame) -> Result<Vec<u8>, 
         // RawNdn and RawNdnS1g share the exact data-frame body; they differ only
         // in the radiotap TX rate header chosen in `build_at`.
         FrameFormat::RawNdn { ethertype } | FrameFormat::RawNdnS1g { ethertype } => {
-            match (frame.addr4, frame.htc) {
-                // ── WIDE PROFILE: 4-address QoS-Data + HT Control ──────────────────────────────
-                // Set together (the wide-profile pushed header). addr4 carries the extra Blur
-                // projection; HT Control carries the exact-match fingerprint + profile marker.
+            match (frame.extra, frame.htc) {
+                // ── THE FILTER FRAME: 4-address QoS-Data + HT Control, 190-bit Blur ────────────
+                // ★ **THE ONE WIRE MAPPING.** `extra[0..6] → addr4`, `extra[6..8] → QoS Control`.
+                // Every backend routes through here; nothing else may split the extra region, which
+                // is why the HAL seam is named `extra` and not `addr4`.
+                //
                 // ToDS=FromDS=1 makes addr4 present; subtype QoS-Data makes QoS Control present;
-                // the Order/+HTC bit makes HT Control present — ~222 usable header bits total.
-                // The base 126-bit Blur still lives byte-identically in addr1‖addr2‖addr3[0:4],
-                // so a base-only receiver reads this frame with zero false negatives.
-                (Some(addr4), Some(htc)) => {
+                // the Order/+HTC bit makes HT Control present. HT Control carries the exact-match
+                // fingerprint + the extra-region bitmap. The base 126-bit Blur still lives
+                // byte-identically in addr1‖addr2‖addr3[0:4], so a base-only receiver reads this
+                // frame with **zero false negatives** — the coexistence contract, and the whole
+                // mid-upgrade story.
+                //
+                // The last 16 bits are literally free: this frame is already QoS-Data and was
+                // already emitting two zero bytes here, so the 36-byte header is paid for whether
+                // or not they carry entropy (MEASURED: P7 S7 reports 12 added bytes at 174 AND at
+                // 190). A-MSDU keeps QoS Control on its own **3-address** frame (`build_amsdu`),
+                // where the A-MSDU-Present bit has an actual reader; in this shape it had neither a
+                // writer nor a reader anywhere in the tree and was being paid for in false
+                // positives.
+                (Some(extra), Some(htc)) => {
                     // FC: type=Data, subtype=QoS Data (0x88); ToDS+FromDS+Order (0x83).
                     out.extend_from_slice(&[0x88, 0x83]);
-                    out.extend_from_slice(&[0x00, 0x00]); // Duration
+                    out.extend_from_slice(&[0x00, 0x00]); // Duration — NOT filter (see tier0.rs)
                     out.extend_from_slice(&frame.dst); // addr1 = Tier-0 filter hi
                     out.extend_from_slice(&frame.src); // addr2 = Tier-0 filter lo
                     out.extend_from_slice(&frame.addr3.unwrap_or(frame.dst)); // addr3 = base[12:16]‖id‖flags
                     out.extend_from_slice(&[0x00, 0x00]); // SeqCtrl
-                    out.extend_from_slice(&addr4); // addr4 = extra Blur (48 bits)
-                    // QoS Control: A-MSDU-present bit CLEAR (this is a single MSDU, not an
-                    // aggregate), TID 0. The extra Blur deliberately does NOT ride here — QoS
-                    // Control belongs to the A-MSDU/QoS layer (see `build_amsdu`).
-                    out.extend_from_slice(&[0x00, 0x00]);
-                    out.extend_from_slice(&htc); // HT Control = fingerprint(24b LE) ‖ marker
+                    out.extend_from_slice(&extra[0..6]); // addr4      = extra Blur bits 0..48
+                    out.extend_from_slice(&extra[6..8]); // QoS Control = extra Blur bits 48..64
+                    out.extend_from_slice(&htc); // HT Control = fingerprint(24b LE) ‖ region bitmap
                     out.extend_from_slice(&LLC_SNAP_PREFIX);
                     out.extend_from_slice(&ethertype.to_be_bytes());
                     out.extend_from_slice(&frame.payload);
@@ -366,6 +375,42 @@ pub fn build_dot11(format: FrameFormat, frame: &InjectFrame) -> Result<Vec<u8>, 
 
 /// Recover the NDN payload + transmitter address from a captured buffer
 /// (`radiotap ++ 802.11 ++ …`). `None` if the frame isn't ours.
+///
+/// # Two things radiotap says that this used to ignore, both live defects on 802.11ah
+///
+/// ★ **The FCS.** `IEEE80211_RADIOTAP_F_FCS` means the driver left the frame's trailing 4-byte
+/// checksum attached. Both HaLow drivers set it on every data frame — Newracom unconditionally
+/// (`rt_flags = 0x10`, then `skb_put(skb, 4)` to append the FCS), Morse from
+/// `MORSE_RX_STATUS_FLAGS_FCS_INCLUDED` — so before this, **four bytes of FCS rode inside the NDN
+/// payload of every HaLow frame we received.** It stayed hidden because the on-air example only
+/// checked `payload.starts_with(MARKER)`; an actual NDN-TLV parse would have rejected the packet.
+/// `F_BADFCS` is the same class in the other direction: a frame the PHY *knows* is corrupt was
+/// being delivered as good. Both are handled here, for every format and every backend — a 2.4 GHz
+/// NIC that sets `F_FCS` benefits identically.
+///
+/// ★ **The S1G TLV.** On 802.11ah the per-frame MCS and (on the NRC7292) the *only* RSSI live in a
+/// radiotap TLV, not in `MCS`/`DBM_ANTSIGNAL`. They are picked up here as a last-resort fallback,
+/// after the caller's out-of-band values and after the standard fields.
+///
+/// ⚠ **`CapturedFrame.phy` is always `None` here, and that is a wire fact, not an omission.**
+/// [`PhyMetrics`](ndn_radio_hal::PhyMetrics) is SNR / EVM / CFO, and **radiotap as these drivers
+/// emit it carries none of the three**: no `DBM_ANTNOISE` field is present (so not even
+/// `signal − noise` is available), and the 6-byte S1G TLV is format / response-indication / GI /
+/// bandwidth / MCS / colour / uplink / signal. Backends that *do* fill `phy` read it from a chip
+/// RX descriptor they parse themselves ([`crate::frame::parse_dot11`] callers), which is a path
+/// an `AF_PACKET` monitor socket does not have. ★ Both HaLow chips measure a quality figure per
+/// frame and both vendor drivers drop it before the netdev — Morse's `morse_skb_rx_status.
+/// noise_dbm` is declared and never read, Newracom's `frame_hdr.flags.rx.snr` goes only into a
+/// per-peer moving average — so closing this is a driver patch, not a parser change. Faking the
+/// field from a per-peer average would be a different quantity wearing a per-frame label.
+///
+/// ⚠ **`CapturedFrame.mcs_index` is documented as an 802.11n MCS, and an S1G MCS is not one.**
+/// Surfacing it there is deliberate — it is the only field that can hold it, and reporting *no*
+/// rate on a HaLow link leaves rate adaptation with no receive-side feedback at all — but the two
+/// ladders are different: S1G rates depend on the channel width, and MCS10 is a 1 MHz-only
+/// repetition-coded BPSK mode that is **slower and more robust than MCS0**, i.e. the ladder is not
+/// even monotone. Do not put an S1G index through [`crate::mcs_phy_rate_bps`] (the 11n 20 MHz
+/// table); use [`ndn_radio_hal::s1g_phy_rate_bps`], which takes the width the same TLV reports.
 pub fn parse(
     format: FrameFormat,
     buf: &[u8],
@@ -374,7 +419,13 @@ pub fn parse(
     domain: ClockDomainId,
 ) -> Option<CapturedFrame> {
     let info = radiotap::parse(buf)?;
-    let body = buf.get(info.header_len..)?;
+    if info.bad_fcs() {
+        return None; // the PHY told us these bytes are corrupt
+    }
+    let mut body = buf.get(info.header_len..)?;
+    if info.fcs_included() {
+        body = body.get(..body.len().checked_sub(4)?)?;
+    }
     // If radiotap carried a TSFT, build a hardware receive stamp for it. The
     // caller supplies the clock `domain` (a TSF counter is per-NIC); the latch
     // is `MacDone` (~1 µs) and precision is clamped to that latch's floor.
@@ -386,12 +437,15 @@ pub fn parse(
             LatchPoint::MacDone,
         )
     });
-    // radiotap RSSI/rate are the fallback when the caller has no out-of-band read.
+    // radiotap RSSI/rate are the fallback when the caller has no out-of-band read; the S1G TLV is
+    // the fallback after that (and, on the NRC7292, the only source of either).
+    let s1g_rssi = info.s1g.and_then(|s| s.rssi_dbm);
+    let s1g_mcs = info.s1g.and_then(|s| s.mcs);
     parse_dot11(
         format,
         body,
-        rssi.or(info.rssi_dbm),
-        mcs.or(info.mcs_index),
+        rssi.or(info.rssi_dbm).or(s1g_rssi),
+        mcs.or(info.mcs_index).or(s1g_mcs),
         stamp,
     )
 }
@@ -451,11 +505,15 @@ pub fn parse_dot11(
                 a.copy_from_slice(s);
                 a
             });
-            // Wide profile: addr4 (extra Blur, at offset 24 when four_addr) and HT Control
-            // (fingerprint + marker, immediately after the QoS Control that precedes it).
-            let addr4 = if four_addr {
-                body.get(24..30).map(|s| {
-                    let mut a = [0u8; 6];
+            // ★ **THE ONE WIRE MAPPING, inverted.** The extra Blur region is reassembled from
+            // `addr4` (offset 24, present when four_addr) ‖ QoS Control (immediately after it).
+            // Both must be present or the region is absent: half a projection is not a coarser
+            // projection, it is a different one, and testing 190-bit masks against it is the
+            // false-negative direction. Whether the bytes may be *tested* is then the HT Control
+            // bitmap's answer (`tier0::extra_regions_usable`), not this function's.
+            let extra = if four_addr && qos {
+                body.get(24..32).map(|s| {
+                    let mut a = [0u8; 8];
                     a.copy_from_slice(s);
                     a
                 })
@@ -477,7 +535,7 @@ pub fn parse_dot11(
                 addr: Some(ta),
                 group: Some(group),
                 addr3,
-                addr4,
+                extra,
                 htc: htc_bytes,
                 rssi_dbm: rssi,
                 mcs_index: mcs,
@@ -519,7 +577,7 @@ pub fn parse_dot11(
                 addr: Some(ta),
                 group: Some(group),
                 addr3: None, // ESP-NOW addr3 is broadcast, not a nonce
-                addr4: None,
+                extra: None,
                 htc: None,
                 rssi_dbm: rssi,
                 mcs_index: mcs,
@@ -549,7 +607,7 @@ pub fn parse_dot11(
                 addr: Some(ta),
                 group: Some(group),
                 addr3,
-                addr4: None,
+                extra: None,
                 htc: None,
                 rssi_dbm: rssi,
                 mcs_index: mcs,
@@ -575,7 +633,7 @@ mod tests {
             dst: BROADCAST,
             src: SRC,
             addr3: None,
-            addr4: None,
+            extra: None,
             htc: None,
         }
     }
@@ -589,6 +647,137 @@ mod tests {
         assert_eq!(got.addr, Some(SRC));
         assert_eq!(got.group, Some(BROADCAST));
         assert_eq!(got.rssi_dbm, Some(-50));
+    }
+
+    /// Build the exact bytes an NRC7292 monitor vif delivers for one of our S1G data frames:
+    /// `struct nrc_radiotap_hdr` (34 B, `FLAGS = 0x10`, S1G TLV at 24) ++ the 802.11 frame ++ the
+    /// 4-byte FCS the driver appends with `skb_put(skb, 4)`.
+    fn nrc7292_capture(dot11: &[u8], mcs: u8, rssi: i8, flags: u8) -> Vec<u8> {
+        let mut w = vec![0u8, 0];
+        w.extend_from_slice(&34u16.to_le_bytes());
+        w.extend_from_slice(&(((1u32) | (1 << 1) | (1 << 3) | (1 << 28)).to_le_bytes()));
+        w.extend_from_slice(&1_234_567u64.to_le_bytes()); //  8..16 TSFT
+        w.push(flags); //                                     16    FLAGS
+        w.push(0); //                                         17    rt_pad
+        w.extend_from_slice(&925u16.to_le_bytes()); //        18..20 CHANNEL
+        w.extend_from_slice(&0x0140u16.to_le_bytes()); //     20..22
+        w.extend_from_slice(&[0, 0]); //                      22..24 rt_pad2
+        w.extend_from_slice(&32u16.to_le_bytes()); //         24..26 TLV type
+        w.extend_from_slice(&6u16.to_le_bytes()); //          26..28 TLV length
+        w.extend_from_slice(&0x007fu16.to_le_bytes()); //     28..30 known
+        w.extend_from_slice(&(1u16 | (1 << 8) | ((mcs as u16) << 12)).to_le_bytes()); // data1
+        w.extend_from_slice(&((rssi as u8 as u16) << 8).to_le_bytes()); //            data2
+        assert_eq!(w.len(), 34);
+        w.extend_from_slice(dot11);
+        w.extend_from_slice(&[0xde, 0xad, 0xbe, 0xef]); // the appended FCS
+        w
+    }
+
+    /// ★ The live defect this closes: with `F_FCS` set (which both HaLow drivers set on every data
+    /// frame) the last four bytes of the buffer are the FCS, not payload. Before this they were
+    /// delivered inside every HaLow NDN packet.
+    #[test]
+    fn fcs_is_stripped_from_the_payload_when_radiotap_says_it_is_there() {
+        let fmt = FrameFormat::RawNdnS1g { ethertype: 0x8624 };
+        let payload = b"\x05\x03interest";
+        let dot11 = build_dot11(fmt, &frame(payload)).unwrap();
+        let wire = nrc7292_capture(&dot11, 7, -46, 0x10);
+
+        let got = parse(fmt, &wire, None, None, crate::ClockDomainId(9)).unwrap();
+        assert_eq!(
+            got.payload.as_ref(),
+            payload,
+            "the 4 FCS bytes must not appear in the NDN payload"
+        );
+        assert_eq!(got.addr, Some(SRC));
+    }
+
+    /// The same frame without the flag keeps every byte — the strip is driven by radiotap, not by
+    /// an assumption about the bearer.
+    #[test]
+    fn no_fcs_flag_means_no_bytes_are_trimmed() {
+        let fmt = FrameFormat::RawNdnS1g { ethertype: 0x8624 };
+        let dot11 = build_dot11(fmt, &frame(b"\x05\x03abc")).unwrap();
+        let wire = nrc7292_capture(&dot11, 0, -60, 0x00);
+        let got = parse(fmt, &wire, None, None, crate::ClockDomainId(9)).unwrap();
+        assert_eq!(got.payload.as_ref(), b"\x05\x03abc\xde\xad\xbe\xef");
+    }
+
+    /// A frame the PHY says failed its checksum must be dropped, not delivered as good.
+    #[test]
+    fn bad_fcs_frames_are_dropped() {
+        let fmt = FrameFormat::RawNdnS1g { ethertype: 0x8624 };
+        let dot11 = build_dot11(fmt, &frame(b"\x05\x03abc")).unwrap();
+        let wire = nrc7292_capture(&dot11, 0, -60, 0x10 | 0x40);
+        assert!(parse(fmt, &wire, None, None, crate::ClockDomainId(9)).is_none());
+    }
+
+    /// The NRC7292 emits **no** `DBM_ANTSIGNAL` and **no** `MCS` field: both live only in the S1G
+    /// TLV. Before the TLV walk this radio reported `rssi_dbm: None` and `mcs_index: None` on every
+    /// frame it ever received.
+    #[test]
+    fn s1g_tlv_supplies_rssi_and_mcs_when_nothing_else_does() {
+        let fmt = FrameFormat::RawNdnS1g { ethertype: 0x8624 };
+        let dot11 = build_dot11(fmt, &frame(b"\x05\x03x")).unwrap();
+        let wire = nrc7292_capture(&dot11, 6, -73, 0x10);
+        let got = parse(fmt, &wire, None, None, crate::ClockDomainId(9)).unwrap();
+        assert_eq!(got.rssi_dbm, Some(-73));
+        assert_eq!(got.mcs_index, Some(6), "an S1G MCS — see the parse() doc");
+        assert!(
+            got.stamp.is_some(),
+            "radiotap TSFT is present on every frame"
+        );
+    }
+
+    /// ★ The empty field, pinned with its reason. An on-air run populated `rssi_dbm`, `mcs_index`
+    /// and `stamp` **1489/1489** and `phy` **0**/1489, and the question was whether our parser was
+    /// dropping something. It is not: radiotap as either HaLow driver emits it carries no SNR, no
+    /// EVM, no CFO and not even a `DBM_ANTNOISE` byte to subtract, so there is nothing to put in
+    /// `PhyMetrics`. This asserts the two halves together — everything the wire DOES carry is
+    /// surfaced, and the one thing it does not is left honestly empty rather than synthesised from
+    /// a per-peer average or a channel-survey noise floor (both real, both different quantities).
+    #[test]
+    fn phy_metrics_stay_none_because_this_wire_carries_no_snr_evm_or_cfo() {
+        let fmt = FrameFormat::RawNdnS1g { ethertype: 0x8624 };
+        let dot11 = build_dot11(fmt, &frame(b"\x05\x03x")).unwrap();
+        let wire = nrc7292_capture(&dot11, 6, -73, 0x10);
+        let got = parse(fmt, &wire, None, None, crate::ClockDomainId(9)).unwrap();
+        // The positive control: the metadata this header really does carry is all present.
+        assert!(got.rssi_dbm.is_some() && got.mcs_index.is_some() && got.stamp.is_some());
+        // And the field the header does not carry is empty, on every arm of the parser.
+        assert!(
+            got.phy.is_none(),
+            "the S1G TLV has no SNR/EVM/CFO and neither driver sets DBM_ANTNOISE — if this ever \
+             becomes Some, it must be because a driver started emitting one, not because we \
+             invented it"
+        );
+        // Out-of-band caller values fill rssi/mcs and still cannot fill `phy`: there is no seam
+        // for it on this path at all, which is the honest statement of the gap.
+        let got = parse(fmt, &wire, Some(-11), Some(2), crate::ClockDomainId(9)).unwrap();
+        assert!(got.phy.is_none());
+    }
+
+    /// An out-of-band value the caller already has always wins over radiotap, and radiotap's
+    /// standard fields always win over the TLV — the TLV is the last resort, not an override.
+    #[test]
+    fn caller_supplied_metadata_still_takes_precedence() {
+        let fmt = FrameFormat::RawNdnS1g { ethertype: 0x8624 };
+        let dot11 = build_dot11(fmt, &frame(b"\x05\x03x")).unwrap();
+        let wire = nrc7292_capture(&dot11, 6, -73, 0x10);
+        let got = parse(fmt, &wire, Some(-11), Some(2), crate::ClockDomainId(9)).unwrap();
+        assert_eq!(got.rssi_dbm, Some(-11));
+        assert_eq!(got.mcs_index, Some(2));
+    }
+
+    /// A frame shorter than its own FCS must be refused rather than panicking on the subtraction.
+    #[test]
+    fn a_frame_too_short_to_hold_an_fcs_is_refused() {
+        let fmt = FrameFormat::RawNdnS1g { ethertype: 0x8624 };
+        let wire = nrc7292_capture(&[], 0, -60, 0x10);
+        // 4 bytes of "FCS" and nothing else: the strip leaves an empty body, which is not a frame.
+        assert!(parse(fmt, &wire, None, None, crate::ClockDomainId(9)).is_none());
+        // And a buffer that stops inside the radiotap header is refused earlier still.
+        assert!(parse(fmt, &wire[..20], None, None, crate::ClockDomainId(9)).is_none());
     }
 
     #[test]
@@ -745,7 +934,7 @@ mod tests {
             dst: BROADCAST,
             src: SRC,
             addr3: None,
-            addr4: None,
+            extra: None,
             htc: None,
         };
         // build_dot11 is the identity on the payload (no extra framing).
@@ -769,15 +958,20 @@ mod tests {
         assert_eq!(got.rssi_dbm, Some(-60));
     }
 
-    /// The **wide profile** builds a 4-address QoS-Data+HT-Control frame that carries addr4 and
-    /// HT Control, round-trips them through `parse_dot11`, AND stays readable by a base receiver:
-    /// the base 126-bit Blur in addr1‖addr2‖addr3 is byte-identical whether or not the wide fields
-    /// are present, so both profiles share one airspace with zero false negatives.
+    /// The 190-bit filter frame is a 4-address QoS-Data+HT-Control MPDU whose **extra region is
+    /// split by exactly one wire mapping** — `extra[0..6] → addr4`, `extra[6..8] → QoS Control` —
+    /// round-trips through `parse_dot11`, AND stays readable by a base receiver: the base 126-bit
+    /// Blur in addr1‖addr2‖addr3 is byte-identical whether or not the extra region is present, so a
+    /// 190-bit sender and a commodity base-only receiver share one airspace with zero false
+    /// negatives. That last property is the entire mid-upgrade story; it is asserted here.
     #[test]
-    fn wide_profile_4addr_qos_htc_round_trips_and_stays_base_readable() {
+    fn the_190_bit_filter_frame_round_trips_and_stays_base_readable() {
         let fmt = FrameFormat::RawNdn { ethertype: 0x8624 };
-        let addr4 = [0x54, 0x02, 0x88, 0x92, 0x6a, 0x10];
-        let htc = [0xd0, 0x38, 0x4e, 0x01]; // fp=0x4e38d0 LE ‖ marker 0x01
+        // 8 extra bytes: the first 6 land in addr4, the last 2 in QoS Control. The QoS pattern is
+        // deliberately one a MAC could not itself produce (A-MSDU-Present clear would be 0x00,
+        // TID 0 would be 0x00) so a chip that rewrote the field is visible, per #96's rule.
+        let extra = [0x54, 0x02, 0x88, 0x92, 0x6a, 0x10, 0xa5, 0x5a];
+        let htc = [0xd0, 0x38, 0x4e, 0x03]; // fp=0x4e38d0 LE ‖ region bitmap 0x03 (addr4|QoS)
         let addr3 = [0x00, 0xc0, 0x81, 0x00, 0x37, 0x00];
         let wide = InjectFrame {
             payload: Bytes::copy_from_slice(b"\x05\x03abc"),
@@ -785,36 +979,60 @@ mod tests {
             dst: [0x03, 0x80, 0x84, 0x00, 0x01, 0x00],
             src: [0x08, 0x00, 0x81, 0x00, 0x05, 0x01],
             addr3: Some(addr3),
-            addr4: Some(addr4),
+            extra: Some(extra),
             htc: Some(htc),
         };
         let dot11 = build_dot11(fmt, &wide).unwrap();
         // Wire header pins: FC = QoS-Data + ToDS+FromDS+Order; then the 36-byte header.
-        assert_eq!(&dot11[0..2], &[0x88, 0x83], "FC: QoS-Data, ToDS=FromDS=Order=1");
+        assert_eq!(
+            &dot11[0..2],
+            &[0x88, 0x83],
+            "FC: QoS-Data, ToDS=FromDS=Order=1"
+        );
         assert_eq!(&dot11[4..10], &wide.dst, "addr1 = base Blur hi");
         assert_eq!(&dot11[10..16], &wide.src, "addr2 = base Blur mid");
         assert_eq!(&dot11[16..22], &addr3, "addr3 = base[12:16]‖id‖flags");
-        assert_eq!(&dot11[24..30], &addr4, "addr4 = extra Blur");
-        assert_eq!(&dot11[30..32], &[0x00, 0x00], "QoS Control: A-MSDU bit CLEAR (reserved for A-MSDU)");
-        assert_eq!(&dot11[32..36], &htc, "HT Control = fingerprint ‖ marker");
+        assert_eq!(
+            &dot11[24..30],
+            &extra[0..6],
+            "addr4 = extra Blur bits 0..48"
+        );
+        assert_eq!(
+            &dot11[30..32],
+            &extra[6..8],
+            "QoS Control = extra Blur bits 48..64 — the free 16 bits, no longer zero"
+        );
+        assert_eq!(
+            &dot11[32..36],
+            &htc,
+            "HT Control = fingerprint ‖ region bitmap"
+        );
         assert_eq!(&dot11[36..42], &LLC_SNAP_PREFIX, "LLC/SNAP at offset 36");
 
-        // Full-fidelity parse recovers the wide fields.
+        // Full-fidelity parse recovers the extra region, reassembled across both fields.
         let got = parse_dot11(fmt, &dot11, Some(-42), Some(5), None).unwrap();
         assert_eq!(got.payload.as_ref(), b"\x05\x03abc");
         assert_eq!(got.group, Some(wide.dst));
         assert_eq!(got.addr, Some(wide.src));
         assert_eq!(got.addr3, Some(addr3));
-        assert_eq!(got.addr4, Some(addr4), "extra Blur surfaced");
-        assert_eq!(got.htc, Some(htc), "fingerprint surfaced");
+        assert_eq!(got.extra, Some(extra), "64-bit extra Blur surfaced");
+        assert_eq!(got.htc, Some(htc), "fingerprint + region bitmap surfaced");
 
         // Base coexistence: a base 3-address frame with the SAME addr1/2/3 yields identical
         // addr1‖addr2‖addr3 bytes — the Blur a base receiver ANDs its masks against is unchanged.
-        let base = InjectFrame { addr4: None, htc: None, ..wide.clone() };
+        let base = InjectFrame {
+            extra: None,
+            htc: None,
+            ..wide.clone()
+        };
         let base11 = build_dot11(fmt, &base).unwrap();
-        assert_eq!(&base11[4..22], &dot11[4..22], "base Blur bytes identical across profiles");
+        assert_eq!(
+            &base11[4..22],
+            &dot11[4..22],
+            "base Blur bytes identical whether or not the extra region rides along"
+        );
         let base_got = parse_dot11(fmt, &base11, None, None, None).unwrap();
-        assert_eq!(base_got.addr4, None, "base frame carries no extra Blur");
+        assert_eq!(base_got.extra, None, "base frame carries no extra Blur");
         assert_eq!(base_got.htc, None, "base frame carries no fingerprint");
     }
 
@@ -832,5 +1050,86 @@ mod tests {
         assert!(parse(esp, &raw_wire, None, None, crate::ClockDomainId(0)).is_none());
         let esp_wire = build(esp, &frame(b"x")).unwrap();
         assert!(parse(raw, &esp_wire, None, None, crate::ClockDomainId(0)).is_none());
+    }
+}
+
+#[cfg(test)]
+mod tier0_wire_cost {
+    use super::*;
+
+    /// ☠ **Tier-0's marginal wire cost is ZERO bytes — not the 12 bytes/frame the comparison
+    /// tables claim**, and that error is what makes the filter look like it might not pay.
+    ///
+    /// An 802.11 data frame carries addr1‖addr2‖addr3 unconditionally: `build_dot11` emits addr3 as
+    /// `addr3.unwrap_or(dst)` whether or not a filter is present. So the filter does not ADD bytes,
+    /// it RECYCLES bytes the frame must carry regardless — which under the no-host-identity doctrine
+    /// would otherwise hold a broadcast address and a nonce.
+    #[test]
+    fn the_filter_costs_no_additional_airtime() {
+        let mk = |dst: [u8; 6], src: [u8; 6], a3: Option<[u8; 6]>| InjectFrame {
+            payload: bytes::Bytes::from_static(b"x"),
+            tx: Default::default(),
+            dst,
+            src,
+            addr3: a3,
+            extra: None,
+            htc: None,
+        };
+        // ☠ **This test was VACUOUS in its first form and a sibling harness caught it.** It used
+        // `FrameFormat::Raw80211`, which is a payload PASSTHROUGH — it builds no 802.11 header, so
+        // both arms were trivially 32 B and the assertion could not have failed. Measuring an
+        // invariant with an instrument that cannot see it is not evidence, which is the same error
+        // as reading `Duration = 0` off broadcast frames whose correct duration is 0.
+        //
+        // `RawNdn` is the format that actually emits the MAC header.
+        let plain = build_dot11(
+            FrameFormat::RawNdn { ethertype: 0x8624 },
+            &mk([0xff; 6], [0xaa; 6], None),
+        )
+        .unwrap();
+        let tier0 = build_dot11(
+            FrameFormat::RawNdn { ethertype: 0x8624 },
+            &mk([0x01; 6], [0x02; 6], Some([0x03; 6])),
+        )
+        .unwrap();
+        assert_eq!(
+            plain.len(),
+            tier0.len(),
+            "same frame length ⇒ same airtime: the BASE filter is recycled address bytes, not added \
+             ones (24 B header either way)"
+        );
+        // ⚠ The extra region is NOT free: addr4 + QoS Control + HT Control take the header
+        // 24 B → 36 B, so the 190-bit filter costs 12 bytes/frame of real airtime. The recycling
+        // argument covers the base region only — do not extend it to the extra region.
+        //
+        // ★ But the LAST 16 of those 190 bits ARE free: the frame is already QoS-Data and already
+        // emitted two bytes there, so 190 costs exactly what 174 cost. Asserted, not assumed.
+        let mk_wide = |extra: [u8; 8]| {
+            build_dot11(
+                FrameFormat::RawNdn { ethertype: 0x8624 },
+                &InjectFrame {
+                    extra: Some(extra),
+                    htc: Some([0x05; 4]),
+                    ..mk([0x01; 6], [0x02; 6], Some([0x03; 6]))
+                },
+            )
+            .unwrap()
+        };
+        let wide = mk_wide([0x04; 8]);
+        assert!(
+            wide.len() > tier0.len(),
+            "the extra region DOES cost airtime; only the base is free"
+        );
+        assert_eq!(
+            wide.len() - tier0.len(),
+            12,
+            "12 B of pushed header, the MEASURED cost (P7 S7)"
+        );
+        assert_eq!(
+            mk_wide([0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x00, 0x00]).len(),
+            wide.len(),
+            "the QoS Control bytes are emitted either way — the last 16 bits are FREE, which is why \
+             190 and 174 have identical airtime"
+        );
     }
 }

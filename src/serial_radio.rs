@@ -39,12 +39,22 @@ fn host_stamp() -> LinkStamp {
         LatchPoint::HostRecv,
     )
 }
+use ndn_radio_hal::bringup::{
+    AppliedPower, BringUp, BringUpReport, Ctx, Fact, Plan, PlanId, PlanRun, PowerReference,
+    PowerRequest, PowerWrite, PumpPolicy, RadioState, Role, Stage, Step, StepClass, StepId,
+    StepOutcome,
+};
 use ndn_radio_hal::{Bandwidth, OpenRadio, RadioKnobs, TxDiscipline};
 
 /// A device stamp from the ESP32-C5's free-running per-frame RX clock (`rx_ctrl.timestamp`): a µs
 /// counter, so `raw` is the µs value and the tick is 1000 ns (see [`RadioTimeSource::free_run_rx_stamp`]).
 /// Unlike [`host_stamp`] this is latched on the device at RX (no serial jitter) and is the same domain as
 /// the clock the C5 schedules TX on — the basis for common-view and frame-age.
+///
+/// ⚠ **`MacDone` is a claim, so only call this for a stamp the MAC really latched.** The C5 qualifies
+/// (`p->rx_ctrl.timestamp`). The BW16 does not — its `T_RX_TS` value is read by software in a vendor
+/// callback — which is why that backend opens unclocked and never reaches here. See
+/// [`bw16_time_sources`].
 fn dev_rx_stamp(ts_us: u32, domain: ClockDomainId) -> LinkStamp {
     LinkStamp::new(
         ts_us as u64,
@@ -52,6 +62,32 @@ fn dev_rx_stamp(ts_us: u32, domain: ClockDomainId) -> LinkStamp {
         LatchPoint::MacDone.precision_floor_ns(),
         LatchPoint::MacDone,
     )
+}
+
+/// **The ESP32-C5's declared time surface.** A free function so the declaration can be asserted in a
+/// unit test without a serial port — and so it sits beside the BW16's, which is the comparison that
+/// matters (same wire protocol, same `T_RX_TS` field, different silicon behind it).
+///
+/// The C5's real link clock is its free-running per-frame RX stamp (`rx_ctrl.timestamp`, µs ticks),
+/// latched **on the device by the MAC** — `firmware/esp32c5-ndn/main/ndn_radio.c` takes it out of
+/// `p->rx_ctrl`, it is not read by our code at all. That is a genuine hardware latch, unlike the
+/// BW16's software counter ([`bw16_time_sources`]). (The 802.11 port TSF reads 0 while unassociated,
+/// so it is deliberately NOT advertised.)
+///
+/// ⚠ Reference: **UNKNOWN.** The latch is real and the reference is not established. The sdkconfig
+/// carries `SOC_XTAL_SUPPORT_40M` and `SOC_SYSTIMER_SUPPORT_RC_FAST` — SoC *capability* flags, which
+/// say both an external crystal and an internal RC exist on this part and say nothing about which
+/// one is behind `esp_timer` at run time. That is the whole ESP32 hazard:
+/// `ndn_time::ClockCapability::esp32_rc` exists in this workspace precisely because an ESP32-class RC
+/// is a 50 ppm-and-temperature-sensitive part, and guessing either way here would be inventing the
+/// answer. A `T_CLOCKREF`-style reply from the firmware (the shape the 7E-A5 fleet settled on as
+/// `CMD_GET_CLOCK_REF`) would make it known — and on THIS part such an answer legitimately completes
+/// the common-view predicate, because the latch half is already true.
+fn c5_time_sources(domain: ClockDomainId) -> Vec<RadioTimeSource> {
+    vec![
+        RadioTimeSource::free_run_rx_stamp(domain, 1_000)
+            .with_reference(ndn_radio_hal::ClockReference::unknown()),
+    ]
 }
 
 /// A per-device clock domain for a C5 on `path` (each device is its own physical counter). FNV-1a over
@@ -76,7 +112,7 @@ const T_TXPOWER: u8 = 0x03; // RTL8720DN: TXAGC index for every rate (0xFF = res
 const T_RATE: u8 = 0x04; // RTL8720DN: MGN rate code; ESP32-C5: wifi_phy_rate_t
 const T_BW40: u8 = 0x05; // wext_set_bw40_enable
 const T_INJECT_ATTR: u8 = 0x06; // poke pkt_attrib bytes, then inject
-const T_NAMEFILTER: u8 = 0x07; // load on-device Tier-0 masks: [enabled][n_masks][mask 16B]*
+const T_PREFIXES: u8 = 0x07; // off-host parse relevance set: [n][u64_le prefix-hash]* (FNV-1a-64 of each "/prefix")
 const T_INJECT_AT: u8 = 0x09; // scheduled TX: [delay_us_le32][802.11 frame] (ESP32-C5 firmware only)
 const T_INJECT_ABS: u8 = 0x0A; // scheduled TX at an ABSOLUTE esp_timer µs: [target_us_le64][frame]
 const T_READCLOCK: u8 = 0x0B; // request the device's schedule clock; reply T_CLOCK [esp_timer_us_le64]
@@ -85,9 +121,12 @@ const T_POWER_PCT: u8 = 0x0D; // RTL8720DN coarse power: [idx] 0=100% 1=-1.5dB 2
 const T_READPOWER: u8 = 0x0E; // request the live TXAGC indices; reply T_POWERIDX
 const T_POWERIDX: u8 = 0x89;
 const T_READSTATS: u8 = 0x10; // request the ESP32-C5's hardware receive counters
+const T_CSI_CFG: u8 = 0x11; // [enabled][every_nth] — per-frame channel-state sensing
+const T_CSI: u8 = 0x8C; // a reduced per-frame channel summary (see `CsiSummary`)
 const T_HWSTATS: u8 = 0x8B; // [rx_fcs_err][rx_abort][brx_err_agc][nrx_err_agcexit][nrx_err][rx_mpdu]
 // [rx_fifo_ovf][rx_cfo_hz] — all u16 LE; the receive-side loss a frame count cannot show // reply to T_READPOWER: [status_i8][20 TXAGC bytes]
 const T_LOG: u8 = 0x84; // device status text (the RTL8720DN's boot markers)
+const T_BLE_PHY: u8 = 0x37; // [phy] BLE advertising PHY: 1 = LE 1M, 2 = LE 2M, 3 = LE Coded (S=8)
 const T_BLE_TXPOWER: u8 = 0x35; // BLE advertising TX power. Units are per-radio: the ESP32-C5 takes an
 // esp_power_level_t 0..15 (-24..+20 dBm, 3 dB/step, MEASURED 36.4 dB span); the RTL8720DN takes a
 // controller gain index (~0.5 dB/step, MEASURED 22.2 dB span).
@@ -146,6 +185,17 @@ pub mod rate {
 pub const SERIAL_RADIO_BAUD: u32 = 115_200;
 
 /// A BW16 reached over its USB-serial port.
+/// FNV-1a-64 over bytes — the #44 shared keyspace hash the on-device parser (`ndr_fnv1a64` in
+/// `ndr_parse.c`) uses, so a host-registered `/`-prefix and the device's rolled name hash agree.
+fn fnv1a64(data: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in data {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
 pub struct SerialRadioBackend {
     tx: Arc<Mutex<Box<dyn serialport::SerialPort>>>,
     format: FrameFormat,
@@ -163,6 +213,8 @@ pub struct SerialRadioBackend {
     /// bearer, routed here by the one reader so the SAME port connection also drives a BLE `AdvBackend`
     /// (see [`ble_next_scanned`](Self::ble_next_scanned)). Empty on the BW16 (Wi-Fi only, no BLE).
     ble_rx: AsyncMutex<mpsc::UnboundedReceiver<(i8, [u8; 6], Bytes)>>,
+    /// Per-frame channel summaries (`T_CSI`), when channel-state sensing is enabled.
+    csi_rx: AsyncMutex<mpsc::UnboundedReceiver<ChannelProfile>>,
     /// TX-power readback replies (`T_POWERIDX` → (status, the 20 live TXAGC indices)). The power
     /// knob's own instrument: it reads the registers back out of the hardware, so a power change can
     /// be proven to have landed before anything is claimed about the air. RTL8720DN only.
@@ -179,6 +231,16 @@ pub struct SerialRadioBackend {
     /// `activity` (`T_OCC`), which is raw channel energy (ambient included) → the interference/channel lever,
     /// not this bearer's named-traffic demand. The coex split balances the two NAMED demands, not occupancy.
     wifi_frames: Arc<std::sync::atomic::AtomicU32>,
+    /// ★ **M6 — the clock domain, declared uniformly.** The per-frame device stamp domain this
+    /// port's reader stamps `T_RX_TS` frames in, or `None` = frames are stamped `HostRecv`.
+    ///
+    /// It was previously known ONLY to the spawned reader thread (an argument to `reader_loop`),
+    /// so the one part of the fleet that has a real hardware RX stamp and the one that
+    /// deliberately refuses to claim one were indistinguishable from the driver's own state.
+    /// §5-M6 asks the serial arms for "a clock domain uniformly"; this field is where both
+    /// answers — the C5's domain and the BW16's honest `None` — are written down, and the
+    /// `clock_domain` rung is what puts each into the report.
+    dev_clock: Option<ClockDomainId>,
 }
 
 impl SerialRadioBackend {
@@ -241,6 +303,7 @@ impl SerialRadioBackend {
         let (ttch, tt_rxch) = mpsc::unbounded_channel();
         let (blech, ble_rxch) = mpsc::unbounded_channel();
         let (pwrch, pwr_rxch) = mpsc::unbounded_channel();
+        let (csich, csi_rxch) = mpsc::unbounded_channel();
         let format = FrameFormat::default();
         let activity = Arc::new(std::sync::atomic::AtomicU32::new(u32::MAX));
         let ble_activity = Arc::new(std::sync::atomic::AtomicU32::new(0));
@@ -257,6 +320,7 @@ impl SerialRadioBackend {
                 ttch,
                 blech,
                 pwrch,
+                csich,
                 act_reader,
                 ble_act_reader,
                 wifi_fr_reader,
@@ -272,8 +336,10 @@ impl SerialRadioBackend {
             activity,
             ble_rx: AsyncMutex::new(ble_rxch),
             reply_rx: AsyncMutex::new(pwr_rxch),
+            csi_rx: AsyncMutex::new(csi_rxch),
             ble_activity,
             wifi_frames,
+            dev_clock,
         })
     }
 
@@ -379,6 +445,43 @@ impl SerialRadioBackend {
     ///   (MEASURED: 22.2 dB span, R² = 0.993; the vendor table anchors 0x06 ≈ −10 dBm, 0x1A ≈ 0 dBm).
     pub fn set_ble_tx_power(&self, level: u8) -> Result<(), FaceError> {
         self.send_framed(T_BLE_TXPOWER, &[level])
+    }
+
+    /// **ESP32-C5.** Enable channel-state sensing, reporting one [`ChannelProfile`] per `integrate`
+    /// received frames, optionally pinned to a single transmitter.
+    ///
+    /// `integrate` is a measurement window, not a subsample: a single frame's estimate is
+    /// noise-dominated (28 dB of apparent spread against a 6.5 dB channel), so ~64 frames is the
+    /// smallest window that yields a stable curve. It also cuts the link cost by the same factor.
+    ///
+    /// Pass `eph_id` to pin the profile to one sender (by ephemeral ID, `addr3[4]` — this MAC has no
+    /// addresses). Without it, a window takes its ID from its first frame and rejects the rest, which
+    /// still yields one sender per profile but leaves which one to chance.
+    pub fn set_csi(
+        &self,
+        enabled: bool,
+        integrate: u8,
+        eph_id: Option<u8>,
+    ) -> Result<(), FaceError> {
+        let mut p = vec![enabled as u8, integrate.max(1)];
+        if let Some(id) = eph_id {
+            p.push(id);
+        }
+        self.send_framed(T_CSI_CFG, &p)
+    }
+
+    /// Await the next integrated channel profile.
+    pub async fn next_csi(&self) -> Option<ChannelProfile> {
+        self.csi_rx.lock().await.recv().await
+    }
+
+    /// **ESP32-C5.** Select the BLE advertising PHY: 1 = LE 1M, 2 = LE 2M, 3 = LE Coded (S=8).
+    ///
+    /// A reach lever with a reachability cost: only extended advertising can carry a PHY selection, so
+    /// 2M and Coded are invisible to a legacy-only controller. MEASURED against two receivers —
+    /// Coded 20/20 to an extended-capable C5 and 0/20 to an RTL8720DN, where 1M was 11/20 and 20/20.
+    pub fn set_ble_phy(&self, phy: u8) -> Result<(), FaceError> {
+        self.send_framed(T_BLE_PHY, &[phy])
     }
 
     /// Running count of scanned BLE advertisements since open — the BLE demand signal (take deltas).
@@ -526,24 +629,20 @@ impl SerialRadioBackend {
         (p.len() >= 2).then(|| (p[1] as i8) / 4)
     }
 
-    /// Load the on-device **Tier-0 name filter** (ESP32-C5 firmware only): up to 8 16-byte prefix-set
-    /// masks (cognition derives them via the shared `tier0` code). When `enabled` and at least one mask
-    /// is present, a received 0x8624 frame whose in-address prefix-set matches no mask is dropped ON THE
-    /// DEVICE — it never crosses the serial link, the §8.2 pre-USB drop. `enabled=false` (or no masks)
-    /// forwards everything (stock behaviour). Masks beyond the 8th are ignored (the firmware cap).
-    pub fn configure_name_filter(
-        &self,
-        enabled: bool,
-        masks: &[[u8; 16]],
-    ) -> Result<(), FaceError> {
-        let n = masks.len().min(8);
-        let mut payload = Vec::with_capacity(2 + n * 16);
-        payload.push(enabled as u8);
+    /// **Off-host parse relevance set** (NDR_MAC_SPEC §6) — the parse-based successor to the retired
+    /// in-frame Tier-0 filter. Registers the node's `/`-joined prefixes; the device parses each RX
+    /// frame's NDN name and drops, before it crosses the serial link, any *named* frame under none of
+    /// them (a nameless/unparseable frame is forwarded — H1: never drop a frame that was for you). An
+    /// empty slice restores the parse-everywhere floor (forward all). No wire cost: the name is already
+    /// in the frame. Prefixes beyond the firmware cap are ignored.
+    pub fn set_relevance_prefixes(&self, prefixes: &[&[u8]]) -> Result<(), FaceError> {
+        let n = prefixes.len().min(24);
+        let mut payload = Vec::with_capacity(1 + n * 8);
         payload.push(n as u8);
-        for m in &masks[..n] {
-            payload.extend_from_slice(m);
+        for p in &prefixes[..n] {
+            payload.extend_from_slice(&fnv1a64(p).to_le_bytes());
         }
-        self.send_framed(T_NAMEFILTER, &payload)
+        self.send_framed(T_PREFIXES, &payload)
     }
 
     /// **Scheduled TX** (ESP32-C5 firmware only): place a frame on air at `delay_us` from now, timed by
@@ -620,6 +719,7 @@ fn reader_loop(
     txtime: mpsc::UnboundedSender<(u64, u64)>,
     ble: mpsc::UnboundedSender<(i8, [u8; 6], Bytes)>,
     reply: mpsc::UnboundedSender<(u8, Vec<u8>)>,
+    csi: mpsc::UnboundedSender<ChannelProfile>,
     activity: Arc<std::sync::atomic::AtomicU32>,
     ble_activity: Arc<std::sync::atomic::AtomicU32>,
     wifi_frames: Arc<std::sync::atomic::AtomicU32>,
@@ -647,6 +747,30 @@ fn reader_loop(
                     // T_POWERIDX — a TX-power readback. The shape is per-radio: the RTL8720DN
                     // answers `[status][20 TXAGC bytes]`, the ESP32-C5 `[requested_q][applied_q]`
                     // in 0.25 dBm units. Forward the payload raw; each backend interprets its own.
+                    // EXACT length, not `>=`. This record's layout changed three times while it was
+                    // being developed, and a `>=` guard accepts a stale or future layout silently —
+                    // every field then decodes to a plausible-looking wrong number, which is an
+                    // instrument fault masquerading as a channel observation.
+                    if ty == T_CSI && payload.len() == 24 {
+                        // Bins are 8*log2(mean |H|^2); one log2 unit is 3.01 dB.
+                        let db = |v: u8| v as f32 / 8.0 * 3.01;
+                        let mut bins = [0f32; 16];
+                        for (i, b) in bins.iter_mut().enumerate() {
+                            *b = db(payload[6 + i]);
+                        }
+                        let _ = csi.send(ChannelProfile {
+                            frames: u16::from_le_bytes([payload[0], payload[1]]),
+                            rssi_dbm: payload[2] as i8,
+                            noise_dbm: payload[3] as i8,
+                            subcarriers: payload[4],
+                            spread_db: db(payload[5]),
+                            bins_db: bins,
+                            eph_id: payload[22],
+                            flags: payload[23],
+                        });
+                        acc.drain(..consumed);
+                        continue;
+                    }
                     if (ty == T_POWERIDX || ty == T_HWSTATS) && !payload.is_empty() {
                         let _ = reply.send((ty, payload.clone()));
                         acc.drain(..consumed);
@@ -685,9 +809,14 @@ fn reader_loop(
                         acc.drain(..consumed);
                         continue;
                     }
-                    // T_RX [rssi][frame] (BW16, no hardware timestamp → HostRecv stamp) and
-                    // T_RX_TS [rssi][noise][rate_code][phy_flags][rx_ts_us_le32][frame] (ESP32-C5: hardware
-                    // RX stamp + the ESP's per-frame PHY metadata — its "radiotap": RX rate/MCS + SNR).
+                    // T_RX [rssi][frame] — no timestamp on the wire at all → HostRecv stamp. And
+                    // T_RX_TS [rssi][noise][rate_code][phy_flags][rx_ts_us_le32][frame] — the ESP's
+                    // per-frame PHY metadata (its "radiotap": RX rate/MCS + SNR) plus a device µs
+                    // stamp. BOTH the C5 and the BW16 send T_RX_TS; only the C5 is opened with a
+                    // device clock domain, so only its stamp reaches the device timeline. The BW16's
+                    // `ts` is `us_ticker_read()` called by software inside the vendor blob's RX
+                    // callback — a device SOFTWARE counter, not a latch — so it opens unclocked and
+                    // its frames fall through to `host_stamp` below. See `bw16_time_sources`.
                     let parsed = if ty == T_RX && !payload.is_empty() {
                         let rssi = payload[0] as i8;
                         frame::parse_dot11(
@@ -706,8 +835,9 @@ fn reader_loop(
                             u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]);
                         // MCS index is meaningful only for HT/VHT/HE; a legacy (11b/g/a) rate is not an MCS.
                         let mcs = (bb_format >= 2).then_some(rate_code);
-                        // A device stamp only if this backend was opened with a device clock domain (the
-                        // C5); else fall back to HostRecv so an un-clocked open still yields frames.
+                        // A device stamp only if this backend was opened with a device clock domain
+                        // — the C5, whose `rx_ctrl.timestamp` the MAC latched. Everything else (the
+                        // BW16 included, deliberately) falls back to HostRecv.
                         let stamp = dev_clock
                             .map(|d| dev_rx_stamp(ts_us, d))
                             .unwrap_or_else(host_stamp);
@@ -763,7 +893,6 @@ fn deframe(buf: &[u8]) -> Option<(u8, Vec<u8>, usize)> {
 
 #[async_trait]
 impl FrameIo for SerialRadioBackend {
-
     /// This radio's own capability, so a face built from the bare `dyn FrameIo` does not have to
     /// invent one. Delegates to this type's [`RadioProfile`] — the single source of truth.
     fn radio_capability(&self) -> Option<ndn_radio_hal::RadioCapability> {
@@ -809,23 +938,48 @@ impl RadioKnobs for SerialRadioBackend {
             ))),
         }
     }
-    fn set_tx_power(&self, idx: u32) -> Result<(), FaceError> {
-        // RTL8720DN: the phydm TXAGC index, ~0.25 dB/step (measured 0.274). Clamp to 0..=126 so a
-        // large cognition index cannot land on 0xFF, which the firmware reads as "restore defaults"
-        // — i.e. asking for maximum power would instead give up control of it.
-        self.set_txpower(idx.min(126) as u8)
-    }
-    fn configure_name_filter(
-        &self,
-        enabled: bool,
-        _key: &[u8; 16],
-        masks: &[[u8; 16]],
-    ) -> Result<(), FaceError> {
-        // The C5/BW16 firmware compares masks against the frame's pre-encoded address octets (the
-        // transmitter baked the prefix-set in), so no on-device re-hash → the `key` is unused here.
-        SerialRadioBackend::configure_name_filter(self, enabled, masks)
-    }
-    fn read_channel_activity(&self) -> Result<Option<u16>, FaceError> {
+    fn set_tx_power(&self, req: PowerRequest) -> Result<AppliedPower, FaceError> {
+        // RTL8720DN: the phydm TXAGC index, ~0.25 dB/step (MEASURED 0.274 dB/step). There is no
+        // calibrated/raw split — one firmware opcode, one axis — so `Raw` reaches the same writer.
+        let want = match &req {
+            PowerRequest::Ceiling(_) => 126u32,
+            PowerRequest::Index(i, _) => *i as u32,
+            PowerRequest::Raw { idx, .. } => *idx as u32,
+            PowerRequest::Dbm(d) => {
+                return Err(io_err(format!(
+                    "serial radio (RTL8720DN): PowerRequest::Dbm({d}) — the TXAGC index has a \
+                     MEASURED 0.274 dB/step but no absolute anchor. Use PowerRequest::Index.",
+                )));
+            }
+            PowerRequest::NoActuator => {
+                return Err(io_err(
+                    "serial radio: PowerRequest::NoActuator, but T_TXPOWER DOES actuate power."
+                        .into(),
+                ));
+            }
+        };
+        // Clamp to 0..=126 so a large cognition index cannot land on 0xFF, which the firmware reads
+        // as "restore defaults" — i.e. asking for maximum power would instead give up control of
+        // it. ★ The clamp is now REPORTED rather than silent.
+        let idx = want.min(126);
+        self.set_txpower(idx as u8)?;
+        Ok(AppliedPower::from_writes(
+            req.clone(),
+            PowerReference::DriverReference {
+                source: "RTL8720DN phydm TXAGC index via T_TXPOWER (MEASURED 0.274 dB/step; \
+                         0xFF is 'restore driver defaults', not maximum)",
+                slope_db_per_idx: Some(0.274),
+            },
+            idx as u8,
+            idx != want,
+            vec![PowerWrite {
+                reg: 0,
+                value: idx as u8,
+                group: "T_TXPOWER",
+                path: 0,
+            }],
+        ))
+    }    fn read_channel_activity(&self) -> Result<Option<u16>, FaceError> {
         // Both firmwares emit their free-running frame counter as T_OCC ~5×/s; the reader caches the
         // latest. u32::MAX = no report yet (an older firmware, or one still booting) → honestly None.
         let v = self.activity.load(std::sync::atomic::Ordering::Relaxed);
@@ -836,6 +990,10 @@ impl RadioKnobs for SerialRadioBackend {
 /// Reference [`RadioTime`] for the `HostRecv` clock kind: the serial board reports no hardware
 /// timestamp, so its only honest link clock is the host monotonic clock read when the serial
 /// line delivered the frame. It is readable on demand, so `read_clock` returns it.
+///
+/// Its clock reference is [`ClockReferenceKind::HostOs`](ndn_radio_hal::ClockReferenceKind::HostOs)
+/// from the constructor — the one reference this workspace knows by construction. It is still not a
+/// common-view source, and for the reason it always was: the latch, not the oscillator.
 impl RadioTime for SerialRadioBackend {
     fn time_sources(&self) -> Vec<RadioTimeSource> {
         vec![RadioTimeSource::host_recv(HOST_CLOCK_DOMAIN)]
@@ -855,8 +1013,59 @@ impl RadioProfile for SerialRadioBackend {
     }
 }
 
+/// An **integrated channel profile** — the frequency response of one link, averaged over `frames`.
+///
+/// Averaged, not per-frame, and that is the whole design. MEASURED on a static bench link: a SINGLE
+/// frame's channel estimate spans **28.4 dB** across subcarriers, while the same link averaged over
+/// ~100 frames spans **6.5 dB** and reproduces to 0.85 dB RMS between runs. Two stationary radios
+/// cannot have a channel that reshapes between consecutive frames, so nearly all of that per-frame
+/// spread is estimation noise — one L-LTF symbol quantised to int8 I/Q. A per-frame "notched
+/// subcarrier" count therefore counts noise, which is what the first version of this reported.
+///
+/// It is keyed to ONE sender, by the **ephemeral ID** (`addr3[4]`) — not by any address. This MAC has
+/// no host addressing: under the Blurred Name wire format the address octets carry the prefix-set Bloom
+/// filter, so grouping by "source address" would group frames by which name prefixes they carry rather
+/// than by who sent them. The 8-bit ID aliases (~19 neighbours by the birthday bound), and that is
+/// acceptable for the same reason it is for RSSI: an alias blends two channels into one estimate, it
+/// never costs a delivery.
+///
+/// Keying matters — integrating across whatever the radio happened to hear averages several different
+/// channels into one meaningless curve, observable as the mean RSSI wandering 16 dB between
+/// consecutive reports. Pinned, reproducibility improves to 0.44 dB RMS and the RSSI holds steady.
+///
+/// This is complementary to RSSI rather than a substitute: the estimate is AGC-normalised, so a 20 dB
+/// change in transmit power moves `rssi_dbm` and leaves the profile shape alone. RSSI carries the
+/// power, this carries the shape.
+#[derive(Clone, Debug)]
+pub struct ChannelProfile {
+    /// Frames integrated into this profile.
+    pub frames: u16,
+    /// Mean RSSI (dBm) over those frames.
+    pub rssi_dbm: i8,
+    /// Mean noise floor (dBm).
+    pub noise_dbm: i8,
+    /// Subcarriers the PHY reported (53 for a legacy L-LTF, up to 245 for HE20).
+    pub subcarriers: u8,
+    /// Peak-to-trough spread of the averaged profile, in dB — the channel's frequency selectivity.
+    /// A flat channel reads ~0; this bench link reads 3–6 dB.
+    pub spread_db: f32,
+    /// 16-bin log-power profile across the band, in dB (arbitrary reference; only shape is meaningful).
+    pub bins_db: [f32; 16],
+    /// The **ephemeral ID** (`addr3[4]`) of the sender this profile describes — soft state, rotating,
+    /// and the only sender-identifying field this MAC has.
+    pub eph_id: u8,
+    /// The sender's flags byte (`addr3[5]`), carried because it is free and rides the same frames.
+    pub flags: u8,
+}
+
 /// A stable per-device clock domain for an RTL8720DN, derived from its port path (as
 /// [`c5_clock_domain`] does for the C5) so two boards on one host never share a timeline.
+///
+/// ⚠ **Not used to stamp received frames**, and do not re-wire it to. [`Bw16SerialBackend`] opens
+/// the transport unclocked because this board's per-frame timestamp is taken by software inside a
+/// vendor blob — see `bw16_time_sources` (private, in this module). The identifier is kept (it is
+/// public API, and the board's µs timeline is real enough to schedule TX against) but nothing in
+/// this crate feeds it to [`SerialRadioBackend::open_clocked`] any more.
 pub fn bw16_clock_domain(path: &str) -> ClockDomainId {
     let mut h: u32 = 0x811c_9dc5;
     for b in path.bytes() {
@@ -864,6 +1073,50 @@ pub fn bw16_clock_domain(path: &str) -> ClockDomainId {
         h = h.wrapping_mul(0x0100_0193);
     }
     ClockDomainId((h & 0x00ff_ffff) | 0x4257_0000) // "BW" tag in the top bytes
+}
+
+/// **The BW16 / RTL8720DN's declared time surface: the host clock, and nothing else.**
+///
+/// ## Why a board that sends a per-frame timestamp declares no per-frame clock
+///
+/// The RTL8720DN firmware does ship a `T_RX_TS` timestamp, and it used to be declared here as
+/// `RadioTimeSource::free_run_rx_stamp(...)` — which sets [`LatchPoint::MacDone`], a 1 000 ns
+/// precision floor, and makes `FaceTimeProfile::hw_rx_stamp` **true**. All three were false:
+///
+/// ```c
+/// // firmware/bw16-rs/src/lib.rs — rust_promisc_cb, the SDK's promiscuous RX callback
+/// pub extern "C" fn rust_promisc_cb(buf: *const u8, len: u32, rssi: i8, mrate: u8) {
+///     let ts = now_us() as u32;   // -> c_micros() -> us_ticker_read()
+/// ```
+///
+/// That is an MCU ticker read **by software**, after the closed Wi-Fi blob has demodulated the
+/// frame, run its own RX path and dispatched a callback. The MAC's real RXTSFL does sit in the RX
+/// descriptor; the blob discards it before our code is reached. So the number is a device *software*
+/// counter, its error budget is an unmeasured blob-callback latency rather than 1 µs, and nothing in
+/// the pipeline was latched by hardware.
+///
+/// This is exactly the case `lora_serial.rs` refuses for the 7E-A5 fleet's
+/// `StampKind::SoftwareCounter` nodes, and it is refused here for the same reason and in the same
+/// shape: there is no [`ndn_frame_io::RadioClockKind`] for a device software counter, and dressing
+/// one of the existing kinds up as it would be worse than reporting only the host stamp. Frames are
+/// therefore stamped `HostRecv` too ([`Bw16SerialBackend::open`] opens the transport unclocked), so
+/// the declaration and the per-frame stamps cannot disagree about how good this clock is.
+///
+/// ## What this deliberately forecloses
+///
+/// A `CLOCK_REF_XTAL`-shaped answer from this part would be a TRUE statement about the RTL8720DN's
+/// oscillator and must still not produce a common view: `FaceTimeProfile::can_common_view` ANDs the
+/// reference with the LATCH, and this board fails the latch half no matter what its crystal is.
+/// Keeping the kind honest is what makes that safe — had the `FreeRunRxStamp` stayed, the first
+/// truthful reference answer would have handed a software counter a common view.
+///
+/// **Earning it back** takes silicon access, not a host edit: a firmware path that recovers the RX
+/// descriptor's RXTSFL (or a GPIO/capture-based latch) before the blob drops it. Then this becomes a
+/// `FreeRunRxStamp` with a citation, and the reference question starts to matter for this part.
+fn bw16_time_sources() -> Vec<RadioTimeSource> {
+    // `host_recv` already carries `ClockReference::host_os()` — the one reference this crate knows by
+    // construction — and still fails the latch half, which is the honest shape for this board.
+    vec![RadioTimeSource::host_recv(HOST_CLOCK_DOMAIN)]
 }
 
 /// **BW16 / RTL8720DN serial-bridge backend** — the RTL8720DN's own identity, the sibling of
@@ -876,22 +1129,36 @@ pub fn bw16_clock_domain(path: &str) -> ClockDomainId {
 ///   directions (ch36 and ch149, TX and RX). The shared profile is 2.4-only, so cognition driving a
 ///   BW16 through it would never choose a 5 GHz channel.
 /// * **Rate units.** `T_RATE` carries a Realtek **MGN** code here, not the C5's `wifi_phy_rate_t`.
-/// * **A device clock.** The firmware stamps every frame from a monotonic µs timeline and answers
-///   `T_READCLOCK`, so frames carry a device stamp rather than a host-receive time.
-/// * **Scheduled TX.** `T_INJECT_AT`/`T_INJECT_ABS` place a frame at a named instant.
+/// * **Scheduled TX.** `T_INJECT_AT`/`T_INJECT_ABS` place a frame at a named instant on the
+///   firmware's own µs timeline, MEASURED at a constant 10 µs submit error over 15 frames.
+///
+/// ⚠ **What it does NOT have, corrected 2026-08-31: a device RX clock.** This bullet used to read
+/// "the firmware stamps every frame from a monotonic µs timeline … so frames carry a device stamp
+/// rather than a host-receive time", and the backend opened [`SerialRadioBackend::open_clocked`] to
+/// match. The `T_RX_TS` field it was trusting is `us_ticker_read()` called by *software* at the top
+/// of the vendor blob's promiscuous RX callback (`firmware/bw16-rs/src/lib.rs`, `rust_promisc_cb`) —
+/// the MAC's own RXTSFL is in the RX descriptor, and the blob discards it before our callback runs.
+/// A software counter read after an RTOS dispatch is not a latch, so this part is held to the same
+/// rule as the 7E-A5 fleet's `StampKind::SoftwareCounter` nodes (`lora_serial.rs`): it reports the
+/// honest host stamp and declares no per-frame hardware clock. See [`Self::time_sources`].
+/// The C5 beside it is genuinely different — `p->rx_ctrl.timestamp` is latched by the MAC — and
+/// keeps its device clock.
 pub struct Bw16SerialBackend {
     inner: Arc<SerialRadioBackend>,
     capability: RadioCapability,
-    clock_domain: ClockDomainId,
 }
 
 impl Bw16SerialBackend {
     /// Open a BW16 running the `firmware/bw16-rs` bridge. Pulses DTR→CEN so a freshly-flashed board
-    /// boots our firmware without a manual reset, and stamps frames in this device's clock domain.
+    /// boots our firmware without a manual reset.
+    ///
+    /// Opened **unclocked** on purpose (not [`SerialRadioBackend::open_clocked`]): the `T_RX_TS`
+    /// timestamp this board sends is a software counter read inside the vendor blob's RX callback,
+    /// so frames are stamped `HostRecv` — the same refusal `lora_serial::rx_stamp` applies to a
+    /// `StampKind::SoftwareCounter` node. See the ⚠ block on [`Bw16SerialBackend`].
     pub fn open(path: &str) -> Result<Self, FaceError> {
-        let clock_domain = bw16_clock_domain(path);
         Ok(Self {
-            inner: Arc::new(SerialRadioBackend::open_clocked(path, clock_domain)?),
+            inner: Arc::new(SerialRadioBackend::open(path)?),
             // MEASURED on air, both directions: 2.4 GHz ch6 and 5 GHz ch36/ch149. The RTL8720DN is
             // 1x1 HT20 — it tops out at HT MCS7 (65 Mb/s), with no VHT and no HE, so no `.with_he()`:
             // claiming the HE reach levers here would make cognition escalate to a modulation this
@@ -899,14 +1166,34 @@ impl Bw16SerialBackend {
             capability: RadioCapability::wifi_monitor_dual_1ss(vec![
                 1, 6, 11, 36, 40, 44, 48, 149, 153, 157, 161,
             ]),
-            clock_domain,
         })
     }
 
     /// Open the BW16 and bundle it as an [`OpenRadio`] — io + knobs + time + profile backed by one
     /// instance, so the measured dual-band profile survives into the engine.
+    ///
+    /// Leaves the radio on the channel its firmware booted with. Byte-for-byte the pre-M6
+    /// behaviour; [`open_radio_on`](Self::open_radio_on) is how a caller commands a channel.
     pub fn open_radio(path: &str) -> Result<OpenRadio, FaceError> {
+        Self::open_radio_on(path, 0, Bandwidth::Bw20)
+    }
+
+    /// **M6 — the BW16 arm of the factory, on a named channel.** Opens the port, then runs
+    /// [`PLAN_SERIAL_BRIDGE`]: the plan declares the on-air format and the clock domain, and
+    /// commands `channel`/`bw` when `channel != 0`.
+    ///
+    /// ⚠ `channel == 0` means *leave the firmware's boot default in force* and sends no bytes —
+    /// which is what this constructor did before M6. Naming a channel is how a caller opts in.
+    pub fn open_radio_on(path: &str, channel: u8, bw: Bandwidth) -> Result<OpenRadio, FaceError> {
         let dev = Arc::new(Self::open(path)?);
+        let report = run_serial_plan(
+            &dev.inner,
+            "RTL8720DN (BW16)",
+            path,
+            channel,
+            bw,
+            dev.capability.clone(),
+        )?;
         let io: Arc<dyn FrameIo> = dev.clone();
         let knobs: Arc<dyn RadioKnobs> = dev.clone();
         let time: Arc<dyn RadioTime> = dev.clone();
@@ -916,6 +1203,7 @@ impl Bw16SerialBackend {
             knobs: Some(knobs),
             time: Some(time),
             profile: Some(profile),
+            report,
         })
     }
 
@@ -973,7 +1261,6 @@ impl Bw16SerialBackend {
 
 #[async_trait]
 impl FrameIo for Bw16SerialBackend {
-
     /// This radio's own capability, so a face built from the bare `dyn FrameIo` does not have to
     /// invent one. Delegates to this type's [`RadioProfile`] — the single source of truth.
     fn radio_capability(&self) -> Option<ndn_radio_hal::RadioCapability> {
@@ -1017,8 +1304,8 @@ impl RadioKnobs for Bw16SerialBackend {
     fn set_channel(&self, channel: u8, bw: Bandwidth) -> Result<(), FaceError> {
         RadioKnobs::set_channel(self.inner.as_ref(), channel, bw)
     }
-    fn set_tx_power(&self, idx: u32) -> Result<(), FaceError> {
-        RadioKnobs::set_tx_power(self.inner.as_ref(), idx)
+    fn set_tx_power(&self, req: PowerRequest) -> Result<AppliedPower, FaceError> {
+        RadioKnobs::set_tx_power(self.inner.as_ref(), req)
     }
     fn tx_discipline(&self) -> TxDiscipline {
         // The firmware spins on its µs timeline to the target instant, then injects. MEASURED
@@ -1028,28 +1315,16 @@ impl RadioKnobs for Bw16SerialBackend {
         TxDiscipline::ScheduledAt {
             granularity_ns: 20_000,
         }
-    }
-    fn configure_name_filter(
-        &self,
-        enabled: bool,
-        key: &[u8; 16],
-        masks: &[[u8; 16]],
-    ) -> Result<(), FaceError> {
-        RadioKnobs::configure_name_filter(self.inner.as_ref(), enabled, key, masks)
-    }
-    fn read_channel_activity(&self) -> Result<Option<u16>, FaceError> {
+    }    fn read_channel_activity(&self) -> Result<Option<u16>, FaceError> {
         RadioKnobs::read_channel_activity(self.inner.as_ref())
     }
 }
 
 impl RadioTime for Bw16SerialBackend {
+    /// **One clock, and it is the host's** — see `bw16_time_sources` (private, in this module) for
+    /// why this part declares no per-frame hardware stamp despite sending a per-frame timestamp.
     fn time_sources(&self) -> Vec<RadioTimeSource> {
-        // Stamped in the promiscuous callback from the SDK's µs ticker — earlier than any host
-        // timestamp, but taken in the driver's RX path rather than latched by the MAC, so it carries
-        // the driver's delivery jitter. Declared at 1 µs resolution, which is the clock's; the
-        // *accuracy* is bounded by that jitter and is not claimed here. (The MAC's own RXTSFL does
-        // sit in the RX descriptor, but the blob discards it before our callback ever runs.)
-        vec![RadioTimeSource::free_run_rx_stamp(self.clock_domain, 1_000)]
+        bw16_time_sources()
     }
     fn read_clock(&self, _domain: ClockDomainId) -> Result<Option<u64>, FaceError> {
         // Latch-only, as on the C5: `T_READCLOCK` exists and answers, but a serial round-trip is a
@@ -1103,12 +1378,43 @@ impl Esp32SerialBackend {
         })
     }
 
+    /// **Off-host parse relevance set** (NDR_MAC_SPEC §6) — register the node's `/`-joined prefixes so
+    /// the C5 parses each RX frame's name and drops, pre-link, any named frame under none of them.
+    /// Empty = parse-everywhere floor. Delegates to [`SerialRadioBackend::set_relevance_prefixes`].
+    pub fn set_relevance_prefixes(&self, prefixes: &[&[u8]]) -> Result<(), FaceError> {
+        self.inner.set_relevance_prefixes(prefixes)
+    }
+
     /// Open the C5 and bundle it as an [`OpenRadio`] — io + knobs + time + profile all backed by the
     /// same instance. This is the capability-carrying path for `MonitorWifiFace::from_open`: the
     /// dual-band [`RadioProfile`] survives into the engine (the scheduler gets the channel knob, the
     /// planner the real bands), whereas `MonitorWifiFace::new(io)` would invent a placeholder cap.
     pub fn open_c5_radio(path: &str) -> Result<OpenRadio, FaceError> {
+        Self::open_c5_radio_on(path, 0, Bandwidth::Bw20)
+    }
+
+    /// **M6 — the ESP32-C5 arm of the factory, on a named channel.** Opens the port, then runs
+    /// [`PLAN_SERIAL_BRIDGE`]: the plan declares the on-air format and this part's hardware RX
+    /// clock domain, and commands `channel`/`bw` when `channel != 0`.
+    ///
+    /// ★ **Byte-identical to what shipped.** `ndn-phy-wifi::factory::build_esp32c5` called
+    /// `knobs.set_channel(ch, Bw20)` immediately after `open_c5_radio`; this rung sends the same
+    /// `T_CHANNEL` + `T_BW40(false)` pair, inside the plan, so it lands in the report and the
+    /// digest instead of happening off the books. `channel == 0` sends nothing.
+    pub fn open_c5_radio_on(
+        path: &str,
+        channel: u8,
+        bw: Bandwidth,
+    ) -> Result<OpenRadio, FaceError> {
         let dev = Arc::new(Self::open_c5(path)?);
+        let report = run_serial_plan(
+            &dev.inner,
+            "ESP32-C5",
+            path,
+            channel,
+            bw,
+            dev.capability.clone(),
+        )?;
         // Explicit trait-object bindings: Arc<Self> → Arc<dyn Trait> unsize coercion (one instance,
         // four views). `as` can't spell this — the coercion is implicit, via the annotated `let`.
         let io: Arc<dyn FrameIo> = dev.clone();
@@ -1120,6 +1426,7 @@ impl Esp32SerialBackend {
             knobs: Some(knobs),
             time: Some(time),
             profile: Some(profile),
+            report,
         })
     }
 
@@ -1129,16 +1436,6 @@ impl Esp32SerialBackend {
     /// connection carries both bearers of the unified C5 firmware (the reader demuxes Wi-Fi and BLE).
     pub fn shared_mux(&self) -> Arc<SerialRadioBackend> {
         self.inner.clone()
-    }
-
-    /// Load the on-device Tier-0 name filter — see [`SerialRadioBackend::configure_name_filter`]. On the
-    /// C5 this is a real pre-serial drop (the firmware is ours), unlike a commodity monitor NIC.
-    pub fn configure_name_filter(
-        &self,
-        enabled: bool,
-        masks: &[[u8; 16]],
-    ) -> Result<(), FaceError> {
-        self.inner.configure_name_filter(enabled, masks)
     }
 
     /// Scheduled TX (the airtime-lease primitive) — see [`SerialRadioBackend::inject_at`].
@@ -1159,7 +1456,6 @@ impl Esp32SerialBackend {
 
 #[async_trait]
 impl FrameIo for Esp32SerialBackend {
-
     /// This radio's own capability, so a face built from the bare `dyn FrameIo` does not have to
     /// invent one. Delegates to this type's [`RadioProfile`] — the single source of truth.
     fn radio_capability(&self) -> Option<ndn_radio_hal::RadioCapability> {
@@ -1233,8 +1529,55 @@ impl RadioKnobs for Esp32SerialBackend {
     ///
     /// Prefer [`set_tx_power_dbm`](RadioKnobs::set_tx_power_dbm): this radio's power really is an
     /// absolute scale, and the index form throws that away.
-    fn set_tx_power(&self, idx: u32) -> Result<(), FaceError> {
-        self.inner.set_txpower(idx.clamp(8, 84) as u8)
+    fn set_tx_power(&self, req: PowerRequest) -> Result<AppliedPower, FaceError> {
+        // The C5's unit is a quarter dBm, so an "index" here really is an absolute axis in
+        // disguise — which is why `Dbm` is the preferred spelling and gets the readback.
+        let want = match &req {
+            PowerRequest::Ceiling(_) => 84u32,
+            PowerRequest::Index(i, _) => *i as u32,
+            PowerRequest::Raw { idx, .. } => *idx as u32,
+            PowerRequest::Dbm(d) => {
+                let applied = RadioKnobs::set_tx_power_dbm(self, *d)?;
+                return Ok(AppliedPower::absolute_dbm(
+                    req.clone(),
+                    applied,
+                    applied != *d,
+                ));
+            }
+            PowerRequest::NoActuator => {
+                return Err(io_err(
+                    "esp32c5: PowerRequest::NoActuator, but esp_wifi_set_max_tx_power DOES \
+                     actuate power (22.6 dB MEASURED, R^2 = 0.974)."
+                        .into(),
+                ));
+            }
+        };
+        let q = want.clamp(8, 84);
+        self.inner.set_txpower(q as u8)?;
+        let mut p = AppliedPower::from_writes(
+            req.clone(),
+            PowerReference::AbsoluteDbm,
+            q as u8,
+            q != want,
+            vec![PowerWrite {
+                reg: 0,
+                value: q as u8,
+                group: "esp_wifi max_tx_power (0.25 dBm)",
+                path: 0,
+            }],
+        );
+        // ☠ **`dbm` stays `None` on this path, and the previous `Some(q / 4)` was wrong by its own
+        // comment.** `q` is the quarter-dBm value we REQUESTED; `AppliedPower::dbm` is defined as
+        // what the radio reported applying, "never inferred from an index" — and here the
+        // difference is MEASURED, not theoretical: the IDF quantises to 11 discrete steps and 21
+        // dBm applies as 20. A planner budgets link margin from this field, so an off-by-a-step
+        // figure it will believe is worse than an honest absence.
+        //
+        // Nothing is lost: `q` is in `writes`/`index_written`, labelled with its unit, where a
+        // reader sees it for what it is — a request in the firmware's own quantity. The value the
+        // radio actually applied is available, with a readback, through `PowerRequest::Dbm`.
+        debug_assert!(p.dbm.is_none());
+        Ok(p)
     }
 
     /// The portable absolute-power knob, returning the power the radio actually applied — which the
@@ -1264,16 +1607,7 @@ impl RadioKnobs for Esp32SerialBackend {
         TxDiscipline::ScheduledAt {
             granularity_ns: 200_000,
         }
-    }
-    fn configure_name_filter(
-        &self,
-        enabled: bool,
-        key: &[u8; 16],
-        masks: &[[u8; 16]],
-    ) -> Result<(), FaceError> {
-        RadioKnobs::configure_name_filter(self.inner.as_ref(), enabled, key, masks)
-    }
-    fn read_channel_activity(&self) -> Result<Option<u16>, FaceError> {
+    }    fn read_channel_activity(&self) -> Result<Option<u16>, FaceError> {
         RadioKnobs::read_channel_activity(self.inner.as_ref())
     }
 
@@ -1296,10 +1630,7 @@ impl RadioKnobs for Esp32SerialBackend {
 
 impl RadioTime for Esp32SerialBackend {
     fn time_sources(&self) -> Vec<RadioTimeSource> {
-        // The C5's real link clock is its free-running per-frame RX stamp (rx_ctrl.timestamp, µs ticks),
-        // latched on the device — a genuine hardware stamp, unlike the BW16's host-recv fallback. (The
-        // 802.11 port TSF reads 0 while unassociated, so it is deliberately NOT advertised.)
-        vec![RadioTimeSource::free_run_rx_stamp(self.clock_domain, 1_000)]
+        c5_time_sources(self.clock_domain)
     }
     fn read_clock(&self, _domain: ClockDomainId) -> Result<Option<u64>, FaceError> {
         // Latch-only: the free-run RX stamp has no read-now over the serial link. (A T_READCLOCK
@@ -1317,4 +1648,397 @@ impl RadioProfile for Esp32SerialBackend {
 
 fn io_err(msg: String) -> FaceError {
     FaceError::Io(std::io::Error::other(msg))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// M6 · §1.4 — THE PLAN.  The serial-bridge radios (BW16 / RTL8720DN, ESP32-C5).
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Specification: `docs/bringup-contract.md` §1.4/§1.5/§5-M6.
+//
+// ⚠ **This plan is not a transcription, because there was nothing to transcribe.** The other
+// migrations copy an existing ladder rung for rung; these two constructors ran NO ladder at all —
+// `Bw16SerialBackend::open_radio(path)` and `Esp32SerialBackend::open_c5_radio(path)` opened a
+// serial port, spawned a reader, and returned. §5-M6 asks them to "gain channel, `RawNdn(0x8624)`,
+// `NDN_RADIO_BW` and a clock domain uniformly", and the ⚠ beside it is the constraint that shapes
+// every rung below:
+//
+//   > A serial radio changing its on-air format is a **wire change** affecting both ends. Do NOT
+//   > change what goes on air; make the plan *declare* the current behaviour and record any
+//   > mismatch as an open item.
+//
+// So the four things the plan gains are split by whether they touch the air:
+//
+// | asked for | what this plan does | bytes on the wire |
+// |---|---|---|
+// | `RawNdn(0x8624)` | **declares and asserts** it — `SerialRadioBackend::open_inner` already takes `FrameFormat::default()`, which IS `RawNdn { ethertype: 0x8624 }`, so forcing it would be byte-identical and asserting it is strictly better | none |
+// | a clock domain | **declares** it, from the new `dev_clock` field: the C5's hardware RX-stamp domain, or the BW16's honest `None` | none |
+// | channel | **commands** it, and only when the caller names one. `channel == 0` = "leave the firmware's own boot default in force", which is exactly what both constructors did before | `T_CHANNEL` + `T_BW40`, or nothing |
+// | `NDN_RADIO_BW` | folded into the channel rung, because `RadioKnobs::set_channel(ch, bw)` is one operation on this wire | as above |
+//
+// ★ **The channel rung is byte-identical to what shipped**, on both existing paths. The BW16
+// constructor had no caller passing a channel, so it gets `channel = 0` and sends nothing. The C5
+// arm in `ndn-phy-wifi::factory::build_esp32c5` called `knobs.set_channel(ch, Bw20)` immediately
+// after opening, which is the same `T_CHANNEL` + `T_BW40(false)` pair this rung sends — moved
+// inside the plan so it lands in the report and the digest instead of happening off the books.
+//
+// ONE plan, on the shared transport, for both parts: the wrapper types differ in capability,
+// clock and power axis, not in bring-up. The part identity travels in `PlanRun::part` and
+// `DeviceAddress::Serial(path)`, which is where it was already carried by the M2 hand-filled
+// report.
+
+type Ser = SerialRadioBackend;
+
+fn s_ser_firmware_booted(b: &Arc<Ser>, c: &mut Ctx<'_>) -> Result<StepOutcome, FaceError> {
+    // No bus traffic and nothing to verify: the 7E-A5 protocol has no "are you there" opcode, and
+    // every command on it is fire-and-forget. Saying so is the point of `OutOfBand`.
+    let _ = b;
+    let _ = c;
+    Ok(StepOutcome::Established(Fact::Firmware {
+        name: "7E-A5 serial bridge (firmware/bw16-rs or firmware/esp32c5-ndn) — flashed, not \
+               downloaded by this process",
+        ready: true,
+    }))
+}
+
+fn s_ser_frame_format(b: &Arc<Ser>, c: &mut Ctx<'_>) -> Result<StepOutcome, FaceError> {
+    match b.format {
+        FrameFormat::RawNdn {
+            ethertype: crate::NDN_ETHERTYPE,
+        } => Ok(StepOutcome::Done),
+        other => {
+            // ⚠ RECORDED, NOT CORRECTED. Forcing the canonical format here would change what this
+            // radio puts on the air, and the peer at the other end of a serial link is a different
+            // board this process cannot reach. §5-M6: a wire change is a separate, witnessed
+            // commit with both ends together.
+            c.warn(format!(
+                "on-air format is {other:?}, not the canonical RawNdn({:#06x}) every other radio \
+                 in the fleet uses — frames from this radio will NOT de-frame on one opened \
+                 through `open_radio`. NOT corrected here: changing a serial radio's format \
+                 is a wire change affecting a peer this process cannot see (§5-M6)",
+                crate::NDN_ETHERTYPE
+            ));
+            Ok(StepOutcome::Branch("non-canonical-format"))
+        }
+    }
+}
+
+fn s_ser_set_channel(b: &Arc<Ser>, c: &mut Ctx<'_>) -> Result<StepOutcome, FaceError> {
+    let (ch, bw) = (c.state_ref().channel, c.state_ref().bw);
+    if ch == 0 {
+        return Ok(StepOutcome::Skipped(
+            "no channel named by the caller — the firmware's own boot default stays in force, and \
+             this process cannot read it back. Exactly what both serial constructors did before \
+             M6; naming a channel is how a caller opts into commanding one",
+        ));
+    }
+    // ONE operation on this wire: `T_CHANNEL` then `T_BW40`. Going through `RadioKnobs` rather
+    // than the inherent `set_channel` is deliberate — it is the same call the factory made
+    // immediately after opening, so the bytes are unchanged, and it carries the width refusal
+    // (Nb5/Nb10 are widened-not-narrowed on this bridge, and are refused rather than actuated).
+    RadioKnobs::set_channel(b.as_ref(), ch, bw)?;
+    Ok(StepOutcome::Done)
+}
+
+fn s_ser_clock_domain(b: &Arc<Ser>, c: &mut Ctx<'_>) -> Result<StepOutcome, FaceError> {
+    match b.dev_clock {
+        Some(d) => Ok(StepOutcome::Branch(match d {
+            _ if d == HOST_CLOCK_DOMAIN => "host-recv (device domain equals the host domain)",
+            _ => "device per-frame stamp",
+        })),
+        None => {
+            c.warn(
+                "no per-frame device clock: frames from this radio are stamped HostRecv (the \
+                 serial line's delivery time), so this radio cannot source common view. On the \
+                 BW16 that is a DELIBERATE refusal — its `T_RX_TS` is `us_ticker_read()` called by \
+                 software at the top of the vendor blob's RX callback, after an RTOS dispatch, and \
+                 the MAC's own RXTSFL is discarded by the blob before our callback runs. A \
+                 software counter read after a dispatch is not a latch",
+            );
+            Ok(StepOutcome::Branch("host-recv"))
+        }
+    }
+}
+
+const SER_R_FIRMWARE: Step<Ser> = Step {
+    id: StepId("firmware_booted"),
+    stage: Stage::Firmware,
+    class: StepClass::OutOfBand {
+        established_by: "the serial-bridge firmware flashed onto the board, which brings the radio \
+                         up on power-on — before this host ever opens the port",
+    },
+    why: "★ The honest first rung for a bridge radio: this process does not bring this radio up \
+          and cannot verify that anything did. The 7E-A5 protocol has no liveness opcode and every \
+          command on it is fire-and-forget, so there is no round trip to take. `OutOfBand` is \
+          `docs/bringup-contract.md` §1.4's word for exactly this, and it is better than a step \
+          list this crate did not run.",
+    must_follow: &[],
+    must_precede: &[],
+    run: s_ser_firmware_booted,
+};
+
+const SER_R_FRAME_FORMAT: Step<Ser> = Step {
+    id: StepId("frame_format"),
+    stage: Stage::Attach,
+    class: StepClass::Assert,
+    why: "§5-M6 asks these arms to gain `RawNdn(0x8624)`. They already have it — \
+          `SerialRadioBackend::open_inner` takes `FrameFormat::default()`, which IS \
+          `RawNdn { ethertype: 0x8624 }` — so this rung READS IT BACK rather than writing it. \
+          ⚠ Forcing the format would be a WIRE CHANGE affecting a peer this process cannot see, \
+          and the byte-identical alternative is to assert. A mismatch (an `open_with_format` \
+          caller) is recorded as a warning and a `Branch`, never silently corrected.",
+    must_follow: &[],
+    must_precede: &[],
+    run: s_ser_frame_format,
+};
+
+const SER_R_SET_CHANNEL: Step<Ser> = Step {
+    id: StepId("set_channel"),
+    stage: Stage::Tune,
+    class: StepClass::Required,
+    why: "★ The one rung here that puts bytes on the wire, and the only behaviour §5-M6 adds: \
+          `T_CHANNEL` + `T_BW40` for the channel and width the CALLER named. Before M6 neither \
+          serial constructor took a channel at all, so a C5 opened through the factory was tuned \
+          by a `knobs.set_channel(ch, Bw20)` call made just after the open — off the books, absent \
+          from the report, and absent from the digest. Same bytes, now inside the plan. \
+          `channel == 0` skips it entirely, which is byte-for-byte the pre-M6 behaviour.",
+    must_follow: &[],
+    must_precede: &[],
+    run: s_ser_set_channel,
+};
+
+const SER_R_CLOCK_DOMAIN: Step<Ser> = Step {
+    id: StepId("clock_domain"),
+    stage: Stage::Verify,
+    class: StepClass::Assert,
+    why: "§5-M6's 'a clock domain uniformly'. Reads back which clock this port's frames are \
+          stamped in — the C5's hardware per-frame RX domain, or `None` = HostRecv — and puts the \
+          answer in the report. It was previously known only to the spawned reader thread, so the \
+          part with a real hardware stamp and the part that deliberately refuses to claim one \
+          looked identical from the driver's own state.",
+    must_follow: &[],
+    must_precede: &[],
+    run: s_ser_clock_domain,
+};
+
+const SER_STEPS: &[Step<Ser>] = &[
+    SER_R_FIRMWARE,
+    SER_R_FRAME_FORMAT,
+    SER_R_SET_CHANNEL,
+    SER_R_CLOCK_DOMAIN,
+];
+
+const SERIAL_PLAN: Plan<Ser> = Plan {
+    id: PlanId {
+        part: "serial-bridge",
+        name: "monitor",
+        ver: 1,
+    },
+    role: Role::TransmitAndReceive,
+    steps: SER_STEPS,
+    excluded: &[
+        (
+            Stage::PowerOn,
+            "there is no power sequence to run: the board powers up with the port. On the C5 the \
+             opposite is the hazard — RTS maps to EN, so asserting it HOLDS THE CHIP IN RESET, \
+             which is why `open_no_reset` exists and why nothing here touches the modem lines.",
+        ),
+        (
+            Stage::MacInit,
+            "MAC/BB/RF init happens inside the flashed firmware before the port is opened. This \
+             crate cannot see it, cannot order it and must not claim it — see the `firmware_booted` \
+             rung's `OutOfBand`.",
+        ),
+        (
+            Stage::Power,
+            "the bridge sets no power at open: whatever the firmware booted with is in force. The \
+             knob is real and MEASURED on both parts (RTL8720DN 0.274 dB/step; C5 an absolute \
+             2..20 dBm axis) — it is simply not a bring-up rung, because a default that has never \
+             been characterised against a regulatory point must not be asserted as one.",
+        ),
+    ],
+};
+
+const _: () = SERIAL_PLAN.check_or_panic();
+
+/// The serial bridges' one plan — see the M6 block above for why it declares more than it writes.
+pub static PLAN_SERIAL_BRIDGE: Plan<Ser> = SERIAL_PLAN;
+
+impl BringUp for SerialRadioBackend {
+    fn plan(role: Role) -> Option<&'static Plan<Self>> {
+        match role {
+            Role::TransmitAndReceive => Some(&PLAN_SERIAL_BRIDGE),
+            // A named refusal. The firmware brings both directions up together and exposes no
+            // opcode to bring up one without the other, so a role that claimed to be one-way
+            // would be a claim about a radio this crate does not control.
+            Role::ReceiveOnly | Role::TransmitOnly => None,
+        }
+    }
+
+    fn tx_unprovable_reason() -> Option<&'static str> {
+        Some(
+            "no TX counter exists in the 7E-A5 protocol — answering (A) here needs a firmware \
+             opcode, not a driver change. `T_TXTIME` confirms a SCHEDULED inject's actual instant \
+             and is per-frame, not a counter, so it cannot be differenced across a probe",
+        )
+    }
+}
+
+/// Run [`PLAN_SERIAL_BRIDGE`] for one of the two bridge parts.
+///
+/// The wrapper types (`Bw16SerialBackend`, `Esp32SerialBackend`) differ in capability, clock and
+/// power axis but not in bring-up, so they share one plan and hand their own identity in here.
+/// `channel == 0` means "leave the firmware's boot default alone" — the pre-M6 behaviour.
+fn run_serial_plan(
+    inner: &Arc<SerialRadioBackend>,
+    part: &'static str,
+    path: &str,
+    channel: u8,
+    bw: Bandwidth,
+    capability: RadioCapability,
+) -> Result<BringUpReport, FaceError> {
+    let run = PlanRun::new(
+        part,
+        ndn_radio_hal::DeviceAddress::Serial(path.to_string()),
+        RadioState {
+            channel,
+            bw,
+            format: "RawNdn(0x8624)",
+            role: Role::TransmitAndReceive,
+            // The bridge sets no power at open: whatever the firmware booted with is in force.
+            // `NoActuator` would be a lie — both parts actuate power — so this says the bring-up
+            // did not touch it, which is the truth.
+            power: AppliedPower::no_actuator(PowerRequest::NoActuator),
+            rate: ndn_radio_hal::RateState::unreported(),
+            warm: None,
+            contention: None,
+            pump: PumpPolicy::CallerOwns,
+            facts: Vec::new(),
+        },
+    );
+    let (report, guards) = <SerialRadioBackend as BringUp>::bring_up(inner, &run).map_err(|f| {
+        eprintln!(
+            "{part} bring-up FAILED at `{}` — the partial report:\n{}",
+            f.failed_at,
+            f.report.render()
+        );
+        f.source
+    })?;
+    debug_assert!(guards.is_empty(), "the serial plan produces no guards");
+    Ok(report.with_capability(capability))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ndn_frame_io::RadioClockKind;
+    use ndn_radio_hal::{ClockReference, ClockReferenceKind, FaceTimeProfile};
+
+    /// A `RadioTime` over a fixed source list, so a backend's DECLARATION can be put through
+    /// `FaceTimeProfile::derive` without opening a serial port.
+    struct Declared(Vec<RadioTimeSource>);
+    impl RadioTime for Declared {
+        fn time_sources(&self) -> Vec<RadioTimeSource> {
+            self.0.clone()
+        }
+    }
+    fn derive(v: Vec<RadioTimeSource>) -> FaceTimeProfile {
+        FaceTimeProfile::derive(&Declared(v), TxDiscipline::BestEffort)
+    }
+
+    /// ★ **The BW16 does not latch in hardware, and must not say it does.** Its `T_RX_TS` value is
+    /// `us_ticker_read()` called by software inside the vendor blob's promiscuous RX callback, yet
+    /// this backend published `free_run_rx_stamp` — `LatchPoint::MacDone`, a 1 µs floor, and
+    /// `hw_rx_stamp = true`. All three were false. `ndr_node_report` prints `hw_rx_stamp` as "the
+    /// latch half", so the reader diagnosing WHICH half failed was told the wrong one.
+    #[test]
+    fn the_bw16_declares_no_hardware_latch() {
+        let v = bw16_time_sources();
+        assert_eq!(v.len(), 1, "one clock: the host's");
+        assert_eq!(v[0].kind, RadioClockKind::HostRecv);
+        assert_eq!(v[0].latch, LatchPoint::HostRecv);
+        assert_eq!(
+            v[0].domain, HOST_CLOCK_DOMAIN,
+            "a host stamp lives in the host domain, not the device's"
+        );
+        assert!(
+            !v.iter().any(|s| s.kind == RadioClockKind::FreeRunRxStamp),
+            "a device software counter is not a free-running hardware stamp"
+        );
+
+        let p = derive(v);
+        assert!(!p.hw_rx_stamp, "the latch half is FALSE for this part");
+        assert!(!p.can_common_view);
+        assert_eq!(p.best_clock, Some(RadioClockKind::HostRecv));
+        assert_eq!(
+            p.stamp_precision_ns,
+            Some(LatchPoint::HostRecv.precision_floor_ns()),
+            "1 us was the MacDone floor for a stamp that never touched the MAC"
+        );
+    }
+
+    /// ★ **And a truthful crystal answer must not rescue it.** The named next step for this board is
+    /// the fleet's `CMD_GET_CLOCK_REF`; the RTL8720DN answering `CLOCK_REF_XTAL` would be a TRUE
+    /// statement about its oscillator. Common view needs BOTH halves on one source, so a part that
+    /// fails the latch stays refused however good its reference turns out to be — which is the
+    /// property that makes the honest `kind` load-bearing rather than cosmetic.
+    #[test]
+    fn a_crystal_answer_cannot_promote_the_bw16s_software_stamp() {
+        let v: Vec<RadioTimeSource> = bw16_time_sources()
+            .into_iter()
+            .map(|s| s.with_reference(ClockReference::crystal()))
+            .collect();
+        let p = derive(v);
+        assert_eq!(
+            p.clock_reference.map(|r| r.kind),
+            Some(ClockReferenceKind::Crystal)
+        );
+        assert!(
+            !p.can_common_view,
+            "a crystal behind a software stamp is still not a common view"
+        );
+        assert!(!p.hw_rx_stamp);
+    }
+
+    /// The C5 beside it is a REAL hardware stamp (`p->rx_ctrl.timestamp`, latched by the MAC) and the
+    /// BW16 fix must not have taken it down with it: the latch half stays true, only the reference is
+    /// unestablished — so this part is one truthful `CLOCK_REF_XTAL` away from a common view, and the
+    /// BW16 is not.
+    #[test]
+    fn the_c5_keeps_its_hardware_stamp_and_fails_only_on_the_reference() {
+        let dom = c5_clock_domain("/dev/ttyACM0");
+        let v = c5_time_sources(dom);
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].kind, RadioClockKind::FreeRunRxStamp);
+        assert_eq!(
+            v[0].domain, dom,
+            "the device's own timeline, not the host's"
+        );
+
+        let p = derive(v.clone());
+        assert!(p.hw_rx_stamp, "the C5 really does latch per frame");
+        assert_eq!(
+            p.clock_reference.map(|r| r.kind),
+            Some(ClockReferenceKind::Unknown)
+        );
+        assert!(!p.can_common_view, "unknown reference earns nothing");
+
+        // The asymmetry, stated: the same hypothetical answer promotes the C5 and not the BW16.
+        let promoted: Vec<RadioTimeSource> = v
+            .into_iter()
+            .map(|s| s.with_reference(ClockReference::crystal()))
+            .collect();
+        assert!(derive(promoted).can_common_view);
+    }
+
+    /// Two boards on one host never share a timeline, and neither collides with the host domain.
+    #[test]
+    fn device_domains_are_distinct_from_each_other_and_from_the_host() {
+        let a = c5_clock_domain("/dev/ttyACM0");
+        let b = c5_clock_domain("/dev/ttyACM1");
+        assert_ne!(a, b);
+        assert_ne!(a, HOST_CLOCK_DOMAIN);
+        assert_ne!(bw16_clock_domain("/dev/ttyUSB0"), a);
+        assert_ne!(bw16_clock_domain("/dev/ttyUSB0"), HOST_CLOCK_DOMAIN);
+    }
 }

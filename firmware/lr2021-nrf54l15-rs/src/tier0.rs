@@ -380,11 +380,27 @@ impl PrefixFilter {
 /// from the Blur, so the Blur never shrinks.
 pub const FP_BITS: u32 = 24;
 
-/// Extra Blur bytes on the Wi-Fi wide profile — `addr4` only (48 bits).
-pub const WIFI_WIDE_EXTRA_BYTES: usize = 6;
+/// Extra Blur bytes on the Wi-Fi wide profile — `addr4` (48 bits) ‖ QoS Control (16 bits) = 64.
+/// QoS Control's two bytes are already on the wire in the wide QoS-Data frame carrying `[0,0]`, so
+/// these last 16 bits cost **zero additional airtime**. MEASURED to survive TX byte-verbatim on
+/// RTL8812AU, MT7610U and AR9271 (`docs/p8-header-passthrough.md`).
+pub const WIFI_WIDE_EXTRA_BYTES: usize = 8;
 
-/// Profile marker written to `HT Control[3]`.
-pub const WIDE_PROFILE_MARKER: u8 = 0x01;
+/// `HT Control[3]` is a **region bitmap**, not a scalar: which extra regions this frame's projection
+/// used. Tested for EXACT equality — a foreign bitmap means "read the base region only", because a
+/// different geometry's bits are unrelated, not coarser, and ANDing our masks against them is a
+/// false negative.
+pub const WIDE_REGION_ADDR4: u8 = 0x01;
+/// The QoS Control half of the extra region.
+pub const WIDE_REGION_QOS: u8 = 0x02;
+/// The regions this build emits and accepts.
+pub const WIDE_PROFILE_MARKER: u8 = WIDE_REGION_ADDR4 | WIDE_REGION_QOS; // 0x03
+
+/// Fill cap on the **extra** region alone. `for_each_prefix` emits at most `(MAX_DEPTH+1)*K = 36`
+/// set bits by construction, so 40 can never fire on an honest name; a saturating sender is
+/// **demoted to the base region**, never rejected — rejecting would make a saturated extra region a
+/// false-negative weapon against honest base bits.
+pub const WIFI_WIDE_EXTRA_FILL_CAP: u32 = 40;
 
 /// Domain separator for the extra projection — a second, independent keyed projection so the extra
 /// region is not correlated with the base.
@@ -419,8 +435,9 @@ pub struct WideFields {
     pub addr1: [u8; 6],
     pub addr2: [u8; 6],
     pub addr3: [u8; 6], // base[12:16] ‖ id ‖ flags
-    pub addr4: [u8; 6], // extra Blur (48 bits)
-    pub htc: [u8; 4],   // fingerprint (24 bits, LE) ‖ profile marker
+    pub addr4: [u8; 6], // extra Blur [0..6] (48 bits)
+    pub qos: [u8; 2],   // extra Blur [6..8] (16 bits) — the free bits
+    pub htc: [u8; 4],   // fingerprint (24 bits, LE) ‖ region bitmap
 }
 
 /// Build the wide-profile header fields for one name — the sender path. The base region is exactly
@@ -452,6 +469,7 @@ pub fn wide_fields(key: &[u8; 16], name: &[u8], id: u8, flags: u8) -> WideFields
         addr2: [0; 6],
         addr3: [0; 6],
         addr4: [0; 6],
+        qos: [0; 2],
         htc: [0; 4],
     };
     f.addr1.copy_from_slice(&bw[0..6]);
@@ -459,7 +477,8 @@ pub fn wide_fields(key: &[u8; 16], name: &[u8], id: u8, flags: u8) -> WideFields
     f.addr3[0..4].copy_from_slice(&bw[12..16]);
     f.addr3[4] = id;
     f.addr3[5] = flags;
-    f.addr4.copy_from_slice(&extra);
+    f.addr4.copy_from_slice(&extra[0..6]);
+    f.qos.copy_from_slice(&extra[6..8]);
     f.htc[0] = fp as u8;
     f.htc[1] = (fp >> 8) as u8;
     f.htc[2] = (fp >> 16) as u8;
@@ -500,10 +519,12 @@ mod tests {
         assert_eq!(MAX_DEPTH, 8);
         assert_eq!(FILL_CAP, 64);
         assert_eq!(RESERVED_MASK0, 0x03);
-        // wide-params fp_bits=24 extra_bytes=6 marker=0x01
+        // wide-params fp_bits=24 extra_bytes=8 regions=0x03 extra_fill_cap=40
+        //             map=extra[0:6]-addr4,extra[6:8]-qos
         assert_eq!(FP_BITS, 24);
-        assert_eq!(WIFI_WIDE_EXTRA_BYTES, 6);
-        assert_eq!(WIDE_PROFILE_MARKER, 0x01);
+        assert_eq!(WIFI_WIDE_EXTRA_BYTES, 8);
+        assert_eq!(WIDE_PROFILE_MARKER, 0x03);
+        assert_eq!(WIFI_WIDE_EXTRA_FILL_CAP, 40);
     }
 
     /// The four base rows: `row <label> <key> <name> <16 wire bytes> <popcount>`.
@@ -555,8 +576,9 @@ mod tests {
     }
 
     /// The wide row (#39): the base Blur must be **byte-identical** to a base-only frame, so a base
-    /// receiver reads a wide sender's frame unchanged. addr4 carries the additive 48-bit second
-    /// projection; HT Control carries the 24-bit fingerprint little-endian, then the marker.
+    /// receiver reads a wide sender's frame unchanged. `addr4 ‖ QoS Control` carry the additive
+    /// **64-bit** second projection; HT Control carries the 24-bit fingerprint little-endian, then
+    /// the region bitmap (`0x03` = addr4 + QoS).
     #[test]
     fn golden_wide_row() {
         let name = b"/ndn/test/v1";
@@ -568,9 +590,10 @@ mod tests {
         all.extend_from_slice(&w.addr4);
         assert_eq!(
             all,
-            unhex("87000800c10308820040040080000011370041a14230d880")
+            unhex("87000800c103088200400400800000113700908141204020")
         );
-        assert_eq!(w.htc.to_vec(), unhex("1486e901"));
+        assert_eq!(w.qos.to_vec(), unhex("0a90"), "the free 16 bits");
+        assert_eq!(w.htc.to_vec(), unhex("1486e903"));
         assert_eq!(name_fingerprint(&KEY1, name), 0x00e9_8614);
 
         // The base half of a wide frame IS a base frame.

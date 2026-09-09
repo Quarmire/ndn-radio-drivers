@@ -61,6 +61,12 @@ use rusb::{Context, Device, DeviceHandle, Direction, TransferType};
 
 use crate::realtek_rx;
 use ndn_frame_io::{CapturedFrame, ClockDomainId, FrameFormat, FrameIo, InjectFrame, frame};
+use ndn_radio_hal::bringup::{
+    AppliedPower, Assert, BringUp, BringUpFailure, BringUpReport, Ctx, Degradation, Deviation,
+    Fact, Guards, NO_CALIBRATION_MSG, Plan, PlanId, PlanRun, PowerReference, PowerRequest,
+    PowerWrite, ProofRequirement, PumpPolicy, RadioState, Role, Severity, Stage, Step, StepClass,
+    StepId, StepOutcome, TxInstrument, power_unsupported,
+};
 use ndn_radio_hal::{Band, RadioCapability, RadioProfile, RadioTime, RadioTimeSource};
 use ndn_transport::FaceError;
 
@@ -100,6 +106,12 @@ pub const REALTEK_VID: u16 = 0x0bda;
 /// 8812**EU**) so opening the AU never disturbs the EU monitor dongle on the
 /// same host. `0x881a` is the RTL8812AU-VS on the test rig.
 pub const RTL8812AU_PIDS: &[u16] = &[0x8812, 0x881a, 0x881b, 0x881c, 0x8813];
+
+/// A product id that selects the RTL8812AU arm of [`open_radio`](crate::open_radio).
+///
+/// The arm keys on membership of [`RTL8812AU_PIDS`] and `open_select` then scans the whole set, so
+/// any member names the part; this is the one to write when a caller has no PID of its own.
+pub const RTL8812AU_PID: u16 = 0x8812;
 
 /// `REG_SYS_CFG` (`0x00F0`) — silicon configuration. For the 8812A the cut
 /// version is bits `[15:12]`; the high bits carry vendor/RF-type straps. A read
@@ -4650,13 +4662,15 @@ impl Rtl8812auBackend {
         Ok(())
     }
 
-    /// Bring the MAC power domain up (card-emulation → active) by running the
-    /// 8812A [`CARDEMU_TO_ACT`] sequence. Run once after [`open`](Self::open),
-    /// before [`download_firmware`](Self::download_firmware).
-    pub fn power_on(&self) -> Result<(), FaceError> {
-        // Release REG_RSV_CTRL so MCU-IO-wrapper register writes take effect.
-        self.write8(REG_RSV_CTRL, 0)?;
-        self.run_pwr_seq(CARDEMU_TO_ACT)
+    rung! {
+        /// Bring the MAC power domain up (card-emulation → active) by running the
+        /// 8812A [`CARDEMU_TO_ACT`] sequence. Run once after [`open`](Self::open),
+        /// before [`download_firmware`](Self::download_firmware).
+        fn power_on(&self) -> Result<(), FaceError> {
+            // Release REG_RSV_CTRL so MCU-IO-wrapper register writes take effect.
+            self.write8(REG_RSV_CTRL, 0)?;
+            self.run_pwr_seq(CARDEMU_TO_ACT)
+        }
     }
 
     /// Bring the MAC power domain down to card-emulation ([`ACT_TO_CARDEMU`]).
@@ -4670,40 +4684,42 @@ impl Rtl8812auBackend {
         self.run_pwr_seq(ACT_TO_CARDEMU)
     }
 
-    /// Download the vendored 8812A NIC firmware to the MCU and wait for it to
-    /// boot (`WINTINI_RDY`). Requires [`power_on`](Self::power_on) first. Returns
-    /// the firmware `(version, subversion)` from its header.
-    ///
-    /// Safe to re-run on a chip that is already up: it resets the 8051 first.
-    pub fn download_firmware(&self) -> Result<(u16, u8), FaceError> {
-        let version = u16::from_le_bytes([FW_NIC[4], FW_NIC[5]]);
-        let subversion = FW_NIC[6];
-        let body = &FW_NIC[FW_HDR_LEN..];
+    rung! {
+        /// Download the vendored 8812A NIC firmware to the MCU and wait for it to
+        /// boot (`WINTINI_RDY`). Requires [`power_on`](Self::power_on) first. Returns
+        /// the firmware `(version, subversion)` from its header.
+        ///
+        /// Safe to re-run on a chip that is already up: it resets the 8051 first.
+        fn download_firmware(&self) -> Result<(u16, u8), FaceError> {
+            let version = u16::from_le_bytes([FW_NIC[4], FW_NIC[5]]);
+            let subversion = FW_NIC[6];
+            let body = &FW_NIC[FW_HDR_LEN..];
 
-        // Reset the 8051 if it is already running a RAM image, before writing a new
-        // one over it. Not a corner case: this is true on every bring-up after the
-        // first, because a process that is killed — a `timeout`, a Ctrl-C — leaves
-        // the chip live with its firmware running.
-        //
-        // Writing firmware over a running 8051 does not fail cleanly. The block
-        // write to FW_START_ADDRESS times out and the device drops off the USB bus
-        // entirely, recoverable only by a physical replug:
-        //   usb write1568(0x1000) failed after 535 ok control transfers: timed out
-        // and every subsequent open then fails on its first register read.
-        //
-        // The vendor driver guards it identically, and says why:
-        // "If 8051 is running in RAM code, driver should inform Fw to reset by
-        //  itself, or it will cause download Fw fail."
-        if self.read8(REG_MCUFWDL)? & MCUFWDL_RAM_DL_SEL != 0 {
-            self.write8(REG_MCUFWDL, 0)?;
-            self.reset_8051()?;
+            // Reset the 8051 if it is already running a RAM image, before writing a new
+            // one over it. Not a corner case: this is true on every bring-up after the
+            // first, because a process that is killed — a `timeout`, a Ctrl-C — leaves
+            // the chip live with its firmware running.
+            //
+            // Writing firmware over a running 8051 does not fail cleanly. The block
+            // write to FW_START_ADDRESS times out and the device drops off the USB bus
+            // entirely, recoverable only by a physical replug:
+            //   usb write1568(0x1000) failed after 535 ok control transfers: timed out
+            // and every subsequent open then fails on its first register read.
+            //
+            // The vendor driver guards it identically, and says why:
+            // "If 8051 is running in RAM code, driver should inform Fw to reset by
+            //  itself, or it will cause download Fw fail."
+            if self.read8(REG_MCUFWDL)? & MCUFWDL_RAM_DL_SEL != 0 {
+                self.write8(REG_MCUFWDL, 0)?;
+                self.reset_8051()?;
+            }
+
+            self.fw_dl_enable(true)?;
+            self.write_fw(body)?;
+            self.fw_dl_enable(false)?;
+            self.fw_free_to_go()?;
+            Ok((version, subversion))
         }
-
-        self.fw_dl_enable(true)?;
-        self.write_fw(body)?;
-        self.fw_dl_enable(false)?;
-        self.fw_free_to_go()?;
-        Ok((version, subversion))
     }
 
     /// `_FWDownloadEnable_8812`: gate the MCU firmware-download path and hold the
@@ -4786,26 +4802,28 @@ impl Rtl8812auBackend {
         unreachable!()
     }
 
-    /// Initialize the LLT packet-buffer page chain (`InitLLTTable8812A`): pages
-    /// `0..boundary-1` form a forward-linked TX-queue list ending in `0xFF`, and
-    /// `boundary..255` form a ring (beacon / loopback buffer). Run after
-    /// [`power_on`](Self::power_on); it's the first MAC-init step and each write
-    /// polls, so success confirms the MAC's buffer engine is alive.
-    pub fn init_llt(&self) -> Result<(), FaceError> {
-        let boundary = TX_PAGE_BOUNDARY;
-        // TX-queue list: each page points to the next.
-        for i in 0..boundary - 1 {
-            self.llt_write(i, i + 1)?;
+    rung! {
+        /// Initialize the LLT packet-buffer page chain (`InitLLTTable8812A`): pages
+        /// `0..boundary-1` form a forward-linked TX-queue list ending in `0xFF`, and
+        /// `boundary..255` form a ring (beacon / loopback buffer). Run after
+        /// [`power_on`](Self::power_on); it's the first MAC-init step and each write
+        /// polls, so success confirms the MAC's buffer engine is alive.
+        fn init_llt(&self) -> Result<(), FaceError> {
+            let boundary = TX_PAGE_BOUNDARY;
+            // TX-queue list: each page points to the next.
+            for i in 0..boundary - 1 {
+                self.llt_write(i, i + 1)?;
+            }
+            // End of the TX-queue list.
+            self.llt_write(boundary - 1, 0xFF)?;
+            // Ring buffer over the remaining pages.
+            for i in boundary..LAST_TX_PKT_PAGE {
+                self.llt_write(i, i + 1)?;
+            }
+            // Last entry loops back to the ring start.
+            self.llt_write(LAST_TX_PKT_PAGE, boundary)?;
+            Ok(())
         }
-        // End of the TX-queue list.
-        self.llt_write(boundary - 1, 0xFF)?;
-        // Ring buffer over the remaining pages.
-        for i in boundary..LAST_TX_PKT_PAGE {
-            self.llt_write(i, i + 1)?;
-        }
-        // Last entry loops back to the ring start.
-        self.llt_write(LAST_TX_PKT_PAGE, boundary)?;
-        Ok(())
     }
 
     // ── Milestone 3: MAC register table (phydm conditional config) ───────────
@@ -4886,10 +4904,12 @@ impl Rtl8812auBackend {
         Ok(())
     }
 
-    /// Apply the MAC register table (`PHY_MACConfig8812`): byte writes, honoring
-    /// the phydm condition blocks. Run after the firmware is ready.
-    pub fn mac_config(&self) -> Result<(), FaceError> {
-        self.config_table(MAC_REG, |s, addr, val| s.write8(addr as u16, val as u8))
+    rung! {
+        /// Apply the MAC register table (`PHY_MACConfig8812`): byte writes, honoring
+        /// the phydm condition blocks. Run after the firmware is ready.
+        fn mac_config(&self) -> Result<(), FaceError> {
+            self.config_table(MAC_REG, |s, addr, val| s.write8(addr as u16, val as u8))
+        }
     }
 
     // ── Milestone 4: baseband (BB/PHY) + AGC init ────────────────────────────
@@ -4909,25 +4929,27 @@ impl Rtl8812auBackend {
         Ok(())
     }
 
-    /// Configure the baseband (`PHY_BBConfig8812`): power on BB + both RF paths,
-    /// then apply the BB PHY-register table and the AGC table. Run after
-    /// [`mac_init_queues`](Self::mac_init_queues). Reuses the phydm condition
-    /// evaluator (the BB/AGC tables share the MAC table's conditional format).
-    pub fn bb_config(&self) -> Result<(), FaceError> {
-        // Power on baseband + RF analog.
-        let fen = self.read8(REG_SYS_FUNC_EN)?;
-        self.write8(REG_SYS_FUNC_EN, fen | FEN_USBA)?;
-        self.write8(
-            REG_SYS_FUNC_EN,
-            fen | FEN_USBA | FEN_BB_GLB_RSTN | FEN_BBRSTB,
-        )?;
-        self.write8(REG_RF_CTRL, 0x07)?; // path-A RF power on
-        self.write8(REG_OPT_CTRL_8812 + 2, 0x07)?; // path-B RF power on
+    rung! {
+        /// Configure the baseband (`PHY_BBConfig8812`): power on BB + both RF paths,
+        /// then apply the BB PHY-register table and the AGC table. Run after
+        /// [`mac_init_queues`](Self::mac_init_queues). Reuses the phydm condition
+        /// evaluator (the BB/AGC tables share the MAC table's conditional format).
+        fn bb_config(&self) -> Result<(), FaceError> {
+            // Power on baseband + RF analog.
+            let fen = self.read8(REG_SYS_FUNC_EN)?;
+            self.write8(REG_SYS_FUNC_EN, fen | FEN_USBA)?;
+            self.write8(
+                REG_SYS_FUNC_EN,
+                fen | FEN_USBA | FEN_BB_GLB_RSTN | FEN_BBRSTB,
+            )?;
+            self.write8(REG_RF_CTRL, 0x07)?; // path-A RF power on
+            self.write8(REG_OPT_CTRL_8812 + 2, 0x07)?; // path-B RF power on
 
-        // BB PHY register table, then the AGC table.
-        self.config_table(PHY_REG, |s, a, d| s.bb_write(a, d))?;
-        self.config_table(AGC_TAB, |s, a, d| s.bb_write(a, d))?;
-        Ok(())
+            // BB PHY register table, then the AGC table.
+            self.config_table(PHY_REG, |s, a, d| s.bb_write(a, d))?;
+            self.config_table(AGC_TAB, |s, a, d| s.bb_write(a, d))?;
+            Ok(())
+        }
     }
 
     /// Read a baseband register (32-bit) — for verifying [`bb_config`](Self::bb_config).
@@ -5389,50 +5411,52 @@ impl Rtl8812auBackend {
 }
 
 impl Rtl8812auBackend {
-    pub fn lc_calibrate(&self) -> Result<(), FaceError> {
-        const RF_LCK: u32 = 0xB4;
-        const RF_CHNLBW: u32 = 0x18;
-        const REG_TXPAUSE: u16 = 0x0522;
+    rung! {
+        fn lc_calibrate(&self) -> Result<(), FaceError> {
+            const RF_LCK: u32 = 0xB4;
+            const RF_CHNLBW: u32 = 0x18;
+            const REG_TXPAUSE: u16 = 0x0522;
 
-        // If a continuous-tone TX is active (0x914[18:16]), don't pause; else
-        // pause packet TX during the cal.
-        let cont_tx = self.read32(0x0914)? & 0x7_0000 != 0;
-        // ★ Save the as-found gate. This used to write 0x00 on exit unconditionally, which
-        // silently RE-OPENS a hold that `RadioKnobs::set_tx_hold` had deliberately asserted — a
-        // retune inside a held airtime slot would let the queues drain into somebody else's turn,
-        // which is the exact bleed a slot schedule exists to prevent.
-        let saved_pause = if cont_tx {
-            None
-        } else {
-            Some(self.read8(REG_TXPAUSE)?)
-        };
-        if !cont_tx {
-            self.write8(REG_TXPAUSE, 0xFF)?;
-        }
-
-        // Enter LCK mode.
-        let lck = self.rf_read(RfPath::A, RF_LCK)?;
-        self.rf_write(RfPath::A, RF_LCK, lck | (1 << 14))?;
-
-        // Trigger LC cal (RF 0x18[15]) and poll until it self-clears.
-        let lc_cal = self.rf_read(RfPath::A, RF_CHNLBW)?;
-        self.rf_write(RfPath::A, RF_CHNLBW, lc_cal | 0x0_8000)?;
-        std::thread::sleep(Duration::from_millis(150));
-        for _ in 0..5 {
-            if self.rf_read(RfPath::A, RF_CHNLBW)? & 0x8000 == 0 {
-                break;
+            // If a continuous-tone TX is active (0x914[18:16]), don't pause; else
+            // pause packet TX during the cal.
+            let cont_tx = self.read32(0x0914)? & 0x7_0000 != 0;
+            // ★ Save the as-found gate. This used to write 0x00 on exit unconditionally, which
+            // silently RE-OPENS a hold that `RadioKnobs::set_tx_hold` had deliberately asserted — a
+            // retune inside a held airtime slot would let the queues drain into somebody else's turn,
+            // which is the exact bleed a slot schedule exists to prevent.
+            let saved_pause = if cont_tx {
+                None
+            } else {
+                Some(self.read8(REG_TXPAUSE)?)
+            };
+            if !cont_tx {
+                self.write8(REG_TXPAUSE, 0xFF)?;
             }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        self.rf_write(RfPath::A, RF_CHNLBW, lc_cal)?; // restore RF 0x18
 
-        // Leave LCK mode + un-pause TX.
-        let lck = self.rf_read(RfPath::A, RF_LCK)?;
-        self.rf_write(RfPath::A, RF_LCK, lck & !(1 << 14))?;
-        if let Some(prev) = saved_pause {
-            self.write8(REG_TXPAUSE, prev)?;
+            // Enter LCK mode.
+            let lck = self.rf_read(RfPath::A, RF_LCK)?;
+            self.rf_write(RfPath::A, RF_LCK, lck | (1 << 14))?;
+
+            // Trigger LC cal (RF 0x18[15]) and poll until it self-clears.
+            let lc_cal = self.rf_read(RfPath::A, RF_CHNLBW)?;
+            self.rf_write(RfPath::A, RF_CHNLBW, lc_cal | 0x0_8000)?;
+            std::thread::sleep(Duration::from_millis(150));
+            for _ in 0..5 {
+                if self.rf_read(RfPath::A, RF_CHNLBW)? & 0x8000 == 0 {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            self.rf_write(RfPath::A, RF_CHNLBW, lc_cal)?; // restore RF 0x18
+
+            // Leave LCK mode + un-pause TX.
+            let lck = self.rf_read(RfPath::A, RF_LCK)?;
+            self.rf_write(RfPath::A, RF_LCK, lck & !(1 << 14))?;
+            if let Some(prev) = saved_pause {
+                self.write8(REG_TXPAUSE, prev)?;
+            }
+            Ok(())
         }
-        Ok(())
     }
 
     /// Select BB page C (`c1=false`) or page C1 (`c1=true`) via `0x82c[31]`.
@@ -5907,77 +5931,81 @@ impl Rtl8812auBackend {
         })
     }
 
-    /// IQ calibration (`_phy_iq_calibrate_8812a`): back up the MAC/BB, AFE and RF
-    /// registers it perturbs, run the dual-path TX/RX IQK, then restore. Run
-    /// after [`set_channel`](Self::set_channel) (and typically before
-    /// [`lc_calibrate`](Self::lc_calibrate)). Corrects TX/RX IQ imbalance —
-    /// improves EVM and image rejection.
-    pub fn iq_calibrate(&self) -> Result<IqkResult, FaceError> {
-        const MACBB: [u16; 9] = [
-            0x520, 0x550, 0x808, 0xa04, 0x90c, 0xc00, 0xe00, 0x838, 0x82c,
-        ];
-        const AFE: [u16; 12] = [
-            0xc5c, 0xc60, 0xc64, 0xc68, 0xcb0, 0xcb4, 0xe5c, 0xe60, 0xe64, 0xe68, 0xeb0, 0xeb4,
-        ];
-        const RFREG: [u32; 3] = [0x65, 0x8f, 0x0];
+    rung! {
+        /// IQ calibration (`_phy_iq_calibrate_8812a`): back up the MAC/BB, AFE and RF
+        /// registers it perturbs, run the dual-path TX/RX IQK, then restore. Run
+        /// after [`set_channel`](Self::set_channel) (and typically before
+        /// [`lc_calibrate`](Self::lc_calibrate)). Corrects TX/RX IQ imbalance —
+        /// improves EVM and image rejection.
+        fn iq_calibrate(&self) -> Result<IqkResult, FaceError> {
+            const MACBB: [u16; 9] = [
+                0x520, 0x550, 0x808, 0xa04, 0x90c, 0xc00, 0xe00, 0x838, 0x82c,
+            ];
+            const AFE: [u16; 12] = [
+                0xc5c, 0xc60, 0xc64, 0xc68, 0xcb0, 0xcb4, 0xe5c, 0xe60, 0xe64, 0xe68, 0xeb0, 0xeb4,
+            ];
+            const RFREG: [u32; 3] = [0x65, 0x8f, 0x0];
 
-        // back up MAC/BB (page C), the C1 one-shot regs, AFE (page C), RF A/B
-        self.page(false)?;
-        let mut macbb_bk = [0u32; 9];
-        for (i, &r) in MACBB.iter().enumerate() {
-            macbb_bk[i] = self.read32(r)?;
-        }
-        self.page(true)?;
-        let reg_c1b8 = self.read32(0xcb8)?;
-        let reg_e1b8 = self.read32(0xeb8)?;
-        self.page(false)?;
-        let mut afe_bk = [0u32; 12];
-        for (i, &r) in AFE.iter().enumerate() {
-            afe_bk[i] = self.read32(r)?;
-        }
-        let mut rfa_bk = [0u32; 3];
-        let mut rfb_bk = [0u32; 3];
-        for (i, &r) in RFREG.iter().enumerate() {
-            rfa_bk[i] = self.rf_read(RfPath::A, r)?;
-            rfb_bk[i] = self.rf_read(RfPath::B, r)?;
-        }
+            // back up MAC/BB (page C), the C1 one-shot regs, AFE (page C), RF A/B
+            self.page(false)?;
+            let mut macbb_bk = [0u32; 9];
+            for (i, &r) in MACBB.iter().enumerate() {
+                macbb_bk[i] = self.read32(r)?;
+            }
+            self.page(true)?;
+            let reg_c1b8 = self.read32(0xcb8)?;
+            let reg_e1b8 = self.read32(0xeb8)?;
+            self.page(false)?;
+            let mut afe_bk = [0u32; 12];
+            for (i, &r) in AFE.iter().enumerate() {
+                afe_bk[i] = self.read32(r)?;
+            }
+            let mut rfa_bk = [0u32; 3];
+            let mut rfb_bk = [0u32; 3];
+            for (i, &r) in RFREG.iter().enumerate() {
+                rfa_bk[i] = self.rf_read(RfPath::A, r)?;
+                rfb_bk[i] = self.rf_read(RfPath::B, r)?;
+            }
 
-        self.iqk_configure_mac()?;
-        let result = self.iqk_tx()?;
+            self.iqk_configure_mac()?;
+            let result = self.iqk_tx()?;
 
-        // restore RF (both paths), AFE, the C1 one-shot regs, and MAC/BB
-        self.page(false)?;
-        for (i, &r) in RFREG.iter().enumerate() {
-            self.rf_write(RfPath::A, r, rfa_bk[i])?;
-        }
-        self.rf_write(RfPath::A, 0xef, 0x0)?;
-        for (i, &r) in RFREG.iter().enumerate() {
-            self.rf_write(RfPath::B, r, rfb_bk[i])?;
-        }
-        self.rf_write(RfPath::B, 0xef, 0x0)?;
+            // restore RF (both paths), AFE, the C1 one-shot regs, and MAC/BB
+            self.page(false)?;
+            for (i, &r) in RFREG.iter().enumerate() {
+                self.rf_write(RfPath::A, r, rfa_bk[i])?;
+            }
+            self.rf_write(RfPath::A, 0xef, 0x0)?;
+            for (i, &r) in RFREG.iter().enumerate() {
+                self.rf_write(RfPath::B, r, rfb_bk[i])?;
+            }
+            self.rf_write(RfPath::B, 0xef, 0x0)?;
 
-        self.iqk_restore_afe(&afe_bk, &AFE)?;
-        self.page(true)?;
-        self.write32(0xcb8, reg_c1b8)?;
-        self.write32(0xeb8, reg_e1b8)?;
-        self.page(false)?;
-        for (i, &r) in MACBB.iter().enumerate() {
-            self.write32(r, macbb_bk[i])?;
+            self.iqk_restore_afe(&afe_bk, &AFE)?;
+            self.page(true)?;
+            self.write32(0xcb8, reg_c1b8)?;
+            self.write32(0xeb8, reg_e1b8)?;
+            self.page(false)?;
+            for (i, &r) in MACBB.iter().enumerate() {
+                self.write32(r, macbb_bk[i])?;
+            }
+            Ok(result)
         }
-        Ok(result)
     }
 
-    /// Configure both RF paths (`PHY_RFConfig8812` → RF6052): apply the radio-A
-    /// and radio-B register tables via the BB LSSI. Run after
-    /// [`bb_config`](Self::bb_config) (which powers on the RF analog).
-    pub fn rf_config(&self) -> Result<(), FaceError> {
-        self.config_table(RADIO_A, |s, addr, data| {
-            s.rf_write_entry(RfPath::A, addr, data)
-        })?;
-        self.config_table(RADIO_B, |s, addr, data| {
-            s.rf_write_entry(RfPath::B, addr, data)
-        })?;
-        Ok(())
+    rung! {
+        /// Configure both RF paths (`PHY_RFConfig8812` → RF6052): apply the radio-A
+        /// and radio-B register tables via the BB LSSI. Run after
+        /// [`bb_config`](Self::bb_config) (which powers on the RF analog).
+        fn rf_config(&self) -> Result<(), FaceError> {
+            self.config_table(RADIO_A, |s, addr, data| {
+                s.rf_write_entry(RfPath::A, addr, data)
+            })?;
+            self.config_table(RADIO_B, |s, addr, data| {
+                s.rf_write_entry(RfPath::B, addr, data)
+            })?;
+            Ok(())
+        }
     }
 
     /// Read an RF register via the BB serial interface (`phy_RFSerialRead`,
@@ -5998,57 +6026,61 @@ impl Rtl8812auBackend {
         self.bb_query(reg, 0x000F_FFFF)
     }
 
-    /// Enable the MAC DMA / WMAC / scheduler / security blocks in `REG_CR`
-    /// (`0x063F`). Run **right after** [`power_on`](Self::power_on), before LLT /
-    /// firmware / MAC-table — the DMA engines must be on for those to take.
-    pub fn mac_enable_dma(&self) -> Result<(), FaceError> {
-        self.write16(REG_CR, 0)?;
-        let cr = self.read16(REG_CR)?;
-        self.write16(REG_CR, cr | CR_DMA_ENABLE)
+    rung! {
+        /// Enable the MAC DMA / WMAC / scheduler / security blocks in `REG_CR`
+        /// (`0x063F`). Run **right after** [`power_on`](Self::power_on), before LLT /
+        /// firmware / MAC-table — the DMA engines must be on for those to take.
+        fn mac_enable_dma(&self) -> Result<(), FaceError> {
+            self.write16(REG_CR, 0)?;
+            let cr = self.read16(REG_CR)?;
+            self.write16(REG_CR, cr | CR_DMA_ENABLE)
+        }
     }
 
-    /// Finish MAC init after the MAC register table: reserved-page split,
-    /// TX/RX FIFO boundaries, the 3-endpoint queue→priority map, transfer page
-    /// size, driver-info size, network type, the **monitor** receive config, and
-    /// finally `REG_CR |= MACTXEN | MACRXEN`. After this the MAC is transmitting
-    /// and receiving. Read `REG_CR` back to confirm the enable bits.
-    pub fn mac_init_queues(&self) -> Result<(), FaceError> {
-        // Reserved pages (RQPN): NPQ first, then the HPQ/LPQ/PUBQ load word.
-        self.write8(REG_RQPN_NPQ, 0x00)?;
-        self.write32(REG_RQPN, RQPN_3EP)?;
+    rung! {
+        /// Finish MAC init after the MAC register table: reserved-page split,
+        /// TX/RX FIFO boundaries, the 3-endpoint queue→priority map, transfer page
+        /// size, driver-info size, network type, the **monitor** receive config, and
+        /// finally `REG_CR |= MACTXEN | MACRXEN`. After this the MAC is transmitting
+        /// and receiving. Read `REG_CR` back to confirm the enable bits.
+        fn mac_init_queues(&self) -> Result<(), FaceError> {
+            // Reserved pages (RQPN): NPQ first, then the HPQ/LPQ/PUBQ load word.
+            self.write8(REG_RQPN_NPQ, 0x00)?;
+            self.write32(REG_RQPN, RQPN_3EP)?;
 
-        // TX packet-buffer boundary across the queue/beacon/loopback registers.
-        let bndy = TX_PAGE_BOUNDARY;
-        self.write8(REG_BCNQ_BDNY, bndy)?;
-        self.write8(REG_MGQ_BDNY, bndy)?;
-        self.write8(REG_WMAC_LBK_BF_HD, bndy)?;
-        self.write8(REG_TRXFF_BNDY, bndy)?;
-        self.write8(REG_TDECTRL + 1, bndy)?;
+            // TX packet-buffer boundary across the queue/beacon/loopback registers.
+            let bndy = TX_PAGE_BOUNDARY;
+            self.write8(REG_BCNQ_BDNY, bndy)?;
+            self.write8(REG_MGQ_BDNY, bndy)?;
+            self.write8(REG_WMAC_LBK_BF_HD, bndy)?;
+            self.write8(REG_TRXFF_BNDY, bndy)?;
+            self.write8(REG_TDECTRL + 1, bndy)?;
 
-        // RX-FIFO boundary.
-        self.write16(REG_TRXFF_BNDY + 2, RX_DMA_BOUNDARY)?;
+            // RX-FIFO boundary.
+            self.write16(REG_TRXFF_BNDY + 2, RX_DMA_BOUNDARY)?;
 
-        // Map the AC queues to the 3 OUT endpoints (preserve the low 3 bits).
-        let pri = (self.read16(REG_TRXDMA_CTRL)? & 0x7) | TRXDMA_MAP_3EP;
-        self.write16(REG_TRXDMA_CTRL, pri)?;
+            // Map the AC queues to the 3 OUT endpoints (preserve the low 3 bits).
+            let pri = (self.read16(REG_TRXDMA_CTRL)? & 0x7) | TRXDMA_MAP_3EP;
+            self.write16(REG_TRXDMA_CTRL, pri)?;
 
-        // Transfer page size + RX driver-info size.
-        self.write8(REG_PBP, PBP_TX_512)?;
-        self.write8(REG_RX_DRVINFO_SZ, 4)?; // DRVINFO_SZ (unit 8 B)
+            // Transfer page size + RX driver-info size.
+            self.write8(REG_PBP, PBP_TX_512)?;
+            self.write8(REG_RX_DRVINFO_SZ, 4)?; // DRVINFO_SZ (unit 8 B)
 
-        // Network type (MSR) = AP, preserving the rest of REG_CR.
-        let cr = self.read32(REG_CR)?;
-        self.write32(REG_CR, (cr & !MASK_NETTYPE) | NETTYPE_AP)?;
+            // Network type (MSR) = AP, preserving the rest of REG_CR.
+            let cr = self.read32(REG_CR)?;
+            self.write32(REG_CR, (cr & !MASK_NETTYPE) | NETTYPE_AP)?;
 
-        // Monitor receive config + accept-all multicast.
-        self.write32(REG_RCR, MONITOR_RCR)?;
-        self.write32(REG_MAR, 0xFFFF_FFFF)?;
-        self.write32(REG_MAR + 4, 0xFFFF_FFFF)?;
+            // Monitor receive config + accept-all multicast.
+            self.write32(REG_RCR, MONITOR_RCR)?;
+            self.write32(REG_MAR, 0xFFFF_FFFF)?;
+            self.write32(REG_MAR + 4, 0xFFFF_FFFF)?;
 
-        // Enable MAC TX/RX.
-        let cr = self.read8(REG_CR)?;
-        self.write8(REG_CR, cr | MACTXEN | MACRXEN)?;
-        Ok(())
+            // Enable MAC TX/RX.
+            let cr = self.read8(REG_CR)?;
+            self.write8(REG_CR, cr | MACTXEN | MACRXEN)?;
+            Ok(())
+        }
     }
 
     /// The current `REG_CR` value — read back after [`mac_init_queues`](Self::mac_init_queues) to
@@ -6118,7 +6150,22 @@ impl Rtl8812auBackend {
         // already sent them once.
         Self::set_desc_bits(&mut d, 16, 17, 1, 1); // RETRY_LIMIT_ENABLE
         Self::set_desc_bits(&mut d, 16, 18, 6, 0); // DATA_RETRY_LIMIT = 0
-        Self::set_desc_bits(&mut d, 32, 15, 1, 1); // HWSEQ_EN (HW sequence #)
+        // HWSEQ_EN (HW sequence #) — unconditional, and the question of turning it off is CLOSED.
+        //
+        // ☠ **Refuted hypothesis, do not re-open without new evidence.** `tier0.rs` reserved SeqCtrl
+        // for "LP reassembly" and the RX header walk in `ndn-frame-io` never reads it (it steps over
+        // SeqCtrl via `hdr_len`), which made those 16 bits look like recyclable filter payload — the
+        // route to a 206-bit filter. MEASURED 2026-09-03: with HWSEQ_EN cleared and a distinctive
+        // sequence number `0xABC` injected, all **6,214** captured frames read `wlan.seq = 0`, while
+        // *the same frames* carried our chosen Duration correctly (so the run was configured as
+        // intended). The host's sequence number does not reach the air on this part. Independently,
+        // the bring-up inventory found **four of our six Wi-Fi TX paths overwrite SeqCtrl anyway**,
+        // two of them in silicon — so it can never be a fleet-wide field.
+        //
+        // The temporary `NDN_NO_HWSEQ` gate that tested this is deleted rather than left behind: a
+        // knob that disables hardware sequence numbering, kept for a question already answered, is
+        // a trap for whoever finds it next. See `ndn-phy-wifi/docs/p8-header-passthrough.md`.
+        Self::set_desc_bits(&mut d, 32, 15, 1, 1);
         // #96 measurement gate: NAVUSEHDR (DWORD3 bit15) tells the MAC to take the
         // NAV/Duration from the MPDU header instead of computing its own. Off by
         // default (the MAC overwrites Duration — measured); set NDN_NAVUSEHDR=1 to
@@ -6455,38 +6502,115 @@ impl Rtl8812auBackend {
         Ok(())
     }
 
-    /// Set the TX power. `idx` is a TXAGC target where **63 = the adapter's fused
-    /// full-power point** and each step down is ~0.5 dB (matching the cognition
-    /// policy's `DB_PER_POWER_IDX`).
+    /// **Set the TX power, and say what that meant.** ([`PowerRequest`] in, [`AppliedPower`] out.)
     ///
-    /// When [`load_tx_power_info`](Self::load_tx_power_info) has read the EFUSE, this
-    /// folds `idx` as an offset onto the per-rate **calibrated base** for the current
-    /// channel — so the output is referenced to *this* adapter's characterized power,
-    /// per rate group, on both RF paths (the devourer `ComputeTxPowerIndex` model:
-    /// base + offset, clamped 0..63). Without a fuse read it falls back to writing the
-    /// flat index (uncalibrated, but still makes the otherwise-silent PA radiate).
+    /// ☠☠ **This is the function the 2026-09-03 bring-up contract exists for.** Its old form —
+    /// `set_tx_power(idx: u8) -> Result<(), FaceError>` — meant **two different physical powers**,
+    /// decided by whether [`load_tx_power_info`](Self::load_tx_power_info) had run three calls
+    /// earlier:
     ///
-    /// Registers: the 8812A power-by-rate `rTxAGC_*_JAguar` at `0xC2x` (path A) /
-    /// `0xE2x` (path B). The BB **TX swing** (`0xC1C[31:21]`) is a per-band constant
-    /// the channel tables program, not this knob.
-    pub fn set_tx_power(&self, idx: u8) -> Result<(), FaceError> {
-        let idx = idx.min(TXAGC_MAX);
-        {
-            let guard = self.tx_power_info.lock().unwrap();
-            let ch = self.cur_channel.load(std::sync::atomic::Ordering::Relaxed);
-            if let (Some(info), true) = (guard.as_ref(), ch != 0) {
+    /// * calibration loaded → `index_base(path, rate, ch) + (idx − 63)` ≈ **27** on the ch6 adapter;
+    /// * not loaded → **it fell through to `set_tx_power_raw(idx)`** — a flat **63** on ten
+    ///   registers. ⚠ The SIZE of the step is channel-dependent and UNVERIFIED: the fused base is 27
+    ///   on ch6 and 44 on ch149, and MEASURED 2026-09-04 at ch149 the difference is ~0 dB.
+    ///
+    /// Same call, same argument, same `Ok(())`. MEASURED at an AR9271 witness: raw 63 → 2301 frames
+    /// at −85.6 dBm; raw 55 → **0**. `examples/nav_probe.rs` never loaded calibration (ran hot,
+    /// "worked"); `bring_up_monitor` did (ran at the fused base, "did not work"); the node binary
+    /// goes through the calibrated path — so the shipped node and every bench example **were not
+    /// the same transmitter**, and nothing said so.
+    ///
+    /// **LAW 2 — the fallthrough is deleted.** Ask for the calibrated scale with no calibration
+    /// resolved and this returns `Err` naming [`PowerRequest::Raw`]. It never silently becomes raw.
+    ///
+    /// **LAW 3 — no environment read.** `NDN_AU_TXAGC12` used to be read from *inside this
+    /// function* and silently turned 10 register writes into 24; it is now
+    /// [`RateGroupPolicy`] on the request and appears in [`AppliedPower::writes`].
+    ///
+    /// On the calibrated scale `idx = 63` **is** the fused regulatory base (`offset = idx − 63`),
+    /// which is why `RadioCapability::max_tx_power` stays 63 and is not renumbered to ~27 — see
+    /// the contract's §2.1 and Appendix A.1.
+    ///
+    /// Registers: the 8812A power-by-rate `rTxAGC_*_JAguar` at `0xC2x` (path A) / `0xE2x` (path B).
+    /// The BB **TX swing** (`0xC1C[31:21]`) is a per-band constant the channel tables program, not
+    /// this knob.
+    pub fn set_tx_power(&self, req: PowerRequest) -> Result<AppliedPower, FaceError> {
+        let ch = self.cur_channel.load(std::sync::atomic::Ordering::Relaxed);
+        match &req {
+            // This part has an actuator, and a caller claiming otherwise has the wrong part.
+            PowerRequest::NoActuator => Err(power_unsupported(
+                "rtl8812au: PowerRequest::NoActuator, but this part DOES actuate power \
+                 (per-rate Jaguar1 TXAGC). Use PowerRequest::Ceiling or ::Index.",
+            )),
+            // ⚠ No dBm axis on this part: `RadioCapability::tx_power_dbm` is None, and the
+            // register→power transfer is monotone but uncalibrated in absolute terms. Refusing by
+            // name is the honest answer; an invented dBm would be believed by a link budget.
+            PowerRequest::Dbm(d) => Err(power_unsupported(format!(
+                "rtl8812au: PowerRequest::Dbm({d}) — this part has no absolute dBm axis \
+                 (RadioCapability::tx_power_dbm is None; the TXAGC transfer is monotone over ~33 dB \
+                 but has no measured absolute anchor). Use PowerRequest::Index on the calibrated \
+                 scale.",
+            ))),
+            // ⚠ **Off the regulatory scale**, and only reachable with an `RfAuthority` — which no
+            // library code can mint. This is the regime the sixteen hand-rolled examples were in
+            // without knowing it; now it is a request, an authority, and a `PowerReference`.
+            PowerRequest::Raw { idx, authority } => {
+                let idx = (*idx).min(TXAGC_MAX);
+                tracing::warn!(
+                    target: "radio",
+                    part = "rtl8812au",
+                    idx,
+                    granted_by = authority.granted_by(),
+                    reason = authority.reason(),
+                    "TX power on the RAW chip TXAGC axis — calibration bypassed, may exceed \
+                     licensed EIRP"
+                );
+                let writes = self.write_txagc_flat(idx)?;
+                Ok(AppliedPower::from_writes(
+                    req.clone(),
+                    PowerReference::ChipRaw,
+                    idx,
+                    false,
+                    writes,
+                ))
+            }
+            PowerRequest::Ceiling(policy) | PowerRequest::Index(_, policy) => {
+                let want = match &req {
+                    PowerRequest::Index(i, _) => *i,
+                    _ => TXAGC_MAX,
+                };
+                let idx = want.min(TXAGC_MAX);
+                let clamped = idx != want;
+                let policy = *policy;
+                let guard = self.tx_power_info.lock().unwrap();
+                let Some(info) = guard.as_ref() else {
+                    // ★★ **THE FIX.** This used to be `return self.set_tx_power_raw(idx);` at
+                    // `rtl8812au.rs:6595` — the same call, the same argument, the same `Ok(())`,
+                    // in a different power regime from, decided by a step three calls earlier the caller could not
+                    // see. Deleting this one fallthrough is the whole repair; everything else in
+                    // `bringup.rs` exists so it cannot come back in a different shape.
+                    return Err(power_unsupported(NO_CALIBRATION_MSG));
+                };
+                if ch == 0 {
+                    // Power on this part is per-channel: `index_base` needs a tuned channel.
+                    // Refusing beats writing a base for channel 0, which does not exist.
+                    return Err(power_unsupported(
+                        "rtl8812au: TX power on the calibrated scale before set_channel — the \
+                         fused base is per-channel and there is no channel to look it up for.",
+                    ));
+                }
                 let offset = idx as i32 - TXAGC_MAX as i32; // 0 at full, negative = backoff
-                // (path-A reg, path-B reg, representative MGN_* rate) per group.
+                // (path-A reg, path-B reg, representative MGN_* rate, group name) per group.
                 //
                 // ★ **All twelve Jaguar1 per-rate TXAGC groups.**
                 //
                 // Provenance, because an earlier attempt at this was reverted on a MISATTRIBUTION
                 // and the reasoning must not be repeated:
                 //
-                //  * **Decisive**: THIS DRIVER ALREADY WRITES ALL 24 OF THESE REGISTERS** on every
-                //    5 GHz channel program — `PROGS_5G` (`src/rtl8812au.rs:471-4004`) contains
-                //    0x0c20..0x0c4c and 0x0e20..0x0e4c, and this silicon has taken those writes
-                //    since the port was written, MEASURED at 490-1258 f/s.
+                //  * **Decisive**: THIS DRIVER ALREADY WRITES ALL 24 OF THESE REGISTERS on every
+                //    5 GHz channel program — `PROGS_5G` contains 0x0c20..0x0c4c and
+                //    0x0e20..0x0e4c, and this silicon has taken those writes since the port was
+                //    written, MEASURED at 490-1258 f/s.
                 //  * `fw/rtl8812au/rtl8812au_phy_reg.bin` boots all 24 at `0x12121212` — the flat
                 //    four-byte TXAGC packing (index 18 x4), not arbitrary BB values.
                 //  * `golden/rtw88-2g-ch6.txt` — the MAINLINE KERNEL driving THIS dongle — writes
@@ -6502,27 +6626,22 @@ impl Rtl8812auBackend {
                 // fact the frame-format bug (a malformed UNICAST `addr1` driving the retry ladder,
                 // see `examples/rtl_contention_ab.rs`), which was present before and after it.
                 //
-                // Without these seven, HT MCS8-15 and every VHT rate keep the init `0x12` (index
-                // 18) while the calibrated base is ~27 — so on 2.4 GHz the rates cognition actually
-                // sends go out ~4.5 dB BELOW the rates the knob moves, and under a deep back-off
-                // the ordering inverts.
-                //
-                // (path-A reg, path-B reg, representative MGN_* rate) per group. Rate codes:
-                // `ODM_MGN_MCS0 = 0x80`, `ODM_MGN_VHT1SS_MCS0 = 0xa0` — the same classification
-                // `mcs_diff_sum` above uses, so base and register agree on what a rate means.
-                let groups = [
-                    (0xc20u16, 0xe20u16, 0x02u8), // CCK 11-1
-                    (0xc24, 0xe24, 0x0c),         // OFDM 18-6
-                    (0xc28, 0xe28, 0x30),         // OFDM 54-24
-                    (0xc2c, 0xe2c, 0x80),         // HT MCS 0-3
-                    (0xc30, 0xe30, 0x84),         // HT MCS 4-7
-                    (0xc34, 0xe34, 0x88),         // HT MCS 8-11   (2SS)
-                    (0xc38, 0xe38, 0x8c),         // HT MCS 12-15  (2SS)
-                    (0xc3c, 0xe3c, 0xa0),         // VHT 1SS MCS 0-3
-                    (0xc40, 0xe40, 0xa4),         // VHT 1SS MCS 4-7
-                    (0xc44, 0xe44, 0xa8),         // VHT 1SS MCS 8-9 + VHT 2SS MCS 0-1
-                    (0xc48, 0xe48, 0xac),         // VHT 2SS MCS 2-5
-                    (0xc4c, 0xe4c, 0xb0),         // VHT 2SS MCS 6-9
+                // Rate codes: `ODM_MGN_MCS0 = 0x80`, `ODM_MGN_VHT1SS_MCS0 = 0xa0` — the same
+                // classification `mcs_diff_sum` above uses, so base and register agree on what a
+                // rate means.
+                const GROUPS: [(u16, u16, u8, &str); 12] = [
+                    (0xc20, 0xe20, 0x02, "CCK 11-1"),
+                    (0xc24, 0xe24, 0x0c, "OFDM 18-6"),
+                    (0xc28, 0xe28, 0x30, "OFDM 54-24"),
+                    (0xc2c, 0xe2c, 0x80, "HT MCS0-3"),
+                    (0xc30, 0xe30, 0x84, "HT MCS4-7"),
+                    (0xc34, 0xe34, 0x88, "HT MCS8-11 (2SS)"),
+                    (0xc38, 0xe38, 0x8c, "HT MCS12-15 (2SS)"),
+                    (0xc3c, 0xe3c, 0xa0, "VHT 1SS MCS0-3"),
+                    (0xc40, 0xe40, 0xa4, "VHT 1SS MCS4-7"),
+                    (0xc44, 0xe44, 0xa8, "VHT 1SS MCS8-9 + 2SS MCS0-1"),
+                    (0xc48, 0xe48, 0xac, "VHT 2SS MCS2-5"),
+                    (0xc4c, 0xe4c, 0xb0, "VHT 2SS MCS6-9"),
                 ];
                 // ☠☠ **FIVE groups. MEASURED AGAINST A WITNESS RECEIVER — this is settled.**
                 //
@@ -6531,27 +6650,25 @@ impl Rtl8812auBackend {
                 //
                 // Writing the seven HT2SS/VHT groups **stops this radio transmitting.** A 250x
                 // difference on air — which the offered rate could not see at all (711 vs 2805
-                // reads as a modest difference), and which two rounds of careful source-reading
-                // got wrong in both directions.
+                // reads as a modest difference), and which two rounds of careful source-reading got
+                // wrong in both directions.
                 //
-                // ⚠ The addresses are NOT the issue, and the artefact evidence for them is real:
-                // `PROGS_5G` in this file writes all 24 of these registers, `phy_reg.bin` boots
-                // them at the flat TXAGC packing `0x12121212`, the mainline kernel writes per-rate
-                // ladders into them on this dongle, and `Hal8812PhyReg.h:178` names 0xc34
-                // `rTxAGC_A_MCS11_MCS8_JAguar`. What differs is the VALUE: `PROGS_5G` replays
-                // captured ladders, while `set_tx_power` writes `index_base(..) + offset` — and for
-                // the 2SS/VHT rate codes that computation evidently lands somewhere this silicon
-                // will not transmit from. Closing the gap needs the value investigated, not the
-                // address list re-argued.
+                // ⚠ The addresses are NOT the issue (see the provenance above). What differs is the
+                // VALUE: `PROGS_5G` replays captured ladders, while this writes
+                // `index_base(..) + offset` — and for the 2SS/VHT rate codes that computation
+                // evidently lands somewhere this silicon will not transmit from. Closing the gap
+                // needs the value investigated, not the address list re-argued.
                 //
-                // `NDN_AU_TXAGC12=1` re-enables all twelve for that investigation. Do not turn it
-                // on without a witness receiver in the loop: the transmitter cannot detect this.
-                let groups: &[(u16, u16, u8)] = if std::env::var_os("NDN_AU_TXAGC12").is_some() {
-                    &groups[..]
-                } else {
-                    &groups[..5]
-                };
-                for &(reg_a, reg_b, rate) in groups {
+                // ★ **This used to be an `NDN_AU_TXAGC12` environment read, performed from inside
+                // this function.** A knob whose meaning depends on the environment is hidden state by
+                // another name — the same disease as `load_tx_power_info`, one level down — and it
+                // silently turned 10 register writes into 24. It is now
+                // `RateGroupPolicy::AllTwelveUnderInvestigation` on the request, and the count of
+                // writes in the returned `AppliedPower` shows which policy ran. Do not select it
+                // without a witness receiver in the loop: the transmitter cannot detect this.
+                let groups = &GROUPS[..policy.group_pairs()];
+                let mut writes = Vec::with_capacity(groups.len() * 2);
+                for &(reg_a, reg_b, rate, name) in groups {
                     for (path, reg) in [(0usize, reg_a), (1usize, reg_b)] {
                         let base = info.index_base(path, rate, 0, 0, ch) as i32;
                         // ☠ **No floor here, and that is MEASURED, not an oversight.**
@@ -6570,34 +6687,78 @@ impl Rtl8812auBackend {
                         // cannot tell a legitimately-low base from an over-deep back-off.
                         let v = (base + offset).clamp(0, TXAGC_MAX as i32) as u8;
                         self.write32(reg, u32::from_le_bytes([v, v, v, v]))?;
+                        writes.push(PowerWrite {
+                            reg: reg as u32,
+                            value: v,
+                            group: name,
+                            path: path as u8,
+                        });
                     }
                 }
-                return Ok(());
+                // The representative fused base a reader compares against: path A, OFDM 18-6, this
+                // channel. It is a FACT about the adapter, not a renumbering of the API scale.
+                let base_index = info.index_base(0, 0x0c, 0, 0, ch);
+                Ok(AppliedPower::from_writes(
+                    req.clone(),
+                    PowerReference::FusedBase {
+                        base_index,
+                        channel: ch,
+                    },
+                    idx,
+                    clamped,
+                    writes,
+                ))
             }
         }
-        // Uncalibrated fallback: flat index on every rate/path.
-        self.set_tx_power_raw(idx)
     }
 
-    /// Write the **raw** TXAGC index `idx` (0–63) to every per-rate register on both
-    /// paths, bypassing the EFUSE regulatory calibration. `set_tx_power` caps output
-    /// at the fused *regulatory* base (≈ index 27 on this ch6 adapter); this reaches
-    /// the chip's full range for **rated/max output** or bench characterization.
+    /// Write the **flat/raw** TXAGC index `idx` (0–63) to every per-rate register on both paths,
+    /// bypassing the EFUSE regulatory calibration, and return what it wrote.
     ///
-    /// On-air (#38, conducted SDR, randomized+replicated, 40 dB SNR): the register→
-    /// power transfer is monotone over the full 0–63 span, ~33 dB range, with the step
-    /// **accelerating 0.5→1.0 dB/idx** up the range (the documented Realtek TXAGC
-    /// non-linearity). ⚠️ Above the regulatory base this can exceed the licensed EIRP —
-    /// an explicit operator/bench opt-in, not for unattended regulatory operation.
-    pub fn set_tx_power_raw(&self, idx: u8) -> Result<(), FaceError> {
+    /// ☠ **Renamed from `set_tx_power_raw`, and that rename is load-bearing.** Under the old name
+    /// it was a *second power API*, and `set_tx_power` fell through to it — which is exactly the
+    /// 2026-09-03 defect. It is now a register writer with a register writer's name, called only
+    /// from [`set_tx_power`](Self::set_tx_power)'s [`PowerRequest::Raw`] arm, and
+    /// `tests/power_has_one_meaning.rs` fails the build if any `fn set_tx_power*` reaches for a
+    /// `set_tx_power_raw`/`set_tx_power_idx` sibling again.
+    ///
+    /// ☠☠ **`pub(crate)`, and that is compiler enforcement rather than discipline.** MEASURED
+    /// 2026-09-03: while this was `pub`, `backend.write_txagc_flat(63)` from any example or face
+    /// crate reached the raw chip axis in one line — no [`PowerRequest`], no
+    /// [`RfAuthority`](ndn_radio_hal::RfAuthority), no `NDN_RF_UNRESTRICTED`, in a different power regime from the
+    /// fused base — and `tests/power_has_one_meaning.rs` passed on it, because that guard only
+    /// scanned `fn set_tx_power*` bodies. Narrowing the visibility is what actually closes it: the
+    /// only route to this writer is now `set_tx_power`'s [`PowerRequest::Raw`] arm, which cannot be
+    /// constructed without the operator's written authority.
+    ///
+    /// `set_tx_power` on the calibrated scale caps output at the fused *regulatory* base (≈ index
+    /// 27 on this ch6 adapter); this reaches the chip's full range for rated/max output or bench
+    /// characterization.
+    ///
+    /// On-air (#38, conducted SDR, randomized+replicated, 40 dB SNR): the register→power transfer
+    /// is monotone over the full 0–63 span, ~33 dB range, with the step **accelerating 0.5→1.0
+    /// dB/idx** up the range (the documented Realtek TXAGC non-linearity). ⚠️ Above the regulatory
+    /// base this can exceed the licensed EIRP — an explicit operator/bench opt-in
+    /// ([`ndn_radio_hal::RfAuthority`]), not for unattended regulatory operation.
+    pub(crate) fn write_txagc_flat(&self, idx: u8) -> Result<Vec<PowerWrite>, FaceError> {
         let idx = idx.min(TXAGC_MAX);
         let w = u32::from_le_bytes([idx, idx, idx, idx]);
-        for reg in [
-            0xc20u16, 0xc24, 0xc28, 0xc2c, 0xc30, 0xe20, 0xe24, 0xe28, 0xe2c, 0xe30,
+        let mut writes = Vec::with_capacity(10);
+        for (path, regs) in [
+            (0u8, [0xc20u16, 0xc24, 0xc28, 0xc2c, 0xc30]),
+            (1u8, [0xe20, 0xe24, 0xe28, 0xe2c, 0xe30]),
         ] {
-            self.write32(reg, w)?;
+            for reg in regs {
+                self.write32(reg, w)?;
+                writes.push(PowerWrite {
+                    reg: reg as u32,
+                    value: idx,
+                    group: "flat (uncalibrated)",
+                    path,
+                });
+            }
         }
-        Ok(())
+        Ok(writes)
     }
 
     /// Force **both** antenna paths to transmit (rTxPath_Jaguar `0x80C` low word =
@@ -6782,150 +6943,126 @@ impl Rtl8812auBackend {
         Ok(())
     }
 
-    /// Release (resume) RX DMA by clearing `RW_RELEASE_EN` (`REG_RXPKT_NUM[18]`).
-    /// After init the 8812AU leaves RX DMA paused (`RW_RELEASE_EN` set,
-    /// `RXDMA_IDLE`), so no captured frame reaches the bulk-IN endpoint until it
-    /// is released. **Call this as the final bring-up step** — IQ calibration
-    /// re-pauses RX DMA, so releasing earlier has no lasting effect.
-    pub fn start_rx_dma(&self) -> Result<(), FaceError> {
-        // **USB RX aggregation** — the throughput lever that reaches a81a parity. Ported from the
-        // aircrack-ng rtl8812au vendor `usb_AggSettingRxUpdate_8812A` + mainline rtl8xxxu. The MISSING
-        // piece was the enable bit: RXDMA_AGG_EN = BIT(2) of REG_TRXDMA_CTRL (0x010C). Without it the
-        // chip ships ~1 frame per bulk-IN transfer → ~200 f/s; page-threshold tuning alone only reached
-        // ~500. In USB-agg mode REG_RXDMA_AGG_PG_TH (0x0280) is `size | (timeout<<8)` where size is in
-        // **512-byte units** (NOT the 128-B DMA-mode page). Default 0x1020 = size 0x20 (16 KB) · timeout
-        // 0x10 → pack toward the 32 KB pump buffer, cutting per-transfer overhead. The parse
-        // (`parse_rx_transfer`) already length-walks each subframe 8-byte aligned, matching the vendor.
-        //  - NDN_RXDMA_AGG=<hex> overrides the 0x0280 size|timeout word.
-        //  - NDN_RX_AGG_OFF=1 leaves aggregation DISABLED (prompt 1-frame flush) if a caller ever needs it.
-        let agg = std::env::var("NDN_RXDMA_AGG")
-            .ok()
-            .and_then(|v| u16::from_str_radix(v.trim().trim_start_matches("0x"), 16).ok())
-            .unwrap_or(0x1020);
-        // mainline parity: USB agg is NOT gated by REG_USB_SPECIAL_OPTION — clear its bit3.
-        let spec = self.read8(0xFE55)?;
-        self.write8(0xFE55, spec & !(1 << 3))?;
-        self.write16(0x0280, agg)?; // REG_RXDMA_AGG_PG_TH = size(512B units) | timeout<<8
-        self.write8(0xFE5B, (agg >> 8) as u8)?; // REG_USB_DMA_AGG_TO = the same timeout (belt-and-suspenders)
-        if std::env::var_os("NDN_RX_AGG_OFF").is_none() {
-            let ctrl = self.read8(REG_TRXDMA_CTRL)?; // 0x010C low byte
-            self.write8(REG_TRXDMA_CTRL, ctrl | 0x04)?; // RXDMA_AGG_EN = BIT(2), set LAST
+    rung! {
+        /// Release (resume) RX DMA by clearing `RW_RELEASE_EN` (`REG_RXPKT_NUM[18]`).
+        /// After init the 8812AU leaves RX DMA paused (`RW_RELEASE_EN` set,
+        /// `RXDMA_IDLE`), so no captured frame reaches the bulk-IN endpoint until it
+        /// is released. **Call this as the final bring-up step** — IQ calibration
+        /// re-pauses RX DMA, so releasing earlier has no lasting effect.
+        fn start_rx_dma(&self) -> Result<(), FaceError> {
+            // **USB RX aggregation** — the throughput lever that reaches a81a parity. Ported from the
+            // aircrack-ng rtl8812au vendor `usb_AggSettingRxUpdate_8812A` + mainline rtl8xxxu. The MISSING
+            // piece was the enable bit: RXDMA_AGG_EN = BIT(2) of REG_TRXDMA_CTRL (0x010C). Without it the
+            // chip ships ~1 frame per bulk-IN transfer → ~200 f/s; page-threshold tuning alone only reached
+            // ~500. In USB-agg mode REG_RXDMA_AGG_PG_TH (0x0280) is `size | (timeout<<8)` where size is in
+            // **512-byte units** (NOT the 128-B DMA-mode page). Default 0x1020 = size 0x20 (16 KB) · timeout
+            // 0x10 → pack toward the 32 KB pump buffer, cutting per-transfer overhead. The parse
+            // (`parse_rx_transfer`) already length-walks each subframe 8-byte aligned, matching the vendor.
+            //  - NDN_RXDMA_AGG=<hex> overrides the 0x0280 size|timeout word.
+            //  - NDN_RX_AGG_OFF=1 leaves aggregation DISABLED (prompt 1-frame flush) if a caller ever needs it.
+            let agg = std::env::var("NDN_RXDMA_AGG")
+                .ok()
+                .and_then(|v| u16::from_str_radix(v.trim().trim_start_matches("0x"), 16).ok())
+                .unwrap_or(0x1020);
+            // mainline parity: USB agg is NOT gated by REG_USB_SPECIAL_OPTION — clear its bit3.
+            let spec = self.read8(0xFE55)?;
+            self.write8(0xFE55, spec & !(1 << 3))?;
+            self.write16(0x0280, agg)?; // REG_RXDMA_AGG_PG_TH = size(512B units) | timeout<<8
+            self.write8(0xFE5B, (agg >> 8) as u8)?; // REG_USB_DMA_AGG_TO = the same timeout (belt-and-suspenders)
+            if std::env::var_os("NDN_RX_AGG_OFF").is_none() {
+                let ctrl = self.read8(REG_TRXDMA_CTRL)?; // 0x010C low byte
+                self.write8(REG_TRXDMA_CTRL, ctrl | 0x04)?; // RXDMA_AGG_EN = BIT(2), set LAST
+            }
+            let v = self.read32(0x0284)?; // REG_RXPKT_NUM — clear RW_RELEASE_EN to resume RX DMA
+            self.write32(0x0284, v & !(1 << 18))?;
+            if std::env::var_os("NDN_RX_AGG_DBG").is_some() {
+                let ctrl = self.read16(REG_TRXDMA_CTRL).unwrap_or(0);
+                let pgth = self.read16(0x0280).unwrap_or(0);
+                let spec = self.read8(0xFE55).unwrap_or(0);
+                eprintln!(
+                    "RXAGG_DBG: TRXDMA_CTRL(0x10C)=0x{ctrl:04x} (RXDMA_AGG_EN bit2={}) AGG_PG_TH(0x280)=0x{pgth:04x} USB_SPEC(0xFE55)=0x{spec:02x}",
+                    (ctrl >> 2) & 1
+                );
+            }
+            Ok(())
         }
-        let v = self.read32(0x0284)?; // REG_RXPKT_NUM — clear RW_RELEASE_EN to resume RX DMA
-        self.write32(0x0284, v & !(1 << 18))?;
-        if std::env::var_os("NDN_RX_AGG_DBG").is_some() {
-            let ctrl = self.read16(REG_TRXDMA_CTRL).unwrap_or(0);
-            let pgth = self.read16(0x0280).unwrap_or(0);
-            let spec = self.read8(0xFE55).unwrap_or(0);
-            eprintln!(
-                "RXAGG_DBG: TRXDMA_CTRL(0x10C)=0x{ctrl:04x} (RXDMA_AGG_EN bit2={}) AGG_PG_TH(0x280)=0x{pgth:04x} USB_SPEC(0xFE55)=0x{spec:02x}",
-                (ctrl >> 2) & 1
-            );
-        }
-        Ok(())
     }
 
-    /// Full monitor-mode bring-up in the **correct order** — the ordering matters:
-    /// [`mac_enable_dma`](Self::mac_enable_dma) zeroes `REG_CR` before setting
-    /// `DMA_ENABLE`, so it must run *before* [`mac_init_queues`](Self::mac_init_queues)
-    /// (which sets `MACTXEN|MACRXEN` last); the reverse silently disables RX. After
-    /// this the dongle captures every frame on `channel`.
+    /// **The one entry point** for this part. M8 deleted `bring_up_monitor`, which was a wrapper
+    /// over this; `open_radio`'s RTL8812AU arm calls it directly, and a bench instrument that
+    /// wants the concrete backend calls it here.
     ///
-    /// ★ **Contention state does NOT leak across processes here — the EDCA registers are
-    /// re-pinned on every bring-up by [`mac_config`](Self::mac_config).**
-    ///
-    /// The MT7610U had that bug: it never wrote the EDCA registers at bring-up, nothing
-    /// power-cycles a USB chip between runs, and each process silently inherited the previous
-    /// one's posture — a 2.5x throughput swing decided by run order.
-    ///
-    /// ☠ **The trap, recorded because I fell in it.** Grepping this file for EDCA writes returns
-    /// nothing but comments, so it *looks* like it has the same hole. The writes are real; they
-    /// are just not source text. [`MAC_REG`] is `include_bytes!("../fw/rtl8812au/
-    /// rtl8812au_mac_reg.bin")` and `mac_config` walks it through
-    /// [`config_table`](Self::config_table) as `(u32 addr, u32 val)` byte writes. Decoding the
-    /// blob shows the EDCA block written in full:
-    ///
-    /// ```text
-    ///   0x0500..03 = 26 a2 2f 00 -> VO 0x002fa226     0x0512 = 0x1c  (PIFS)
-    ///   0x0504..07 = 28 a3 5e 00 -> VI 0x005ea328     0x0514 = 0x0a  (SIFS)
-    ///   0x0508..0b = 2b a4 5e 00 -> BE 0x005ea42b     0x0516 = 0x0a
-    ///   0x050c..0f = 4f a4 00 00 -> BK 0x0000a44f
-    /// ```
-    ///
-    /// **A register write can live as DATA in an `include_bytes!` blob — a source grep will never
-    /// see it.** Decode the table before concluding a register is unwritten. (These four words are
-    /// bit-identical to what `libusb_rtl88xx::init_edca_cfg` writes by name: the same Realtek
-    /// vendor defaults, arriving by a different route. They sit past the table's only conditional
-    /// block, so they apply for every cut/package/interface.)
-    ///
-    /// Belt and braces: `claim` also does a USB port reset, and on a warm chip without one
-    /// `power_on`'s `CARDEMU_TO_ACT` poll cannot complete, so bring-up returns `Err` at its first
-    /// `?` — a loud failure rather than silent inheritance.
-    ///
-    /// MEASURED 2026-08-31 across five processes with `Owned` applied in the middle,
-    /// `examples/au_edca_probe.rs` reports the SAME as-found state every time, byte for byte —
-    /// and it is exactly the table above:
-    ///
-    /// ```text
-    ///   VO 0x0500=002fa226  VI 0x0504=005ea328  BE 0x0508=005ea42b  BK 0x050c=0000a44f  slot=0x09
-    /// ```
-    ///
-    /// A process that had just written `Owned` (`...4219` on all four ACs) is followed by one that
-    /// reads the defaults back. Those constants are bit-identical to what
-    /// `libusb_rtl88xx::init_edca_cfg` writes explicitly, i.e. they are the Realtek vendor
-    /// defaults arriving by a different route.
-    ///
-    /// ⚠ Throughput is the WRONG instrument for this question: on a contended channel the same
-    /// A/B varied 22x between identical runs (648 to 14174 frames) and `Owned` came out *slowest*.
-    /// Read the registers. `examples/au_edca_probe.rs` is that instrument, kept for re-checking
-    /// after any change to the bring-up order.
-    pub fn bring_up_monitor(&self, channel: u8) -> Result<(), FaceError> {
-        self.power_on()?;
-        self.download_firmware()?;
-        self.mac_config()?;
-        self.mac_enable_dma()?; // clears CR then sets DMA_EN — MUST precede init_queues
-        self.mac_init_queues()?; // sets MACTXEN|MACRXEN last
-        self.bb_config()?;
-        self.rf_config()?;
-        self.set_channel(channel)?;
-        // Read the EFUSE TX-power calibration so `set_tx_power` is referenced to this
-        // adapter's fused full-power point (best-effort: falls back to a flat index if
-        // the fuse read fails). Must precede set_tx_power.
-        let _ = self.load_tx_power_info();
-        // TXAGC: without this the TXAGC registers sit at their reset default (~0), so injected
-        // frames leave the PA at essentially zero power — the frame is built + queued but never
-        // radiates decodably (SDR-confirmed: no on-air energy until this is set). idx=0x3f = the
-        // fused full-power point (calibrated) or a flat mid-high index (fallback).
-        self.set_tx_power(0x3f)?;
-        // Monitor injection must not defer to energy-detect carrier sense: the reset
-        // default can leave the TX engine holding frames when the channel reads "busy".
-        // Blast regardless (cognition can re-arm EDCCA via `set_edcca_ignore`).
-        let _ = self.disable_edcca();
-        // IQK is best-effort (tunes RX EVM, not the on-air gate) but each RX path only
-        // converges marginally — one of the two per attempt, alternating (measured on
-        // 5 GHz). The vendor retries the whole IQK up to 3× for exactly this; do the same
-        // and keep re-running until BOTH RX paths lock (the last run's corrections are the
-        // ones left applied), so 5 GHz HT-MCS demod gets a fully-calibrated RX. Falls
-        // through after the cap with whatever the best-effort last attempt produced.
-        let mut iqk = self.iq_calibrate();
-        for _ in 0..5 {
-            match &iqk {
-                Ok(r) if r.tx_a && r.rx_a && r.tx_b && r.rx_b => break,
-                _ => iqk = self.iq_calibrate(),
-            }
+    /// The role selects the plan ([`BringUp::plan`]); `power` is the [`PowerRequest`] the final
+    /// rung actuates, carrying its [`RateGroupPolicy`](ndn_radio_hal::bringup::RateGroupPolicy) —
+    /// so which of the twelve Jaguar1 TXAGC group pairs get written is a *caller's* decision that
+    /// lands in the report, not a variable read from inside the writer; the deviation, if any, is
+    /// resolved against the plan before the first register write and lands in the digest; the proof
+    /// requirement is validated against the role and this part's (empty) instrument set, also
+    /// before the first register write.
+    // The `Err` is large BECAUSE it carries the partial report — the whole point of §3.
+    #[allow(clippy::result_large_err)]
+    pub fn bring_up_planned(
+        self: &Arc<Self>,
+        channel: u8,
+        role: Role,
+        power: PowerRequest,
+        deviation: Option<Deviation>,
+        proof: ProofRequirement,
+    ) -> Result<(BringUpReport, Guards), BringUpFailure> {
+        let mut run = PlanRun::new(
+            "RTL8812AU",
+            self.device_address(),
+            self.initial_state(channel, role, power),
+        )
+        .with_proof(proof);
+        if let Some(d) = deviation {
+            run = run.with_deviation(d);
         }
-        match iqk {
-            Ok(r) => tracing::info!(
-                target: "named_radio",
-                tx_a = r.tx_a, rx_a = r.rx_a, tx_b = r.tx_b, rx_b = r.rx_b,
-                ch = self.cur_channel.load(std::sync::atomic::Ordering::Relaxed),
-                "8812au IQK done"
-            ),
-            Err(e) => tracing::warn!(target: "named_radio", error = ?e, "8812au IQK failed"),
+        // UFCS: the inherent `bring_up_planned` is not the trait method, but keep the same spelling
+        // the 88xx arm uses so the two read alike.
+        let (report, guards) = <Self as BringUp>::bring_up(self, &run)?;
+        // The runner is part-agnostic and cannot know this part's PHY capability; the driver does.
+        Ok((
+            report.with_capability(RadioProfile::capability(self.as_ref())),
+            guards,
+        ))
+    }
+
+    /// The regime a plan starts from. Not a claim about the radio: it is what the caller asked
+    /// for, and the rungs fill in what they establish.
+    ///
+    /// ⚠ `power` starts at [`AppliedPower::no_actuator`] carrying the caller's **request**, not at
+    /// the fused base. No power has been written when a plan begins; `load_tx_power_info` is the
+    /// rung that establishes the reference and `set_tx_power` is the rung that writes, and claiming
+    /// either before it ran is the exact shape of defect this contract exists to remove. The
+    /// request rides here so the last rung can read it back out of [`Ctx`] instead of reaching for
+    /// the environment.
+    fn initial_state(&self, channel: u8, role: Role, power: PowerRequest) -> RadioState {
+        RadioState {
+            channel,
+            bw: ndn_radio_hal::Bandwidth::Bw20,
+            format: "RawNdn/Raw80211 (see with_format)",
+            role,
+            power: AppliedPower::no_actuator(power),
+            // ⚠ The bring-up does not program a rate: `inject` carries the DESC rate per frame
+            // (`NDN_RADIO_TX_RATE`, default legacy 6M). Saying "unreported" beats inventing one.
+            rate: ndn_radio_hal::RateState::unreported(),
+            warm: None,
+            contention: None,
+            pump: PumpPolicy::CallerOwns,
+            facts: Vec::new(),
         }
-        let _ = self.lc_calibrate();
-        self.start_rx_dma()?;
-        Ok(())
+    }
+
+    /// Where this dongle is on the USB tree, for the bring-up report.
+    fn device_address(&self) -> ndn_radio_hal::DeviceAddress {
+        match crate::DeviceSelect::from_env() {
+            crate::DeviceSelect::Addr(a) => ndn_radio_hal::DeviceAddress::Usb(a),
+            crate::DeviceSelect::Index(i) => ndn_radio_hal::DeviceAddress::Usb(format!("#{i}")),
+            // ⚠ "first match on the bus" is not an address. `Unknown` says so rather than
+            // printing a number that would not identify the device again.
+            crate::DeviceSelect::First => ndn_radio_hal::DeviceAddress::Unknown,
+        }
     }
 
     /// One raw bulk-IN read (diagnostic): returns the byte count without parsing
@@ -7131,7 +7268,7 @@ impl Rtl8812auBackend {
                             // NAN/Raw80211 capture: the whole 802.11 frame is the payload; the
                             // wide-profile extra fields are not surfaced here (RawNdn routes through
                             // parse_dot11 above, which does surface them).
-                            addr4: None,
+                            extra: None,
                             htc: None,
                             rssi_dbm,
                             mcs_index,
@@ -7187,6 +7324,614 @@ impl Rtl8812auBackend {
     }
 }
 
+// ═════════════════════════════════════════════════════════════════════════════
+// §5-M7 — the RTL8812AU bring-up, as a plan
+//
+// ☠ **TRANSCRIBED, NOT REDESIGNED.** Appendix A.3 of `docs/bringup-contract.md` is explicit that
+// migrating the one 8812au sequence measured to put frames on air into a table someone *believes*
+// is equivalent is exactly the reasoning-about-radios that has a ~0 % hit rate. So: this is the
+// body of the pre-M7 `bring_up_monitor`, rung for rung, in its order, with **not one register
+// write moved, added or reordered**. The acceptance is an on-air witness run the operator
+// performs, not a green test — see the "M7 acceptance" section of the contract.
+//
+// ☠ **Three things are NOT here, and their absence is the measurement.** `init_llt` (added → no
+// change on air), a `REG_TXPAUSE` clear (added → A/B'd inert: 2789 / 4508 / 4588 / 4406 frames,
+// run-to-run noise, no direction — and `REG_TXPAUSE` MEASURED `0x00` after three bring-ups), and
+// the bulk-OUT endpoint theory (all three endpoints → 0 frames). The 2026-09-03 "does not
+// transmit" symptom was **the power regime**, fixed in M1 by deleting `set_tx_power`'s
+// fallthrough. The TXPAUSE clear comes back as an `Assert` — read the gate, do not write it.
+// ═════════════════════════════════════════════════════════════════════════════
+
+// ── the rungs ─────────────────────────────────────────────────────────────────
+
+fn s_power_on(b: &Arc<Rtl8812auBackend>, _c: &mut Ctx<'_>) -> Result<StepOutcome, FaceError> {
+    b.power_on()?;
+    Ok(StepOutcome::Done)
+}
+
+fn s_download_firmware(
+    b: &Arc<Rtl8812auBackend>,
+    _c: &mut Ctx<'_>,
+) -> Result<StepOutcome, FaceError> {
+    let (version, subversion) = b.download_firmware()?;
+    tracing::debug!(target: "named_radio", version, subversion, "8812au firmware downloaded");
+    // The name is `Fact::Firmware`'s only honest filling: `fw_free_to_go` polls `WINTINI_RDY` and
+    // returns `Err` on timeout, so reaching this line IS the ready signal.
+    Ok(StepOutcome::Established(Fact::Firmware {
+        name: "rtl8812au_fw_nic.bin",
+        ready: true,
+    }))
+}
+
+fn s_mac_config(b: &Arc<Rtl8812auBackend>, _c: &mut Ctx<'_>) -> Result<StepOutcome, FaceError> {
+    b.mac_config()?;
+    Ok(StepOutcome::Done)
+}
+
+fn s_mac_enable_dma(b: &Arc<Rtl8812auBackend>, _c: &mut Ctx<'_>) -> Result<StepOutcome, FaceError> {
+    b.mac_enable_dma()?;
+    Ok(StepOutcome::Done)
+}
+
+fn s_mac_init_queues(
+    b: &Arc<Rtl8812auBackend>,
+    _c: &mut Ctx<'_>,
+) -> Result<StepOutcome, FaceError> {
+    b.mac_init_queues()?;
+    Ok(StepOutcome::Done)
+}
+
+fn s_bb_config(b: &Arc<Rtl8812auBackend>, _c: &mut Ctx<'_>) -> Result<StepOutcome, FaceError> {
+    b.bb_config()?;
+    Ok(StepOutcome::Done)
+}
+
+fn s_rf_config(b: &Arc<Rtl8812auBackend>, _c: &mut Ctx<'_>) -> Result<StepOutcome, FaceError> {
+    b.rf_config()?;
+    Ok(StepOutcome::Done)
+}
+
+fn s_set_channel(b: &Arc<Rtl8812auBackend>, c: &mut Ctx<'_>) -> Result<StepOutcome, FaceError> {
+    b.set_channel(c.state_ref().channel)?;
+    Ok(StepOutcome::Done)
+}
+
+/// ★★ **The rung that decided what `set_tx_power` meant.**
+///
+/// Verbatim from the M2 ladder, including the `channel.max(1)` in the representative base and the
+/// `BestEffort` class: on `Err` the old code pushed a warning and a `Skipped` record and carried
+/// on, which is what `StepClass::BestEffort` does — except that now the loss is *named* by the
+/// `Degradation` instead of spelled out in an ad-hoc string, and the failure can no longer end in a
+/// silent regime step because `set_tx_power` refuses the calibrated scale outright (M1).
+fn s_load_tx_power_info(
+    b: &Arc<Rtl8812auBackend>,
+    c: &mut Ctx<'_>,
+) -> Result<StepOutcome, FaceError> {
+    let channel = c.state_ref().channel;
+    b.load_tx_power_info()?;
+    let base_index = b
+        .tx_power_info
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|i| i.index_base(0, 0x0c, 0, 0, channel.max(1)))
+        .unwrap_or(0);
+    Ok(StepOutcome::Established(Fact::PowerReference(
+        PowerReference::FusedBase {
+            base_index,
+            channel,
+        },
+    )))
+}
+
+fn s_disable_edcca(b: &Arc<Rtl8812auBackend>, _c: &mut Ctx<'_>) -> Result<StepOutcome, FaceError> {
+    b.disable_edcca()?;
+    Ok(StepOutcome::Done)
+}
+
+/// The IQK retry loop, transcribed: one attempt, then up to five more until **both** RX paths and
+/// both TX paths converge. `Branch` reports which way it came out, which the old ladder only put on
+/// the tracing tree.
+fn s_iq_calibrate(b: &Arc<Rtl8812auBackend>, _c: &mut Ctx<'_>) -> Result<StepOutcome, FaceError> {
+    let mut iqk = b.iq_calibrate();
+    for _ in 0..5 {
+        match &iqk {
+            Ok(r) if r.tx_a && r.rx_a && r.tx_b && r.rx_b => break,
+            _ => iqk = b.iq_calibrate(),
+        }
+    }
+    match iqk {
+        Ok(r) => {
+            tracing::info!(
+                target: "named_radio",
+                tx_a = r.tx_a, rx_a = r.rx_a, tx_b = r.tx_b, rx_b = r.rx_b,
+                ch = b.cur_channel.load(std::sync::atomic::Ordering::Relaxed),
+                "8812au IQK done"
+            );
+            Ok(StepOutcome::Branch(
+                if r.tx_a && r.rx_a && r.tx_b && r.rx_b {
+                    "all four paths converged"
+                } else {
+                    "partial convergence after six attempts — the last attempt's corrections are \
+                     the ones left applied"
+                },
+            ))
+        }
+        // BestEffort: the runner warns with the `Degradation` and continues, which is what the old
+        // `tracing::warn!` arm did — except it now reaches the report as well as the log.
+        Err(e) => {
+            tracing::warn!(target: "named_radio", error = ?e, "8812au IQK failed");
+            Err(e)
+        }
+    }
+}
+
+fn s_lc_calibrate(b: &Arc<Rtl8812auBackend>, _c: &mut Ctx<'_>) -> Result<StepOutcome, FaceError> {
+    b.lc_calibrate()?;
+    Ok(StepOutcome::Done)
+}
+
+fn s_start_rx_dma(b: &Arc<Rtl8812auBackend>, _c: &mut Ctx<'_>) -> Result<StepOutcome, FaceError> {
+    b.start_rx_dma()?;
+    Ok(StepOutcome::Done)
+}
+
+/// The power rung. It reads the request **out of [`Ctx`]** — LAW 1 and LAW 3 in one line.
+fn s_set_tx_power(b: &Arc<Rtl8812auBackend>, c: &mut Ctx<'_>) -> Result<StepOutcome, FaceError> {
+    let requested = c.state_ref().power.requested.clone();
+    let applied = b.set_tx_power(requested)?;
+    let reference = applied.reference;
+    c.state().power = applied;
+    // LAW 6 — the resolved reference is what a later reader compares two runs by, so it is a Fact
+    // and the runner hoists it into `RadioState::facts`. On the M7 acceptance run this is the field
+    // that must read `FusedBase` on one node and `ChipRaw` on the other.
+    Ok(StepOutcome::Established(Fact::PowerReference(reference)))
+}
+
+// ── the rungs, as reviewable constants ───────────────────────────────────────
+
+const R_POWER_ON: Step<Rtl8812auBackend> = Step {
+    id: StepId("power_on"),
+    stage: Stage::PowerOn,
+    class: StepClass::Required,
+    why: "the 8812A power-on sequence. Until it completes the MAC is card-disabled: register writes \
+          are accepted and dropped, so every later readback is fiction. **LAW 5**: it polls the \
+          power-sequence entries and returns Err on timeout.",
+    must_follow: &[],
+    must_precede: &[],
+    run: s_power_on,
+};
+
+const R_DOWNLOAD_FIRMWARE: Step<Rtl8812auBackend> = Step {
+    id: StepId("download_firmware"),
+    stage: Stage::Firmware,
+    class: StepClass::Required,
+    why: "the 8051 runs `rtl8812au_fw_nic.bin`; the H2C path and the TX report block speak to it. \
+          **LAW 5**: `fw_free_to_go` polls `WINTINI_RDY` (1000 tries) and errors on timeout — and a \
+          firmware written over an ALREADY-RUNNING 8051 does not fail cleanly, it drops the device \
+          off the USB bus until it is physically replugged, which is why the reset guard inside it \
+          is not a corner case.",
+    must_follow: &[StepId("power_on")],
+    must_precede: &[],
+    run: s_download_firmware,
+};
+
+const R_MAC_CONFIG: Step<Rtl8812auBackend> = Step {
+    id: StepId("mac_config"),
+    stage: Stage::MacInit,
+    class: StepClass::Required,
+    why: "the phydm MAC register table (`rtl8812au_mac_reg.bin`), walked through `config_table`. \
+          ★ It is also what re-pins EDCA on every bring-up, so contention state does NOT leak \
+          across processes on this part — MEASURED byte-identical as-found state over five \
+          processes with `Owned` applied in the middle. ☠ The four EDCA words live as DATA in the \
+          `include_bytes!` blob (0x0500/0x0504/0x0508/0x050c), so a source grep will never see \
+          them; decode the table before concluding a register is unwritten.",
+    must_follow: &[StepId("download_firmware")],
+    must_precede: &[],
+    run: s_mac_config,
+};
+
+const R_MAC_ENABLE_DMA: Step<Rtl8812auBackend> = Step {
+    id: StepId("mac_enable_dma"),
+    stage: Stage::MacInit,
+    class: StepClass::Required,
+    why: "enables the MAC DMA / WMAC / scheduler / security blocks in `REG_CR`. ★ It ZEROES \
+          `REG_CR` before setting `DMA_ENABLE`, so it MUST run before `mac_init_queues` — which \
+          sets `MACTXEN|MACRXEN` last. The reverse order silently disables RX, which is why the \
+          ordering is a `must_precede` and not a sentence in a doc comment.",
+    must_follow: &[StepId("mac_config")],
+    must_precede: &[StepId("mac_init_queues")],
+    run: s_mac_enable_dma,
+};
+
+const R_MAC_INIT_QUEUES: Step<Rtl8812auBackend> = Step {
+    id: StepId("mac_init_queues"),
+    stage: Stage::MacInit,
+    class: StepClass::Required,
+    why: "RQPN / page boundaries / the 3-endpoint queue map / the promiscuous monitor RCR, and \
+          `REG_CR |= MACTXEN|MACRXEN` LAST. This is the rung that makes the part both a monitor and \
+          a transmitter; the `mac_tx_rx_enabled` assert reads its final write back.",
+    must_follow: &[StepId("mac_enable_dma")],
+    must_precede: &[],
+    run: s_mac_init_queues,
+};
+
+const R_BB_CONFIG: Step<Rtl8812auBackend> = Step {
+    id: StepId("bb_config"),
+    stage: Stage::PhyInit,
+    class: StepClass::Required,
+    why: "powers on the baseband + RF analog (`FEN_BB_GLB_RSTN`/`FEN_BBRSTB`, then path-A and \
+          path-B RF power), then loads the BB PHY table and the AGC table. It must precede \
+          `rf_config`, which addresses the radios through the LSSI this powers up. It is also where \
+          the three asserted BB gates get their post-bring-up values: `0x0808 = 0x0e028233`, \
+          `0x0838 = 0x06c89b44`, `0x0a04 = 0x01ff000c` (decoded from `rtl8812au_phy_reg.bin`).",
+    must_follow: &[StepId("mac_init_queues")],
+    must_precede: &[StepId("rf_config")],
+    run: s_bb_config,
+};
+
+const R_RF_CONFIG: Step<Rtl8812auBackend> = Step {
+    id: StepId("rf_config"),
+    stage: Stage::PhyInit,
+    class: StepClass::Required,
+    why: "`PHY_RFConfig8812` → RF6052: the radio-A and radio-B register tables, applied through the \
+          BB LSSI. `set_channel` writes RF `0x18` on both paths and therefore needs the radios \
+          configured first.",
+    must_follow: &[StepId("bb_config")],
+    must_precede: &[StepId("set_channel")],
+    run: s_rf_config,
+};
+
+const R_SET_CHANNEL: Step<Rtl8812auBackend> = Step {
+    id: StepId("set_channel"),
+    stage: Stage::Tune,
+    class: StepClass::Required,
+    why: "tunes the synth. It must precede BOTH cal rungs and the power rung: IQK is a per-channel \
+          calibration (`iq_calibrate`'s own doc says run it after `set_channel`), and TX power on \
+          this part is per-channel — `index_base(path, rate, ch)` needs a tuned channel, and \
+          `set_tx_power` REFUSES outright when `cur_channel == 0` rather than writing a base for a \
+          channel that does not exist. ⚠ On 5 GHz this replays a captured per-channel kernel \
+          program (`PROGS_5G`), which also re-writes `0x0808` and `0x0a04`; see `cck_rx_restored`.",
+    must_follow: &[StepId("rf_config")],
+    must_precede: &[
+        StepId("load_tx_power_info"),
+        StepId("iq_calibrate"),
+        StepId("set_tx_power"),
+    ],
+    run: s_set_channel,
+};
+
+const R_LOAD_TX_POWER_INFO: Step<Rtl8812auBackend> = Step {
+    id: StepId("load_tx_power_info"),
+    stage: Stage::Calibrate,
+    class: StepClass::BestEffort(Degradation::new(
+        "the EFUSE TX-power calibration is NOT loaded, so the calibrated power scale is \
+         UNREACHABLE on this handle and `set_tx_power` will refuse `Ceiling`/`Index` by name",
+        "nothing that puts energy on the air — the `set_tx_power` rung below is Required and will \
+         fail the bring-up. The handle is still good for register-level inspection of everything \
+         this ladder wrote before it",
+    )),
+    why: "★★ **The rung that decided what `set_tx_power` meant, and the founding case of LAW 6.** \
+          MEASURED 2026-09-03: with calibration loaded, `set_tx_power(0x3f)` wrote the fused base \
+          (≈ index 27 on the ch6 adapter); without it the SAME call fell through to a flat 63 on \
+          ten registers, in a different power regime from, and still returned `Ok(())`. The fallthrough is deleted \
+          (M1) and this rung now returns `Fact::PowerReference(FusedBase{..})`, which the runner \
+          hoists into `RadioState::facts` — so the regime is in the report whether or not anyone \
+          asks. Best-effort because that is what it was; the difference is that its failure is no \
+          longer invisible in either direction.",
+    must_follow: &[StepId("set_channel")],
+    must_precede: &[StepId("set_tx_power")],
+    run: s_load_tx_power_info,
+};
+
+const R_DISABLE_EDCCA: Step<Rtl8812auBackend> = Step {
+    id: StepId("disable_edcca"),
+    stage: Stage::Posture,
+    class: StepClass::BestEffort(Degradation::new(
+        "energy-detect carrier sense is left ARMED, so the TX engine may hold frames on a busy \
+         channel — injection defers to a medium reading it did not choose to respect",
+        "receiving, and for transmitting on a quiet channel; cognition can still re-arm or clear it \
+         later through `set_edcca_ignore`",
+    )),
+    why: "monitor injection must not defer to energy-detect carrier sense: the reset default can \
+          leave the TX engine holding frames when the channel reads busy, so this maxes the \
+          thresholds and sets the ignore-EDCCA bit. ⚠ It does NOT touch `0x838[3:0]` (the OFDM \
+          packet CCA) — that is `set_cca_ignore`, which the factory applies AFTER the plan under \
+          `NDN_CCA_OFF`, which is why the `cca_restored` assert is meaningful here.",
+    must_follow: &[StepId("mac_init_queues")],
+    must_precede: &[],
+    run: s_disable_edcca,
+};
+
+const R_IQ_CALIBRATE: Step<Rtl8812auBackend> = Step {
+    id: StepId("iq_calibrate"),
+    stage: Stage::Calibrate,
+    class: StepClass::BestEffort(Degradation::new(
+        "TX/RX IQ imbalance is uncorrected: worse EVM and image rejection, and 5 GHz HT-MCS demod \
+         in particular is not fully calibrated",
+        "transmitting and receiving — IQK is not the on-air gate on this part; every legacy-rate \
+         number from the run stands, but per-rate/EVM/RSSI figures are uncalibrated",
+    )),
+    why: "`_phy_iq_calibrate_8812a`, run **up to six times**. Each RX path converges only \
+          marginally — one of the two per attempt, ALTERNATING (measured on 5 GHz) — and the vendor \
+          driver retries the whole IQK up to 3× for exactly this; this retries until BOTH RX paths \
+          lock, because the last run's corrections are the ones left applied. ⚠ The loop count is \
+          transcribed, not chosen: 1 + 5 is what the measured ladder ran. ☠ This is also the rung \
+          the five §1.5 asserts exist for: `iqk_configure_mac` drops TXPAUSE, the RX antenna, CCA \
+          and the CCK RX path, and restores them only in the tail block that `iqk_tx()?` skips on \
+          error.",
+    must_follow: &[StepId("set_channel")],
+    must_precede: &[StepId("set_tx_power")],
+    run: s_iq_calibrate,
+};
+
+const R_LC_CALIBRATE: Step<Rtl8812auBackend> = Step {
+    id: StepId("lc_calibrate"),
+    stage: Stage::Calibrate,
+    class: StepClass::BestEffort(Degradation::new(
+        "the RF VCO is left at its last tuned state — the LC tank is not re-centred for this \
+         channel, so the synth may sit off its best operating point",
+        "transmitting and receiving on the tuned channel; it is a trim, not a gate",
+    )),
+    why: "the LC tank calibration, run after IQK exactly as the ladder ran it. It pauses the TX \
+          queues around the sweep (`REG_TXPAUSE = 0xff`) and restores the saved value at its tail — \
+          the `0xff` half of what `txpause_released` reads back. ⚠ `8307161` changed this function \
+          on 2026-08-31 and sixteen private ladders did not notice; that is the failure a named \
+          rung with an id makes loud.",
+    must_follow: &[StepId("iq_calibrate")],
+    must_precede: &[StepId("set_tx_power")],
+    run: s_lc_calibrate,
+};
+
+const R_START_RX_DMA: Step<Rtl8812auBackend> = Step {
+    id: StepId("start_rx_dma"),
+    stage: Stage::RxEnable,
+    class: StepClass::Required,
+    why: "releases RX DMA (`REG_RXPKT_NUM[18]` `RW_RELEASE_EN` cleared) and arms USB RX \
+          aggregation. It must be LAST among the RX rungs because IQ calibration RE-PAUSES RX DMA — \
+          releasing earlier has no lasting effect. Required, not best-effort: without it no \
+          captured frame ever reaches the bulk-IN endpoint and the radio is silently deaf. \
+          MEASURED: the aggregation enable bit is the difference between ~200 f/s and a81a parity. \
+          ⚠ **KNOWN LAW 1 EXCEPTION, one call deep and written down rather than hidden**: \
+          `start_rx_dma` itself still reads `NDN_RXDMA_AGG`, `NDN_RX_AGG_OFF` and `NDN_RX_AGG_DBG`. \
+          Hoisting them to the request needs §1.1's `BringUpRequest`/`PartOpts`, which is not built \
+          yet; M7 does not invent a third home for them, and `plan_shape_8812au.rs` pins the three \
+          names so the set cannot grow silently.",
+    must_follow: &[StepId("iq_calibrate")],
+    must_precede: &[],
+    run: s_start_rx_dma,
+};
+
+const R_SET_TX_POWER: Step<Rtl8812auBackend> = Step {
+    id: StepId("set_tx_power"),
+    stage: Stage::Power,
+    class: StepClass::Required,
+    why: "★ **TXAGC is set LAST, after everything that touches the TX gain chain.** IQK is a TX/RX \
+          loopback calibration that drives the gain registers and runs up to six times above, so \
+          setting power before it leaves the final TXAGC unguaranteed. ⚠ Not individually validated \
+          on air — the ordering moved on reasoning, not measurement; what WAS measured \
+          (2026-09-03) is that the ordering is NOT what made this bring-up appear silent \
+          (`load_tx_power_info` is). Required because on the calibrated scale an unresolved \
+          calibration is now a refusal, and a bring-up that returns a handle whose power regime is \
+          unknown is the defect this contract removes. The request — including its \
+          `RateGroupPolicy` — is read out of `Ctx`, never out of the environment.",
+    must_follow: &[
+        StepId("load_tx_power_info"),
+        StepId("iq_calibrate"),
+        StepId("lc_calibrate"),
+    ],
+    must_precede: &[],
+    run: s_set_tx_power,
+};
+
+// ── the plan ─────────────────────────────────────────────────────────────────
+
+/// The one sequence, in the order `bring_up_monitor` ran it.
+const M7_STEPS: &[Step<Rtl8812auBackend>] = &[
+    R_POWER_ON,
+    R_DOWNLOAD_FIRMWARE,
+    R_MAC_CONFIG,
+    R_MAC_ENABLE_DMA,
+    R_MAC_INIT_QUEUES,
+    R_BB_CONFIG,
+    R_RF_CONFIG,
+    R_SET_CHANNEL,
+    R_LOAD_TX_POWER_INFO,
+    R_DISABLE_EDCCA,
+    R_IQ_CALIBRATE,
+    R_LC_CALIBRATE,
+    R_START_RX_DMA,
+    R_SET_TX_POWER,
+];
+
+const M7_PLAN: Plan<Rtl8812auBackend> = Plan {
+    id: PlanId {
+        part: "rtl8812au",
+        name: "monitor",
+        // ★ ver 2: ver 1 was the M2 hand-filled report. The digest changes, and that is correct —
+        // an M2 number and an M7 number are not the same run description even though the register
+        // sequence is byte-identical.
+        ver: 2,
+    },
+    role: Role::TransmitAndReceive,
+    steps: M7_STEPS,
+    excluded: &[
+        (
+            Stage::Attach,
+            "the device is selected and claimed BEFORE the plan runs — `open_select` takes a \
+             `DeviceSelect` (first / Nth / `\"<bus>-<port>\"`) and `claim` does the USB port reset. \
+             ⚠ That reset is load-bearing on this part and is deliberately NOT a rung: on a warm \
+             chip without it `power_on`'s `CARDEMU_TO_ACT` poll cannot complete, so bring-up fails \
+             LOUDLY at its first `?` rather than silently inheriting the previous process's \
+             posture. Moving it into the plan would change when it happens.",
+        ),
+        (
+            Stage::TxEnable,
+            "★ **This part has no TX-enable rung, and that is MEASURED, not an omission.** Unlike \
+             the 8733BU — where radiating needs a whole second block (`enable_tx`'s IQK → TXGAPK → \
+             DPK plus a power-tracking thread) — the 8812AU transmits from this ladder as written: \
+             `mac_init_queues` sets `MACTXEN|MACRXEN` and nothing further is required. The \
+             reference number is 3074 frames at the AR9271 witness from a calibrated bring-up plus \
+             a raw write. Adding a TX-enable rung here would be an unmeasured change to the one \
+             radiating sequence this fleet has, which Appendix A.3 forbids by name.",
+        ),
+        (
+            Stage::Verify,
+            "no Verify-stage rung. The readbacks this ladder owes are the five part-wide `Assert`s \
+             (`ASSERTS_8812AU`), which the runner takes after the last rung; and §4's transmit \
+             question is answered `Unprovable` with the measurement quoted, because no Jaguar1 \
+             MAC->BB counter is ported for this part. A rung that claimed to verify transmission \
+             from the host alone would be spelling (B), which only a witness can answer.",
+        ),
+    ],
+};
+
+// ★ **A malformed plan is a compile error, not a runtime one.** In particular, moving
+// `R_SET_TX_POWER` above the cal chain, or `R_MAC_INIT_QUEUES` above `R_MAC_ENABLE_DMA`, stops the
+// crate building.
+const _: () = M7_PLAN.check_or_panic();
+
+/// **The RTL8812AU monitor plan** — the transcription of `bring_up_monitor` (contract §5-M7).
+pub static PLAN_8812AU_MONITOR: Plan<Rtl8812auBackend> = M7_PLAN;
+
+/// §1.5 — **read back every gate you write.** The five the contract names for this part.
+///
+/// ☠ **All five are the `iqk_configure_mac` quiesce list**, not just TXPAUSE. That function drops
+/// five things — TX pause, `0x550`'s two bits, the RX antenna, the OFDM CCA mode, the CCK RX path —
+/// and they are restored only in `iq_calibrate`'s tail block, which the `iqk_tx()?` error path
+/// skips. The retry loop makes it worse: an attempt that fails after `iqk_configure_mac` leaves the
+/// quiesced values in place, and the next attempt's backup then *saves the quiesced values* and
+/// faithfully restores them. Nothing in the ladder notices; the radio simply goes quiet or deaf.
+///
+/// ⚠ **`Warn` for all five, per §5/M-hazards.** Promotion to `Fatal` is per part and needs a
+/// measurement. `txpause_released` in particular has MEASURED `0x00 / 0x00 / 0x00` over three
+/// bring-ups — structurally real, not firing today — and a readback nobody has watched fail is not
+/// allowed to refuse the radio the forwarder runs on.
+///
+/// ⚠ **These are asserts, not steps.** The hand-rolled `write8(0x522, 0x00)` that lived in
+/// `inject8812au`/`pwr_sweep8812au` was A/B'd INERT (2789 / 4508 / 4588 / 4406 frames — run-to-run
+/// noise, no direction) and reverted. Read the gate; do not write it.
+const ASSERTS_8812AU: &[Assert<Rtl8812auBackend>] = &[
+    Assert {
+        id: StepId("txpause_released"),
+        reg: 0x0522,
+        read: |b: &Rtl8812auBackend| b.read8(0x0522).map(u32::from),
+        want: 0x00,
+        mask: 0xff,
+        why: "REG_TXPAUSE. `iqk_configure_mac` writes 0x3f and `lc_calibrate` writes 0xff; both \
+              restore at a tail the error path skips. A held TXPAUSE means frames queue, `inject` \
+              returns Ok, and NOTHING reaches the air with the host never told. 0x3f is the \
+              aborted-IQK residue, 0xff the aborted-LCK one (`examples/rf_ab.rs`). The identical \
+              one-line assert catches a LIVE defect on the sibling 88xx, where `txgapk_tx_pause` \
+              writes 0xff and the resume sits past a swallowed error.",
+        severity: Severity::Warn,
+    },
+    Assert {
+        id: StepId("mac_tx_rx_enabled"),
+        reg: 0x0100,
+        read: |b: &Rtl8812auBackend| b.read_cr().map(u32::from),
+        // MACTXEN (1<<6) | MACRXEN (1<<7).
+        want: 0xc0,
+        mask: 0xc0,
+        why: "REG_CR's MACTXEN|MACRXEN, the last write `mac_init_queues` makes. `read_cr()` already \
+              existed for exactly this readback and had ONE caller — an example. A monitor whose \
+              MAC RX enable never took is deaf and reports nothing; a transmitter whose MAC TX \
+              enable never took injects into a MAC that will not key.",
+        severity: Severity::Warn,
+    },
+    Assert {
+        id: StepId("rx_antenna_restored"),
+        reg: 0x0808,
+        read: |b: &Rtl8812auBackend| b.read8(0x0808).map(u32::from),
+        // The RX-path byte `bb_config`'s `rtl8812au_phy_reg.bin` programs (0x0e028233) and every
+        // one of the 25 captured 5 GHz programs writes (0x3e028233) — 0x33 in both, so this byte
+        // is band-invariant.
+        want: 0x33,
+        mask: 0xff,
+        why: "`iqk_configure_mac` writes `0x808 = 0x00` (RX antenna OFF) and the restore is a \
+              dword write of the pre-IQK backup, in the tail block `iqk_tx()?` skips. Left at 0x00 \
+              the part receives nothing at all — and the ladder would still return a handle. \
+              0x33 is what the BB table and all 25 captured per-channel programs put in that byte.",
+        severity: Severity::Warn,
+    },
+    Assert {
+        id: StepId("cca_restored"),
+        reg: 0x0838,
+        read: |b: &Rtl8812auBackend| b.bb_read(0x0838),
+        // `rtl8812au_phy_reg.bin`: 0x0838 = 0x06c89b44. No captured 5 GHz program writes 0x0838, so
+        // the nibble is 0x4 in both bands after bring-up.
+        want: 0x4,
+        mask: 0xf,
+        why: "the OFDM CCA-mode nibble `0x838[3:0]`. `iqk_configure_mac` forces it to 0xc (\"CCA \
+              off\") and restores it from the pre-IQK dword backup. Left at 0xc the MAC always \
+              reads the medium idle — which is a legitimate posture (`set_cca_ignore(true)` asks \
+              for exactly it) but NOT one anybody asked for here, and it silently changes what \
+              every later contention or occupancy measurement means. ⚠ The factory applies \
+              `set_cca_ignore` under `NDN_CCA_OFF` *after* the plan returns, so this readback is \
+              unambiguous at the point the runner takes it.",
+        severity: Severity::Warn,
+    },
+    Assert {
+        id: StepId("cck_rx_restored"),
+        reg: 0x0a07,
+        read: |b: &Rtl8812auBackend| b.read8(0x0a07).map(u32::from),
+        // `rtl8812au_phy_reg.bin`: 0x0a04 = 0x01ff000c, i.e. byte 0x0a07 = 0x01; the 2.4 GHz branch
+        // of `set_channel` then writes 0x1 into `0x0A04[27:24]`, leaving 0x01.
+        want: 0x01,
+        mask: 0xff,
+        why: "the CCK RX path byte. `iqk_configure_mac` writes `0xa07 = 0x0f` (CCK RX off) and \
+              restores it from the `0xa04` dword backup in the skipped tail block; left at 0x0f the \
+              part cannot demodulate CCK at all. \
+              ☠ **This assert has NO discriminating power on 5 GHz and WILL warn there — written \
+              down rather than papered over.** `PROGS_5G` replays a captured kernel program that \
+              sets `0x0a04 = 0x0fff000c`, i.e. `0xa07 = 0x0f` — byte-identical to the quiesce \
+              value, so on a 5 GHz channel a restored register and a leaked one cannot be told \
+              apart by any static `want`. The value chosen is the 2.4 GHz one, because ch6 is where \
+              this part's power regime was measured and where the M7 acceptance runs. Closing the \
+              5 GHz half needs a per-band `want`, which `Assert` does not carry — a type change \
+              plus a measurement, not a guess.",
+        severity: Severity::Warn,
+    },
+];
+
+/// §4 — what this part can prove about its own transmitter: **nothing, and it says why.**
+///
+/// Quoted from the pre-M7 report, which is the fleet's own discipline and is kept verbatim. The
+/// consequence is the whole shape of §5-M7: the acceptance for this migration is an on-air witness
+/// run, because the host cannot answer even question (A) here.
+const TX_UNPROVABLE_8812AU: &str = "no Jaguar1 MAC->BB counter ported; CCX/SPE_RPT is lossy (1-4 records per ~2300 armed) and \
+     needs a running RX pump. Prove with a witness.";
+
+impl BringUp for Rtl8812auBackend {
+    fn plan(role: Role) -> Option<&'static Plan<Self>> {
+        match role {
+            Role::TransmitAndReceive => Some(&PLAN_8812AU_MONITOR),
+            // ★ Named refusals, not silent downgrades. **One plan**, because one ladder is all this
+            // part has ever run: `bring_up_monitor` is the only bring-up in the tree for it, and
+            // the sixteen hand-rolled example ladders are copies of it or deviations from it, not
+            // alternatives to it. An RX-only variant would mean deleting the cal chain and the
+            // power rung, and a TX-only variant would mean deleting the monitor RCR out of the
+            // middle of `mac_init_queues` — neither has been run on this silicon, and inventing one
+            // here is exactly the unmeasured ladder this contract exists to remove. A caller that
+            // only wants to listen asks for `TransmitAndReceive` and does not inject.
+            Role::ReceiveOnly | Role::TransmitOnly => None,
+        }
+    }
+
+    fn asserts() -> &'static [Assert<Self>] {
+        ASSERTS_8812AU
+    }
+
+    /// Empty, and that is the measured answer — see [`TX_UNPROVABLE_8812AU`].
+    fn tx_instruments() -> &'static [TxInstrument] {
+        &[]
+    }
+
+    fn tx_unprovable_reason() -> Option<&'static str> {
+        Some(TX_UNPROVABLE_8812AU)
+    }
+}
+
 /// The RX pump's per-transfer parse for the 8812AU — shares the async-URB pipeline with the other
 /// Realtek USB backends via one [`crate::rx_pump`] implementation.
 impl crate::rx_pump::Pumpable for Rtl8812auBackend {
@@ -7209,7 +7954,6 @@ impl crate::rx_pump::Pumpable for Rtl8812auBackend {
 /// USB I/O runs on the blocking pool so the async reactor is never stalled.
 #[async_trait]
 impl FrameIo for Rtl8812auBackend {
-
     /// This radio's own capability, so a face built from the bare `dyn FrameIo` does not have to
     /// invent one. Delegates to this type's [`RadioProfile`] — the single source of truth.
     fn radio_capability(&self) -> Option<ndn_radio_hal::RadioCapability> {

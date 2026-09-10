@@ -519,12 +519,48 @@ fn env_pump_depth() -> usize {
 ///   none of the three has an actuator to reach. Saying so is the point.
 /// * **AR9271 — width is a plan input, not a post-plan knob.** Its `set_channel` validates a
 ///   same-channel apply; a live retune on this part is `hw_reset`, i.e. re-open.
+/// The hard channel limit for a part that tunes from captured op-streams (the mt76 family), so
+/// [`open_radio`] can reject an unsatisfiable pin before claiming the device. `None` = the part
+/// tunes in-band across its band (the RTL userspace drivers) and needs no up-front gate.
+fn declared_channels(pid: u16) -> Option<Vec<u8>> {
+    if MT7612U_PIDS.contains(&pid) {
+        return Some(crate::Mt7612uBackend::declared_capability().channels);
+    }
+    if MT7610U_PIDS.contains(&pid) {
+        return Some(crate::mt76x0::declared_capability().channels);
+    }
+    if MT7921U_PIDS.contains(&pid) {
+        return Some(crate::mt7921::declared_capability().channels);
+    }
+    None
+}
+
 #[allow(clippy::result_large_err)]
 pub fn open_radio(
     pid: u16,
     sel: &DeviceSelect,
     req: &BringUpRequest,
 ) -> Result<OpenRadio, BringUpFailure> {
+    // ── Fail-fast channel check (field 2026-09-10) ───────────────────────────────────────────
+    //
+    // The mt76 parts tune from CAPTURED op-streams, so their declared channel list is a HARD limit
+    // (not the representative sample the in-band RTL tuners publish). Pinning a channel outside it
+    // used to claim the dongle and then fail deep in `tune_channel` on-air with a cryptic error
+    // (ch149 on an MT7612U whose captured programs are only [6, 36]). Reject it up front, naming
+    // the supported set, before touching the bus.
+    if let Some(chans) = declared_channels(pid)
+        && !chans.contains(&req.channel)
+    {
+        return Err(BringUpFailure::not_opened(
+            "mt76",
+            "open_radio::channel_check",
+            FaceError::Io(std::io::Error::other(format!(
+                "channel {} has no captured RF program on this part; supported: {chans:?}                  (capturing another means bench work — see docs/RADIO_SUBSYSTEM.md)",
+                req.channel
+            ))),
+        ));
+    }
+
     // ── AR9271 (ath9k_htc) ───────────────────────────────────────────────────────────────────
     //
     // The one Wi-Fi part whose FIRMWARE is ours, so Tier-0 can reject a frame before it crosses

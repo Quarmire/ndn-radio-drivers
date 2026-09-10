@@ -349,6 +349,12 @@ fn the_refuted_usb_probe_flags_are_deleted_and_their_refutations_recorded() {
 #[test]
 fn usb_probe_is_split_into_a_plan_runner_and_a_register_surface() {
     let ex = ws().join("ndn-radio/crates/faces/ndn-phy-wifi/examples");
+    // This asserts about the ndn-radio SIBLING repo; when it is not checked out
+    // (e.g. this crate's own CI, which only stages ndn-rs + ndn-ext), there is
+    // nothing to check — a missing reader is not a violation.
+    if !ex.exists() {
+        return;
+    }
     assert!(
         !ex.join("usb_probe.rs").exists(),
         "usb_probe.rs is back. It was 1084 lines and ~27 flags under the doc comment \"List USB \

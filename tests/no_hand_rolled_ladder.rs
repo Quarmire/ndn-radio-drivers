@@ -88,28 +88,6 @@ const LADDER: &[&str] = &[
 /// prevent.
 const EXEMPT: &[(&str, &str, &str)] = &[
     (
-        "bisect_bringup.rs",
-        "main",
-        "M4's frozen instrument, named in §5-M4 as one of three to freeze until the a81a gate \
-         passed. Bisecting a ladder — running a prefix of it and stopping — is exactly what it is \
-         for. ⚠ It is the clearest `Deviation::stop_after` candidate after `rx8733b_bisect`, and \
-         is named here as such.",
-    ),
-    (
-        "cal_probe.rs",
-        "main",
-        "Reads the firmware IQK/DPK done-flag at BB 0x2d9c BEFORE and AFTER each cal, with timing. \
-         The readings must be INTERLEAVED with the rungs; a plan reports rung outcomes, not \
-         mid-rung register state, so `Deviation` cannot express this measurement.",
-    ),
-    (
-        "ath9k_eeprom_dump.rs",
-        "main",
-        "The EEPROM/OTP cal read that the OLPC `set_board_values` port was derived FROM. Its \
-         subject is precisely the gap between `hw_reset` and the board cal — the two rungs a plan \
-         would run together — so composing them by hand IS the measurement.",
-    ),
-    (
         "ath9k_hw_reset.rs",
         "main",
         "This instrument IS `hw_reset`: it runs the rung in isolation and repeatedly, to answer \
@@ -117,34 +95,6 @@ const EXEMPT: &[(&str, &str, &str)] = &[
          is the opposite of the question. ⚠ Listed against `main` and not `run` because the \
          ladder is SPLIT across the two — main downloads the firmware, run does hw_reset and \
          wmi_start — which is the shape the call expansion above exists to see.",
-    ),
-    (
-        "ath9k_rx_ceiling.rs",
-        "main",
-        "The AR9271 RX-throughput ceiling instrument: it measures the PUMP, not the bring-up, and \
-         needs the rungs interleaved with reader-thread startup to say where the ceiling is. \
-         ⚠ On the list to convert to `Role::ReceiveOnly` + `PLAN_AR9271_RX`.",
-    ),
-    (
-        "ath9k_setboard.rs",
-        "main",
-        "The before/after A/B for `set_board_values` against a B210: phase 1 floods with the PA \
-         UNCALIBRATED (no `board_cal`), phase 2 applies it and re-floods. A plan that ran the cal \
-         as a rung would delete phase 1, which is the control.",
-    ),
-    (
-        "probe8733b.rs",
-        "main",
-        "The 8733b M1+M2 identity/power-on probe: it reads chip identity BETWEEN rungs and prints \
-         what each one changed. Its output is the rung-by-rung account, not the radio.",
-    ),
-    (
-        "rx8733b_bisect.rs",
-        "main",
-        "The 8733b RX bisect: it captures frames after each stage to split `bring_up`-vs-pump. \
-         ⚠ THE clearest candidate for `Deviation::stop_after`, and named here as the one to \
-         convert next — not done because each arm interleaves a capture window with the cut, and \
-         that is a behaviour change on a part with no local hardware to check it against.",
     ),
 ];
 

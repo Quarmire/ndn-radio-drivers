@@ -26,6 +26,9 @@ serialport = { version = "4", optional = true, default-features = false }
 
 [features]
 default = []
+# Expose individual bring-up rungs as `pub` (else `pub(crate)`) so per-rung
+# examples/benches can drive one step in isolation. See the `step!` macro in lib.rs.
+bench = []
 # The serial-bridged 802.11 monitor-mode backend (SerialRadioBackend / Esp32SerialBackend), speaking the
 # `[4E 44 …]` ND wire protocol to a BW16 (RTL8720DN) or an ESP32-C5 over USB-serial.
 serial-radio = ["dep:serialport"]
@@ -35,45 +38,12 @@ lora = []
 # BW16 examples need the `bw16` backend — gate them so `cargo build --examples`
 # (default features) skips them instead of failing on the unresolved import.
 [[example]]
-name = "bw16_probe"
-required-features = ["serial-radio"]
-
-[[example]]
-name = "bw16_probe_rate"
-required-features = ["serial-radio"]
-
-[[example]]
-name = "bw16_txpower"
-required-features = ["serial-radio"]
-
-[[example]]
-name = "bw16_knobs"
-required-features = ["serial-radio"]
-
-[[example]]
 name = "lora_link"
 required-features = ["lora"]
 
 # Same `lora` gate as lora_link above — it imports `LoraSerialBackend`, which the feature gates.
 # Without this entry cargo built it unconditionally, so `cargo test -p ndn-radio-drivers` failed to
 # compile and the crate's tests never ran at all.
-[[example]]
-name = "lora_contention"
-required-features = ["lora"]
-
-[[example]]
-name = "ndn_dataplane_test"
-required-features = ["lora"]
-
-[[example]]
-name = "lora_dfu"
-required-features = ["lora"]
-
-# The two examples that consumed ndn-ext crates (lora_cognition,
-# named_time_node) moved to ndn-ext in P2 — that dev-dep back-edge was the
-# repo cycle ext <-> radio-drivers; the graph is a DAG again:
-# ndn-rs <- ndn-radio-drivers <- ndn-ext.
-
 [workspace]
 members = [
     "crates/ndn-radio-hal",

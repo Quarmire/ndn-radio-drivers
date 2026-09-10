@@ -16,7 +16,6 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use ndn_radio_drivers::open_ath9k;
 use ndn_radio_hal::{Bandwidth, InjectFrame, TxIntent};
 
 fn main() -> ExitCode {
@@ -24,9 +23,15 @@ fn main() -> ExitCode {
         .nth(1)
         .and_then(|s| s.parse().ok())
         .unwrap_or(1);
-    println!("opening AR9271 via open_ath9k(ch={ch}) — the production OpenRadio path");
+    println!(
+        "opening AR9271 via ndn_radio_drivers::open_radio(ndn_radio_drivers::AR9271_PID, &ndn_radio_drivers::DeviceSelect::First, &ndn_radio_drivers::BringUpRequest::from_env(ch={ch})) — the production OpenRadio path"
+    );
 
-    let radio = match open_ath9k(ch) {
+    let radio = match ndn_radio_drivers::open_radio(
+        ndn_radio_drivers::AR9271_PID,
+        &ndn_radio_drivers::DeviceSelect::First,
+        &ndn_radio_drivers::BringUpRequest::from_env(ch),
+    ) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("open_ath9k FAILED: {e}");

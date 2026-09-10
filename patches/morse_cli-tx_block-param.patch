@@ -1,0 +1,50 @@
+Add the TX_BLOCK generic parameter (id 6) to morse_cli.
+
+`MORSE_CMD_PARAM_ID_TX_BLOCK = 6` is already declared in the vendor's own
+`morse_commands.h`, and both the driver and the firmware accept it with no
+association, no vif and no AID: `command.c:1671` switches only on
+AP_POWER_SAVE / NON_TIM_MODE / HOME_CHANNEL_DWELL / ACTIVE_SCAN_DWELL /
+CHANNELIZATION, so id 6 falls through to `default:` -> `morse_cmd_tx()`, and
+firmware handler 0x00132eb4 does `snez` then `sb a5, 0x802006FE` (any non-zero
+blocks, no range check, always returns 0). Only `params.c`'s `params[]` table
+was missing an entry, so the gate was unreachable from userspace.
+
+MEASURED on an MM6108 (mds-o5p-2, 904.5 MHz / 1 MHz, monitor injection, no
+association), chip MAC-core `TX Total` as the instrument (idle drift +0/6 s):
+
+  tx_block=0, inject 200 @100 f/s -> TX Total +200 ; peer received 293/300
+  tx_block=1, inject 200          -> TX Total +0   ; peer received 0 in 15 s
+  tx_block=0, inject NOTHING      -> TX Total +200 ; peer received 244 in ONE
+                                                     1-second bucket
+  tx_block=0, inject 200          -> TX Total +200
+
+i.e. it gates, it HOLDS rather than drops, and it is reversible.
+
+Build:
+  sed -i 's/ -Werror//' Makefile
+  nix-shell -p gcc gnumake pkg-config libnl libusb1 --run \
+    'make CONFIG_MORSE_TRANS_NL80211=1 CFLAGS="$(pkg-config --cflags libnl-genl-3.0)" all'
+
+Consumed by `MorseKnobs`'s `RadioKnobs::set_tx_hold` (src/morse.rs). A stock
+morse_cli prints "Invalid parameter: 'tx_block'" and exits 1; that path is
+reported as an error there, never as a hold that took.
+
+--- params.c.orig	2026-09-01 17:35:46.023461355 -0500
++++ params.c	2026-09-01 17:36:01.650788059 -0500
+@@ -153,6 +153,16 @@
+         .get_fn = param_get_uint32,
+     },
+     {
++        .id = MORSE_CMD_PARAM_ID_TX_BLOCK,
++        .name = "tx_block",
++        .help = "Block all transmissions at the chip MAC (1 to block, 0 to release). "
++                "Coarse gate: the host command round-trip is milliseconds.",
++        .min_val = 0,
++        .max_val = 1,
++        .set_fn = param_set_uint32,
++        .get_fn = param_get_uint32,
++    },
++    {
+         .id = MORSE_CMD_PARAM_ID_WAKE_ACTION_GPIO,
+         .name = "wake_action_gpio",
+         .help = "Specify GPIO to pulse on reception of a Morse Micro "

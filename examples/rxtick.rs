@@ -29,13 +29,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .nth(3)
         .and_then(|s| s.parse().ok())
         .unwrap_or(20);
-    let r = ndn_radio_drivers::open_named_radio(pid, ch)?;
-    let declared = r
+    let r = ndn_radio_drivers::open_radio(
+        pid,
+        &ndn_radio_drivers::DeviceSelect::from_env(),
+        &ndn_radio_drivers::BringUpRequest::from_env(ch),
+    )?;
+    let head = r
         .time
         .as_ref()
-        .and_then(|t| t.time_sources().first().map(|s| s.tick_ns))
-        .unwrap_or(0);
+        .and_then(|t| t.time_sources().first().copied());
+    let declared = head.map(|s| s.tick_ns).unwrap_or(0);
     println!("pid {pid:04x} ch{ch}: declares {declared} ns/tick");
+    // The other declaration this run bears on. A backend whose reference is `Unknown` is refused a
+    // common view; the ppm this instrument measures against the host clock is exactly the evidence
+    // that would let it declare `ClockReference::crystal()` instead (an RC reference is
+    // percent-class — MEASURED +2253 ppm on the LR2021's, ~-3100 ppm on the Waveshare's — so this
+    // audit separates the two by three orders of magnitude even at its own accuracy).
+    println!("            reference {:?}", head.map(|s| s.reference));
 
     let (mut first, mut last, mut last_host, mut n) = (None::<(u64, u128)>, 0u64, 0u128, 0usize);
     let t0 = Instant::now();

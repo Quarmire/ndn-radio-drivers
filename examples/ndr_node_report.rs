@@ -161,16 +161,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  best_clock          {:?}", ftp.best_clock);
     println!("  stamp_precision_ns  {:?}", ftp.stamp_precision_ns);
     println!("  tx_discipline       {:?}", ftp.tx_discipline);
+    // The two halves, printed apart, because a node that fails the capability deserves to say
+    // WHICH half it failed on. `hw_rx_stamp` is the latch; `clock_reference` is what the counter
+    // runs on. A hardware latch on an unknown or RC reference reads `true / false` here.
+    println!("  hw_rx_stamp         {}  <- latch half", ftp.hw_rx_stamp);
     println!(
-        "  can_common_view     {}  <- the capability the whole timing plane keys on",
+        "  clock_reference     {:?}  <- reference half (Unknown earns nothing)",
+        ftp.clock_reference
+    );
+    println!(
+        "  can_common_view     {}  <- the capability the whole timing plane keys on (needs BOTH)",
         ftp.can_common_view
     );
     println!("  steering            {:?}", ftp.steering);
     println!("  FrameIo::schedules_tx() = {}", dev.schedules_tx());
     for s in dev.time_sources() {
         println!(
-            "  time source: {:?} precision {} ns domain {:?}",
-            s.kind, s.precision_ns, s.domain
+            "  time source: {:?} precision {} ns domain {:?} reference {:?}",
+            s.kind, s.precision_ns, s.domain, s.reference
         );
     }
 

@@ -90,8 +90,9 @@ use bytes::Bytes;
 use ndn_radio_drivers::{
     BROADCAST, DEFAULT_SRC, DeviceSelect, FrameFormat, FrameIo, InjectFrame, LibUsbRtl88xxBackend,
     McsDescriptor, RTL8812AU_PIDS, Reliability, Rtl8812auBackend, TxIntent, frame as dot11,
-    open_named_radio, realtek_contention,
+    realtek_contention,
 };
+use ndn_radio_hal::bringup::{PowerRequest, ProofRequirement, Role};
 use ndn_radio_hal::{
     Bandwidth, ContentionApplied, ContentionPosture, FaceError, RadioKnobs, RxGain,
 };
@@ -761,8 +762,10 @@ fn apply_arm(dev: &Dev, io: &Arc<dyn FrameIo>, arm: &Arm) -> Applied {
             }
             "txpower" => match v.parse::<u32>() {
                 Ok(idx) => knobs
-                    .set_tx_power(idx)
-                    .map(|_| format!("txpower={idx}"))
+                    .set_tx_power(ndn_radio_hal::PowerRequest::index(idx.min(255) as u8))
+                    // ★ Report what was APPLIED, not what was asked for: the whole point of the
+                    // return type. A clamp or a different power reference shows up here.
+                    .map(|a| format!("txpower={idx} -> {}", a.render()))
                     .map_err(|e| format!("set_tx_power({idx}): {e}")),
                 Err(_) => Err(format!("txpower='{v}' is not a number")),
             },
@@ -1232,16 +1235,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         } else if RTL8812AU_PIDS.contains(&pid) {
             let sel = DeviceSelect::from_env();
             let d = Arc::new(Rtl8812auBackend::open_select(&sel)?.with_format(fmt));
-            d.bring_up_monitor(channel)?;
+            d.bring_up_planned(
+                channel,
+                Role::TransmitAndReceive,
+                PowerRequest::ceiling(),
+                None,
+                ProofRequirement::BestAvailable,
+            )?;
             if pump_depth > 0 {
                 std::mem::forget(d.spawn_rx_pump(pump_depth));
             }
             Dev::Au(d)
         } else if matches!(pid, 0xa81a | 0xa811 | 0x8814) {
             let sel = DeviceSelect::from_env();
-            let d = Arc::new(LibUsbRtl88xxBackend::open_monitor_pid_select(
-                pid, &sel, channel,
-            )?);
+            let d = {
+                // M8: `open_monitor*` is deleted. Claim, then run the ONE plan (`PLAN_A81A`)
+                // with the role named at the call site — and keep the report instead of
+                // discarding it, which is the thing those openers got wrong.
+                let d = std::sync::Arc::new(LibUsbRtl88xxBackend::open_pid_select(pid, &sel)?);
+                d.bring_up_planned(
+                    channel,
+                    ndn_radio_hal::bringup::Role::TransmitAndReceive,
+                    ndn_radio_drivers::a81a_env_deviation(),
+                    ndn_radio_hal::bringup::ProofRequirement::BestAvailable,
+                )?;
+                d
+            };
             if pump_depth > 0 {
                 std::mem::forget(d.spawn_rx_pump(pump_depth));
             }
@@ -1250,7 +1269,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Everything else: the standardized opener. NB it starts its own RX pump unless
             // NDN_NO_PUMP=1 — a pumped run and an unpumped run are different experiments, so say
             // which one this is in the write-up.
-            let o = open_named_radio(pid, channel)?;
+            let o = ndn_radio_drivers::open_radio(
+                pid,
+                &ndn_radio_drivers::DeviceSelect::from_env(),
+                &ndn_radio_drivers::BringUpRequest::from_env(channel),
+            )?;
             Dev::Generic {
                 io: o.io.clone(),
                 knobs: o.knobs.clone(),
@@ -1301,7 +1324,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             dst: BROADCAST,
             src: DEFAULT_SRC,
             addr3: None,
-            addr4: None,
+            extra: None,
             htc: None,
         };
         match dot11::build_dot11(fmt, &frame) {

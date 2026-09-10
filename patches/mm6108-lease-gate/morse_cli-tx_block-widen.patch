@@ -1,0 +1,38 @@
+Widen the tx_block parameter range so it can carry lease-gate register writes.
+
+Depends on patches/morse_cli-tx_block-param.patch (which adds the entry).
+
+The MM6108 lease-gate firmware patch (build_lease_gate.py, stage `config`)
+repoints the firmware set-handler of MORSE_CMD_PARAM_ID_TX_BLOCK (id 6, handler
+0x00132eb4) so that the top nibble of the 32-bit value selects a register:
+
+    value >> 28 == 0        legacy tx_block   (snez ; sb 0x802006FE)  -- unchanged
+    value >> 28 == 1        RHO      = value & 0x0FFFFFFF   (grid origin, chip us)
+    value >> 28 == 2        PERIOD   = value & 0x0FFFFFFF   (0 = gate OFF; write LAST)
+    value >> 28 == 3        OPEN_LO  = value & 0x0FFFFFFF   (slot start within period)
+    value >> 28 == 4        OPEN_HI  = value & 0x0FFFFFFF   (slot end; 0 = fail open)
+    value >> 28 >  4        ignored (the handler bounds-checks before storing)
+
+Stock morse_cli clamps this parameter to [0,1] client-side, so the word never
+reaches the chip and the write silently reports success against the legacy path.
+That is the failure mode this patch removes -- a decided-but-unactuated knob.
+
+The off switch is a single command:  morse_cli -i wlan0 tx_block 0x20000000
+
+--- params.c.orig
++++ params.c
+@@
+         .id = MORSE_CMD_PARAM_ID_TX_BLOCK,
+         .name = "tx_block",
+         .help = "Block all transmissions at the chip MAC (1 to block, 0 to release). "
+-                "Coarse gate: the host command round-trip is milliseconds.",
++                "Coarse gate: the host command round-trip is milliseconds. "
++                "With the NDR lease-gate firmware patch loaded, values with a "
++                "non-zero top nibble are register writes: 1=RHO 2=PERIOD 3=OPEN_LO "
++                "4=OPEN_HI, payload = value & 0x0FFFFFFF. PERIOD=0 disables the gate.",
+         .min_val = 0,
+-        .max_val = 1,
++        .max_val = 0xFFFFFFFF,
+         .set_fn = param_set_uint32,
+         .get_fn = param_get_uint32,
+     },

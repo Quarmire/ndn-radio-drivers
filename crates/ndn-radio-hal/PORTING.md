@@ -35,14 +35,14 @@ does not use them.
 
 ## Known coupling to keep an eye on
 
-- **`ndn-coding`** is a portable codec **only under a lean feature set**. Its forwarder
-  integrations are feature-gated + `optional` (`endpoint`->`ndn-app`, `mgmt`->`ndn-mgmt`,
-  `f2-recode-face`->`ndn-engine`/`ndn-security`). Two items remain for a fully portable default:
-  1. `default = ["endpoint","mgmt"]` pulls the native forwarder by default — a stack-agnostic
-     consumer must build with `default-features = false` (+ the codec features it wants).
-  2. `ndn-store` is a **non-optional** dependency, used only for `NameTrie` in the ungated
-     `policy.rs`. Making it optional (or using a local prefix-trie) removes the last always-on
-     forwarder-stack edge from the codec core.
+- **`ndn-coding`** is a portable codec core. Its forwarder integrations are feature-gated +
+  `optional` (`endpoint`->`ndn-app`, `mgmt`->`ndn-mgmt`, `f2-recode-face`->`ndn-engine`/`ndn-security`),
+  and as of 2026 the codec is decoupled by default:
+  1. **`default = []`** — the lean FEC/codec core is the default; the native forwarder
+     integrations are opt-in (`endpoint`, `mgmt`). In-workspace consumers that need them
+     (ndn-ext/ndn-mobile/ndn-fwd) request them explicitly.
+  2. **`ndn-store` removed** — `policy.rs`'s prefix table is now a local dependency-free
+     `NameTrie` (`src/prefix_table.rs`), so the codec core carries no forwarder-stack edge at all.
 
 ## Rule going forward
 

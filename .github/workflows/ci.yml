@@ -61,14 +61,16 @@ jobs:
           workspaces: ndn-radio-drivers
           shared-key: lint
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      # Plain clippy, not `-D warnings`: the lib carries 18 pre-existing lints
-      # (needless_range_loop and friends in the Realtek backends). Escalate to
-      # `-- -D warnings` once those are burned down.
+      # Plain clippy, not `-D warnings`: the lib carries pre-existing lints
+      # (needless_range_loop / result_large_err and friends in the Realtek
+      # backends). Escalate to `-- -D warnings` once those are burned down.
+      # Same feature matrix as the test job so the serial-radio / lora / bench
+      # code paths are linted too, not just the default-feature surface.
       - name: clippy (lib + bins)
-        run: cargo clippy -p ndn-radio-drivers --lib --bins
+        run: cargo clippy -p ndn-radio-drivers --lib --bins --features serial-radio,lora,bench
 
   test:
-    name: host tests (lib + tier0 golden)
+    name: host tests (lib + integration, feature matrix)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

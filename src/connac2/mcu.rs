@@ -1834,27 +1834,29 @@ pub fn wfsys_reset(bus: &Connac2Usb) -> Result<(), FaceError> {
     Err(mcu_err("WFSYS reset did not reach INIT_DONE"))
 }
 
-/// `mt792xu_mcu_power_on` (`mt792x_usb.c:214-232`) — one `MT_VEND_POWER_ON`
-/// vendor write with no data stage, then poll `MT_CONN_ON_MISC` for
-/// `FW_PWR_ON` for 500 ms.
-///
-/// MEASURED before this runs: `MT_CONN_ON_MISC = 0x0000_0000`, i.e. `FW_PWR_ON`
-/// clear. That is the observation that says the part is genuinely off and this
-/// call is not a no-op.
-pub fn power_on(bus: &Connac2Usb) -> Result<(), FaceError> {
-    bus.power_on()?;
-    if !poll_msec(
-        bus,
-        MT_CONN_ON_MISC,
-        MT_TOP_MISC2_FW_PWR_ON,
-        MT_TOP_MISC2_FW_PWR_ON,
-        500,
-    )? {
-        return Err(mcu_err(
-            "timeout waiting for MT_TOP_MISC2_FW_PWR_ON after MT_VEND_POWER_ON",
-        ));
+rung! {
+    /// `mt792xu_mcu_power_on` (`mt792x_usb.c:214-232`) — one `MT_VEND_POWER_ON`
+    /// vendor write with no data stage, then poll `MT_CONN_ON_MISC` for
+    /// `FW_PWR_ON` for 500 ms.
+    ///
+    /// MEASURED before this runs: `MT_CONN_ON_MISC = 0x0000_0000`, i.e. `FW_PWR_ON`
+    /// clear. That is the observation that says the part is genuinely off and this
+    /// call is not a no-op.
+    fn power_on(bus: &Connac2Usb) -> Result<(), FaceError> {
+        bus.power_on()?;
+        if !poll_msec(
+            bus,
+            MT_CONN_ON_MISC,
+            MT_TOP_MISC2_FW_PWR_ON,
+            MT_TOP_MISC2_FW_PWR_ON,
+            500,
+        )? {
+            return Err(mcu_err(
+                "timeout waiting for MT_TOP_MISC2_FW_PWR_ON after MT_VEND_POWER_ON",
+            ));
+        }
+        Ok(())
     }
-    Ok(())
 }
 
 /// What [`power_up`] found on the chip, so a caller can log it rather than

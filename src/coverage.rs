@@ -89,20 +89,90 @@ pub enum TxIntentSupport {
 
 /// One row per backend that transmits. Adding a backend without an entry fails the gate below.
 pub const TX_INTENT: &[(&str, TxIntentSupport)] = &[
-    ("LibUsbRtl88xxBackend", TxIntentSupport::Honoured("inject forces DESC 0x04 (legacy OFDM 6M) and suppresses HT-only SGI/LDPC/STBC")),
-    ("Rtl8812auBackend", TxIntentSupport::Honoured("desc_rate_for returns DESC_RATE_6M ahead of the stored descriptor")),
-    ("Rtl8733buBackend", TxIntentSupport::Honoured("inject picks DESC_RATE_6M with flags cleared, instead of the stored tx_rate/tx_flags. ★ VERIFIED ON AIR 2026-09-01, THREE arms so the delivery reading is controlled: A MostRobust 354 @ 6.0 Mb/s legacy, B Throughput 2 @ 65.0 Mb/s MCS7, C Throughput 354 @ 6.5 Mb/s MCS0 (405 sent each). C is the discriminator: the witness decodes this DUT HT fine at MCS0, so B is real rate/margin loss and not a dead HT decoder — a two-arm run could not tell those apart")),
-    ("Rtl8821cuBackend", TxIntentSupport::Honoured("build_tx forces DESC_RATE_OFDM6M where the DESC code is chosen, so a stored cur_mcs cannot bypass it. ⚠ NOT verifiable on air yet, and NOT for want of trying: after a replug the dongle mode-switched to 0bda:c820 and our bring-up ran, but 440+439 injected frames produced ZERO frames at a witness on the same host. That is this row knobs/time exclusion showing up on the TX side too — bring-up is validated RX-side only and no control write has been hardware-verified. Lifted by the same bench session that lifts those")),
-    ("Mt7610uBackend", TxIntentSupport::Honoured("resolved_rate returns the legacy OFDM-6M TXWI word ahead of cur_rate")),
-    ("Mt7612uBackend", TxIntentSupport::Honoured("inject builds at MT76_RATE_OFDM6M via build_data_bulk_at, with the width field clamped to 0 (legacy PPDUs carry no wide format). ★ VERIFIED ON AIR 2026-09-01: 391 @ 6.0 Mb/s vs 348 @ 65.0 Mb/s MCS7")),
-    ("Mt7921uBackend", TxIntentSupport::Honoured("legacy OFDM 6M rate word, deliberately not for_intent's HE ER-SU branch")),
-    ("Ath9kHtcBackend", TxIntentSupport::Honoured("build_tx_frame returns early at LegacyRate::Ofdm6 with rate_flags 0, ahead of both cur_legacy and cur_mcs. ★ VERIFIED ON AIR 2026-09-01: 65 @ 6.0 Mb/s vs 64 @ 65.0 Mb/s MCS7")),
-    ("SerialRadioBackend", TxIntentSupport::NotApplicable("rate is device state set by a command over the serial link, not a per-frame field; honouring intent per frame would cost a round trip per frame")),
-    ("Bw16SerialBackend", TxIntentSupport::NotApplicable("as SerialRadioBackend — rate is a command, not a per-frame field")),
-    ("Esp32SerialBackend", TxIntentSupport::NotApplicable("as SerialRadioBackend — rate is a command, not a per-frame field")),
-    ("LoraSerialBackend", TxIntentSupport::NotApplicable("LoRa has no basic rate; robustness is the spreading factor, which is channel state adapted by the LoRa phy, not a per-frame choice")),
-    ("MorseFrameIo", TxIntentSupport::Gap("HaLow injects through mac80211 and does not name a rate; lifting this means writing the S1G MCS field into the injected radiotap header")),
-    ("Nrc7292FrameIo", TxIntentSupport::Gap("as MorseFrameIo — would need an explicit rate in the injected radiotap header")),
+    (
+        "LibUsbRtl88xxBackend",
+        TxIntentSupport::Honoured(
+            "inject forces DESC 0x04 (legacy OFDM 6M) and suppresses HT-only SGI/LDPC/STBC",
+        ),
+    ),
+    (
+        "Rtl8812auBackend",
+        TxIntentSupport::Honoured(
+            "desc_rate_for returns DESC_RATE_6M ahead of the stored descriptor",
+        ),
+    ),
+    (
+        "Rtl8733buBackend",
+        TxIntentSupport::Honoured(
+            "inject picks DESC_RATE_6M with flags cleared, instead of the stored tx_rate/tx_flags. ★ VERIFIED ON AIR 2026-09-01, THREE arms so the delivery reading is controlled: A MostRobust 354 @ 6.0 Mb/s legacy, B Throughput 2 @ 65.0 Mb/s MCS7, C Throughput 354 @ 6.5 Mb/s MCS0 (405 sent each). C is the discriminator: the witness decodes this DUT HT fine at MCS0, so B is real rate/margin loss and not a dead HT decoder — a two-arm run could not tell those apart",
+        ),
+    ),
+    (
+        "Rtl8821cuBackend",
+        TxIntentSupport::Honoured(
+            "build_tx forces DESC_RATE_OFDM6M where the DESC code is chosen, so a stored cur_mcs cannot bypass it. ⚠ NOT verifiable on air yet, and NOT for want of trying: after a replug the dongle mode-switched to 0bda:c820 and our bring-up ran, but 440+439 injected frames produced ZERO frames at a witness on the same host. That is this row knobs/time exclusion showing up on the TX side too — bring-up is validated RX-side only and no control write has been hardware-verified. Lifted by the same bench session that lifts those",
+        ),
+    ),
+    (
+        "Mt7610uBackend",
+        TxIntentSupport::Honoured(
+            "resolved_rate returns the legacy OFDM-6M TXWI word ahead of cur_rate",
+        ),
+    ),
+    (
+        "Mt7612uBackend",
+        TxIntentSupport::Honoured(
+            "inject builds at MT76_RATE_OFDM6M via build_data_bulk_at, with the width field clamped to 0 (legacy PPDUs carry no wide format). ★ VERIFIED ON AIR 2026-09-01: 391 @ 6.0 Mb/s vs 348 @ 65.0 Mb/s MCS7",
+        ),
+    ),
+    (
+        "Mt7921uBackend",
+        TxIntentSupport::Honoured(
+            "legacy OFDM 6M rate word, deliberately not for_intent's HE ER-SU branch",
+        ),
+    ),
+    (
+        "Ath9kHtcBackend",
+        TxIntentSupport::Honoured(
+            "build_tx_frame returns early at LegacyRate::Ofdm6 with rate_flags 0, ahead of both cur_legacy and cur_mcs. ★ VERIFIED ON AIR 2026-09-01: 65 @ 6.0 Mb/s vs 64 @ 65.0 Mb/s MCS7",
+        ),
+    ),
+    (
+        "SerialRadioBackend",
+        TxIntentSupport::NotApplicable(
+            "rate is device state set by a command over the serial link, not a per-frame field; honouring intent per frame would cost a round trip per frame",
+        ),
+    ),
+    (
+        "Bw16SerialBackend",
+        TxIntentSupport::NotApplicable(
+            "as SerialRadioBackend — rate is a command, not a per-frame field",
+        ),
+    ),
+    (
+        "Esp32SerialBackend",
+        TxIntentSupport::NotApplicable(
+            "as SerialRadioBackend — rate is a command, not a per-frame field",
+        ),
+    ),
+    (
+        "LoraSerialBackend",
+        TxIntentSupport::NotApplicable(
+            "LoRa has no basic rate; robustness is the spreading factor, which is channel state adapted by the LoRa phy, not a per-frame choice",
+        ),
+    ),
+    (
+        "MorseFrameIo",
+        TxIntentSupport::Gap(
+            "HaLow injects through mac80211 and does not name a rate; lifting this means writing the S1G MCS field into the injected radiotap header",
+        ),
+    ),
+    (
+        "Nrc7292FrameIo",
+        TxIntentSupport::Gap(
+            "as MorseFrameIo — would need an explicit rate in the injected radiotap header",
+        ),
+    ),
 ];
 
 /// ★ **How each backend makes its contention posture DETERMINISTIC** (added 2026-08-31).
@@ -135,20 +205,77 @@ pub enum Contention {
 
 /// One row per backend that owns a MAC. Adding a backend without an entry fails the gate below.
 pub const CONTENTION: &[(&str, Contention)] = &[
-    ("Mt7610uBackend", Contention::Pinned("bring_up -> mt76::knobs::set_contention(Shared); the radio the 2.5x swing was measured on")),
-    ("Mt7921uBackend", Contention::Pinned("bring_up -> restore_edca(); EDCA is MCU_CE_CMD firmware state no register read reveals. ⚠ 2026-09-01: pin is non-fatal and CONSISTENT with working (no-posture runs 2187/2334/2277 f/s across interleaved aggressive runs) but NOT proven — the contention lever measures only 5.6% on this part (cw_min exp 2 vs 5: 3619 vs 3426 f/s) against a 3.3% run spread, so a leak would look like noise. Underpowered, not passing. Needs a firmware EDCA read-back the MCU does not expose")),
-    ("Mt7612uBackend", Contention::Pinned("bring_up -> restore_edca_defaults(); writes the boot window, never below it (mt76x2 window_floor hazard). ★ PROVEN AT THE REGISTERS 2026-09-01, both halves in one run: a prior process left NDN_POSTURE=yielding (AIFSN 0x3333 / CWMIN 0x6666 / AC0 0x000a6300), a fresh process READ THOSE BACK as-found (the leak is real), and bring_up restored 0x2222 / 0x4444 / 0x000a4200 (the pin works). ☠ The first version of this pin was INERT: it sat at the tail of the COLD path while the warm re-open returns early — and the warm path is exactly where a chip keeps the previous state. Both paths now call one pin_edca() helper. Note Owned CANNOT test this on mt76x2 (window_floor clamps it to the boot window, so Owned == Shared == boot); Yielding is the only posture that moves these registers")),
-    ("LibUsbRtl88xxBackend", Contention::Pinned("mac_init -> init_edca_cfg(); slot + all four AC params by name")),
-    ("Rtl8812auBackend", Contention::Pinned("mac_config -> config_table(MAC_REG); the writes are DATA in an include_bytes! blob, invisible to a source grep — MEASURED identical across five processes")),
-    ("Rtl8733buBackend", Contention::PowerCycled("bring_up_monitor -> power_off() then power_on(); every entry point routes through it")),
-    ("Rtl8821cuBackend", Contention::PowerCycled("bring-up card-disables first when REG_CR != 0xea, then CARD_ENABLE. Its own EDCA write is gated behind NDN_RADIO_IBSS and does NOT run by default")),
-    ("Ath9kHtcBackend", Contention::Pinned("init_queues resets all four TX queues on every bring-up via the ath9k_hw_resettxqueue sequence, writing AR_DLCL_IFS/AR_DRETRY_LIMIT/AR_QMISC/AR_DMISC with the USEDEFAULT DCF parameters (cwmin 15, cwmax 1023, aifs 2). Contention is therefore re-established per open, not inherited. ★ Reviewed 2026-09-01; the earlier Unreviewed reason named ath9k_hw_set_txq_props, which was never ported and so was the wrong thing to look for")),
-    ("MorseFrameIo", Contention::NotApplicable("HaLow via mac80211 — the kernel driver owns the EDCA arbiter")),
-    ("Nrc7292FrameIo", Contention::NotApplicable("HaLow via mac80211 — the kernel driver owns the EDCA arbiter")),
-    ("SerialRadioBackend", Contention::NotApplicable("the MAC lives in device firmware across a serial link")),
-    ("Bw16SerialBackend", Contention::NotApplicable("the MAC lives in device firmware across a serial link")),
-    ("Esp32SerialBackend", Contention::NotApplicable("the MAC lives in device firmware across a serial link")),
-    ("LoraSerialBackend", Contention::NotApplicable("LoRa has no EDCA; contention is the firmware's CSMA/LBT")),
+    (
+        "Mt7610uBackend",
+        Contention::Pinned(
+            "bring_up -> mt76::knobs::set_contention(Shared); the radio the 2.5x swing was measured on",
+        ),
+    ),
+    (
+        "Mt7921uBackend",
+        Contention::Pinned(
+            "bring_up -> restore_edca(); EDCA is MCU_CE_CMD firmware state no register read reveals. ⚠ 2026-09-01: pin is non-fatal and CONSISTENT with working (no-posture runs 2187/2334/2277 f/s across interleaved aggressive runs) but NOT proven — the contention lever measures only 5.6% on this part (cw_min exp 2 vs 5: 3619 vs 3426 f/s) against a 3.3% run spread, so a leak would look like noise. Underpowered, not passing. Needs a firmware EDCA read-back the MCU does not expose",
+        ),
+    ),
+    (
+        "Mt7612uBackend",
+        Contention::Pinned(
+            "bring_up -> restore_edca_defaults(); writes the boot window, never below it (mt76x2 window_floor hazard). ★ PROVEN AT THE REGISTERS 2026-09-01, both halves in one run: a prior process left NDN_POSTURE=yielding (AIFSN 0x3333 / CWMIN 0x6666 / AC0 0x000a6300), a fresh process READ THOSE BACK as-found (the leak is real), and bring_up restored 0x2222 / 0x4444 / 0x000a4200 (the pin works). ☠ The first version of this pin was INERT: it sat at the tail of the COLD path while the warm re-open returns early — and the warm path is exactly where a chip keeps the previous state. Both paths now call one pin_edca() helper. Note Owned CANNOT test this on mt76x2 (window_floor clamps it to the boot window, so Owned == Shared == boot); Yielding is the only posture that moves these registers",
+        ),
+    ),
+    (
+        "LibUsbRtl88xxBackend",
+        Contention::Pinned("mac_init -> init_edca_cfg(); slot + all four AC params by name"),
+    ),
+    (
+        "Rtl8812auBackend",
+        Contention::Pinned(
+            "mac_config -> config_table(MAC_REG); the writes are DATA in an include_bytes! blob, invisible to a source grep — MEASURED identical across five processes",
+        ),
+    ),
+    (
+        "Rtl8733buBackend",
+        Contention::PowerCycled(
+            "PLAN_8812AU_MONITOR's `power_on` rung -> power_off() then power_on(); since M8 every \
+             entry point routes through that plan",
+        ),
+    ),
+    (
+        "Rtl8821cuBackend",
+        Contention::PowerCycled(
+            "bring-up card-disables first when REG_CR != 0xea, then CARD_ENABLE. Its own EDCA write is gated behind NDN_RADIO_IBSS and does NOT run by default",
+        ),
+    ),
+    (
+        "Ath9kHtcBackend",
+        Contention::Pinned(
+            "init_queues resets all four TX queues on every bring-up via the ath9k_hw_resettxqueue sequence, writing AR_DLCL_IFS/AR_DRETRY_LIMIT/AR_QMISC/AR_DMISC with the USEDEFAULT DCF parameters (cwmin 15, cwmax 1023, aifs 2). Contention is therefore re-established per open, not inherited. ★ Reviewed 2026-09-01; the earlier Unreviewed reason named ath9k_hw_set_txq_props, which was never ported and so was the wrong thing to look for",
+        ),
+    ),
+    (
+        "MorseFrameIo",
+        Contention::NotApplicable("HaLow via mac80211 — the kernel driver owns the EDCA arbiter"),
+    ),
+    (
+        "Nrc7292FrameIo",
+        Contention::NotApplicable("HaLow via mac80211 — the kernel driver owns the EDCA arbiter"),
+    ),
+    (
+        "SerialRadioBackend",
+        Contention::NotApplicable("the MAC lives in device firmware across a serial link"),
+    ),
+    (
+        "Bw16SerialBackend",
+        Contention::NotApplicable("the MAC lives in device firmware across a serial link"),
+    ),
+    (
+        "Esp32SerialBackend",
+        Contention::NotApplicable("the MAC lives in device firmware across a serial link"),
+    ),
+    (
+        "LoraSerialBackend",
+        Contention::NotApplicable("LoRa has no EDCA; contention is the firmware's CSMA/LBT"),
+    ),
 ];
 
 /// ★ **The declaration-vs-actuator gate for the payload ceiling** (added 2026-08-31).

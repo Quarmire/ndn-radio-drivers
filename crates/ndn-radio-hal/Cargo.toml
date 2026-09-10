@@ -9,6 +9,13 @@ license.workspace = true
 [package.metadata.scope]
 classification = "spec"
 
+[features]
+# ★ The ONLY way, besides `NDN_RF_UNRESTRICTED`, to mint an `RfAuthority` — i.e. to reach the raw
+# chip TXAGC axis, off the regulatory scale. Off by default so no library code can construct one:
+# the regulatory ceiling is enforced by the type system rather than by discipline. Bench examples
+# that need it declare it in `required-features`.
+bench = []
+
 [dependencies]
 ndn-transport = { workspace = true }
 # The link-timestamp vocabulary (LinkStamp/ClockDomainId/LatchPoint) lives in

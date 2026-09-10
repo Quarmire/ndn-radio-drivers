@@ -7,14 +7,17 @@ use std::sync::Mutex;
 
 use async_trait::async_trait;
 use ndn_frame_io::{
-    AfPacketBackend, CapturedFrame, ClockDomainId, FaceError, FrameFormat, FrameIo, InjectFrame,
-    McsDescriptor, RadioCapability, RadioProfile, RadioTime, RadioTimeSource, frame,
+    AfPacketBackend, CapturedFrame, ClockDomainId, ClockReference, FaceError, FrameFormat, FrameIo,
+    InjectFrame, LatchPoint, McsDescriptor, RadioCapability, RadioClockKind, RadioProfile,
+    RadioTime, RadioTimeSource, frame,
 };
 use ndn_radio_hal::MeshCv;
 
 use super::{
-    MM6108_AMSDU_BODY, MM6108_MAX_PAYLOAD, MORSE_INJECT_BW_PARAM, MORSE_INJECT_MCS_PARAM,
-    MeshCvHarvester, check_morse_ifaces, mm6108_capability, nrc7292_capability,
+    HalowIfaces, IfaceNature, MM6108_AMSDU_BODY, MM6108_MAX_PAYLOAD, MORSE_INJECT_BW_PARAM,
+    MORSE_INJECT_MCS_PARAM, MeshCvHarvester, check_morse_ifaces, check_morse_vif_roles,
+    check_nrc_iface, mm6108_bringup, mm6108_capability, morse_monitor_vif_error, nrc7292_bringup,
+    nrc7292_capability,
 };
 use crate::nrc7292::Nrc7292Clock;
 
@@ -53,6 +56,56 @@ fn require_up(iface: &str) -> Result<(), FaceError> {
     )))
 }
 
+/// Does the interface exist at all? `/sys/class/net/<iface>` is the directory every netdev has.
+///
+/// Asked separately from [`require_up`] because on the Morse the *absent* TX vif is not a generic
+/// "no such device": it is the monitor-vif precondition, and it deserves that error rather than an
+/// `ENOENT` that says nothing about why receive will be silent.
+fn iface_exists(iface: &str) -> bool {
+    Path::new(&format!("/sys/class/net/{iface}")).exists()
+}
+
+/// Read `/sys/class/net/<iface>/type` — the ARP hardware type, which is how sysfs answers "is this
+/// a monitor netdev or a managed one".
+///
+/// An error here is a real error, not a shrug: [`require_up`] has already read this interface's
+/// `flags`, so the directory demonstrably exists, and `type` is present on every netdev sysfs has
+/// ever exported. Failing open would put the silent-zero checks back to being unchecked.
+fn iface_arphrd(iface: &str) -> Result<u32, FaceError> {
+    let raw = std::fs::read_to_string(format!("/sys/class/net/{iface}/type")).map_err(|e| {
+        FaceError::Io(std::io::Error::new(
+            e.kind(),
+            format!("{iface}: cannot read the interface type: {e}"),
+        ))
+    })?;
+    raw.trim().parse::<u32>().map_err(|e| {
+        FaceError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{iface}: unparseable type {:?}: {e}", raw.trim()),
+        ))
+    })
+}
+
+/// The last component of a sysfs symlink's target, or `None` when the link is absent or unreadable.
+/// `None` is a *fact* for `phy80211` (the interface is not a mac80211 vif) and merely "sysfs did
+/// not say" for `phy80211/device/driver`; [`IfaceNature`] documents which is which.
+fn link_basename(path: PathBuf) -> Option<String> {
+    let target = std::fs::read_link(path).ok()?;
+    Some(target.file_name()?.to_string_lossy().into_owned())
+}
+
+/// Gather what sysfs says about an interface's nature, for the pure rules next door
+/// ([`check_morse_vif_roles`], [`check_nrc_iface`]) to judge.
+fn iface_nature(iface: &str) -> Result<IfaceNature, FaceError> {
+    Ok(IfaceNature {
+        arphrd: iface_arphrd(iface)?,
+        mac80211_phy: link_basename(PathBuf::from(format!("/sys/class/net/{iface}/phy80211"))),
+        phy_driver: link_basename(PathBuf::from(format!(
+            "/sys/class/net/{iface}/phy80211/device/driver"
+        ))),
+    })
+}
+
 /// Write a decimal value to a driver module parameter, turning "the patch is not loaded" into a
 /// named error rather than a silent no-op.
 fn write_param(path: &Path, value: u32) -> Result<(), FaceError> {
@@ -73,8 +126,13 @@ fn write_param(path: &Path, value: u32) -> Result<(), FaceError> {
 ///
 /// What this adds over a bare [`AfPacketBackend::split`]:
 ///
-/// * the two silent misconfigurations are refused at construction ([`super::check_morse_ifaces`]),
-///   not discovered on air;
+/// * the two silent *naming* misconfigurations are refused at construction
+///   ([`super::check_morse_ifaces`]), not discovered on air;
+/// * ★ the silent *role* misconfigurations are too ([`super::check_morse_vif_roles`]) — above all
+///   the **monitor-vif precondition**: `morse0` delivers ZERO frames unless a mac80211 monitor vif
+///   exists on the phy (MEASURED, same node/second/channel: no `mon0` → 0 packets, `mon0` → 1880)
+///   and nothing anywhere reports that. The TX vif this face already needs is exactly what
+///   satisfies it, so the check costs a deployment nothing it was not already doing right;
 /// * both interfaces are checked UP, because a down sniffer netdev captures nothing *and reports
 ///   nothing*;
 /// * the A-MSDU budget and the single-frame payload cap are the **MEASURED** 1546 bytes rather
@@ -86,6 +144,12 @@ pub struct MorseFrameIo {
     af: AfPacketBackend,
     tx_iface: String,
     rx_iface: String,
+    /// The clock domain every RX stamp off this face is keyed on: the **sniffer** interface's
+    /// index, the same value [`AfPacketBackend::recv_frame`] hands to
+    /// [`frame::parse`](ndn_frame_io::frame::parse) and the same convention
+    /// [`Nrc7292FrameIo`] uses. Cached at construction because `time_sources()` must name it and
+    /// takes `&self`.
+    domain: ClockDomainId,
     inject_mcs: Option<PathBuf>,
     inject_bw: Option<PathBuf>,
 }
@@ -95,19 +159,57 @@ impl MorseFrameIo {
     /// `rx_iface` (the driver's sniffer netdev, e.g. `morse0`).
     ///
     /// Refuses `tx_iface == rx_iface` and refuses to transmit on a `morseN` netdev; requires both
-    /// interfaces to exist and be UP.
+    /// interfaces to exist and be UP; and requires each to *be* what its role needs — the TX vif a
+    /// mac80211 monitor vif on the Morse phy, the RX netdev a radiotap sniffer that is **not** a
+    /// mac80211 vif. See [`super::check_morse_vif_roles`]: those are the rules whose violation
+    /// produces no frames and no error.
     pub fn new(tx_iface: &str, rx_iface: &str, format: FrameFormat) -> Result<Self, FaceError> {
         check_morse_ifaces(tx_iface, rx_iface)?;
-        require_up(tx_iface)?;
+        // ★ The TX vif's two "not there" cases are reported as what they actually cost — the
+        // monitor-vif precondition, i.e. RECEIVE — rather than as a bare ENOENT or a generic
+        // "is DOWN". These are the *reachable* forms of the silent zero: the operator who never
+        // ran `iw phy … interface add mon0 type monitor` has no `mon0` to name, and a monitor vif
+        // that is merely down never raises IEEE80211_CONF_CHANGE_MONITOR either. Both leave
+        // `morse0` delivering nothing, forever, with no error anywhere.
+        if !iface_exists(tx_iface) {
+            return Err(morse_monitor_vif_error(
+                tx_iface,
+                rx_iface,
+                "no such interface",
+            ));
+        }
+        if !iface_is_up(tx_iface)? {
+            return Err(morse_monitor_vif_error(
+                tx_iface,
+                rx_iface,
+                "the interface exists but is DOWN, and a closed monitor vif does not count",
+            ));
+        }
         require_up(rx_iface)?;
+        // What the two interfaces *are*, now that both are known to exist: the remaining
+        // silent-zero shapes (a monitor vif that is not on the Morse phy, a receive netdev that is
+        // really a mac80211 vif and only echoes our own TX, a managed vif that cannot carry
+        // radiotap at all). The existence checks above are what let `iface_nature` treat an
+        // unreadable `type` as a hard error rather than a shrug.
+        check_morse_vif_roles(
+            tx_iface,
+            rx_iface,
+            &iface_nature(tx_iface)?,
+            &iface_nature(rx_iface)?,
+        )?;
         let af = AfPacketBackend::split(tx_iface, rx_iface, format)
             .map_err(FaceError::Io)?
             .with_amsdu_cap(MM6108_AMSDU_BODY)
             .with_capability(mm6108_capability(Vec::new()));
+        // Keyed on the RX ifindex, NOT the TX one: `AfPacketBackend::split` stamps captured
+        // frames `ClockDomainId(rx_ifindex)`, so anything else here would advertise a domain no
+        // stamp this face emits is ever in.
+        let domain = ClockDomainId(af.rx_ifindex() as u32);
         Ok(Self {
             af,
             tx_iface: tx_iface.to_string(),
             rx_iface: rx_iface.to_string(),
+            domain,
             inject_mcs: None,
             inject_bw: None,
         })
@@ -120,6 +222,7 @@ impl MorseFrameIo {
             af,
             tx_iface,
             rx_iface,
+            domain,
             inject_mcs,
             inject_bw,
         } = self;
@@ -127,6 +230,7 @@ impl MorseFrameIo {
             af: af.with_capability(capability),
             tx_iface,
             rx_iface,
+            domain,
             inject_mcs,
             inject_bw,
         }
@@ -218,6 +322,16 @@ impl MorseFrameIo {
         (&self.tx_iface, &self.rx_iface)
     }
 
+    /// The clock domain this face's RX stamps are keyed on — the **sniffer** interface's index.
+    ///
+    /// Exposed for the same reason [`Nrc7292Clock::domain`] is: a caller composing this face with
+    /// anything that relates timestamps (a `RadioHwClock`, a cross-domain map) has to be able to
+    /// check that the two are talking about the same counter, and on this radio the answer is a
+    /// property of *which netdev capture came off*, not of the driver.
+    pub fn clock_domain(&self) -> ClockDomainId {
+        self.domain
+    }
+
     /// ★ **Does [`set_rate`](FrameIo::set_rate) reach the air on this instance?**
     ///
     /// `true` only when [`with_inject_mcs_param`](Self::with_inject_mcs_param) has verified the
@@ -246,6 +360,52 @@ impl MorseFrameIo {
         self.inject_bw.is_some()
     }
 
+    /// **M6 — the MM6108 as a full [`OpenRadio`], with the report `PLAN_MM6108` produces.**
+    ///
+    /// ⚠ The plan brings NOTHING up: every rung is `OutOfBand`. Its value is the `vif_roles`
+    /// validation — the split-data-plane rule whose violation gives zero frames and no error at
+    /// all — plus naming `modprobe` / `iw` / `morse_cli` / `hostapd_s1g` as the establishers of
+    /// everything it cannot check. See [`crate::halow`]'s M6 block.
+    ///
+    /// `channel` is the caller's claim about what `morse_cli` did, and is reported as a claim. On
+    /// S1G the width travels WITH the channel number, so both are unverified together.
+    pub fn open_radio(
+        tx_iface: &str,
+        rx_iface: &str,
+        format: FrameFormat,
+        channel: u8,
+        bw: ndn_radio_hal::Bandwidth,
+    ) -> Result<ndn_radio_hal::OpenRadio, FaceError> {
+        // `new` FIRST: it owns `morse_monitor_vif_error`, which explains that a missing or down
+        // TX monitor vif breaks RECEIVE on this part. A bare `iface_nature` error would replace
+        // that with a sysfs read failure and lose the one message worth having here.
+        let dev = std::sync::Arc::new(Self::new(tx_iface, rx_iface, format)?);
+        let tx_nature = iface_nature(tx_iface)?;
+        let rx_nature = iface_nature(rx_iface)?;
+        let report = mm6108_bringup(
+            HalowIfaces {
+                tx: tx_iface.to_string(),
+                rx: rx_iface.to_string(),
+                tx_nature,
+                rx_nature,
+            },
+            channel,
+            bw,
+            RadioProfile::capability(dev.as_ref()),
+        )?;
+        // ⚠ No second `emit()`: `run_plan` already emitted this report.
+        Ok(ndn_radio_hal::OpenRadio {
+            io: dev.clone(),
+            // No `RadioKnobs` impl: the rate/width actuators on this part are module PARAMETERS
+            // (`inject_mcs`, `inject_bw`), reached through this type's own methods and only on a
+            // patched driver. Channel and power are `morse_cli`/nl80211, out of band.
+            knobs: None,
+            time: Some(dev.clone()),
+            profile: Some(dev),
+            report,
+        })
+    }
+
     /// Refuse a frame the chip would discard without telling anyone.
     fn check_payload(&self, frame: &InjectFrame) -> Result<(), FaceError> {
         if frame.payload.len() > MM6108_MAX_PAYLOAD {
@@ -264,7 +424,6 @@ impl MorseFrameIo {
 
 #[async_trait]
 impl FrameIo for MorseFrameIo {
-
     /// This radio's own capability, so a face built from the bare `dyn FrameIo` does not have to
     /// invent one. Delegates to this type's [`RadioProfile`] — the single source of truth.
     fn radio_capability(&self) -> Option<ndn_radio_hal::RadioCapability> {
@@ -332,8 +491,8 @@ impl FrameIo for MorseFrameIo {
 }
 
 /// Per-frame RX stamps from the **sniffer** netdev's radiotap TSFT, keyed on that interface's
-/// index — delegated to the `AF_PACKET` backend, including its [`ndn_frame_io::ClockReference`]
-/// of `unknown`.
+/// index — the same domain the `AF_PACKET` backend stamps with, re-declared here rather than
+/// delegated, and carrying that backend's [`ndn_frame_io::ClockReference`] of `unknown`.
 ///
 /// That `unknown` is not laziness and is not upgraded here. The Morse driver does stamp every
 /// frame with `hdr_rx_status->rx_timestamp_us` at zero bus cost, and the firmware does implement
@@ -343,6 +502,27 @@ impl FrameIo for MorseFrameIo {
 /// warns that monitor mode may be reporting a local timer rather than the TSF. Until the four
 /// checks (non-zero, monotonic, wall-clock-consistent, not a host timer) are run, claiming a
 /// hardware latch on a stated oscillator would be an assumption wearing a measurement's clothes.
+///
+/// ★ **THREE OF THE FOUR ARE NOW MEASURED** (2026-09-01, the lease acceptance run: 1709 frames
+/// over 165 s on mds-o5p-1, `examples/halow_lease.rs rx --csv`, analysed by
+/// `tools/lease_accept.py`).
+///
+/// * **stamped** — 1709/1709 frames carried a TSFT. Not a field that is sometimes filled.
+/// * **non-zero, monotonic** — both, over the whole capture.
+/// * **wall-clock-consistent** — regressed against the receiver's own `CLOCK_REALTIME` the stamp
+///   runs at **1.000005544 host µs per tick (+5.5 ppm)**. It is a microsecond counter.
+/// * **not a host timer — evidence, not proof.** On the SAME frames the stamp's jitter about the
+///   sender's intended instant is **1.3–2.3× smaller** than the host `CLOCK_REALTIME`'s
+///   (sd 142–164 µs vs 196–328 µs, every arm). A timestamp taken where userspace reads the frame
+///   cannot be quieter than userspace's own read; this one is latched upstream of it. That rules
+///   out the *host* — it does not distinguish the S1G TSF from the chip's local timer, which is
+///   precisely what the vendor header warns about, so the `unknown` kind STAYS.
+///
+/// ⚠ **Nothing about the declaration changes on this evidence.** The acceptance run did not need
+/// the kind upgraded: every decisive statistic it reports (the Rayleigh R, the two-point phase
+/// shift) is invariant to the arrival clock's offset and needs only its rate. Reading these
+/// measurements as licence to publish a hardware latch would repeat exactly the leak the override
+/// below exists to close.
 impl RadioTime for MorseFrameIo {
     /// ⚠ **Deliberately NOT `self.af.time_sources()`.** That would inherit
     /// [`AfPacketBackend`]'s `free_run_rx_stamp` — a declaration that the stamp is latched by the
@@ -355,22 +535,67 @@ impl RadioTime for MorseFrameIo {
     /// The af_packet claim is right where it was written — the NRC7292 on the same ifindex domain
     /// has a verified TSF — and wrong here, so the override belongs in this impl rather than there.
     ///
+    /// ⚠ **The downgrade is on the KIND axis only.** The domain stays
+    /// `ClockDomainId(rx_ifindex)`, because that is not a claim about the clock's quality — it is
+    /// the *identity* of the counter the stamps on this face are already counted in
+    /// (`AfPacketBackend::recv_frame` → `frame::parse`). Substituting a host-clock domain here to
+    /// avoid the `free_run_rx_stamp` claim would leave the face advertising a clock that no stamp
+    /// it emits belongs to, so a consumer pairing `LinkStamp::domain` against the declared sources
+    /// would match nothing, forever, with no error — and `Nrc7292FrameIo`, five hundred lines
+    /// below, would be right on the very same ifindex convention. Withholding a capability and
+    /// misnaming a counter are different acts; only the first one is safe.
+    ///
     /// This UNDERSTATES the part: the Morse driver really does stamp every frame with
     /// `hdr_rx_status->rx_timestamp_us`, and it may well be a true TSF. Understating is the safe
     /// direction — a declaration may withhold a capability, never grant one. Run the four checks
     /// (non-zero, monotonic, wall-clock-consistent, not a host timer) and this becomes
     /// `free_run_rx_stamp` on a stated reference.
     fn time_sources(&self) -> Vec<RadioTimeSource> {
-        // (compile fix: `self.domain` does not exist on this struct. Every other `host_recv`
-        // caller in the crate passes HOST_CLOCK_DOMAIN, and that is the right domain by
-        // definition — a HOST-received timestamp is in the host's clock, not the NIC's.)
-        // The host clock domain, "HOST" as four ASCII bytes — the same constant the serial
-        // backends use. Defined locally rather than reaching across modules: it is a wire-level
-        // identity, not shared state.
-        const HOST_CLOCK_DOMAIN: ndn_frame_io::ClockDomainId =
-            ndn_frame_io::ClockDomainId(0x484F_5354);
-        vec![RadioTimeSource::host_recv(HOST_CLOCK_DOMAIN)]
+        morse_time_sources(self.domain)
     }
+
+    // `read_clock` keeps the trait's `Ok(None)` default, and the declaration above keeps
+    // `read_now: false` to match it. There is no host path to this counter: no `morse_cli` verb
+    // issues `MORSE_CMD_ID_GET_TSF` and the driver exposes no debugfs hook, so a source claiming a
+    // read-now would be advertising a reader that does not exist.
+}
+
+/// The MM6108's link-clock declaration, as a free function so it can be unit-tested without a
+/// socket (constructing a [`MorseFrameIo`] needs two live netdevs, which no test host has).
+///
+/// Every field is either a fact or a deliberate understatement, and the understatements are the
+/// point — see [`MorseFrameIo`]'s `RadioTime` impl for why each one is withheld.
+fn morse_time_sources(domain: ClockDomainId) -> Vec<RadioTimeSource> {
+    vec![RadioTimeSource {
+        // ⚠ NOT `FreeRunRxStamp`. That kind asserts the MAC/PHY latched the counter with no
+        // software in the path, which is exactly the unrun check — and it is the sole input to
+        // `FaceTimeProfile::hw_rx_stamp`, so declaring it would grant the latch half on evidence
+        // nobody has taken. `PortTsf` is what a radiotap TSFT *claims* to be, grants neither
+        // `hw_rx_stamp` nor `can_common_view`, and its "gated, resynced, not monotonic" character
+        // is the honest description of a counter whose behaviour has never been checked.
+        kind: RadioClockKind::PortTsf,
+        // The sniffer ifindex — the same domain `frame::parse` stamps every captured frame with
+        // (`AfPacketBackend::recv_frame`). A different value here would be a face advertising a
+        // clock none of its own stamps belong to, so nothing could relate the two.
+        domain,
+        // Matches the stamps this face actually delivers: `frame::parse` builds every TSFT stamp
+        // at `MacDone` / 1 µs. Advertising looser than you stamp is safe; advertising tighter is
+        // the failure `precision_floor_ns` exists to clamp.
+        latch: LatchPoint::MacDone,
+        precision_ns: LatchPoint::MacDone.precision_floor_ns(),
+        // 1 µs: radiotap TSFT is microseconds by definition, and the driver's own field is
+        // `hdr_rx_status->rx_timestamp_us`. This one is known.
+        tick_ns: 1_000,
+        // Unverified — "monotonic" is one of the four checks, and it is the check a beacon-resynced
+        // TSF fails. Not claimed.
+        monotonic: false,
+        // No host path reads this counter. See the note on `read_clock` above.
+        read_now: false,
+        // ⚠ NOT `ClockReference::host_os()`. This counter is the radio's, not the host's; `HostOs`
+        // is one of the two kinds where `holds_rate()` is true, so claiming it would hand a
+        // never-measured oscillator half of the common-view predicate.
+        reference: ClockReference::unknown(),
+    }]
 }
 
 impl RadioProfile for MorseFrameIo {
@@ -397,10 +622,23 @@ impl RadioProfile for MorseFrameIo {
 ///    frame"), so `recv_frame` never sees one; this backend reads the raw capture first, offers it
 ///    to a [`MeshCvHarvester`], and then decodes normally.
 ///
-/// ⚠ A monitor vif puts the whole chip in promiscuous mode (`nrc_mac_rx` diverts *all* receive to
-/// the monitor path when `nw->promisc`), so the managed/AP data path receives nothing while this
-/// face exists. Named-radio operation and a concurrent managed path are mutually exclusive on this
-/// radio, as they are on the Morse.
+/// ☠ **Both of those are unreachable on the stock driver, and this doc used to claim the opposite.**
+/// MEASURED 2026-08-31 on the `halow_demo` pair (see the [`super`] module docs for the numbers):
+/// the radiotap that actually arrives is mac80211's 18-byte header with **no TSFT and no S1G
+/// TLV**, so `stamp` is `None` on every frame and `with_clock` has nothing to relate its counter
+/// to; and `frame::parse` sees no beacons through this vif either, so `mesh_common_view` stays
+/// `None`. Injection is dead in the same driver (`p->inject` is never set for radiotap monitor TX),
+/// so this type is **receive-only in practice** — `inject` returns `Ok(())` and the chip's TX
+/// counter does not move.
+///
+/// ⚠ The old warning that "a monitor vif puts the whole chip in promiscuous mode, so the managed/AP
+/// data path receives nothing while this face exists" is also **false as measured**: the
+/// association held and IP ping ran 0% loss with `mon0` up on both ends. mac80211 never calls the
+/// driver's `add_interface` for this vif, so `nw->promisc` is never set.
+///
+/// ⚠ `recv_frame` also returns **this host's own transmissions** — the same netdev delivers
+/// radiotap TX echoes (TX_FLAGS set, `rssi_dbm: None`), MEASURED 60/120 of the frames in a
+/// two-way run. Nothing here filters them, so a caller that must not hear itself has to.
 pub struct Nrc7292FrameIo {
     af: AfPacketBackend,
     clock: Option<Nrc7292Clock>,
@@ -409,13 +647,20 @@ pub struct Nrc7292FrameIo {
 }
 
 impl Nrc7292FrameIo {
-    /// Open on `iface` — one netdev, already in `type monitor` and UP.
+    /// Open on `iface` — one netdev, already in `type monitor` and UP. Both are *checked*
+    /// ([`super::check_nrc_iface`]): a managed vif cannot deliver a radiotap header, so a face
+    /// opened on one would report no TSFT, no S1G TLV, no RSSI and no MCS, which reads as a broken
+    /// radio rather than as a misconfigured interface.
     ///
     /// Injection additionally needs the out-of-tree `nrc7292/inject_monitor.patch`; without it the
     /// socket accepts frames the radio never transmits. That cannot be detected from here (the
     /// send succeeds either way), so it is a deployment precondition, not a constructor check.
     pub fn new(iface: &str, format: FrameFormat) -> Result<Self, FaceError> {
         require_up(iface)?;
+        // Monitor mode is the precondition for everything this face reads: on a managed vif the
+        // frames go to mac80211 with no radiotap header, so the capture carries no TSFT, no S1G
+        // TLV, no RSSI and no MCS — and it fails by being quietly useless rather than by erroring.
+        check_nrc_iface(iface, &iface_nature(iface)?)?;
         let af = AfPacketBackend::new(iface, format)
             .map_err(FaceError::Io)?
             .with_capability(nrc7292_capability(Vec::new()));
@@ -499,11 +744,55 @@ impl Nrc7292FrameIo {
     pub fn rate_actuated(&self) -> bool {
         false
     }
+
+    /// **M6 — the NRC7292 as a full [`OpenRadio`], with the report `PLAN_NRC7292` produces.**
+    ///
+    /// ⚠ The plan brings NOTHING up: every rung is `OutOfBand`, and the report's value is that it
+    /// NAMES `modprobe` / `iw` / `hostapd_s1g` / the vendor `cli_app` as the establishers and
+    /// marks the channel, the width and the injection patch as unverified provenance. See
+    /// [`crate::halow`]'s M6 block for why that is better than shell history and worse than owning
+    /// the sequence.
+    ///
+    /// `channel` is the caller's claim about what the out-of-band tuning did, and is reported as
+    /// a claim.
+    pub fn open_radio(
+        iface: &str,
+        format: FrameFormat,
+        channel: u8,
+        bw: ndn_radio_hal::Bandwidth,
+    ) -> Result<ndn_radio_hal::OpenRadio, FaceError> {
+        // `new` FIRST: it owns the diagnostic messages for every reachable failure (missing,
+        // down, managed rather than monitor), and a bare `iface_nature` error would replace them
+        // with a sysfs read failure. The natures are then re-gathered for the report.
+        let dev = std::sync::Arc::new(Self::new(iface, format)?);
+        let nature = iface_nature(iface)?;
+        let report = nrc7292_bringup(
+            HalowIfaces {
+                tx: iface.to_string(),
+                rx: iface.to_string(),
+                tx_nature: nature.clone(),
+                rx_nature: nature,
+            },
+            channel,
+            bw,
+            RadioProfile::capability(dev.as_ref()),
+        )?;
+        // ⚠ No second `emit()`: `run_plan` already emitted this report.
+        Ok(ndn_radio_hal::OpenRadio {
+            io: dev.clone(),
+            // No `RadioKnobs` impl on this type: channel and power are reached through nl80211 and
+            // the vendor CLI, both out of band. Saying `None` is the honest answer — a knob that
+            // silently does nothing is worse than no knob.
+            knobs: None,
+            time: Some(dev.clone()),
+            profile: Some(dev),
+            report,
+        })
+    }
 }
 
 #[async_trait]
 impl FrameIo for Nrc7292FrameIo {
-
     /// This radio's own capability, so a face built from the bare `dyn FrameIo` does not have to
     /// invent one. Delegates to this type's [`RadioProfile`] — the single source of truth.
     fn radio_capability(&self) -> Option<ndn_radio_hal::RadioCapability> {
@@ -589,5 +878,140 @@ impl RadioTime for Nrc7292FrameIo {
 impl RadioProfile for Nrc7292FrameIo {
     fn capability(&self) -> RadioCapability {
         self.af.capability()
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════════════════════
+// Tests
+// ═════════════════════════════════════════════════════════════════════════════════════════════
+//
+// ⚠ This whole file is `cfg(target_os = "linux")`, so these run on the target and nowhere else —
+// which is precisely why they exist. The declaration below was wrong for an entire release and a
+// macOS test run could not have said so.
+//
+// Neither `FrameIo` is constructible without live netdevs, so what is testable is the part that
+// was actually wrong: the *rules*, factored out of the constructors.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ndn_frame_io::ClockReferenceKind;
+    use ndn_radio_hal::{FaceTimeProfile, TxDiscipline};
+
+    /// A stand-in that answers only `time_sources`, so `FaceTimeProfile::derive` can be exercised
+    /// against the MM6108 declaration without a socket.
+    struct MorseClockOnly(ClockDomainId);
+    impl RadioTime for MorseClockOnly {
+        fn time_sources(&self) -> Vec<RadioTimeSource> {
+            morse_time_sources(self.0)
+        }
+    }
+
+    /// ★ The regression this file's history is about. The declared domain must be the interface
+    /// index the captured frames are stamped in — `AfPacketBackend::recv_frame` passes
+    /// `ClockDomainId(rx_ifindex)` to `frame::parse`, so any other value advertises a counter none
+    /// of this face's own stamps live in. A previous compile fix substituted a host-clock domain
+    /// here; it compiled, and nothing could ever have matched a stamp against it again.
+    #[test]
+    fn the_declared_domain_is_the_rx_ifindex_domain() {
+        for ifindex in [3u32, 7, 42] {
+            let v = morse_time_sources(ClockDomainId(ifindex));
+            assert_eq!(
+                v.len(),
+                1,
+                "one clock, or the `best_clock` head is ambiguous"
+            );
+            assert_eq!(
+                v[0].domain,
+                ClockDomainId(ifindex),
+                "the declaration must name the domain the stamps are keyed on"
+            );
+        }
+        // And it must NOT be the serial backends' host domain, "HOST" as four ASCII bytes.
+        assert_ne!(
+            morse_time_sources(ClockDomainId(3))[0].domain.0,
+            0x484F_5354
+        );
+    }
+
+    /// `read_now` is a promise that `read_clock` answers, and on this radio nothing does: no
+    /// `morse_cli` verb issues `MORSE_CMD_ID_GET_TSF` and there is no debugfs hook, so
+    /// `RadioTime::read_clock` keeps its `Ok(None)` default. A source claiming otherwise is the
+    /// "reports success, actuates nothing" defect in declaration form.
+    #[test]
+    fn no_read_now_is_claimed_because_nothing_reads_it() {
+        let s = morse_time_sources(ClockDomainId(3))[0];
+        assert!(!s.read_now, "no host path reads this counter");
+        // The trait default is what backs that up — assert the default is still what we get.
+        let c = MorseClockOnly(ClockDomainId(3));
+        assert_eq!(c.read_clock(ClockDomainId(3)).unwrap(), None);
+        assert_eq!(c.read_clock(ClockDomainId(999)).unwrap(), None);
+    }
+
+    /// The reference is `Unknown`, not `HostOs`. `HostOs` is one of the two kinds where
+    /// `holds_rate()` is true, so declaring it would hand a never-measured oscillator half of the
+    /// common-view predicate — on a counter that is the radio's, not the host's.
+    #[test]
+    fn the_oscillator_is_not_claimed() {
+        let s = morse_time_sources(ClockDomainId(3))[0];
+        assert_eq!(s.reference.kind, ClockReferenceKind::Unknown);
+        assert!(!s.reference.holds_rate());
+        assert_eq!(
+            s.reference.measured, None,
+            "nobody has measured this counter"
+        );
+    }
+
+    /// ★ The withheld capability, asserted through the consumer that reads it. `hw_rx_stamp` is the
+    /// LATCH half of common view and its sole input is a `FreeRunRxStamp` source; the four checks
+    /// (non-zero, monotonic, wall-clock-consistent, not a host timer) have not been run on this
+    /// part, and the vendor header warns monitor mode may report a local timer. So: false.
+    #[test]
+    fn the_unverified_latch_is_not_granted() {
+        let p =
+            FaceTimeProfile::derive(&MorseClockOnly(ClockDomainId(3)), TxDiscipline::BestEffort);
+        assert!(
+            !p.hw_rx_stamp,
+            "the latch half must stay withheld until the four checks are run"
+        );
+        assert!(!p.can_common_view);
+        assert_eq!(p.best_clock, Some(RadioClockKind::PortTsf));
+        assert_ne!(p.best_clock, Some(RadioClockKind::FreeRunRxStamp));
+    }
+
+    /// The advertisement and the per-frame stamps must not disagree about how good the clock is:
+    /// `frame::parse` builds every radiotap-TSFT stamp at `MacDone` / 1 µs, so the declaration says
+    /// the same. Advertising *tighter* than you stamp is the failure `precision_floor_ns` clamps.
+    #[test]
+    fn the_advertisement_matches_the_stamps_it_describes() {
+        let s = morse_time_sources(ClockDomainId(3))[0];
+        assert_eq!(s.latch, LatchPoint::MacDone);
+        assert_eq!(s.precision_ns, LatchPoint::MacDone.precision_floor_ns());
+        assert_eq!(s.tick_ns, 1_000, "radiotap TSFT is microseconds");
+        assert!(
+            s.precision_ns >= s.latch.precision_floor_ns(),
+            "never advertise tighter than the latch's floor"
+        );
+        assert!(!s.monotonic, "monotonicity is one of the four unrun checks");
+    }
+
+    /// The Morse and the NRC7292 must key their domains the same way, or a node running both
+    /// cannot tell whether two faces share a counter. Both are `ClockDomainId(rx_ifindex)`; this
+    /// pins that they are derived by the same rule rather than by coincidence.
+    #[test]
+    fn both_halow_radios_key_their_domain_on_the_rx_ifindex() {
+        let ifindex: i32 = 11;
+        assert_eq!(
+            morse_time_sources(ClockDomainId(ifindex as u32))[0].domain,
+            ClockDomainId(ifindex as u32),
+            "same rule Nrc7292FrameIo::new applies: ClockDomainId(af.rx_ifindex() as u32)"
+        );
+    }
+
+    /// Payload-cap refusal is a real rule this file owns (the MEASURED byte-exact 1546/1547
+    /// boundary), and it had no test either.
+    #[test]
+    fn the_measured_payload_cap_is_byte_exact() {
+        assert_eq!(MM6108_MAX_PAYLOAD, 1546);
+        assert!(MM6108_AMSDU_BODY >= MM6108_MAX_PAYLOAD);
     }
 }

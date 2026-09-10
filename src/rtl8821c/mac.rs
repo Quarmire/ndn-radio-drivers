@@ -14,15 +14,17 @@ use ndn_transport::FaceError;
 use super::Rtl8821cuBackend;
 
 impl Rtl8821cuBackend {
-    /// Full MAC init: TRX FIFO/queue config → chip MAC register group → H2C ring
-    /// → driver-info config. Run after firmware download, before the PHY tables.
-    pub fn mac_init(&self) -> Result<(), FaceError> {
-        self.init_trx_cfg()?;
-        self.mac_init_regs()?;
-        self.drv_info_cfg()
-        // NOTE: hci_usb_cfg (RX burst+agg) runs LAST in bring_up, matching the
-        // kernel's rtw_hci_start ordering — done before the PHY tables it would
-        // be clobbered by the BB table load / channel set.
+    rung! {
+        /// Full MAC init: TRX FIFO/queue config → chip MAC register group → H2C ring
+        /// → driver-info config. Run after firmware download, before the PHY tables.
+        fn mac_init(&self) -> Result<(), FaceError> {
+            self.init_trx_cfg()?;
+            self.mac_init_regs()?;
+            self.drv_info_cfg()
+            // NOTE: hci_usb_cfg (RX burst+agg) runs LAST in bring_up, matching the
+            // kernel's rtw_hci_start ordering — done before the PHY tables it would
+            // be clobbered by the BB table load / channel set.
+        }
     }
 
     /// USB-specific HCI config: `rtw_usb_init_burst_pkt_len` (the RXDMA burst

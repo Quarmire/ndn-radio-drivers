@@ -12,6 +12,7 @@
 pub mod common_view_pool;
 pub mod event_id;
 pub mod frame;
+pub mod keyspace;
 pub mod radiotap;
 
 pub use common_view_pool::{CommonViewPool, InterReceiverOffset, ReceiverId};
@@ -21,15 +22,21 @@ pub use event_id::EventId;
 /// here so every existing `ndn_frame_io::X` path and internal `crate::X`
 /// reference still resolves unchanged.
 pub use ndn_radio_hal::{
-    BROADCAST, CapturedFrame, ClockDomainId, CsiSupport, DEFAULT_SRC, FaceError, FaceId, FrameIo,
-    InjectFrame, LatchPoint, LinkStamp, MAX_RELIABLE_MCS, McsDescriptor, McsPolicy, PhyMetrics,
-    RadioCapability, RadioClockKind, RadioProfile, RadioTime, RadioTimeSource, Reach, Reliability,
-    TxDiscipline, TxIntent, mcs_for_rssi, mcs_phy_rate_bps,
+    BROADCAST, CapturedFrame, ClockDomainId, ClockReference, ClockReferenceKind, CsiSupport,
+    DEFAULT_SRC, FaceError, FaceId, FrameIo, InjectFrame, LatchPoint, LinkStamp, MAX_RELIABLE_MCS,
+    McsDescriptor, McsPolicy, PhyMetrics, RadioCapability, RadioClockKind, RadioProfile, RadioTime,
+    RadioTimeSource, RateMeasurement, RateWitness, Reach, Reliability, TxDiscipline, TxIntent,
+    mcs_for_rssi, mcs_phy_rate_bps, s1g_phy_rate_bps,
 };
 
 pub use frame::{
     ESPNOW_MAX_BODY, ESPNOW_OUI, EphemeralSource, GroupKey, OPEN_GROUP_KEY, siphash24,
 };
+
+/// The one name keyspace (#44). `prefix_hash` moved DOWN to this crate so the driver that actuates
+/// the named airtime lease and the control plane that decides it share one implementation rather
+/// than two copies free to drift — see [`keyspace`] for why that could not be a dependency edge.
+pub use keyspace::{prefix_hash, prefix_hash_slash, slash_components};
 
 mod loopback;
 pub use loopback::{LoopbackEndpoint, LoopbackMonitorBus};
@@ -67,6 +74,19 @@ pub use af_packet::AfPacketBackend;
 /// frames of 2200/2260/2300 B deliver 100%; frames of 2312 B and up never arrive.
 pub const MONITOR_MTU: usize = 2272;
 
+/// Default A-MSDU body cap (bytes, excluding radiotap + MPDU header) for
+/// `AfPacketBackend::inject_batch_at` (Linux only). The classic 802.11 small A-MSDU limit; the cognition
+/// plane's `amsdu_msdus` bounds the count on top of it.
+///
+/// ⚠ **It is an 802.11n/ac number and it is too large for 802.11ah.** The MM6108's on-air cutoff is
+/// byte-exact and MEASURED at 1546 B of payload — 1546 delivers, 1547 never arrives — and the chip
+/// discards an oversize aggregate with no error anywhere, the same silent-drop shape as the
+/// 2296 → 2272 bug above. So every HaLow caller must narrow it with
+/// `AfPacketBackend::with_amsdu_cap` (which `ndn_radio_drivers::halow::MorseFrameIo` does). This
+/// stays the default only because changing it would silently shrink aggregates on the 2.4/5 GHz
+/// backends that have been measured at this value.
+pub const DEFAULT_AMSDU_BODY: usize = 3839;
+
 /// The legacy ~1500-byte-Ethernet-ish MTU used before the single-MSDU bump,
 /// kept as a named baseline for the goodput A/B (`with_mtu(LEGACY_ETHER_MTU)`).
 pub const LEGACY_ETHER_MTU: usize = 1450;
@@ -94,6 +114,13 @@ pub enum FrameFormat {
     /// with the 2.4/5 GHz backends: same [`FrameIo`] data plane, same face. Our
     /// own traffic still rides an NDN data frame (doctrine) — this is that frame
     /// on a sub-GHz PHY, not a host-addressed interop format.
+    ///
+    /// ⚠ **"Same data plane" is true of the framing and NOT of the socket.** The Newracom NRC7292
+    /// runs both directions on one monitor netdev; the Morse Micro MM6108 physically cannot —
+    /// monitor mode diverts all receive to the driver's own `morse0` sniffer netdev, and that same
+    /// netdev's `xmit` frees every skb handed to it, so injection must go out elsewhere. Use
+    /// `AfPacketBackend::split` (Linux only), or `ndn_radio_drivers::halow::MorseFrameIo`, which refuses the
+    /// two silent misconfigurations at construction.
     RawNdnS1g { ethertype: u16 },
     /// wfb-ng frame layout — interop with OpenIPC / FPV chipsets. (Phase 3.)
     Wfb,
@@ -137,7 +164,7 @@ mod tests {
             dst,
             src,
             addr3: None,
-            addr4: None,
+            extra: None,
             htc: None,
         }
     }

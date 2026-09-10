@@ -114,6 +114,12 @@ use std::time::Duration;
 use async_trait::async_trait;
 use rusb::{Context, DeviceHandle};
 
+use ndn_radio_hal::bringup::{
+    AppliedPower, Assert, BringUp, BringUpFailure, BringUpReport, Ctx, Degradation, Deviation,
+    Fact, Guards, Plan, PlanId, PlanRun, PowerReference, PowerRequest, PowerWrite,
+    ProofRequirement, PumpPolicy, RadioState, Role, Severity, Stage, Step, StepClass, StepId,
+    StepOutcome,
+};
 use ndn_radio_hal::{
     Band, Bandwidth, CsiSupport, RadioCapability, RadioKind, RadioKnobs, RadioProfile, RadioTime,
     RateCapability, TxDiscipline,
@@ -651,6 +657,26 @@ pub struct Mt7610uBackend {
     /// do not drain each other's counter — two consumers sampling at different cadences
     /// would otherwise each see a fraction of the traffic and neither would be wrong-looking.
     rx_ok_window: AtomicU64,
+    /// Stop flag for the **bring-up-duration** bulk-IN drain (M5).
+    ///
+    /// ★ It lives on the backend, and not in a `StepOutcome::Guard`, so that the drain covers
+    /// EXACTLY the rungs it covered before the plan existed. A guard is owned by the returned
+    /// handle, which would silently extend the drain across `monitor_rx` and `tune_channel` —
+    /// rungs it never covered — and leave a thread eating received frames for the life of the
+    /// process. Two rungs (`rx_drain` / `rx_drain_stop`) bracket it instead, and
+    /// [`bring_up_planned`](Mt7610uBackend::bring_up_planned) sets it unconditionally afterwards
+    /// so a failure partway through the ladder does not leak the thread either.
+    bringup_drain: Arc<std::sync::atomic::AtomicBool>,
+    /// `NDN_RADIO_FORCE_FW`, read ONCE at the wrapper boundary (LAW 1) and stashed here for the
+    /// one rung that branches on it.
+    ///
+    /// ⚠ Stated plainly: this is driver state a rung reads, which is the shape of thing this
+    /// contract removes — but it is *set from an argument at the caller boundary*, never from the
+    /// environment inside the ladder, and the rung reports which way it went as its own
+    /// `StepOutcome::Branch`. §1.1's `BringUpRequest` is where the flag belongs for good; the
+    /// `Ctx` a rung is handed carries `RadioState` and nothing else, so until that type exists
+    /// there is no other channel from the boundary to the rung.
+    force_cold_fw: std::sync::atomic::AtomicBool,
 }
 
 impl Mt7610uBackend {
@@ -726,6 +752,8 @@ impl Mt7610uBackend {
             rx_undecodable: AtomicU64::new(0),
             rx_accepted: AtomicU64::new(0),
             rx_ok_window: AtomicU64::new(0),
+            bringup_drain: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            force_cold_fw: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -893,162 +921,158 @@ impl Mt7610uBackend {
         Ok(())
     }
 
-    /// True when the MCU firmware is already up: `mt76x0_firmware_running`
+    /// True when the MCU firmware **status latch** says it is up: `mt76x0_firmware_running`
     /// (`mt76x0/mcu.h:41-44`) is exactly `MT_MCU_COM_REG0 == 1`.
     ///
-    /// This is the warm-reopen guard. It is checked **before** anything touches
-    /// `MT_WLAN_FUN_CTRL`, because the point is to leave a live MCU alone.
+    /// ☠ **This is no longer the warm/cold decision, and must not become one again** (M5).
+    /// `MT_MCU_COM_REG0` (`0x0730`) is a **MAILBOX**, not a status flag: the firmware reuses it
+    /// as a destination address and it goes stale. On the sibling MT7612U, deciding warm/cold
+    /// from this latch was MEASURED wrong in BOTH directions — "cold" on a chip the kernel had
+    /// just loaded (so the cold path downloaded firmware into a live MCU, collided with the FCE
+    /// and wedged the part) and "warm" on a chip that answered nothing. Each mistake cost a
+    /// physical replug. That part fixed it with a round trip; this one still read the latch,
+    /// which is the live divergence M5 was told to close. See
+    /// [`mcu_responsive`](Self::mcu_responsive), which is what the plan branches on.
+    ///
+    /// Kept as a diagnostic — it is the corroborating heuristic in the three-outcome decision,
+    /// and it is what upstream itself tests — but it decides nothing on its own.
     pub fn firmware_running(&self) -> bool {
         matches!(self.rr(regs::MT_MCU_COM_REG0), Ok(1))
     }
 
+    /// **Does the MCU answer *us*, as opposed to merely being loaded?** The warm/cold evidence.
+    ///
+    /// ☠ The rule this exists for: *warm/cold must use a round trip, not a status latch.*
+    /// Deciding from `MT_MCU_COM_REG0` was wrong in both directions on the sibling MT7612U and
+    /// cost a replug each time; that part's `mcu_responsive()` is the fix, and this is its
+    /// MT7610U twin, written against the same reasoning:
+    ///
+    /// * it sends a command that requires the MCU to **compose a response** —
+    ///   [`mcu::rd_rp`] is `CMD_RANDOM_READ`, which upstream itself always waits on
+    ///   (`mt76x02_usb_mcu.c:198`) because there is nowhere else for the value to come from. A
+    ///   fire-and-forget command would "succeed" against a dead MCU and tell us nothing;
+    /// * it reads a register we already know (`MT_MCU_CLOCK_CTL`) so the *value* is irrelevant
+    ///   and only the round trip is being tested;
+    /// * **any** error, timeout or malformed answer reports NOT responsive. A false "responsive"
+    ///   costs a bench trip (the cold path never runs and the chip stays half-initialised); a
+    ///   false "unresponsive" costs one firmware download. Conservative in the cheap direction.
+    ///
+    /// ⚠ It is a real bus round trip (~1 ms, and up to the MCU response timeout when the MCU is
+    /// dead), which is why it is taken **once**, inside the `firmware_ready` rung, and not
+    /// polled.
+    pub fn mcu_responsive(&self) -> bool {
+        let mut pairs = [RegPair {
+            reg: regs::MT_MCU_CLOCK_CTL,
+            value: 0,
+        }];
+        mcu::rd_rp(self, 0, &mut pairs).is_ok()
+    }
+
     // ── Bring-up ────────────────────────────────────────────────────────────
 
-    /// Full bring-up, in upstream's order: power the WLAN block, download firmware, program
-    /// the MAC and BBP tables, initialise the RF, and program the factory MAC address.
+    /// **The full bring-up — [`PLAN_MT7610U`], `Role::TransmitAndReceive`.** A thin wrapper over
+    /// [`bring_up_planned`](Self::bring_up_planned); the sequence lives in the plan, where every
+    /// rung states why it is there and a reviewer sees the whole ladder at once.
     ///
-    /// **The warm-reopen path is the important part.** Re-downloading firmware over a
-    /// running MCU is what wedges these parts (the same failure the mt7612 backend guards
-    /// against), so if `MT_MCU_COM_REG0` already reads 1 this skips both the power cycle and
-    /// the download and re-applies only the idempotent register programming. Set
-    /// `NDN_RADIO_FORCE_FW=1` to force the cold path on a device you are willing to replug.
+    /// Power the WLAN block, download firmware, program the MAC and BBP tables, initialise the RF,
+    /// program the factory MAC address, pin the contention posture, **put the MAC into promiscuous
+    /// monitor RX, and tune** — the last two being the M5 change: `bring_up`, `setup_monitor_rx`
+    /// and the tune are ONE plan now, so `MT_MAC_SYS_CTRL = ENABLE_TX | ENABLE_RX` can no longer
+    /// be missing because a caller forgot a call. `ASSERTS_MT7610U` reads that gate back.
     ///
-    /// Cold sequence, with upstream lines:
-    /// 1. `mt76x0_chip_onoff(false, false)` — the OFF pass. `mt76x0/usb.c:257-258` calls it
-    ///    *"Disable the HW, otherwise MCU fail to initialize on hot reboot"*.
-    /// 2. `mt76x02_wait_for_mac` (`usb.c:260`).
-    /// 3. `mt76x0_chip_onoff(true, true)` + `wait_for_mac` (`usb.c:155-158`).
-    /// 4. firmware download (`usb.c:160` → `mt76x0/usb_mcu.c:85-162`).
-    /// 5. `mt76x0_init_usb_dma` (`usb.c:164` → `usb.c:46-71`).
-    /// 6. `mt76x0_init_hardware` (`usb.c:165` → `mt76x0/init.c:171-212`).
-    /// 7. `MT_US_CYC_CFG` / `MT_TXOP_CTRL_CFG` (`usb.c:171-174`).
-    pub fn bring_up(&self) -> Result<(), FaceError> {
-        let force = std::env::var_os("NDN_RADIO_FORCE_FW").is_some();
-        let warm = !force && self.firmware_running();
+    /// ⚠ **`self: &Arc<Self>`, not `&self`** (M5). [`Step::run`] takes `&Arc<B>` because a rung
+    /// may hand back a live guard. This part produces none, but the runner's signature is shared
+    /// with the part that does (the 8733b `PowerTracker`).
+    ///
+    /// ⚠ **`channel` is now an argument.** The old `bring_up()` left the radio untuned and
+    /// reported `channel: 0`; the factory then tuned separately and patched the report's channel
+    /// field afterwards. The report now describes a tuned radio because the plan tuned it.
+    ///
+    /// ⚠ **`NDN_RADIO_FORCE_FW` is no longer read inside the ladder** (LAW 1). It is read once,
+    /// here, at the wrapper boundary, and passed down as an argument.
+    pub fn bring_up(self: &Arc<Self>, channel: u8) -> Result<BringUpReport, FaceError> {
+        // ★ M8: ONE reader. `NDN_RADIO_FORCE_FW` is read by
+        // `crate::open_radio::mt76_force_cold_from_env`, which `BringUpRequest::from_env` also
+        // calls — so this wrapper and the factory can never disagree about it.
+        let force_cold = crate::open_radio::mt76_force_cold_from_env();
+        self.bring_up_planned(
+            channel,
+            Role::TransmitAndReceive,
+            force_cold,
+            None,
+            ProofRequirement::BestAvailable,
+        )
+        .map(|(report, guards)| {
+            debug_assert!(guards.is_empty(), "this plan produces no guards");
+            report
+        })
+        .map_err(drop_partial_report)
+    }
 
-        // ★ Drain the data bulk-IN for the duration of bring-up.
-        //
-        // mt76 USB expects the host to keep RX transfers posted. If nobody reads, the device's
-        // USB DMA backs up and the MCU stops consuming inband commands — they are accepted into
-        // the FIFO and never processed, so the *next* command's bulk-out times out rather than
-        // the offending one. MEASURED here as `command 0x0c seq 0 bulk-out (200 B): Operation
-        // timed out` partway through `init_hardware`, on a device whose registers were all
-        // responding normally; and the sibling MT7612U backend carries the same workaround with
-        // the same explanation (`mt7612/mod.rs`, `spawn_rx_drain`).
-        //
-        // The command *response* pipe (0x85) is separate from the data pipe (0x84) on this part,
-        // so this drain cannot steal an MCU reply — it only keeps the data pipe moving.
-        let drain_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        {
-            let stop = drain_stop.clone();
-            let h = self.usb.handle();
-            let ep = self.usb.ep_in_data();
-            std::thread::spawn(move || {
-                let mut buf = vec![0u8; 8192];
-                while !stop.load(Ordering::Relaxed) {
-                    let _ = h.read_bulk(ep, &mut buf, Duration::from_millis(50));
-                }
-            });
+    /// **The one entry point.** Everything else is a wrapper over this.
+    ///
+    /// The role selects the plan ([`BringUp::plan`]); the deviation, if any, is resolved against
+    /// that plan before the first register write and lands in the report's digest; the proof
+    /// requirement is validated against the role and this part's (empty) instrument set, also
+    /// before the first register write.
+    ///
+    /// `force_cold` is `NDN_RADIO_FORCE_FW`, read at the caller boundary rather than inside a
+    /// rung. §1.1's `BringUpRequest` is where it belongs for good; until that exists it is an
+    /// argument, stashed for the one rung that needs it and reported as the branch that rung took.
+    // The `Err` is large BECAUSE it carries the partial report — the whole point of §3. Same
+    // allow, same reason, as `run_plan`'s.
+    #[allow(clippy::result_large_err)]
+    pub fn bring_up_planned(
+        self: &Arc<Self>,
+        channel: u8,
+        role: Role,
+        force_cold: bool,
+        deviation: Option<Deviation>,
+        proof: ProofRequirement,
+    ) -> Result<(BringUpReport, Guards), BringUpFailure> {
+        self.force_cold_fw
+            .store(force_cold, std::sync::atomic::Ordering::Relaxed);
+        let mut run = PlanRun::new(
+            "MT7610U",
+            ndn_radio_hal::DeviceAddress::Usb(self.usb.usb_addr().to_string()),
+            self.initial_state(channel, role),
+        )
+        .with_proof(proof);
+        if let Some(d) = deviation {
+            run = run.with_deviation(d);
         }
-        // Stop the drain on every exit path, including the error ones.
-        struct DrainGuard(std::sync::Arc<std::sync::atomic::AtomicBool>);
-        impl Drop for DrainGuard {
-            fn drop(&mut self) {
-                self.0.store(true, Ordering::Relaxed);
-            }
+        // UFCS: the inherent `bring_up(channel)` above shadows the trait method of the same name.
+        let out = <Self as BringUp>::bring_up(self, &run);
+        // ★ Belt over the `rx_drain_stop` rung: a Required failure anywhere above it would return
+        // before that rung runs, and the drain thread would then read bulk-IN for the life of the
+        // process and compete with whatever ran next. `DrainGuard`'s `Drop` used to do this.
+        self.bringup_drain
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let (report, guards) = out?;
+        Ok((
+            report.with_capability(ndn_radio_hal::RadioProfile::capability(self.as_ref())),
+            guards,
+        ))
+    }
+
+    /// The regime a plan starts from. Not a claim about the radio: it is what the caller asked
+    /// for, and the rungs fill in what they establish.
+    fn initial_state(&self, channel: u8, role: Role) -> RadioState {
+        RadioState {
+            channel,
+            bw: ndn_radio_hal::Bandwidth::Bw20,
+            format: "RawNdn (see with_format)",
+            role,
+            // ⚠ The ladder sets no power: this part's power is per-channel AND per-rate, so it
+            // cannot be set before a tune. `NoActuator` would be a lie (the knob works); this says
+            // the bring-up did not touch it, which is the truth.
+            power: AppliedPower::no_actuator(PowerRequest::NoActuator),
+            rate: ndn_radio_hal::RateState::unreported(),
+            warm: None,
+            contention: None,
+            pump: PumpPolicy::CallerOwns,
+            facts: Vec::new(),
         }
-        let _drain = DrainGuard(drain_stop);
-
-        if warm {
-            tracing::info!(
-                target: "named_radio",
-                chip = "MT7610U",
-                "firmware already running (MT_MCU_COM_REG0 == 1) — warm re-open, \
-                 skipping the power cycle and the firmware download"
-            );
-        } else {
-            self.chip_onoff(false, false)?;
-            self.wait_for_mac()?;
-            self.chip_onoff(true, true)?;
-            self.wait_for_mac()?;
-            // The whole download — DMA-cfg preamble, FCE setup, ILM/IVB/DLM, load-IVB and
-            // the MT_MCU_COM_REG0 readiness poll — belongs to `mcu::load_firmware`
-            // (mt76x0/usb_mcu.c:85-162). Nothing here second-guesses it.
-            mcu::load_firmware(self, MT7610U_FIRMWARE)?;
-        }
-
-        self.init_usb_dma()?;
-        self.init_hardware()?;
-
-        // usb.c:171-174. The TXOP value here is bit-identical to the MEASURED
-        // kernel-monitor `MT_TXOP_CTRL_CFG = 0x0000_583f` (TRUN_EN 0x3f, EXT_CCA_DLY 0x58,
-        // ED-CCA off), which is a genuine cross-check of the transcription.
-        self.rmw(regs::MT_US_CYC_CFG, regs::MT_US_CYC_CNT, 0x1e)?;
-        self.wr(
-            regs::MT_TXOP_CTRL_CFG,
-            regs::field_prep(regs::MT_TXOP_TRUN_EN, 0x3f)
-                | regs::field_prep(regs::MT_TXOP_EXT_CCA_DLY, 0x58),
-        )?;
-
-        self.set_mac_address(self.eeprom.mac_addr())?;
-
-        // ★★ Program EDCA to a KNOWN posture. This driver never wrote these registers at all,
-        // and on USB nothing power-cycles the chip between processes, so the contention state was
-        // simply **whatever the previous process left behind**.
-        //
-        // MEASURED 2026-08-31, Bw80 / VHT MCS7 / 1400 B / pump=8, five consecutive processes:
-        //
-        // ```text
-        //   A  no NDN_POSTURE            6321 f/s
-        //   B  NDN_POSTURE=owned         6382 f/s
-        //   C  no NDN_POSTURE            6706 f/s   <- inherited Owned
-        //   D  NDN_POSTURE=shared        2965 f/s
-        //   E  no NDN_POSTURE            2724 f/s   <- inherited Shared
-        // ```
-        //
-        // A run that sets no posture measured **2724 or 6706 f/s — a 2.5x swing — decided purely
-        // by what ran before it.** Any A/B that does not pin the posture is comparing history, and
-        // any absolute throughput figure taken without one is unreproducible. This is the same
-        // cross-process latching class as the ALC/baseband override, and the file's own
-        // `set_contention` already warns that "a fresh process inherits whatever the previous one
-        // left and has no 'as found' to go back to" — it just had no caller at bring-up.
-        //
-        // `Shared` (`MT_EDCA_CFG_AC(n) = 0x000a4200` = TXOP 0, AIFSN 2, CWMIN 4, CWMAX 10) is a
-        // known, conservative posture at or above every measured floor, and the polite one for a
-        // shared medium. `RadioKnobs::set_contention` still moves it afterwards for anyone who asks.
-        //
-        // ⚠ It is NOT this part's "boot value" — I claimed that and it is not supported. That
-        // constant comes from the MT7612U's captured `init_replay`, and there is no MT7610U EEPROM
-        // or datasheet read behind it. MEASURED with `examples/mt7610_edca_probe.rs` on a chip
-        // freshly initialised by the kernel `mt76x0u` driver, the as-found state is DIFFERENT:
-        //
-        // ```text
-        //   as found (kernel):  AIFSN 0x1111  CWMIN 0x2222  CWMAX 0xaaaa  AC0/AC1 0x000a2100
-        //   after our bring-up: AIFSN 0x2222  CWMIN 0x4444  CWMAX 0xaaaa  AC0/AC1 0x000a4200
-        // ```
-        //
-        // The kernel's AC0/AC1 are the aggressive categories (VO/VI) and legitimately carry AIFSN 1
-        // / CWMIN 2. Note the shared helper writes ONE posture to all four ACs, flattening
-        // VO/VI/BE/BK — deliberate for a radio with a single traffic class, but it means "restoring
-        // the default" is not what this does. What it does, and all it claims to do, is make the
-        // posture DETERMINISTIC instead of inherited.
-        //
-        // Safe on THIS family: the window-below-boot hazard that cost two MT7612U replugs is
-        // mt76x2-specific (`window_floor`), we are writing the boot value rather than below it,
-        // and the MT7610U is MEASURED fine even at `Owned`. Non-fatal on purpose — a contention
-        // write failing should not turn a working radio into no radio.
-        if let Err(e) = crate::mt76::knobs::set_contention(
-            self,
-            ndn_radio_hal::ContentionPosture::Shared,
-            crate::mt76::Family::Mt76x0,
-            &self.edca_saved,
-        ) {
-            eprintln!(
-                "mt7610u: EDCA not initialised ({e}) — contention posture is whatever the \
-                 previous process left; pin NDN_POSTURE before trusting any throughput figure"
-            );
-        }
-        Ok(())
     }
 
     /// `mt76x0_init_usb_dma` (`mt76x0/usb.c:46-71`).
@@ -1189,63 +1213,65 @@ impl Mt7610uBackend {
 
     // ── Monitor RX ──────────────────────────────────────────────────────────
 
-    /// Put the MAC into promiscuous monitor receive and start the TSF.
-    ///
-    /// **`MT_RX_FILTR_CFG = 0`, not the MEASURED kernel-monitor `0x0000_1093`.** That value
-    /// is what mac80211's monitor path leaves: the init table's `0x0001_7f97`
-    /// (`mt76x0/initvals_init.h:20`) minus PROMISC and the control-frame group
-    /// (`mt76x0/main.c:80-87`, `mt76x02_util.c:223-229`). It still **drops** CRC-error
-    /// frames, RTS, duplicates, version errors and BARs. A named-data receiver wants the
-    /// opposite: every PPDU the PHY delivers, with the CRC verdict carried per frame in
-    /// `MT_RXINFO_CRCERR` so a bad-FCS frame is *counted* and then dropped in software
-    /// rather than never seen. Dropping in hardware makes a marginal link and a quiet
-    /// channel look identical — which is the exact ambiguity the frame-free occupancy
-    /// counters exist to resolve.
-    ///
-    /// The bits are `mt76x02u_mac_start`'s otherwise (`mt76x02_usb_core.c:25-43`):
-    /// `MT_MAC_SYS_CTRL = ENABLE_TX | ENABLE_RX` (= the MEASURED `0x0c`), with the USB DMA
-    /// bulk enables re-asserted first because a firmware download leaves them elsewhere.
-    pub fn setup_monitor_rx(&self) -> Result<(), FaceError> {
-        use regs::*;
-        self.init_usb_dma()?;
-        self.wr(MT_RX_FILTR_CFG, 0)?;
-        self.wr(
-            MT_MAC_SYS_CTRL,
-            MT_MAC_SYS_CTRL_ENABLE_TX | MT_MAC_SYS_CTRL_ENABLE_RX,
-        )?;
-        self.enable_tsf()?;
-        // Arm the channel-time counters too. They are free (one register write), they are the
-        // radio's only frame-free occupancy sense, and leaving them unarmed makes
-        // `read_channel_activity` return a confident 0 permille — which reads as "quiet
-        // channel" and is not. MEASURED before this call was added: `MT_CH_TIME_CFG` came out
-        // of init at 0x1f, i.e. counting, but with `MT_CH_CCA_RC_EN` (bit 6) clear, so the
-        // counters free-ran instead of being read-and-clear and `MT_CH_BUSY` read 0.
-        crate::mt76::knobs::enable_channel_time_counters(self)?;
-
-        // ★ Post-condition check, because the two ways this silicon fails silently are both
-        // visible in one register each and neither raises an error on its own.
-        //   * `MT_WLAN_FUN_CTRL` bit 0 (`WLAN_EN`) clear = the WLAN function is gated off. The
-        //     MAC still answers every register read, the RF hears nothing, and the symptom is
-        //     an interface that comes up perfectly and receives zero frames.
-        //   * `MT_CMB_CTRL` without `XTAL_RDY|PLL_LD` = the synthesiser never locked.
-        // MEASURED on this part: a run that reached monitor with `WLAN_FUN_CTRL = 0xff000012`
-        // (bit 0 clear) logged 0 CRC errors, 0 PHY errors and 0 busy microseconds — the
-        // receiver was not merely quiet, it was off.
-        let wlan = self.rr(MT_WLAN_FUN_CTRL)?;
-        if wlan & MT_WLAN_FUN_CTRL_WLAN_EN == 0 {
-            tracing::warn!(
-                wlan_fun_ctrl = format!("{wlan:#010x}"),
-                "mt7610u: WLAN_EN is clear after monitor setup — re-asserting; the radio would                  otherwise receive nothing while looking healthy"
-            );
+    rung! {
+        /// Put the MAC into promiscuous monitor receive and start the TSF.
+        ///
+        /// **`MT_RX_FILTR_CFG = 0`, not the MEASURED kernel-monitor `0x0000_1093`.** That value
+        /// is what mac80211's monitor path leaves: the init table's `0x0001_7f97`
+        /// (`mt76x0/initvals_init.h:20`) minus PROMISC and the control-frame group
+        /// (`mt76x0/main.c:80-87`, `mt76x02_util.c:223-229`). It still **drops** CRC-error
+        /// frames, RTS, duplicates, version errors and BARs. A named-data receiver wants the
+        /// opposite: every PPDU the PHY delivers, with the CRC verdict carried per frame in
+        /// `MT_RXINFO_CRCERR` so a bad-FCS frame is *counted* and then dropped in software
+        /// rather than never seen. Dropping in hardware makes a marginal link and a quiet
+        /// channel look identical — which is the exact ambiguity the frame-free occupancy
+        /// counters exist to resolve.
+        ///
+        /// The bits are `mt76x02u_mac_start`'s otherwise (`mt76x02_usb_core.c:25-43`):
+        /// `MT_MAC_SYS_CTRL = ENABLE_TX | ENABLE_RX` (= the MEASURED `0x0c`), with the USB DMA
+        /// bulk enables re-asserted first because a firmware download leaves them elsewhere.
+        fn setup_monitor_rx(&self) -> Result<(), FaceError> {
+            use regs::*;
+            self.init_usb_dma()?;
+            self.wr(MT_RX_FILTR_CFG, 0)?;
             self.wr(
-                MT_WLAN_FUN_CTRL,
-                wlan | MT_WLAN_FUN_CTRL_WLAN_EN | MT_WLAN_FUN_CTRL_WLAN_CLK_EN,
+                MT_MAC_SYS_CTRL,
+                MT_MAC_SYS_CTRL_ENABLE_TX | MT_MAC_SYS_CTRL_ENABLE_RX,
             )?;
-            std::thread::sleep(Duration::from_millis(1));
-            let mask = MT_CMB_CTRL_XTAL_RDY | MT_CMB_CTRL_PLL_LD;
-            self.poll(MT_CMB_CTRL, mask, mask, 2000)?;
+            self.enable_tsf()?;
+            // Arm the channel-time counters too. They are free (one register write), they are the
+            // radio's only frame-free occupancy sense, and leaving them unarmed makes
+            // `read_channel_activity` return a confident 0 permille — which reads as "quiet
+            // channel" and is not. MEASURED before this call was added: `MT_CH_TIME_CFG` came out
+            // of init at 0x1f, i.e. counting, but with `MT_CH_CCA_RC_EN` (bit 6) clear, so the
+            // counters free-ran instead of being read-and-clear and `MT_CH_BUSY` read 0.
+            crate::mt76::knobs::enable_channel_time_counters(self)?;
+
+            // ★ Post-condition check, because the two ways this silicon fails silently are both
+            // visible in one register each and neither raises an error on its own.
+            //   * `MT_WLAN_FUN_CTRL` bit 0 (`WLAN_EN`) clear = the WLAN function is gated off. The
+            //     MAC still answers every register read, the RF hears nothing, and the symptom is
+            //     an interface that comes up perfectly and receives zero frames.
+            //   * `MT_CMB_CTRL` without `XTAL_RDY|PLL_LD` = the synthesiser never locked.
+            // MEASURED on this part: a run that reached monitor with `WLAN_FUN_CTRL = 0xff000012`
+            // (bit 0 clear) logged 0 CRC errors, 0 PHY errors and 0 busy microseconds — the
+            // receiver was not merely quiet, it was off.
+            let wlan = self.rr(MT_WLAN_FUN_CTRL)?;
+            if wlan & MT_WLAN_FUN_CTRL_WLAN_EN == 0 {
+                tracing::warn!(
+                    wlan_fun_ctrl = format!("{wlan:#010x}"),
+                    "mt7610u: WLAN_EN is clear after monitor setup — re-asserting; the radio would                  otherwise receive nothing while looking healthy"
+                );
+                self.wr(
+                    MT_WLAN_FUN_CTRL,
+                    wlan | MT_WLAN_FUN_CTRL_WLAN_EN | MT_WLAN_FUN_CTRL_WLAN_CLK_EN,
+                )?;
+                std::thread::sleep(Duration::from_millis(1));
+                let mask = MT_CMB_CTRL_XTAL_RDY | MT_CMB_CTRL_PLL_LD;
+                self.poll(MT_CMB_CTRL, mask, mask, 2000)?;
+            }
+            Ok(())
         }
-        Ok(())
     }
 
     /// A one-line summary of the registers that decide whether this radio can hear anything.
@@ -2075,7 +2101,6 @@ pub const MAX_MPDU_PAYLOAD: usize = 11_418;
 
 #[async_trait]
 impl FrameIo for Mt7610uBackend {
-
     /// This radio's own capability, so a face built from the bare `dyn FrameIo` does not have to
     /// invent one. Delegates to this type's [`RadioProfile`] — the single source of truth.
     fn radio_capability(&self) -> Option<ndn_radio_hal::RadioCapability> {
@@ -2314,12 +2339,60 @@ impl RadioKnobs for Mt7610uBackend {
     /// Forwarded to `phy::set_tx_power`, which resolves it against the EEPROM's per-rate
     /// calibration for the current channel — power on this part is per-channel *and*
     /// per-rate (`mt76x0_get_tx_power_per_rate`), so it cannot be set before a tune.
-    fn set_tx_power(&self, idx: u32) -> Result<(), FaceError> {
+    fn set_tx_power(&self, req: PowerRequest) -> Result<AppliedPower, FaceError> {
         let ch = self.channel.load(Ordering::Relaxed);
         if ch == 0 {
             return Err(io_err("mt7610u: set_tx_power before set_channel".into()));
         }
-        phy::set_tx_power(self, ch, None, Some(idx.min(63) as u8)).map(|_| ())
+        // ⚠ There is no second (raw) axis on this part: `phy::set_tx_power` always resolves against
+        // the EEPROM per-rate calibration, so `Raw` reaches the same writer. Recorded as
+        // `DriverReference` rather than `FusedBase`, because what this knob writes is a per-rate
+        // TXAGC target derived from the EEPROM — the fuse read is inside `phy`, and this driver has
+        // never separated "the adapter's fused base" from "the vendor's reference".
+        let idx = match &req {
+            PowerRequest::Ceiling(_) => 63u32,
+            PowerRequest::Index(i, _) => *i as u32,
+            PowerRequest::Raw { idx, .. } => *idx as u32,
+            PowerRequest::Dbm(d) => {
+                let applied = phy::set_tx_power(self, ch, Some(*d), None)?;
+                return Ok(AppliedPower::absolute_dbm(
+                    req.clone(),
+                    applied,
+                    applied != *d,
+                ));
+            }
+            PowerRequest::NoActuator => {
+                return Err(ndn_radio_hal::bringup::power_unsupported(
+                    "mt7610u: PowerRequest::NoActuator, but this part DOES actuate power.",
+                ));
+            }
+        };
+        let want = idx;
+        let idx = idx.min(63);
+        let applied = phy::set_tx_power(self, ch, None, Some(idx as u8))?;
+        let mut p = AppliedPower::from_writes(
+            req.clone(),
+            PowerReference::DriverReference {
+                source: "mt76x0 EEPROM per-rate target power (mt76x0_get_tx_power_per_rate), \
+                         half-dB units — per-channel AND per-rate, so it cannot be set before a tune",
+                slope_db_per_idx: None,
+            },
+            idx as u8,
+            idx != want,
+            vec![PowerWrite {
+                reg: 0x1314,
+                value: idx as u8,
+                group: "MT_TX_PWR_CFG (per-rate)",
+                path: 0,
+            }],
+        );
+        // ⚠ `phy::set_tx_power` returns an EEPROM-derived half-dB figure, and `declared_capability`
+        // still reports `tx_power_dbm: None` — the two are not in contradiction: nothing on THIS
+        // silicon has been measured against a meter. So the value is recorded on the applied power
+        // (where a reader can see the driver's own arithmetic) and NOT promoted into the capability
+        // a planner budgets link margin from.
+        p.dbm = Some(applied);
+        Ok(p)
     }
 
     /// TX power on the absolute dBm scale, returning what was actually applied.
@@ -2622,6 +2695,497 @@ pub fn declared_capability() -> RadioCapability {
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────
+
+// ─────────────────────────────────────────────────────────────────────────────
+// M5 · §1.4 — THE PLAN.  One sequence, executed by the shared runner.
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Specification: `docs/bringup-contract.md` §1.4/§1.5/§4/§5-M5.
+//
+// ★ **Every rung below is transcribed VERBATIM, IN ORDER, from the M2 `bring_up`, then
+// `setup_monitor_rx`, then the tune** — the three calls `open_named_radio`'s MT7610U arm always
+// made back to back. Not one register write moved, was added, or was reordered. A plan that
+// "improves" a ladder is an unmeasured change to a radio nobody at this keyboard can test.
+//
+// **Why the three collapse into one plan** (§5-M5): `MT_MAC_SYS_CTRL = ENABLE_TX | ENABLE_RX` is
+// written by `setup_monitor_rx` and by nothing else, so a caller that ran `bring_up` and stopped
+// got a radio that answers every register read and receives nothing. Eight `mt7612_*` examples on
+// the sibling part are exactly that shape (`bring_up` then `setup_monitor_rx` by hand), and the
+// factory's own MT7921AU arm had the tune and the monitor call in the WRONG ORDER for every caller
+// until 2026-09-01. One plan removes the ordering question from the caller, and `ASSERTS_MT7610U`
+// reads the gate back afterwards.
+//
+// Three things that are NOT verbatim, each named where it happens:
+//
+//   1. ☠ **warm/cold now branches on a ROUND TRIP, not on a status latch** — `mcu_responsive()`,
+//      not `firmware_running()`. That was M5's explicit instruction and it is the one live
+//      divergence this part carried: the sibling MT7612U was MEASURED wrong in BOTH directions
+//      from the same latch, each mistake costing a physical replug. See `R_FIRMWARE_READY`.
+//   2. `NDN_RADIO_FORCE_FW` left the ladder (LAW 1): read once at the wrapper boundary, passed as
+//      an argument, and reported as the branch the rung took (`cold-forced`).
+//   3. the bring-up-duration bulk-IN drain is bracketed by two rungs (`rx_drain` /
+//      `rx_drain_stop`) instead of a local `DrainGuard`, so its span is EXACTLY the rungs it
+//      covered before — see `Mt7610uBackend::bringup_drain`.
+//
+// ⚠ **No on-air behaviour change.** This part declares no `TxInstrument` (see
+// `TX_UNPROVABLE_MT7610U`), so `run_plan` takes no transmit probe and the plan puts nothing on the
+// air the old ladder did not.
+
+/// Shorthand for the step tables below.
+type Mt7610 = Mt7610uBackend;
+
+// ── the rungs ────────────────────────────────────────────────────────────────
+
+fn s_rx_drain(b: &Arc<Mt7610>, _c: &mut Ctx<'_>) -> Result<StepOutcome, FaceError> {
+    b.bringup_drain.store(false, Ordering::Relaxed);
+    let stop = b.bringup_drain.clone();
+    let h = b.usb.handle();
+    let ep = b.usb.ep_in_data();
+    std::thread::spawn(move || {
+        let mut buf = vec![0u8; 8192];
+        while !stop.load(Ordering::Relaxed) {
+            let _ = h.read_bulk(ep, &mut buf, Duration::from_millis(50));
+        }
+    });
+    Ok(StepOutcome::Done)
+}
+
+fn s_firmware_ready(b: &Arc<Mt7610>, c: &mut Ctx<'_>) -> Result<StepOutcome, FaceError> {
+    let force = b.force_cold_fw.load(Ordering::Relaxed);
+    let live = !force && b.mcu_responsive();
+    // The corroborating latch, logged and never decisive — see `firmware_running`.
+    let latch = b.firmware_running();
+    if live != latch {
+        c.warn(format!(
+            "MT_MCU_COM_REG0 latch says firmware_running={latch} while the MCU round trip says \
+             responsive={live}. The round trip decides (the latch is a MAILBOX and has been wrong \
+             in both directions on the sibling MT7612U). Recorded because a disagreement is \
+             evidence about the latch, and the latch is what upstream's own probe tests."
+        ));
+    }
+    c.state().warm = Some(live);
+    // LAW 6. `StepOutcome` admits ONE variant per rung and the operator-facing answer here is the
+    // branch label, so the fact is written straight into the state the runner would have hoisted
+    // it into. Warm/cold changes what everything after it means and no register read reveals it
+    // to a later caller.
+    let fact = Fact::Warm(live);
+    if !c.state().facts.contains(&fact) {
+        c.state().facts.push(fact);
+    }
+    if live {
+        tracing::info!(
+            target: "named_radio",
+            chip = "MT7610U",
+            "MCU answers a CMD_RANDOM_READ round trip — warm re-open, skipping the power cycle \
+             and the firmware download"
+        );
+        return Ok(StepOutcome::Branch("warm"));
+    }
+    b.chip_onoff(false, false)?;
+    b.wait_for_mac()?;
+    b.chip_onoff(true, true)?;
+    b.wait_for_mac()?;
+    // The whole download — DMA-cfg preamble, FCE setup, ILM/IVB/DLM, load-IVB and the
+    // MT_MCU_COM_REG0 readiness poll — belongs to `mcu::load_firmware`
+    // (mt76x0/usb_mcu.c:85-162). Nothing here second-guesses it.
+    mcu::load_firmware(b.as_ref(), MT7610U_FIRMWARE)?;
+    Ok(StepOutcome::Branch(if force {
+        "cold-forced"
+    } else {
+        "cold"
+    }))
+}
+
+fn s_init_usb_dma(b: &Arc<Mt7610>, _c: &mut Ctx<'_>) -> Result<StepOutcome, FaceError> {
+    b.init_usb_dma()?;
+    Ok(StepOutcome::Done)
+}
+
+fn s_init_hardware(b: &Arc<Mt7610>, _c: &mut Ctx<'_>) -> Result<StepOutcome, FaceError> {
+    b.init_hardware()?;
+    Ok(StepOutcome::Done)
+}
+
+fn s_usb_timing(b: &Arc<Mt7610>, _c: &mut Ctx<'_>) -> Result<StepOutcome, FaceError> {
+    b.rmw(regs::MT_US_CYC_CFG, regs::MT_US_CYC_CNT, 0x1e)?;
+    b.wr(
+        regs::MT_TXOP_CTRL_CFG,
+        regs::field_prep(regs::MT_TXOP_TRUN_EN, 0x3f)
+            | regs::field_prep(regs::MT_TXOP_EXT_CCA_DLY, 0x58),
+    )?;
+    Ok(StepOutcome::Done)
+}
+
+fn s_mac_address(b: &Arc<Mt7610>, _c: &mut Ctx<'_>) -> Result<StepOutcome, FaceError> {
+    b.set_mac_address(b.eeprom.mac_addr())?;
+    Ok(StepOutcome::Done)
+}
+
+fn s_pin_contention(b: &Arc<Mt7610>, c: &mut Ctx<'_>) -> Result<StepOutcome, FaceError> {
+    // ★ The applied posture goes into the report. `state.contention == None` means "inherited /
+    // unknown", which on USB is a real and hazardous state (§3's own table); recording what was
+    // actually programmed is the only way a throughput number can be read back later and trusted.
+    let applied = knobs::set_contention(
+        b.as_ref(),
+        ndn_radio_hal::ContentionPosture::Shared,
+        Family::Mt76x0,
+        &b.edca_saved,
+    )?;
+    c.state().contention = Some(applied);
+    Ok(StepOutcome::Done)
+}
+
+fn s_rx_drain_stop(b: &Arc<Mt7610>, _c: &mut Ctx<'_>) -> Result<StepOutcome, FaceError> {
+    b.bringup_drain.store(true, Ordering::Relaxed);
+    Ok(StepOutcome::Done)
+}
+
+fn s_monitor_rx(b: &Arc<Mt7610>, _c: &mut Ctx<'_>) -> Result<StepOutcome, FaceError> {
+    b.setup_monitor_rx()?;
+    Ok(StepOutcome::Done)
+}
+
+fn s_tune_channel(b: &Arc<Mt7610>, c: &mut Ctx<'_>) -> Result<StepOutcome, FaceError> {
+    let (ch, bw) = (c.state_ref().channel, c.state_ref().bw);
+    ndn_radio_hal::RadioKnobs::set_channel(b.as_ref(), ch, bw)?;
+    Ok(StepOutcome::Done)
+}
+
+// ── the rungs, as reviewable constants ───────────────────────────────────────
+
+const R_RX_DRAIN: Step<Mt7610> = Step {
+    id: StepId("rx_drain"),
+    stage: Stage::Attach,
+    class: StepClass::Required,
+    why: "★ MEASURED: mt76 USB expects the host to keep RX transfers posted. If nobody reads, the \
+          device's USB DMA backs up and the MCU stops CONSUMING inband commands — they are \
+          accepted into the FIFO and never processed, so the NEXT command's bulk-out times out \
+          rather than the offending one. Seen here as `command 0x0c seq 0 bulk-out (200 B): \
+          Operation timed out` partway through `init_hardware`, on a device whose registers were \
+          all answering normally. The command RESPONSE pipe (0x85) is a different pipe from the \
+          data pipe (0x84) on this part, so this drain cannot steal an MCU reply.",
+    must_follow: &[],
+    must_precede: &[StepId("firmware_ready"), StepId("init_hardware")],
+    run: s_rx_drain,
+};
+
+const R_FIRMWARE_READY: Step<Mt7610> = Step {
+    id: StepId("firmware_ready"),
+    stage: Stage::Firmware,
+    class: StepClass::Required,
+    why: "★ The warm/cold decision AND the cold sequence, in ONE rung — branching BETWEEN steps is \
+          not expressible (§1.4), so the decision lives inside a named step and reports which way \
+          it went as `StepOutcome::Branch`. Cold is upstream's order: `chip_onoff(false,false)` \
+          (usb.c:257 — \"Disable the HW, otherwise MCU fail to initialize on hot reboot\"), \
+          `wait_for_mac`, `chip_onoff(true,true)`, `wait_for_mac`, then the firmware download. \
+          ☠ The decision is a ROUND TRIP (`mcu_responsive`), NOT `MT_MCU_COM_REG0`: that register \
+          is a MAILBOX, and deciding from it was MEASURED wrong in BOTH directions on the sibling \
+          MT7612U — 'cold' on a chip the kernel had just loaded (the download then collides with \
+          the FCE and wedges the part) and 'warm' on a chip that answered nothing. Each mistake \
+          cost a physical replug. **LAW 5**: the cold path polls XTAL_RDY|PLL_LD in `chip_onoff` \
+          and MT_MCU_COM_REG0 for firmware readiness in `load_firmware`, and a timed-out boot that \
+          continued would leave a radio whose every later readback is fiction.",
+    must_follow: &[StepId("rx_drain")],
+    must_precede: &[StepId("init_hardware")],
+    run: s_firmware_ready,
+};
+
+const R_INIT_USB_DMA: Step<Mt7610> = Step {
+    id: StepId("init_usb_dma"),
+    stage: Stage::MacInit,
+    class: StepClass::Required,
+    why: "`mt76x0_init_usb_dma` (mt76x0/usb.c:46-71 via usb.c:164): enable both bulk directions \
+          and CLEAR `RX_BULK_AGG_EN` — upstream's own comment is \"disable AGGR_BULK_RX in order \
+          to receive one frame in each rx urb and avoid copies\", and the oracle MEASURED the bit \
+          clear on the live kernel interface. One RX unit per bulk-IN transfer is what \
+          `parse_transfer` is written against, so this rung is what makes the RX framing \
+          assumption true.",
+    must_follow: &[StepId("firmware_ready")],
+    must_precede: &[],
+    run: s_init_usb_dma,
+};
+
+const R_INIT_HARDWARE: Step<Mt7610> = Step {
+    id: StepId("init_hardware"),
+    stage: Stage::MacInit,
+    class: StepClass::Required,
+    why: "`mt76x0_init_hardware` (mt76x0/init.c:171-212 via usb.c:165) — the MAC tables, the BBP \
+          tables and the RF init, in upstream's order. It must come AFTER the firmware: both init \
+          tables go through the MCU register-pair path (upstream's `RANDOM_WRITE` macro is \
+          `mt76_wr_rp(dev, MT_MCU_MEMMAP_WLAN, tab, n)`, init.c:83-85), so a cold run that \
+          programmed the MAC first would be writing through an MCU that is not there. **LAW 5**: \
+          it polls WPDMA idle, MAC idle, TX/RX idle and BBP ready, each of which returns Err on \
+          timeout — a bring-up that walked past any of them would leave every later readback \
+          fiction.",
+    must_follow: &[StepId("firmware_ready"), StepId("init_usb_dma")],
+    must_precede: &[],
+    run: s_init_hardware,
+};
+
+const R_USB_TIMING: Step<Mt7610> = Step {
+    id: StepId("usb_timing"),
+    stage: Stage::MacInit,
+    class: StepClass::Required,
+    why: "`MT_US_CYC_CFG` + `MT_TXOP_CTRL_CFG` (usb.c:171-174), one pair, in upstream's order. \
+          ★ The TXOP value written here is bit-identical to the MEASURED kernel-monitor \
+          `MT_TXOP_CTRL_CFG = 0x0000_583f` (TRUN_EN 0x3f, EXT_CCA_DLY 0x58, ED-CCA off) — a \
+          genuine cross-check of the transcription against the live kernel driver, and the reason \
+          `set_edcca_ignore(true)` is close to a no-op on this part.",
+    must_follow: &[StepId("init_hardware")],
+    must_precede: &[],
+    run: s_usb_timing,
+};
+
+const R_MAC_ADDRESS: Step<Mt7610> = Step {
+    id: StepId("mac_address"),
+    stage: Stage::MacInit,
+    class: StepClass::Required,
+    why: "`mt76x02_mac_setaddr` (mt76x02_mac.c:740-743) — the MAC_ADDR_DW0/DW1 half only; the \
+          BSSID/multi-BSS/beacon block after it configures beaconing, which this driver never \
+          does, and BSSID filtering, which a promiscuous monitor ignores. ⚠ The address is a \
+          receive-side filter datum and diagnostic only: the named-data doctrine forbids a host \
+          identity in the source field, and `build_dot11` stamps its own.",
+    must_follow: &[StepId("init_hardware")],
+    must_precede: &[],
+    run: s_mac_address,
+};
+
+const R_PIN_CONTENTION: Step<Mt7610> = Step {
+    id: StepId("pin_contention"),
+    stage: Stage::Posture,
+    class: StepClass::BestEffort(Degradation::new(
+        "the contention posture is whatever the PREVIOUS process left on the chip — USB never \
+         power-cycles it between processes, and there is no 'as found' to go back to",
+        "RX capture and functional link work; NOT any absolute throughput, airtime or A/B figure, \
+         which on this part MEASURED a 2.5x swing decided purely by run order",
+    )),
+    why: "★★ MEASURED 2026-08-31, Bw80/VHT MCS7/1400 B/pump=8, five consecutive processes: a run \
+          that set no posture returned 2724 OR 6706 f/s — a 2.5x swing decided purely by what ran \
+          before it (A 6321 no-posture, B 6382 owned, C 6706 no-posture INHERITING owned, D 2965 \
+          shared, E 2724 no-posture INHERITING shared). This driver never wrote these registers at \
+          all, so contention was simply latched across processes, and any unpinned A/B was \
+          comparing history. ⚠ `Shared` is NOT this part's boot value — that constant comes from \
+          the MT7612U's captured init, and the MEASURED as-found kernel state here is different \
+          (AIFSN 0x1111 / CWMIN 0x2222 vs our 0x2222 / 0x4444). What this rung claims, and all it \
+          claims, is that the posture is DETERMINISTIC instead of inherited. Best effort: a \
+          contention write failing must not turn a working radio into no radio.",
+    must_follow: &[StepId("init_hardware")],
+    must_precede: &[],
+    run: s_pin_contention,
+};
+
+const R_RX_DRAIN_STOP: Step<Mt7610> = Step {
+    id: StepId("rx_drain_stop"),
+    stage: Stage::RxEnable,
+    class: StepClass::Required,
+    why: "Ends the bring-up-duration drain, at exactly the point the old `DrainGuard` dropped — \
+          the last statement of `bring_up`, BEFORE monitor RX is enabled. It has to stop here: \
+          past `monitor_rx` the chip delivers real frames, and a drain thread reading the data \
+          pipe would then compete with the RX pump for them and silently eat a fraction of every \
+          capture. Making the drain a `StepOutcome::Guard` instead would have handed it to the \
+          returned handle and done exactly that, for the life of the process.",
+    must_follow: &[StepId("rx_drain")],
+    must_precede: &[StepId("monitor_rx")],
+    run: s_rx_drain_stop,
+};
+
+const R_MONITOR_RX: Step<Mt7610> = Step {
+    id: StepId("monitor_rx"),
+    stage: Stage::RxEnable,
+    class: StepClass::Required,
+    why: "★ THE RUNG §5-M5 EXISTS FOR. `mt76x02u_mac_start` (mt76x02_usb_core.c:25-43): re-assert \
+          the USB DMA bulk enables (a firmware download leaves them elsewhere), open \
+          `MT_RX_FILTR_CFG` to 0, and write `MT_MAC_SYS_CTRL = ENABLE_TX | ENABLE_RX` (the \
+          MEASURED 0x0c). Nothing else in this ladder writes that register, so a caller that ran \
+          the old `bring_up` and stopped had a radio that answered every register read and \
+          received nothing. It also arms the TSF and the channel-time counters, which are free and \
+          whose absence makes `read_channel_activity` return a confident 0 permille — reading as \
+          'quiet channel' when the counters were simply never armed. `ASSERTS_MT7610U` reads the \
+          MAC_SYS_CTRL gate back.",
+    must_follow: &[StepId("init_hardware"), StepId("rx_drain_stop")],
+    must_precede: &[],
+    run: s_monitor_rx,
+};
+
+const R_TUNE_CHANNEL: Step<Mt7610> = Step {
+    id: StepId("tune_channel"),
+    stage: Stage::Tune,
+    class: StepClass::Required,
+    why: "★ Also part of §5-M5's collapse: the tune was the factory's third separate call, and the \
+          old `bring_up` reported `channel: 0` because it genuinely left the radio untuned — the \
+          factory then patched the report's channel field afterwards, which is a report describing \
+          something the plan did not do. Fatal on purpose: an untuned monitor receives nothing, \
+          and returning a working-looking handle that hears silence is the failure this repo keeps \
+          paying for. It runs AFTER `monitor_rx`, which is the order the factory has always used \
+          on this part; unlike the MT7612U's captured channel replay, `phy::set_channel_ext` here \
+          writes neither `MT_RX_FILTR_CFG` nor `MT_MAC_SYS_CTRL`, so it cannot undo the rung above \
+          it. (On the MT7612U it does, and that cost a MEASURED 9975-CRC-error silent receiver.)",
+    must_follow: &[StepId("monitor_rx")],
+    must_precede: &[],
+    run: s_tune_channel,
+};
+
+const MT7610U_STEPS: &[Step<Mt7610>] = &[
+    R_RX_DRAIN,
+    R_FIRMWARE_READY,
+    R_INIT_USB_DMA,
+    R_INIT_HARDWARE,
+    R_USB_TIMING,
+    R_MAC_ADDRESS,
+    R_PIN_CONTENTION,
+    R_RX_DRAIN_STOP,
+    R_MONITOR_RX,
+    R_TUNE_CHANNEL,
+];
+
+const MT7610U_PLAN: Plan<Mt7610> = Plan {
+    id: PlanId {
+        part: "mt76x0",
+        name: "monitor",
+        // v1 was the M2 hand-filled `bring_up` report, which described only the first seven rungs
+        // and reported an untuned radio. v2 is the executed plan and covers the monitor + tune the
+        // factory always ran beside it, so the two digests must not be comparable.
+        ver: 2,
+    },
+    role: Role::TransmitAndReceive,
+    steps: MT7610U_STEPS,
+    excluded: &[
+        (
+            Stage::PowerOn,
+            "no PowerOn-stage rung. `chip_onoff` IS the power sequence on this part and it lives \
+             inside `firmware_ready`, because the warm branch must skip it and the cold branch \
+             must run it — and branching between rungs is not expressible (§1.4). The stage label \
+             follows the rung, not the other way round (Appendix A.2).",
+        ),
+        (
+            Stage::PhyInit,
+            "no separate PhyInit rung. `phy::init_rf` is the last statement of \
+             `mt76x0_init_hardware` (init.c:210) and is transcribed inside `init_hardware` where \
+             upstream put it. Splitting it out would be a sequence change dressed as bookkeeping.",
+        ),
+        (
+            Stage::Calibrate,
+            "no Calibrate rung at bring-up, and that is upstream's shape, not an omission: on this \
+             part the PHY calibration is per-channel and is issued by `phy::set_channel` itself \
+             (`MCU_CAL_*` through CMD_CALIBRATION_OP). `Mt7610uBackend::calibrate` exists for a \
+             re-cal after a long dwell or a temperature swing and REFUSES to run before a tune.",
+        ),
+        (
+            Stage::Power,
+            "no Power rung. TX power on this part is per-channel AND per-rate, computed from the \
+             EEPROM by the tune, so there is no index to write at bring-up; `RadioState::power` \
+             stays `no_actuator(NoActuator)`, which says 'the bring-up did not touch it' rather \
+             than the false 'this part has no power knob' (it has one — `set_tx_power`).",
+        ),
+        (
+            Stage::Verify,
+            "no Verify rung. The one readback this ladder owes — `MT_MAC_SYS_CTRL` after \
+             `monitor_rx` — is a part-wide `Assert` (`ASSERTS_MT7610U`) that the runner takes \
+             after the last rung; and §4's transmit question is answered `Unprovable` with the \
+             measurement quoted, because this part's only counter is read-and-clear and shared \
+             with any bound kernel driver.",
+        ),
+    ],
+};
+
+// ★ A malformed plan is a compile error, not a runtime one.
+const _: () = MT7610U_PLAN.check_or_panic();
+
+/// The MT7610U plan — `bring_up` + `setup_monitor_rx` + the tune, as one reviewable sequence.
+pub static PLAN_MT7610U: Plan<Mt7610> = MT7610U_PLAN;
+
+/// §1.5 — read back every gate you write.
+///
+/// ★ `mac_tx_rx_enabled` is the assert §5-M5 named this part for: `MT_MAC_SYS_CTRL` is written by
+/// `monitor_rx` and by nothing else in the ladder, and a chip without it answers every register
+/// read while receiving and transmitting nothing. Now that the three calls are one plan the rung
+/// cannot be *forgotten*; the assert covers the other half — that it was written and stuck.
+///
+/// ⚠ `Warn` on introduction, per §5/M-hazards. Promotion to `Fatal` is per part and needs a
+/// measurement.
+const ASSERTS_MT7610U: &[Assert<Mt7610>] = &[
+    Assert {
+        id: StepId("mac_tx_rx_enabled"),
+        reg: regs::MT_MAC_SYS_CTRL,
+        read: |b: &Mt7610| b.rr(regs::MT_MAC_SYS_CTRL),
+        want: regs::MT_MAC_SYS_CTRL_ENABLE_TX | regs::MT_MAC_SYS_CTRL_ENABLE_RX,
+        mask: regs::MT_MAC_SYS_CTRL_ENABLE_TX | regs::MT_MAC_SYS_CTRL_ENABLE_RX,
+        why: "MT_MAC_SYS_CTRL ENABLE_TX|ENABLE_RX (the MEASURED 0x0c). Written once, by \
+              `monitor_rx`. Without it the MAC engines are off: registers all read fine, the RF \
+              hears nothing, and the symptom is an interface that comes up perfectly and receives \
+              zero frames. ⚠ Also the bit `reset_csr_bbp` clears and `init_mac_registers` \
+              re-clears, so an out-of-order sequence would leave it 0 with nothing complaining.",
+        severity: Severity::Warn,
+    },
+    Assert {
+        id: StepId("wlan_enabled"),
+        reg: regs::MT_WLAN_FUN_CTRL,
+        read: |b: &Mt7610| b.rr(regs::MT_WLAN_FUN_CTRL),
+        want: regs::MT_WLAN_FUN_CTRL_WLAN_EN,
+        mask: regs::MT_WLAN_FUN_CTRL_WLAN_EN,
+        why: "MT_WLAN_FUN_CTRL bit 0 (WLAN_EN). MEASURED on this part: a run that reached monitor \
+              with `WLAN_FUN_CTRL = 0xff000012` (bit 0 clear) logged 0 CRC errors, 0 PHY errors \
+              and 0 busy microseconds — the receiver was not merely quiet, it was OFF. \
+              `setup_monitor_rx` re-asserts the bit when it finds it clear; this reads back \
+              whether that repair held, which the repair itself does not check.",
+        severity: Severity::Warn,
+    },
+];
+
+/// §4 — what this part can prove about its own transmitter: **nothing at bring-up, and it says
+/// why.**
+///
+/// The instrument named in §4's table (`MT_TX_STAT_FIFO` 0x1718) is transcribed in
+/// [`crate::mt76::regs`] with **zero readers**, and two properties make it wrong for a bring-up
+/// probe rather than merely unimplemented — both recorded here so the next person does not wire it
+/// up expecting an answer.
+const TX_UNPROVABLE_MT7610U: &str = "no transmit counter is read at bring-up. The one candidate, MT_TX_STAT_FIFO 0x1718, is \
+     READ-AND-CLEAR (so a bound kernel mt76x0u steals roughly half of every reading, and two \
+     readers each see a fraction with neither looking wrong) and is transcribed with zero readers \
+     — it has never been differenced across a known number of injects on this silicon, which is \
+     what the 8733b's calibrated +50-across-50-injects instrument has and this one does not. \
+     Question (A) is answerable here in principle and is NOT answered; prove (B) with a witness.";
+
+impl BringUp for Mt7610uBackend {
+    fn plan(role: Role) -> Option<&'static Plan<Self>> {
+        match role {
+            Role::TransmitAndReceive => Some(&PLAN_MT7610U),
+            // ★ Named refusals, not silent downgrades. One plan is all this part has ever run.
+            // `monitor_rx` writes ENABLE_TX and ENABLE_RX in the SAME register write, so an
+            // RX-only variant would mean inventing a MAC_SYS_CTRL value this silicon has never
+            // been brought up with — the unmeasured ladder this contract exists to remove. A
+            // caller that only wants to listen asks for TransmitAndReceive and does not inject.
+            Role::ReceiveOnly | Role::TransmitOnly => None,
+        }
+    }
+
+    fn asserts() -> &'static [Assert<Self>] {
+        ASSERTS_MT7610U
+    }
+
+    /// Empty — see [`TX_UNPROVABLE_MT7610U`].
+    fn tx_instruments() -> &'static [ndn_radio_hal::TxInstrument] {
+        &[]
+    }
+
+    fn tx_unprovable_reason() -> Option<&'static str> {
+        Some(TX_UNPROVABLE_MT7610U)
+    }
+}
+
+/// The cost of the pre-M8 wrapper signature: `FaceError` cannot carry a partial report.
+///
+/// So it is **emitted before it is dropped** — a failed bring-up that says how far it got is the
+/// entire point of §3, and losing it silently here would put the old defect back one level up.
+fn drop_partial_report(f: BringUpFailure) -> FaceError {
+    f.report.emit();
+    eprintln!(
+        "mt7610u bring-up FAILED at `{}` — the partial report:\n{}",
+        f.failed_at,
+        f.report.render()
+    );
+    f.source
+}
 
 #[cfg(test)]
 mod tests {

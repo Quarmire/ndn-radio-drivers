@@ -1191,27 +1191,29 @@ impl Connac2Usb {
 
     // ── Non-register vendor requests ────────────────────────────────────────
 
-    /// The `MT_VEND_POWER_ON` request (`0x04`) — `mt792xu_mcu_power_on`
-    /// (`mt792x_usb.c:214-232`).
-    ///
-    /// ★ Note the odd argument order upstream uses: `wValue = 0x0`,
-    /// `wIndex = 0x1`, **no data stage**. The 1 is in the *index*, not the value.
-    /// Why is not stated anywhere in the tree; it is ported as an opaque pair by
-    /// its one call site, not derived.
-    ///
-    /// This only kicks the request. The caller must then poll `MT_CONN_ON_MISC`
-    /// (`0x7c06_00f0`) for `MT_TOP_MISC2_FW_PWR_ON` (bit 0) — upstream allows
-    /// 500 ms — and that poll belongs in `mcu.rs`, which owns the register names.
-    /// ★ MEASURED: that register reads `0x0000_0000` on a cold part, so the bit
-    /// really is the "did power-on take" signal and not something already set.
-    pub fn power_on(&self) -> Result<(), FaceError> {
-        // ★ REQ_OUT_UPSTREAM (0x5f), NOT `self.tag.req_out()`. MEASURED: the same request at
-        // the plain 0x40 is ACKed and does nothing — `MT_CONN_ON_MISC` never leaves 0. The
-        // bootrom gates this one on the vendor-specific recipient in the low five bits, while
-        // the register window (also MEASURED) answers only at 0xc0/0x40. The split is real; do
-        // not "simplify" either side to match the other.
-        self.vendor_write_typed(REQ_OUT_UPSTREAM, MT_VEND_POWER_ON, 0x0, 0x1, &[])?;
-        Ok(())
+    rung! {
+        /// The `MT_VEND_POWER_ON` request (`0x04`) — `mt792xu_mcu_power_on`
+        /// (`mt792x_usb.c:214-232`).
+        ///
+        /// ★ Note the odd argument order upstream uses: `wValue = 0x0`,
+        /// `wIndex = 0x1`, **no data stage**. The 1 is in the *index*, not the value.
+        /// Why is not stated anywhere in the tree; it is ported as an opaque pair by
+        /// its one call site, not derived.
+        ///
+        /// This only kicks the request. The caller must then poll `MT_CONN_ON_MISC`
+        /// (`0x7c06_00f0`) for `MT_TOP_MISC2_FW_PWR_ON` (bit 0) — upstream allows
+        /// 500 ms — and that poll belongs in `mcu.rs`, which owns the register names.
+        /// ★ MEASURED: that register reads `0x0000_0000` on a cold part, so the bit
+        /// really is the "did power-on take" signal and not something already set.
+        fn power_on(&self) -> Result<(), FaceError> {
+            // ★ REQ_OUT_UPSTREAM (0x5f), NOT `self.tag.req_out()`. MEASURED: the same request at
+            // the plain 0x40 is ACKed and does nothing — `MT_CONN_ON_MISC` never leaves 0. The
+            // bootrom gates this one on the vendor-specific recipient in the low five bits, while
+            // the register window (also MEASURED) answers only at 0xc0/0x40. The split is real; do
+            // not "simplify" either side to match the other.
+            self.vendor_write_typed(REQ_OUT_UPSTREAM, MT_VEND_POWER_ON, 0x0, 0x1, &[])?;
+            Ok(())
+        }
     }
 
     /// Is the bus answering? Reads `MT_HW_CHIPID` and returns it —

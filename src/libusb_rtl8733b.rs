@@ -35,6 +35,12 @@ use async_trait::async_trait;
 use ndn_frame_io::{
     CapturedFrame, ClockDomainId, FrameFormat, FrameIo, InjectFrame, PhyMetrics, frame,
 };
+use ndn_radio_hal::bringup::{
+    AppliedPower, Assert, BringUp, BringUpFailure, BringUpReport, Ctx, Degradation, Deviation,
+    Fact, Guards, Plan, PlanId, PlanRun, PowerReference, PowerRequest, PowerWrite,
+    ProofRequirement, PumpPolicy, RadioState, Role, Severity, Stage, Step, StepClass, StepId,
+    StepOutcome, TxInstrument, TxProbe, WitnessOracle,
+};
 use ndn_radio_hal::{
     Band, Bandwidth, ClockSteering, McsDescriptor, RadioCapability, RadioKnobs, RadioProfile,
     RadioTime, RadioTimeSource, RateCapability, TxDiscipline,
@@ -667,11 +673,13 @@ impl Rtl8733buBackend {
         })
     }
 
-    /// **M2**: run the card-enable power-on sequence, bringing the MAC from
-    /// card-disable/emulation to the active state (BB/RF out of reset, RF path
-    /// up). Errors if any poll step times out (~200 ms budget each).
-    pub fn power_on(&self) -> Result<(), FaceError> {
-        self.run_pwr_seq(POWER_ON_8733B, "power-on")
+    rung! {
+        /// **M2**: run the card-enable power-on sequence, bringing the MAC from
+        /// card-disable/emulation to the active state (BB/RF out of reset, RF path
+        /// up). Errors if any poll step times out (~200 ms budget each).
+        fn power_on(&self) -> Result<(), FaceError> {
+            self.run_pwr_seq(POWER_ON_8733B, "power-on")
+        }
     }
 
     /// Full card-disable power-down ([`POWER_OFF_8733B`], captured from the vendor `rmmod`).
@@ -881,55 +889,57 @@ impl Rtl8733buBackend {
         self.dl_rsvd_page(pg_addr, &page)
     }
 
-    /// **M5**: download the firmware and boot the WLAN CPU. Enable download mode,
-    /// push each memory section (DMEM then IMEM) to the reserved page in 4 KB
-    /// chunks and IDDMA-copy it into the CPU's IMEM/DMEM, verify per-section
-    /// checksums, then release the CPU and poll for firmware-ready. On success the
-    /// on-chip WLAN CPU is running the NIC firmware. (Vendor `download_firmware` /
-    /// `start_dlfw` / `dlfw_end_flow`, verified against a usbmon capture.)
-    ///
-    /// Verified on Linux: `MCUFW_CTRL=0xe079` (bit 15 booted) + a live `FW_DBG7` PC.
-    ///
-    /// Works on macOS too, after fixing two platform issues: (1) macOS caps bulk-OUT
-    /// transfers at 4096 B, so a 4096-byte chunk (4136 with the txdesc) lost its tail —
-    /// fixed by [`FW_CHUNK`] = 2048. (2) The IDDMA registers (0x1200) appeared inert on
-    /// macOS because `DDMA_FUNC_EN` (BIT(17) of `REG_EXT_SYS_FUNC_EN`) was clear — the
-    /// Linux/OPi chip had it set by power-on default, a fresh macOS-side chip did not —
-    /// so `fw_dl_setup` now sets it explicitly. Verified on both: `MCUFW_CTRL=0xe079`.
-    pub fn download_firmware(&self) -> Result<(), FaceError> {
-        let hdr = Self::fw_header()?;
-        let fw = FW_NIC_8733B;
+    rung! {
+        /// **M5**: download the firmware and boot the WLAN CPU. Enable download mode,
+        /// push each memory section (DMEM then IMEM) to the reserved page in 4 KB
+        /// chunks and IDDMA-copy it into the CPU's IMEM/DMEM, verify per-section
+        /// checksums, then release the CPU and poll for firmware-ready. On success the
+        /// on-chip WLAN CPU is running the NIC firmware. (Vendor `download_firmware` /
+        /// `start_dlfw` / `dlfw_end_flow`, verified against a usbmon capture.)
+        ///
+        /// Verified on Linux: `MCUFW_CTRL=0xe079` (bit 15 booted) + a live `FW_DBG7` PC.
+        ///
+        /// Works on macOS too, after fixing two platform issues: (1) macOS caps bulk-OUT
+        /// transfers at 4096 B, so a 4096-byte chunk (4136 with the txdesc) lost its tail —
+        /// fixed by [`FW_CHUNK`] = 2048. (2) The IDDMA registers (0x1200) appeared inert on
+        /// macOS because `DDMA_FUNC_EN` (BIT(17) of `REG_EXT_SYS_FUNC_EN`) was clear — the
+        /// Linux/OPi chip had it set by power-on default, a fresh macOS-side chip did not —
+        /// so `fw_dl_setup` now sets it explicitly. Verified on both: `MCUFW_CTRL=0xe079`.
+        fn download_firmware(&self) -> Result<(), FaceError> {
+            let hdr = Self::fw_header()?;
+            let fw = FW_NIC_8733B;
 
-        // wlan_cpu_en(0): hold the WLAN CPU off during the download.
-        let v = self.read8(REG_SYS_FUNC_EN + 1)?;
-        self.write8(REG_SYS_FUNC_EN + 1, v & !(1 << 2))?;
+            // wlan_cpu_en(0): hold the WLAN CPU off during the download.
+            let v = self.read8(REG_SYS_FUNC_EN + 1)?;
+            self.write8(REG_SYS_FUNC_EN + 1, v & !(1 << 2))?;
 
-        // pltfm_reset: toggle BIT0 of REG_EXT_SYS_FUNC_EN+2 (0x1002), clear then set —
-        // the platform reset the vendor does after fw_dl_setup and before download
-        // mode. Without it the CPU never boots (bit 15 stays clear) even though the
-        // download and checksums pass.
-        let r = self.read8(REG_EXT_SYS_FUNC_EN + 2)?;
-        self.write8(REG_EXT_SYS_FUNC_EN + 2, r & !1)?;
-        let r = self.read8(REG_EXT_SYS_FUNC_EN + 2)?;
-        self.write8(REG_EXT_SYS_FUNC_EN + 2, r | 1)?;
+            // pltfm_reset: toggle BIT0 of REG_EXT_SYS_FUNC_EN+2 (0x1002), clear then set —
+            // the platform reset the vendor does after fw_dl_setup and before download
+            // mode. Without it the CPU never boots (bit 15 stays clear) even though the
+            // download and checksums pass.
+            let r = self.read8(REG_EXT_SYS_FUNC_EN + 2)?;
+            self.write8(REG_EXT_SYS_FUNC_EN + 2, r & !1)?;
+            let r = self.read8(REG_EXT_SYS_FUNC_EN + 2)?;
+            self.write8(REG_EXT_SYS_FUNC_EN + 2, r | 1)?;
 
-        // start_dlfw: enter FW-download mode. FWDL_EN (BIT0) + the MCU boot-select
-        // bit 13 (0x2000): the reference driver had it set in REG_MCUFW_CTRL & 0x3800
-        // before download; a fresh chip reads 0, so set it explicitly (without it the
-        // CPU never sets the FW-booted bit 15 even though the download + checksums pass).
-        let mcufw = self.read16(REG_MCUFW_CTRL)? & 0x3800;
-        self.write16(REG_MCUFW_CTRL, mcufw | 0x2000 | 0x0001)?;
+            // start_dlfw: enter FW-download mode. FWDL_EN (BIT0) + the MCU boot-select
+            // bit 13 (0x2000): the reference driver had it set in REG_MCUFW_CTRL & 0x3800
+            // before download; a fresh chip reads 0, so set it explicitly (without it the
+            // CPU never sets the FW-booted bit 15 even though the download + checksums pass).
+            let mcufw = self.read16(REG_MCUFW_CTRL)? & 0x3800;
+            self.write16(REG_MCUFW_CTRL, mcufw | 0x2000 | 0x0001)?;
 
-        // Section layout: header(64) | DMEM(size+8) | IMEM(size+8).
-        let hdr_sz = FW_HDR_SIZE as usize;
-        let dmem_len = (hdr.dmem_size + FW_HDR_CHKSUM_SIZE) as usize;
-        let imem_len = (hdr.imem_size + FW_HDR_CHKSUM_SIZE) as usize;
-        let dmem = &fw[hdr_sz..hdr_sz + dmem_len];
-        let imem = &fw[hdr_sz + dmem_len..hdr_sz + dmem_len + imem_len];
-        self.dlfw_section(dmem, hdr.dmem_addr)?;
-        self.dlfw_section(imem, hdr.imem_addr)?;
+            // Section layout: header(64) | DMEM(size+8) | IMEM(size+8).
+            let hdr_sz = FW_HDR_SIZE as usize;
+            let dmem_len = (hdr.dmem_size + FW_HDR_CHKSUM_SIZE) as usize;
+            let imem_len = (hdr.imem_size + FW_HDR_CHKSUM_SIZE) as usize;
+            let dmem = &fw[hdr_sz..hdr_sz + dmem_len];
+            let imem = &fw[hdr_sz + dmem_len..hdr_sz + dmem_len + imem_len];
+            self.dlfw_section(dmem, hdr.dmem_addr)?;
+            self.dlfw_section(imem, hdr.imem_addr)?;
 
-        self.dlfw_end_flow()
+            self.dlfw_end_flow()
+        }
     }
 
     /// Download one firmware memory section: stream it through the reserved page in
@@ -1148,13 +1158,15 @@ impl Rtl8733buBackend {
         Ok(())
     }
 
-    /// **M6b**: baseband init — apply the BB PHY-register table then the AGC table
-    /// (`array_mp_8733b_phy_reg` + `array_mp_8733b_agc_tab`). The BB block is already
-    /// powered by [`mac_config`](Self::mac_config) (`0x002 = 0xC3`). Run after [`mac_config`](Self::mac_config).
-    pub fn bb_config(&self) -> Result<(), FaceError> {
-        self.config_table_bin(PHY_REG_8733B, |s, a, d| s.bb_write(a, d))?;
-        self.config_table_bin(AGC_TAB_8733B, |s, a, d| s.bb_write(a, d))?;
-        Ok(())
+    rung! {
+        /// **M6b**: baseband init — apply the BB PHY-register table then the AGC table
+        /// (`array_mp_8733b_phy_reg` + `array_mp_8733b_agc_tab`). The BB block is already
+        /// powered by [`mac_config`](Self::mac_config) (`0x002 = 0xC3`). Run after [`mac_config`](Self::mac_config).
+        fn bb_config(&self) -> Result<(), FaceError> {
+            self.config_table_bin(PHY_REG_8733B, |s, a, d| s.bb_write(a, d))?;
+            self.config_table_bin(AGC_TAB_8733B, |s, a, d| s.bb_write(a, d))?;
+            Ok(())
+        }
     }
 
     /// One RF (radioA) write. The 8733b maps each path-A RF register directly into
@@ -1176,10 +1188,12 @@ impl Rtl8733buBackend {
         Ok(())
     }
 
-    /// **M6c**: RF init — apply the radioA table (`array_mp_8733b_radioa`) through the
-    /// direct RF-write window. Run after [`bb_config`](Self::bb_config).
-    pub fn rf_config(&self) -> Result<(), FaceError> {
-        self.config_table_bin(RADIOA_8733B, |s, a, d| s.rf_write(a, d))
+    rung! {
+        /// **M6c**: RF init — apply the radioA table (`array_mp_8733b_radioa`) through the
+        /// direct RF-write window. Run after [`bb_config`](Self::bb_config).
+        fn rf_config(&self) -> Result<(), FaceError> {
+            self.config_table_bin(RADIOA_8733B, |s, a, d| s.rf_write(a, d))
+        }
     }
 
     /// Read a path-A RF register (for verifying [`rf_config`](Self::rf_config)) via the direct window.
@@ -1258,42 +1272,44 @@ impl Rtl8733buBackend {
         self.tsf_domain
     }
 
-    /// **M6 tail**: normal-mode TRX/queue init (`init_trx_cfg_8733b`). Switches the
-    /// download-mode page/RQPN config over to the normal-operation layout so the data
-    /// path can run: queue→DMA map, enable all TRX, normal RQPN + reserved-page
-    /// boundary, then the hardware auto-LLT (poll `REG_AUTO_LLT` BIT16 until it
-    /// clears). All values are the reference driver's, taken from its usbmon capture.
-    /// Run after the BB/RF tables ([`rf_config`](Self::rf_config)).
-    pub fn init_trx(&self) -> Result<(), FaceError> {
-        self.write16(REG_TXDMA_PQ_MAP, 0xF5A0)?; // queue → DMA mapping (normal)
-        self.write8(REG_CR, 0x00)?;
-        self.write8(REG_CR, 0xFF)?; // MAC_TRX_ENABLE — enable all TX/RX engines
-        // RQPN: high=8, low=8, pub=211; normal=8, extra=0; then trigger.
-        self.write32(REG_RQPN_CTRL_HLPQ, 0x00D3_0808)?;
-        self.write32(REG_RQPN_NPQ, 0x0000_0008)?;
-        self.write8(REG_RQPN_CTRL_HLPQ + 3, 0x80)?;
-        // Reserved-page boundary (236) across the beacon-queue boundary regs.
-        self.write8(REG_DWBCN0_CTRL + 1, 0xEC)?;
-        self.write8(REG_BCNQ_BDNY, 0xEC)?;
-        self.write8(REG_BCNQ2_BDNY, 0xEC)?;
-        // Block-descriptor count + TXDMA offset check.
-        self.write8(REG_DWBCN0_CTRL, 0x30)?;
-        self.write16(REG_TXDMA_OFFSET_CHK, 0x0200)?; // +1 BIT1
-        // Hardware auto-LLT: set BIT16 (+ params), poll until it self-clears.
-        self.write32(REG_AUTO_LLT, 0x0001_2020)?;
-        let deadline = Instant::now() + Duration::from_millis(200);
-        let mut done = false;
-        while Instant::now() < deadline {
-            if self.read32(REG_AUTO_LLT)? & (1 << 16) == 0 {
-                done = true;
-                break;
+    rung! {
+        /// **M6 tail**: normal-mode TRX/queue init (`init_trx_cfg_8733b`). Switches the
+        /// download-mode page/RQPN config over to the normal-operation layout so the data
+        /// path can run: queue→DMA map, enable all TRX, normal RQPN + reserved-page
+        /// boundary, then the hardware auto-LLT (poll `REG_AUTO_LLT` BIT16 until it
+        /// clears). All values are the reference driver's, taken from its usbmon capture.
+        /// Run after the BB/RF tables ([`rf_config`](Self::rf_config)).
+        fn init_trx(&self) -> Result<(), FaceError> {
+            self.write16(REG_TXDMA_PQ_MAP, 0xF5A0)?; // queue → DMA mapping (normal)
+            self.write8(REG_CR, 0x00)?;
+            self.write8(REG_CR, 0xFF)?; // MAC_TRX_ENABLE — enable all TX/RX engines
+            // RQPN: high=8, low=8, pub=211; normal=8, extra=0; then trigger.
+            self.write32(REG_RQPN_CTRL_HLPQ, 0x00D3_0808)?;
+            self.write32(REG_RQPN_NPQ, 0x0000_0008)?;
+            self.write8(REG_RQPN_CTRL_HLPQ + 3, 0x80)?;
+            // Reserved-page boundary (236) across the beacon-queue boundary regs.
+            self.write8(REG_DWBCN0_CTRL + 1, 0xEC)?;
+            self.write8(REG_BCNQ_BDNY, 0xEC)?;
+            self.write8(REG_BCNQ2_BDNY, 0xEC)?;
+            // Block-descriptor count + TXDMA offset check.
+            self.write8(REG_DWBCN0_CTRL, 0x30)?;
+            self.write16(REG_TXDMA_OFFSET_CHK, 0x0200)?; // +1 BIT1
+            // Hardware auto-LLT: set BIT16 (+ params), poll until it self-clears.
+            self.write32(REG_AUTO_LLT, 0x0001_2020)?;
+            let deadline = Instant::now() + Duration::from_millis(200);
+            let mut done = false;
+            while Instant::now() < deadline {
+                if self.read32(REG_AUTO_LLT)? & (1 << 16) == 0 {
+                    done = true;
+                    break;
+                }
             }
+            if !done {
+                return Err(io_err("init_trx: AUTO_LLT BIT16 poll timeout".into()));
+            }
+            self.write8(REG_CR + 3, 0x00)?; // transfer mode = normal
+            Ok(())
         }
-        if !done {
-            return Err(io_err("init_trx: AUTO_LLT BIT16 poll timeout".into()));
-        }
-        self.write8(REG_CR + 3, 0x00)?; // transfer mode = normal
-        Ok(())
     }
 
     /// **M10**: read `size` bytes from the physical efuse (`read_hw_efuse_87xx`) via the
@@ -1436,81 +1452,120 @@ impl Rtl8733buBackend {
         Ok(())
     }
 
-    /// Full monitor-mode bring-up: power-on → firmware → MAC/BB/RF init → normal TRX →
-    /// tune `channel` → promiscuous RX. After this the backend **captures** frames and
-    /// **injects to the MAC** (the [`FrameIo`] path) — both verified on the OPi.
+    /// **The one entry point** for this part. M8 deleted the four wrappers that stood below it
+    /// (`bring_up_monitor`, `bring_up_tx`, `bring_up_tx_tracked`, `bring_up_tx_until`); what they
+    /// each hid is now a named argument. Superseded text follows: the
+    /// wrappers rather than this.
     ///
-    /// TX status: this call alone gets RX + inject-to-MAC. It does **not** complete the
-    /// on-air TX path — that additionally needs [`enable_tx`](Self::enable_tx)'s full
-    /// calibration and datapath TXAGC block, after which injected frames do radiate
-    /// (verified against a witness radio). Use [`bring_up_tx`](Self::bring_up_tx) or
-    /// [`bring_up_tx_tracked`](Self::bring_up_tx_tracked) for a transmitting radio; the
-    /// residual open item there is the (retracted, see `bring_up_tx`) cold-start question, not the
-    /// register path. (An earlier revision of this comment claimed the RF never radiates
-    /// — that was true before `enable_tx` landed and is no longer.)
-    ///
-    /// Note the chip wedges after repeated re-inits in a process — open once per
-    /// power-cycle.
-    pub fn bring_up_monitor(&self, channel: u8) -> Result<(), FaceError> {
-        // Full card-disable first so every bring-up starts from a clean analog/FSM state
-        // (best-effort: the chip may already be off on a fresh enumeration).
-        let _ = self.power_off();
-        std::thread::sleep(Duration::from_millis(10));
-        self.power_on()?;
-        self.fw_dl_setup()?;
-        self.download_firmware()?;
-        self.mac_config()?;
-        self.bb_config()?;
-        self.rf_config()?;
-        self.init_trx()?;
-        let _ = self.rfk_init(); // load cal (KIP) microcode — vendor does this during normal init
-        self.tune_channel(channel)?;
-        // NOTE: RF 0x01=0 at idle is NORMAL (the vendor reads 0 too when not actively
-        // transmitting; the HW sets the TX AGC per-transmit). The earlier TXGAPK call
-        // here was chasing a non-bug and left cal residue in the RF/BB state — removed.
-        self.set_monitor()?;
-        self.enable_tx_path()?; // RF mode table → TX + BB CCK TX (normal-op TX enable)
-        self.set_txagc_table(0x2d)?; // per-rate TX gain (0 by default → no output)
-        let _ = self.configure_trsw(true); // external TRSW antenna routing (best-effort)
-        Ok(())
+    /// The role selects the plan ([`BringUp::plan`]); the deviation, if any, is resolved against
+    /// that plan before the first register write and lands in the report's digest; the proof
+    /// requirement is validated against the role and this part's instrument, also before the first
+    /// register write.
+    // The `Err` is large BECAUSE it carries the partial report — the whole point of §3, a failed
+    // bring-up that says how far it got instead of a bare `FaceError`. Same allow, same reason, as
+    // `run_plan`'s.
+    #[allow(clippy::result_large_err)]
+    pub fn bring_up_planned(
+        self: &Arc<Self>,
+        channel: u8,
+        role: Role,
+        deviation: Option<Deviation>,
+        proof: ProofRequirement,
+        witness: Option<WitnessOracle>,
+    ) -> Result<(BringUpReport, Guards), BringUpFailure> {
+        let mut run = PlanRun::new(
+            "RTL8733BU",
+            ndn_radio_hal::DeviceAddress::Unknown,
+            self.initial_state(channel, role),
+        )
+        .with_proof(proof);
+        if let Some(d) = deviation {
+            run = run.with_deviation(d);
+        }
+        if let Some(w) = witness {
+            run = run.with_witness(w);
+        }
+        let (report, guards) = self.bring_up(&run)?;
+        // The runner is part-agnostic and cannot know this part's PHY capability; the driver does.
+        Ok((
+            report.with_capability(RadioProfile::capability(self.as_ref())),
+            guards,
+        ))
     }
 
-    /// Reliable-TX bring-up (the productized "approach B" path): monitor bring-up +
-    /// [`enable_tx`](Self::enable_tx) + a background [`spawn_power_tracking`](Self::spawn_power_tracking)
-    /// loop that sustains TX with no thermal fade. Returns the [`PowerTracker`] guard — keep it
-    /// alive for as long as you transmit; drop it to stop tracking.
+    /// The regime a plan starts from. Not a claim about the radio: it is what the caller asked
+    /// for, and the rungs fill in what they establish.
     ///
-    /// This gives **sustained** reliable TX once a boot radiates. The residual ~50% per-boot
-    /// cold-start variance (whether a fresh bring-up radiates at all — an analog TX-power-path
-    /// variance the vendor's full init avoids) is handled at the process/supervisor layer:
-    /// relaunch the process until protocol-level delivery is confirmed (see
-    /// `scripts/supervise_tx.sh`). Descriptor / firmware-MACID paths were ruled out as levers.
-    pub fn bring_up_tx_tracked(self: &Arc<Self>, ch: u8) -> Result<PowerTracker, FaceError> {
-        // Route through `bring_up_tx` rather than repeating monitor+enable_tx here, so the two paths
-        // cannot drift apart. They already had: the `NDN_8733B_TSSI` gate was added to `bring_up_tx`
-        // and this function silently bypassed it, so a run that asked for TSSI got the normal path
-        // and looked like a null result (2026-08-24).
-        self.bring_up_tx(ch)?;
-        // ★ Do NOT run the software power tracker when TSSI is on. `spawn_power_tracking` is our
-        // stand-in for the vendor's power-tracking DM (a `//[TBD]` stub on this chip): every 400 ms
-        // it reads the RF thermal meter and writes the OFDM swing `0x18a0`. TSSI is a HARDWARE loop
-        // doing that same thermal compensation — running both means two controllers fighting over
-        // the same quantity, on the same USB handle.
-        //
-        // ⚠ This is a PRINCIPLED change, NOT a measured fix — do not read it as one. An earlier
-        // comment here claimed the tracker caused a USB failure with TSSI on; that was refuted:
-        // running the tracker's exact operations (thermal read, swing read/modify/write, and both
-        // together) alongside an enabled TSSI loop passed 7/7 runs at ~8000 frames each. The single
-        // observed failure was intermittent and its cause is UNKNOWN.
-        // What remains true, and is why this stays: TSSI performs thermal compensation in hardware,
-        // so a software tracker writing the same quantity is redundant and semantically wrong.
-        if std::env::var_os("NDN_8733B_NO_TSSI").is_none() {
-            eprintln!(
-                "8733b: TSSI enabled — skipping the software power tracker (hardware loop owns thermal)"
-            );
-            return Ok(PowerTracker::inert());
+    /// ⚠ `power` starts at `no_actuator`, **not** at the TXAGC index the M2 hand-filled report
+    /// asserted up front. No power has been written when a plan begins; `set_txagc_table` is the
+    /// rung that establishes the reference, and claiming it before it ran is the shape of defect
+    /// this contract exists to remove.
+    fn initial_state(&self, channel: u8, role: Role) -> RadioState {
+        RadioState {
+            channel,
+            bw: Bandwidth::Bw20,
+            format: "RawNdn (see with_format)",
+            role,
+            power: AppliedPower::no_actuator(PowerRequest::NoActuator),
+            rate: ndn_radio_hal::RateState::unreported(),
+            warm: None,
+            contention: None,
+            pump: PumpPolicy::CallerOwns,
+            facts: Vec::new(),
         }
-        Ok(self.spawn_power_tracking())
+    }
+
+    /// §4, question (A): key the transmitter `probes` times and difference the OFDM `tx_en`
+    /// counter (`0x2de0`).
+    ///
+    /// ★ **This is the one part in the fleet that can offer real transmit evidence, so it offers
+    /// it** — `read_tx_counters` was a declared capability with no bring-up caller, which is this
+    /// codebase's characteristic defect.
+    ///
+    /// The reading is taken as three counter reads: two back-to-back for the **idle control**
+    /// (the same difference across an interval with no probes — the control that makes the Morse
+    /// instrument the best-calibrated one in the fleet, taken here for the same reason), then the
+    /// probes, then a third. The idle interval is the two control reads' own duration; no sleep is
+    /// added, because a bring-up should not pay for a nicer control.
+    ///
+    /// ⚠ **It transmits.** `probes` broadcast frames at `DESC_RATE_6M` — under a millisecond of
+    /// airtime, and the only thing in a bring-up that puts energy on the air. Legacy OFDM is not a
+    /// choice: the CCK counter pair (0x2de4/0x2de6) is unimplemented, so a CCK probe would read +0
+    /// and look exactly like a dead transmitter.
+    ///
+    /// ⚠ It answers (A) — *did the MAC key the transmitter?* — and **not** (B), *did anything
+    /// coherent radiate?* On the AR9271 those two came apart in silicon, MEASURED. Only a witness
+    /// answers (B); see `ProofRequirement::WitnessOrFail`.
+    pub fn probe_tx_counters(&self, probes: u16) -> Result<TxProbe, FaceError> {
+        let tx_en = || -> Result<u16, FaceError> {
+            <Self as RadioKnobs>::read_tx_counters(self)?
+                .map(|(en, _on)| en)
+                .ok_or_else(|| {
+                    io_err(
+                        "read_tx_counters returned None on the one part that declares the \
+                         instrument"
+                            .into(),
+                    )
+                })
+        };
+        let before_control = tx_en()?;
+        let after_control = tx_en()?;
+        let frame = frame::build_dot11(
+            self.format,
+            &InjectFrame::broadcast(
+                bytes::Bytes::from_static(TX_PROBE_PAYLOAD),
+                ndn_frame_io::TxIntent::CONSERVATIVE,
+            ),
+        )?;
+        for seq in 0..probes {
+            self.inject_raw(&frame, DESC_RATE_6M, seq)?;
+        }
+        let after_probes = tx_en()?;
+        Ok(TxProbe {
+            probes,
+            delta: after_probes.wrapping_sub(after_control),
+            idle_control: Some(after_control.wrapping_sub(before_control)),
+        })
     }
 
     /// Start a background TX **power-tracking** loop — the driver-side stand-in for the
@@ -1578,91 +1633,12 @@ impl Rtl8733buBackend {
     /// power_off/card-disable; re-establishes the device the way a kernel-driver bind/unbind
     /// does. In-process register resets do NOT re-randomize the per-boot analog TX state
     /// (retry stays stuck), but only a fresh process — which involves a kernel USB cycle —
-    /// does; this exposes that cycle in-process. Re-run [`Self::bring_up_monitor`] after it.
+    /// does; this exposes that cycle in-process. Re-open with `open_radio` after it.
     pub fn usb_reset(&self) -> Result<(), FaceError> {
         self.handle.reset().map_err(usb_err)
     }
 
-    /// One-shot TX bring-up: [`bring_up_monitor`](Self::bring_up_monitor) (self-resets the
-    /// chip via card-disable) then [`enable_tx`](Self::enable_tx) (cal + datapath + grant).
-    /// After this, injected frames radiate. (An older note here claimed only ~62% of boots
-    /// radiate; that was RETRACTED — measured 20/20 on a healthy bus, see `open_named_radio`.
-    /// The ~62% was an external USB fault plus per-boot `usbreset`s, not this chip.)
-    pub fn bring_up_tx(&self, ch: u8) -> Result<(), FaceError> {
-        self.bring_up_monitor(ch)?;
-        // The full TSSI setup — the vendor's `halrf_do_tssi_8733b` port,
-        // including the efuse-derived DE — BEFORE `enable_tx`, and leaves the loop enabled.
-        //
-        // Ordering is the whole trick, and is why this was previously unusable. `tssi_setup` and
-        // `enable_tx` both write parts of the datapath (`0x1c38`, `0x1c84`, `0x1ca4`, `0x1e1c`), so
-        // running TSSI *after* `enable_tx` clobbers the datapath TXAGC that makes the chip radiate —
-        // that is the "kills output" warning on `enable_tx`. But `enable_tx` never touches `0x43xx`,
-        // where the TSSI loop itself lives. Running TSSI first therefore keeps the loop configured
-        // AND lets `enable_tx` establish the datapath on top.
-        //
-        // ★ NOW THE DEFAULT (was `NDN_8733B_TSSI` opt-in). This part's efuse selects a TSSI regime
-        // (`0xc8[7:4]` = 4), so the TSSI loop is not an experiment here — it is the ONLY path that
-        // controls radiated power, and the whole TXAGC page is inert without it. Set
-        // `NDN_8733B_NO_TSSI=1` to skip it for register-level debugging.
-        //
-        // It must run HERE, before `enable_tx`, and cannot be deferred: MEASURED end-to-end through
-        // `RadioKnobs::set_tx_power`, a full sweep gives **19.6 dB** of monotonic range with this
-        // setup, and only **1.6 dB** if the loop is merely enabled afterwards by flipping 0x4318
-        // BIT30. An enabled-but-unconfigured loop gives the DE no authority — which reads exactly
-        // like a dead knob.
-        let tssi = std::env::var_os("NDN_8733B_NO_TSSI").is_none();
-        if tssi {
-            self.tssi_setup(ch)?;
-            let v = self.read32(0x4318)?;
-            eprintln!(
-                "8733b: TSSI setup applied, 0x4318={v:08x} tssi_field={}",
-                (v >> 28) & 0x7
-            );
-        }
-        self.enable_tx(ch)?;
-        if tssi {
-            // `enable_tx` re-tunes and re-applies the datapath; report whether the loop survived it.
-            let v = self.read32(0x4318)?;
-            eprintln!(
-                "8733b: after enable_tx, 0x4318={v:08x} tssi_field={}",
-                (v >> 28) & 0x7
-            );
-        }
-        Ok(())
-    }
-
-    /// Retrying TX bring-up: re-run [`bring_up_tx`](Self::bring_up_tx) (full clean re-init)
-    /// until `verify(self)` returns `true` or `max_attempts` is reached. Returns `Ok(true)`
-    /// once verified, `Ok(false)` if exhausted.
-    ///
-    /// ⚠ This exists as INSURANCE, not because bring-up is unreliable. It was written when the
-    /// port believed only ~62% of boots radiate; that is retracted (20/20 measured — see
-    /// [`bring_up_tx`](Self::bring_up_tx)). Keep using it only where a missed transmit is
-    /// expensive and you have a cheap external check.
-    ///
-    /// If you do gate, `verify` must use **external feedback** — transmit a probe and confirm a
-    /// response (an ACK, an NDN Data for an Interest, a peer echo). No on-chip signal reports
-    /// radiated power on this part, which is a real and separate finding: the entire TXAGC page
-    /// is inert here, so registers cannot tell you how much RF left the antenna.
-    pub fn bring_up_tx_until<F>(
-        &self,
-        ch: u8,
-        max_attempts: u32,
-        mut verify: F,
-    ) -> Result<bool, FaceError>
-    where
-        F: FnMut(&Self) -> bool,
-    {
-        for _ in 0..max_attempts.max(1) {
-            self.bring_up_tx(ch)?;
-            if verify(self) {
-                return Ok(true);
-            }
-        }
-        Ok(false)
-    }
-
-    /// Enable on-air TX (call after [`bring_up_monitor`](Self::bring_up_monitor)). Runs the
+    /// Enable on-air TX (a rung of [`PLAN_8733B_TX`], after the monitor rungs). Runs the
     /// full RF calibration — IQK ([`phy_iq_calibrate`](Self::phy_iq_calibrate)), TXGAPK
     /// ([`phy_txgapk`](Self::phy_txgapk)), DPK ([`phy_dpk`](Self::phy_dpk)) — which converges
     /// once [`phy_lok`](Self::phy_lok)'s loopback gains are set; then applies the datapath
@@ -1765,13 +1741,15 @@ impl Rtl8733buBackend {
         Ok(frames)
     }
 
-    /// **M6a**: apply the 8733b MAC register table (`array_mp_8733b_mac_reg`) — a
-    /// short list of byte writes, including `0x002 = 0xC3` which brings up the BB
-    /// block. Run after the firmware is booted.
-    pub fn mac_config(&self) -> Result<(), FaceError> {
-        self.config_table(MAC_REG_8733B, |s, addr, val| {
-            s.write8(addr as u16, val as u8)
-        })
+    rung! {
+        /// **M6a**: apply the 8733b MAC register table (`array_mp_8733b_mac_reg`) — a
+        /// short list of byte writes, including `0x002 = 0xC3` which brings up the BB
+        /// block. Run after the firmware is booted.
+        fn mac_config(&self) -> Result<(), FaceError> {
+            self.config_table(MAC_REG_8733B, |s, addr, val| {
+                s.write8(addr as u16, val as u8)
+            })
+        }
     }
 
     /// The discovered bulk endpoints (for the later TX/RX milestones).
@@ -1784,6 +1762,657 @@ impl Rtl8733buBackend {
     }
     pub fn bulk_in(&self) -> u8 {
         self.bulk_in
+    }
+}
+
+/// LAW 1 lives at the wrapper boundary, not in a rung.
+///
+/// `NDN_8733B_NO_TSSI` is read HERE — once, at the caller boundary, where §1.1's
+/// `BringUpRequest::from_env` will read it for good — and becomes a **self-labelling
+/// [`Deviation`]** that lands in the report and changes `plan_digest`. Inside a plan step it would
+/// be exactly `load_tx_power_info` one level up: hidden state deciding what a later call means.
+///
+/// It also stops being two code paths. The old ladder had `bring_up_tx` gate on this variable and
+/// `bring_up_tx_tracked` silently bypass the gate, so a run that asked for TSSI got the normal
+/// path and looked like a null result (2026-08-24). One plan and one skip cannot drift that way.
+pub fn rtl8733b_env_deviation() -> Option<Deviation> {
+    std::env::var_os("NDN_8733B_NO_TSSI").map(|_| {
+        Deviation::new(
+            "NDN_8733B_NO_TSSI: what do the registers look like with the TSSI loop left \
+             unconfigured? (register-level debugging only)",
+        )
+        .skip(
+            "tssi_setup",
+            "MEASURED: the TX-power knob keeps 1.6 dB of usable range instead of 19.6 dB. Skipping \
+             does NOT disable power control on this part — it makes the knob look dead, because \
+             the efuse selects a TSSI regime and the whole TXAGC page is inert without the loop.",
+        )
+    })
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// M3 · §1.4 — THE PLAN.  One sequence per role, executed by the shared runner.
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Specification: `docs/bringup-contract.md` §1.4/§1.5/§4/§5-M3.
+//
+// This part is the contract's first adopter for three stated reasons: it is the only one already
+// layered into named primitives, it is the only one with a working `read_tx_counters`, and it has a
+// **20/20 cold-bring-up baseline** to regress against (2026-08-24: 20 sequential bring-ups, 98.9%
+// delivery, scored against a real receiver rather than an airtime proxy).
+//
+// ★ **Every rung below is transcribed VERBATIM, IN ORDER, from the five overlapping bring-ups it
+// replaces** (`bring_up_monitor`, `bring_up_tx`, `bring_up_tx_tracked`, `bring_up_tx_until`, and
+// `open_named_radio`'s 8733b arm). Not one register write moved, was added, or was reordered. A
+// plan that "improves" a ladder is an unmeasured change to a radio nobody at the keyboard can test,
+// and the improvements that looked obvious here — `init_llt`, a TXPAUSE clear — were both A/B'd
+// inert and reverted. Three things did change, each named where it happens:
+//
+//   1. the two roles are now ONE shared step list plus four TX rungs, instead of `bring_up_tx`
+//      calling `bring_up_monitor` and appending;
+//   2. `NDN_8733B_NO_TSSI` and the tracker's TSSI check no longer live INSIDE the ladder (LAW 1) —
+//      the env is read once at the wrapper boundary and becomes a self-labelling `Deviation`, and
+//      the tracker branches on a hardware readback instead;
+//   3. two readbacks the old ladder printed to stderr and forgot are now `StepClass::Assert` rungs
+//      whose result lands in the report.
+
+/// Shorthand for the step tables below — `Step<Rtl8733buBackend>` twenty times is unreadable.
+type Dev = Rtl8733buBackend;
+
+/// The per-rate TXAGC index the ladder pins. Named rather than repeated so the rung, the report
+/// and the `why` cannot drift.
+const TXAGC_LADDER_INDEX: u8 = 0x2d;
+
+/// ⚠ What the power line on this part actually means. The ladder writes the per-rate TXAGC table
+/// and NOT a `RadioKnobs::set_tx_power`, because on this chip the TXAGC page is **inert by efuse
+/// design** (`0xc8[7:4]` = 4 ⇒ `power_track_type` = 4, and every vendor TXAGC writer returns
+/// early). The live knob is the TSSI DE, which `tssi_setup` configures and `set_tx_power` drives
+/// afterwards. Saying `DriverReference{TXAGC table}` without this sentence would overclaim.
+const TXAGC_TABLE_SOURCE: &str = "8733b per-rate TXAGC table 0x3a00 pinned at 0x2d by the ladder — \
+     ⚠ MEASURED INERT on this part (efuse power_track_type = 4); the live knob is the TSSI DE";
+
+/// The guard name when the hardware TSSI loop owns thermal compensation and the software tracker
+/// stands down. Not "no tracker": the handle still holds a `PowerTracker`, it simply owns no thread.
+const GUARD_TRACKER_INERT: &str = "PowerTracker (inert — hardware TSSI loop owns thermal)";
+/// The guard name when the software tracker is the only thermal controller running.
+const GUARD_TRACKER_SOFTWARE: &str = "PowerTracker (software thermal loop, 400 ms)";
+
+// ── the rungs ────────────────────────────────────────────────────────────────
+
+fn s_card_disable(b: &Arc<Dev>, _c: &mut Ctx<'_>) -> Result<StepOutcome, FaceError> {
+    // Verbatim, including the sleep-on-failure: the old ladder was `let _ = self.power_off();`
+    // followed unconditionally by the settle. What changed is that the failure is now NAMED
+    // instead of discarded by a bare `let _`.
+    let r = b.power_off();
+    std::thread::sleep(Duration::from_millis(10));
+    r?;
+    Ok(StepOutcome::Done)
+}
+
+fn s_power_on(b: &Arc<Dev>, _c: &mut Ctx<'_>) -> Result<StepOutcome, FaceError> {
+    b.power_on()?;
+    Ok(StepOutcome::Done)
+}
+
+fn s_fw_dl_setup(b: &Arc<Dev>, _c: &mut Ctx<'_>) -> Result<StepOutcome, FaceError> {
+    b.fw_dl_setup()?;
+    Ok(StepOutcome::Done)
+}
+
+fn s_download_firmware(b: &Arc<Dev>, _c: &mut Ctx<'_>) -> Result<StepOutcome, FaceError> {
+    b.download_firmware()?;
+    Ok(StepOutcome::Established(Fact::Firmware {
+        name: "rtl8733bu (embedded)",
+        ready: true,
+    }))
+}
+
+fn s_mac_config(b: &Arc<Dev>, _c: &mut Ctx<'_>) -> Result<StepOutcome, FaceError> {
+    b.mac_config()?;
+    Ok(StepOutcome::Done)
+}
+
+fn s_bb_config(b: &Arc<Dev>, _c: &mut Ctx<'_>) -> Result<StepOutcome, FaceError> {
+    b.bb_config()?;
+    Ok(StepOutcome::Done)
+}
+
+fn s_rf_config(b: &Arc<Dev>, _c: &mut Ctx<'_>) -> Result<StepOutcome, FaceError> {
+    b.rf_config()?;
+    Ok(StepOutcome::Done)
+}
+
+fn s_init_trx(b: &Arc<Dev>, _c: &mut Ctx<'_>) -> Result<StepOutcome, FaceError> {
+    b.init_trx()?;
+    Ok(StepOutcome::Done)
+}
+
+fn s_rfk_init(b: &Arc<Dev>, _c: &mut Ctx<'_>) -> Result<StepOutcome, FaceError> {
+    b.rfk_init()?;
+    Ok(StepOutcome::Done)
+}
+
+fn s_tune_channel(b: &Arc<Dev>, c: &mut Ctx<'_>) -> Result<StepOutcome, FaceError> {
+    b.tune_channel(c.state_ref().channel)?;
+    Ok(StepOutcome::Done)
+}
+
+fn s_set_monitor(b: &Arc<Dev>, _c: &mut Ctx<'_>) -> Result<StepOutcome, FaceError> {
+    b.set_monitor()?;
+    Ok(StepOutcome::Done)
+}
+
+fn s_enable_tx_path(b: &Arc<Dev>, _c: &mut Ctx<'_>) -> Result<StepOutcome, FaceError> {
+    b.enable_tx_path()?;
+    Ok(StepOutcome::Done)
+}
+
+fn s_set_txagc_table(b: &Arc<Dev>, c: &mut Ctx<'_>) -> Result<StepOutcome, FaceError> {
+    b.set_txagc_table(TXAGC_LADDER_INDEX)?;
+    // LAW 6 — this rung decides what a later `set_tx_power` is referenced to, so it says so, and
+    // the runner hoists the fact into `RadioState::facts`. `load_tx_power_info` is the founding
+    // case of a rung that changed a later API's meaning invisibly; this is the same shape, written
+    // down.
+    let reference = PowerReference::DriverReference {
+        source: TXAGC_TABLE_SOURCE,
+        slope_db_per_idx: None,
+    };
+    c.state().power = AppliedPower::from_writes(
+        PowerRequest::index(TXAGC_LADDER_INDEX),
+        reference,
+        TXAGC_LADDER_INDEX,
+        false,
+        vec![PowerWrite {
+            reg: 0x3a00,
+            value: TXAGC_LADDER_INDEX,
+            group: "per-rate TXAGC table",
+            path: 0,
+        }],
+    );
+    Ok(StepOutcome::Established(Fact::PowerReference(reference)))
+}
+
+fn s_configure_trsw(b: &Arc<Dev>, _c: &mut Ctx<'_>) -> Result<StepOutcome, FaceError> {
+    b.configure_trsw(true)?;
+    Ok(StepOutcome::Done)
+}
+
+fn s_tssi_setup(b: &Arc<Dev>, c: &mut Ctx<'_>) -> Result<StepOutcome, FaceError> {
+    b.tssi_setup(c.state_ref().channel)?;
+    Ok(StepOutcome::Done)
+}
+
+fn s_enable_tx(b: &Arc<Dev>, c: &mut Ctx<'_>) -> Result<StepOutcome, FaceError> {
+    b.enable_tx(c.state_ref().channel)?;
+    Ok(StepOutcome::Done)
+}
+
+fn s_txpause_released(b: &Arc<Dev>, c: &mut Ctx<'_>) -> Result<StepOutcome, FaceError> {
+    let v = b.tx_pause()?;
+    if v != 0x00 {
+        c.warn(format!(
+            "REG_TXPAUSE (0x0522) reads {v:#04x}, want 0x00 — the MAC transmit queues are HELD. \
+             0x3f is aborted-IQK residue and 0xff aborted-LCK; either way frames will queue and \
+             never reach the air, and the host will not be told"
+        ));
+    }
+    Ok(StepOutcome::Done)
+}
+
+fn s_tssi_loop_live(b: &Arc<Dev>, c: &mut Ctx<'_>) -> Result<StepOutcome, FaceError> {
+    let v = b.read32(0x4318)?;
+    if v & (1 << 30) == 0 {
+        c.warn(format!(
+            "0x4318={v:08x} tssi_field={} — the TSSI loop is NOT enabled after enable_tx. This is \
+             the ONLY path that controls radiated power on this part (the TXAGC page is inert by \
+             efuse design), so the TX-power knob keeps ~1.6 dB of range instead of 19.6 dB",
+            (v >> 28) & 0x7
+        ));
+        return Ok(StepOutcome::Branch("tssi-loop-clobbered"));
+    }
+    Ok(StepOutcome::Branch("tssi-loop-survived-enable_tx"))
+}
+
+fn s_power_tracking(b: &Arc<Dev>, _c: &mut Ctx<'_>) -> Result<StepOutcome, FaceError> {
+    // ★ The branch that used to be an env var and a `bring_up_tx` / `bring_up_tx_tracked` fork is
+    // now ONE named rung deciding from a HARDWARE READBACK — the same read
+    // `spawn_power_tracking`'s own loop takes every tick, for the same reason: `set_tx_power`
+    // enables the TSSI loop LAZILY, long after any spawn-time or env check could see it.
+    //
+    // ⚠ PRINCIPLED, not measured: TSSI is a hardware closed loop doing thermal compensation
+    // against a real power detector, so a software tracker writing the same quantity (`0x18a0`)
+    // is redundant and semantically wrong — two controllers on one quantity. An earlier comment
+    // claimed the pair caused a USB failure; that was REFUTED (7/7 runs, ~8000 frames each).
+    if b.read32(0x4318)? & (1 << 30) != 0 {
+        return Ok(StepOutcome::Guard(
+            GUARD_TRACKER_INERT,
+            Box::new(PowerTracker::inert()),
+        ));
+    }
+    Ok(StepOutcome::Guard(
+        GUARD_TRACKER_SOFTWARE,
+        Box::new(b.spawn_power_tracking()),
+    ))
+}
+
+// ── the rungs, as reviewable constants ───────────────────────────────────────
+//
+// Each rung is a `const` so the shared prefix is LITERALLY shared between the two plans rather
+// than copy-pasted. Two ladders that were "the same except…" is the defect this contract exists to
+// remove; writing the prefix twice here would reintroduce it inside the fix.
+
+const R_CARD_DISABLE: Step<Dev> = Step {
+    id: StepId("card_disable"),
+    stage: Stage::PowerOn,
+    class: StepClass::BestEffort(Degradation::new(
+        "a known-clean analog/FSM start state — this bring-up then layers on whatever the previous \
+         process left in the RF/BB",
+        "a fresh enumeration, where the chip is already off and there is nothing to disable",
+    )),
+    why: "full card-disable first so every bring-up starts from a clean analog/FSM state. Best \
+          effort because the chip may already be off on a fresh enumeration, which is the case the \
+          old `let _ = self.power_off()` was written for.",
+    must_follow: &[],
+    must_precede: &[StepId("power_on")],
+    run: s_card_disable,
+};
+
+const R_POWER_ON: Step<Dev> = Step {
+    id: StepId("power_on"),
+    stage: Stage::PowerOn,
+    class: StepClass::Required,
+    why: "the MAC is card-disabled until the power sequence runs: REG_CR reads the 0xEA \
+          not-ready sentinel and every later register write is a no-op (see `is_powered`).",
+    must_follow: &[],
+    must_precede: &[],
+    run: s_power_on,
+};
+
+const R_FW_DL_SETUP: Step<Dev> = Step {
+    id: StepId("fw_dl_setup"),
+    stage: Stage::Firmware,
+    class: StepClass::Required,
+    why: "switches the MAC to the download-mode page/RQPN layout and enables TXDMA; without it \
+          `download_firmware`'s reserved-page write and IDDMA copy land nowhere.",
+    must_follow: &[StepId("power_on")],
+    must_precede: &[StepId("download_firmware")],
+    run: s_fw_dl_setup,
+};
+
+const R_DOWNLOAD_FIRMWARE: Step<Dev> = Step {
+    id: StepId("download_firmware"),
+    stage: Stage::Firmware,
+    class: StepClass::Required,
+    why: "the MAC CPU runs vendor firmware; nothing above the PHY works without it. **LAW 5**: it \
+          polls DDMA-idle and the WINTINI_RDY boot handshake, and a step that polls a hardware \
+          completion bit is always Required — a timed-out boot that continues is a radio whose \
+          every later readback is fiction.",
+    must_follow: &[],
+    must_precede: &[],
+    run: s_download_firmware,
+};
+
+const R_MAC_CONFIG: Step<Dev> = Step {
+    id: StepId("mac_config"),
+    stage: Stage::MacInit,
+    class: StepClass::Required,
+    why: "the vendor MAC register table (`array_mp_8733b_mac_reg`), including `0x002 = 0xC3` \
+          which brings up the BB block that `bb_config` then programs.",
+    must_follow: &[StepId("download_firmware")],
+    must_precede: &[],
+    run: s_mac_config,
+};
+
+const R_BB_CONFIG: Step<Dev> = Step {
+    id: StepId("bb_config"),
+    stage: Stage::PhyInit,
+    class: StepClass::Required,
+    why: "the baseband PHY register table; the RF tables written next are addressed through the \
+          BB, so this cannot follow `rf_config`.",
+    must_follow: &[StepId("mac_config")],
+    must_precede: &[StepId("rf_config")],
+    run: s_bb_config,
+};
+
+const R_RF_CONFIG: Step<Dev> = Step {
+    id: StepId("rf_config"),
+    stage: Stage::PhyInit,
+    class: StepClass::Required,
+    why: "the RF register table for path A; the synth cannot lock and `tune_channel` has nothing \
+          to retune without it.",
+    must_follow: &[],
+    must_precede: &[],
+    run: s_rf_config,
+};
+
+const R_INIT_TRX: Step<Dev> = Step {
+    id: StepId("init_trx"),
+    stage: Stage::MacInit,
+    class: StepClass::Required,
+    why: "normal-mode TRX/queue init (`init_trx_cfg_8733b`) — it takes the MAC OUT of the \
+          download-mode layout `fw_dl_setup` put it in, so the data path can run at all. **LAW 5**: \
+          it polls the hardware auto-LLT (REG_AUTO_LLT BIT16 until it self-clears) and already \
+          returns Err on timeout.",
+    must_follow: &[StepId("rf_config")],
+    must_precede: &[],
+    run: s_init_trx,
+};
+
+const R_RFK_INIT: Step<Dev> = Step {
+    id: StepId("rfk_init"),
+    stage: Stage::Calibrate,
+    class: StepClass::BestEffort(Degradation::new(
+        "the KIP calibration microcode is not loaded, so IQK and DPK will not converge and the \
+         transmitter is uncalibrated",
+        "monitor RX and inject-to-MAC; NOT a power number, and NOT a comparison against a run \
+         where the cal did converge",
+    )),
+    why: "loads the cal (KIP) microcode; the vendor does this during normal init and IQK/DPK are \
+          built on it. Best effort with a named loss, transcribed from the old ladder's `if let \
+          Err(e) = self.rfk_init()` warning — `enable_tx` calls it again as a hard prerequisite.",
+    must_follow: &[],
+    must_precede: &[],
+    run: s_rfk_init,
+};
+
+const R_TUNE_CHANNEL: Step<Dev> = Step {
+    id: StepId("tune_channel"),
+    stage: Stage::Tune,
+    class: StepClass::Required,
+    why: "puts the synth on the requested channel. An untuned monitor hears silence and an \
+          untuned transmitter radiates somewhere nobody is listening; returning a working-looking \
+          handle for either is the failure this repo keeps paying for.",
+    must_follow: &[StepId("init_trx")],
+    must_precede: &[],
+    run: s_tune_channel,
+};
+
+const R_SET_MONITOR: Step<Dev> = Step {
+    id: StepId("set_monitor"),
+    stage: Stage::RxEnable,
+    class: StepClass::Required,
+    why: "promiscuous RX: REG_RCR accepts every frame including CRC/ICV errors and appends PHY \
+          status + FCS, and all three RXFLTMAP filter maps are opened. This is what makes the part \
+          a monitor rather than a station.",
+    must_follow: &[],
+    must_precede: &[],
+    run: s_set_monitor,
+};
+
+const R_ENABLE_TX_PATH: Step<Dev> = Step {
+    id: StepId("enable_tx_path"),
+    stage: Stage::TxEnable,
+    class: StepClass::Required,
+    why: "RF mode table → TX plus the BB CCK TX enable: the normal-operation TX enable. It is in \
+          the ReceiveOnly plan too because the old `bring_up_monitor` ran it, and a monitor that \
+          can inject to the MAC is what several instruments depend on. It does NOT complete the \
+          on-air TX path — that is `tssi_setup` + `enable_tx`, which is what the roles differ by.",
+    must_follow: &[],
+    must_precede: &[],
+    run: s_enable_tx_path,
+};
+
+const R_SET_TXAGC_TABLE: Step<Dev> = Step {
+    id: StepId("set_txagc_table"),
+    stage: Stage::Power,
+    class: StepClass::Required,
+    why: "the per-rate TX gain table is 0 by default, which is no output at all. ⚠ On this part \
+          the page is MEASURED INERT (efuse power_track_type = 4) — this rung establishes the \
+          reference the report names, and the knob that actually moves power is the TSSI DE.",
+    must_follow: &[StepId("enable_tx_path")],
+    must_precede: &[],
+    run: s_set_txagc_table,
+};
+
+const R_CONFIGURE_TRSW: Step<Dev> = Step {
+    id: StepId("configure_trsw"),
+    stage: Stage::Posture,
+    class: StepClass::BestEffort(Degradation::new(
+        "external TRSW antenna routing is not applied, so the RF may be routed to the wrong port \
+         — everything works and the link budget is quietly wrong",
+        "register-level work and same-board loopback; NOT a range, RSSI or delivery number",
+    )),
+    why: "external TRSW antenna routing. Best effort with a named loss, transcribed from the old \
+          ladder's `if let Err(e) = self.configure_trsw(true)` warning.",
+    must_follow: &[],
+    must_precede: &[],
+    run: s_configure_trsw,
+};
+
+const R_TSSI_SETUP: Step<Dev> = Step {
+    id: StepId("tssi_setup"),
+    stage: Stage::Calibrate,
+    class: StepClass::Required,
+    why: "the vendor's `halrf_do_tssi_8733b` port including the efuse-derived DE. ★ MEASURED \
+          end-to-end through `RadioKnobs::set_tx_power`: a full sweep gives **19.6 dB** of \
+          monotonic range with this rung before `enable_tx`, and only **1.6 dB** if the loop is \
+          merely enabled afterwards by flipping 0x4318 BIT30 — an enabled-but-unconfigured loop \
+          gives the DE no authority, which reads exactly like a dead knob. This part's efuse \
+          selects a TSSI regime (0xc8[7:4] = 4), so the loop is not an experiment here: it is the \
+          ONLY path that controls radiated power.",
+    must_follow: &[],
+    // ★ The ordering that was prose in a doc comment and is now checked at plan construction.
+    must_precede: &[StepId("enable_tx")],
+    run: s_tssi_setup,
+};
+
+const R_ENABLE_TX: Step<Dev> = Step {
+    id: StepId("enable_tx"),
+    stage: Stage::TxEnable,
+    class: StepClass::Required,
+    why: "the full RF cal (IQK incl. LOK → TXGAPK → DPK) plus the datapath TXAGC block \
+          (0x1e40-0x1e60) the cal leaves zeroed, the re-tune the cal needs to re-lock RF/BB, and \
+          the GNT_WL grant of the shared front-end. Frames injected after this radiate, verified \
+          against a witness radio. It must run AFTER `tssi_setup`: the two both write 0x1c38 / \
+          0x1c84 / 0x1ca4 / 0x1e1c, so TSSI last clobbers the datapath TXAGC and kills output, \
+          while `enable_tx` never touches 0x43xx where the loop itself lives.",
+    must_follow: &[StepId("tssi_setup")],
+    must_precede: &[],
+    run: s_enable_tx,
+};
+
+const R_TXPAUSE_RELEASED: Step<Dev> = Step {
+    id: StepId("txpause_released"),
+    stage: Stage::Verify,
+    class: StepClass::Assert,
+    why: "§1.5 — read back every gate you write. `enable_tx` ends with `write8(0x0522, 0x00)`, so \
+          this reads it back rather than writing it again: the hand-rolled second `write8(0x522, \
+          0x00)` on the sibling 8812au was A/B'd INERT (2789/4508/4588/4406 frames — run-to-run \
+          noise, no direction) and reverted, and REG_TXPAUSE MEASURED 0x00 over three bring-ups \
+          there. The hazard it guards is structurally real (a cal error path can leave the gate \
+          held) and is not firing today. An assert, not a rung.",
+    must_follow: &[StepId("enable_tx")],
+    must_precede: &[],
+    run: s_txpause_released,
+};
+
+const R_TSSI_LOOP_LIVE: Step<Dev> = Step {
+    id: StepId("tssi_loop_live"),
+    stage: Stage::Verify,
+    class: StepClass::Assert,
+    why: "§1.5 — `enable_tx` re-tunes and re-applies the datapath, so this reads back whether the \
+          TSSI loop survived it. The old ladder printed this same 0x4318 read to stderr twice and \
+          nothing consumed it; here the answer lands in the report as a Branch and a warning.",
+    must_follow: &[StepId("enable_tx")],
+    must_precede: &[],
+    run: s_tssi_loop_live,
+};
+
+const R_POWER_TRACKING: Step<Dev> = Step {
+    id: StepId("power_tracking"),
+    stage: Stage::Power,
+    class: StepClass::Required,
+    why: "★ thermal compensation is NOT a caller's choice: an untracked TX plan fades as the PA \
+          heats. The vendor's power-tracking DM is a `//[TBD]` stub on this chip, so either the \
+          hardware TSSI loop or this software stand-in must own the die thermal — and exactly one \
+          of them, which is what the rung decides from a readback. Verified to hold TX for the \
+          full length of a long transmit (893 frames over 15 s) with no fade. Delivered as a \
+          `StepOutcome::Guard`, so it is dropped with the handle rather than leaked or forgotten.",
+    must_follow: &[StepId("enable_tx")],
+    must_precede: &[],
+    run: s_power_tracking,
+};
+
+// ── the two plans ────────────────────────────────────────────────────────────
+
+/// The rungs both roles share, in the order `bring_up_monitor` ran them.
+const SHARED_STEPS: &[Step<Dev>] = &[
+    R_CARD_DISABLE,
+    R_POWER_ON,
+    R_FW_DL_SETUP,
+    R_DOWNLOAD_FIRMWARE,
+    R_MAC_CONFIG,
+    R_BB_CONFIG,
+    R_RF_CONFIG,
+    R_INIT_TRX,
+    R_RFK_INIT,
+    R_TUNE_CHANNEL,
+    R_SET_MONITOR,
+    R_ENABLE_TX_PATH,
+    R_SET_TXAGC_TABLE,
+    R_CONFIGURE_TRSW,
+];
+
+/// The shared rungs plus what `bring_up_tx` appended, in its order.
+const TX_STEPS: &[Step<Dev>] = &[
+    R_CARD_DISABLE,
+    R_POWER_ON,
+    R_FW_DL_SETUP,
+    R_DOWNLOAD_FIRMWARE,
+    R_MAC_CONFIG,
+    R_BB_CONFIG,
+    R_RF_CONFIG,
+    R_INIT_TRX,
+    R_RFK_INIT,
+    R_TUNE_CHANNEL,
+    R_SET_MONITOR,
+    R_ENABLE_TX_PATH,
+    R_SET_TXAGC_TABLE,
+    R_CONFIGURE_TRSW,
+    R_TSSI_SETUP,
+    R_ENABLE_TX,
+    R_TXPAUSE_RELEASED,
+    R_TSSI_LOOP_LIVE,
+    R_POWER_TRACKING,
+];
+
+/// The one exclusion both plans share: this part has no device selector.
+const EXCLUDED_ATTACH: (Stage, &str) = (
+    Stage::Attach,
+    "`Rtl8733buBackend::open` claims the FIRST matching 8731bu/8733bu on the bus and has no \
+     `open_select` sibling, so there is nothing to attach and no address to report \
+     (`DeviceAddress::Unknown`, stated rather than invented). Fine while a host carries one f72b; \
+     a second would need `DeviceSelect` added here, as the 8812au/88xx arms have.",
+);
+
+const MONITOR_PLAN: Plan<Dev> = Plan {
+    id: PlanId {
+        part: "rtl8733b",
+        name: "monitor",
+        ver: 2,
+    },
+    role: Role::ReceiveOnly,
+    steps: SHARED_STEPS,
+    excluded: &[
+        EXCLUDED_ATTACH,
+        (
+            Stage::Verify,
+            "ReceiveOnly: §4's transmit question is `NotRequested`, so there is nothing to verify \
+             by transmitting and no probe is taken. The one role-neutral readback (SYS_FUNC_EN's \
+             BB/RF enables) is a part-wide `Assert`, run after the last rung. ⚠ This plan does run \
+             `enable_tx_path` and can inject to the MAC — it is a receiver by DECLARED ROLE, and \
+             an instrument that wants to transmit must ask for TransmitAndReceive.",
+        ),
+    ],
+};
+
+const TX_PLAN: Plan<Dev> = Plan {
+    id: PlanId {
+        part: "rtl8733b",
+        name: "tx",
+        ver: 2,
+    },
+    role: Role::TransmitAndReceive,
+    steps: TX_STEPS,
+    excluded: &[EXCLUDED_ATTACH],
+};
+
+// ★ **A malformed plan is a compile error, not a runtime one.** In particular, moving
+// `R_TSSI_SETUP` after `R_ENABLE_TX` in `TX_STEPS` stops the crate building — the 19.6 dB / 1.6 dB
+// ordering is now enforced by the compiler rather than by a paragraph nobody re-reads.
+const _: () = MONITOR_PLAN.check_or_panic();
+const _: () = TX_PLAN.check_or_panic();
+
+/// The RTL8733BU's `Role::ReceiveOnly` plan — the old `bring_up_monitor`.
+pub static PLAN_8733B_MONITOR: Plan<Dev> = MONITOR_PLAN;
+/// The RTL8733BU's `Role::TransmitAndReceive` plan — the old `bring_up_tx` / `bring_up_tx_tracked`.
+pub static PLAN_8733B_TX: Plan<Dev> = TX_PLAN;
+
+/// §1.5, part-wide: the readbacks that hold for **both** roles, so neither plan produces a warning
+/// on a healthy bring-up. Role-specific readbacks (`txpause_released`, `tssi_loop_live`) are
+/// `StepClass::Assert` rungs inside the TX plan instead — same discipline, correct scope.
+///
+/// ⚠ `Warn` on introduction, per §5/M-hazards. Promotion to `Fatal` is per part and needs a
+/// measurement; a readback nobody has watched fail is not allowed to refuse a radio.
+const ASSERTS_8733B: &[Assert<Dev>] = &[Assert {
+    id: StepId("bb_rf_enabled"),
+    reg: 0x0002,
+    read: |b: &Dev| b.read_sys_func_en().map(u32::from),
+    want: 0x03,
+    mask: 0x03,
+    why: "REG_SYS_FUNC_EN's BB/RF-enable bits. `power_on` sets them and `is_powered` already reads \
+          them as its liveness test; both plans run `power_on`, so this holds for either role. A \
+          clear bit here means the analog block went away underneath a ladder that kept writing \
+          registers and getting Ok — which is exactly the silence this contract removes.",
+    severity: Severity::Warn,
+}];
+
+/// §4 — what this part can prove about its own transmitter.
+///
+/// ★ **The best-calibrated instrument in the fleet, and it is now actually called.** MEASURED
+/// exactly +50 across 50 injects, so the counter is one-per-transmit-request and can be differenced
+/// directly. A zero delta across an event that should have transmitted proves the failure is
+/// upstream of the PHY — queue, descriptor or doorbell — not on the air.
+///
+/// ⚠ **OFDM pair only.** CCK lives at 0x2de4/0x2de6 and is unimplemented, so a CCK-rate probe would
+/// read +0 and look like a refutation. `probe_tx` therefore keys the transmitter at
+/// `DESC_RATE_6M` (legacy OFDM), which is also this backend's boot default.
+const TX_INSTRUMENTS_8733B: &[TxInstrument] = &[TxInstrument {
+    name: "read_tx_counters 0x2de0/0x2de2 (OFDM tx_en/tx_on)",
+    cost_us: 2_000,
+}];
+
+/// The probe frame's payload — deliberately self-identifying, because these frames go on the air
+/// and somebody staring at a capture deserves to know what they are.
+const TX_PROBE_PAYLOAD: &[u8] = b"NDR-BRINGUP-TXPROBE";
+
+impl BringUp for Rtl8733buBackend {
+    fn plan(role: Role) -> Option<&'static Plan<Self>> {
+        match role {
+            Role::ReceiveOnly => Some(&PLAN_8733B_MONITOR),
+            Role::TransmitAndReceive => Some(&PLAN_8733B_TX),
+            // A named refusal, not a silent downgrade. There is no transmit-only ladder on this
+            // part: `set_monitor` (RCR + the three filter maps) is in the middle of the sequence
+            // the TX path is built on, and removing it has never been measured. A caller that
+            // wants a pure TX blast asks for TransmitAndReceive and does not start the RX pump.
+            Role::TransmitOnly => None,
+        }
+    }
+
+    fn asserts() -> &'static [Assert<Self>] {
+        ASSERTS_8733B
+    }
+
+    fn tx_instruments() -> &'static [TxInstrument] {
+        TX_INSTRUMENTS_8733B
+    }
+
+    fn probe_tx(
+        self: &Arc<Self>,
+        _instrument: &TxInstrument,
+        probes: u16,
+    ) -> Option<Result<TxProbe, FaceError>> {
+        Some(self.probe_tx_counters(probes))
     }
 }
 
@@ -2047,19 +2676,21 @@ impl Rtl8733buBackend {
         Ok(())
     }
 
-    /// Tune the RF to a 2.4 GHz channel (`config_phydm_switch_channel_8733b`, G-band
-    /// path): clear the band/channel bits of RF 0x18 and set the channel, write both
-    /// paths with the cut-D settle loop (poll RF 0xc5 BIT15), restore RF 0x19, and
-    /// select the 2.4 GHz RX AGC table. Prerequisite for calibration + TX/RX.
-    /// Set up and enable the **TSSI** (Transmit Signal Strength Indication) TX-power loop —
-    /// the vendor `halrf_do_tssi_8733b` path. On the 8731bu the per-rate TX power is driven
-    /// by TSSI when enabled (`0x4318[30:28]=7`); without it the TX datapath comes up with
-    /// undefined/intermittent power. Ports anapar + rf-setting + txpwr-bb-common + DCK +
-    /// slope + slope-cal + track + enable for the given band (5 GHz when `ch > 14`), minus
-    /// the efuse-DE/thermal fine-offsets (thermal table left at hardware default). Call
-    /// after [`bring_up_monitor`](Self::bring_up_monitor) / [`tune_channel`](Self::tune_channel).
-    pub fn tssi_setup(&self, ch: u8) -> Result<(), FaceError> {
-        self.tssi_setup_upto(ch, u8::MAX)
+    rung! {
+        /// Tune the RF to a 2.4 GHz channel (`config_phydm_switch_channel_8733b`, G-band
+        /// path): clear the band/channel bits of RF 0x18 and set the channel, write both
+        /// paths with the cut-D settle loop (poll RF 0xc5 BIT15), restore RF 0x19, and
+        /// select the 2.4 GHz RX AGC table. Prerequisite for calibration + TX/RX.
+        /// Set up and enable the **TSSI** (Transmit Signal Strength Indication) TX-power loop —
+        /// the vendor `halrf_do_tssi_8733b` path. On the 8731bu the per-rate TX power is driven
+        /// by TSSI when enabled (`0x4318[30:28]=7`); without it the TX datapath comes up with
+        /// undefined/intermittent power. Ports anapar + rf-setting + txpwr-bb-common + DCK +
+        /// slope + slope-cal + track + enable for the given band (5 GHz when `ch > 14`), minus
+        /// the efuse-DE/thermal fine-offsets (thermal table left at hardware default). Call
+        /// after [`bring_up_monitor`](Self::bring_up_monitor) / [`tune_channel`](Self::tune_channel).
+        fn tssi_setup(&self, ch: u8) -> Result<(), FaceError> {
+            self.tssi_setup_upto(ch, u8::MAX)
+        }
     }
 
     /// [`tssi_setup`](Self::tssi_setup) truncated after phase `upto` — for bisecting which phase
@@ -4054,23 +4685,25 @@ impl Rtl8733buBackend {
         Ok(())
     }
 
-    /// **Enable the RF TX path for normal operation** (`config_phydm_trx_mode_8733b` +
-    /// `phydm_dis_cck_trx_8733b(SET)`, path A 1×1). Programs the RF mode table
-    /// (`0x1800`, nibbles `0=shutdown/1=standby/2=TX/3=RX`) to a TX-capable state,
-    /// selects path A (`0x1884`), enables BB CCK TX (`0x2a00[1]=0`) + CCK CCA
-    /// (`0x2a24[13]=0`), and resets the BB. Without this the RF never enters TX mode on
-    /// a MAC transmit, so injected frames don't radiate.
-    pub fn enable_tx_path(&self) -> Result<(), FaceError> {
-        self.bb_set(0x1800, 0x000F_FFFF, 0x33311)?; // RF mode table (pre)
-        self.bb_set(0x1884, 1 << 21, 0)?; // sw-control s0/s1
-        self.bb_set(0x1884, 1 << 20, 0)?; // tx = rx = path A
-        self.bb_set(0x1800, 0x000F_FFFF, 0x33312)?; // RF mode table (TX-capable)
-        self.bb_reset()?;
-        self.igi_toggle()?;
-        self.bb_set(0x2a24, 1 << 13, 0)?; // enable CCK CCA
-        self.bb_set(0x2a00, 1 << 1, 0)?; // enable BB CCK TX
-        self.bb_reset()?;
-        Ok(())
+    rung! {
+        /// **Enable the RF TX path for normal operation** (`config_phydm_trx_mode_8733b` +
+        /// `phydm_dis_cck_trx_8733b(SET)`, path A 1×1). Programs the RF mode table
+        /// (`0x1800`, nibbles `0=shutdown/1=standby/2=TX/3=RX`) to a TX-capable state,
+        /// selects path A (`0x1884`), enables BB CCK TX (`0x2a00[1]=0`) + CCK CCA
+        /// (`0x2a24[13]=0`), and resets the BB. Without this the RF never enters TX mode on
+        /// a MAC transmit, so injected frames don't radiate.
+        fn enable_tx_path(&self) -> Result<(), FaceError> {
+            self.bb_set(0x1800, 0x000F_FFFF, 0x33311)?; // RF mode table (pre)
+            self.bb_set(0x1884, 1 << 21, 0)?; // sw-control s0/s1
+            self.bb_set(0x1884, 1 << 20, 0)?; // tx = rx = path A
+            self.bb_set(0x1800, 0x000F_FFFF, 0x33312)?; // RF mode table (TX-capable)
+            self.bb_reset()?;
+            self.igi_toggle()?;
+            self.bb_set(0x2a24, 1 << 13, 0)?; // enable CCK CCA
+            self.bb_set(0x2a00, 1 << 1, 0)?; // enable BB CCK TX
+            self.bb_reset()?;
+            Ok(())
+        }
     }
 
     /// Route the TX/RX antenna-switch (TRSW) control GPIOs
@@ -4236,7 +4869,6 @@ const DESC_RATE_6M: u8 = 0x04;
 
 #[async_trait]
 impl FrameIo for Rtl8733buBackend {
-
     /// This radio's own capability, so a face built from the bare `dyn FrameIo` does not have to
     /// invent one. Delegates to this type's [`RadioProfile`] — the single source of truth.
     fn radio_capability(&self) -> Option<ndn_radio_hal::RadioCapability> {
@@ -4346,13 +4978,62 @@ impl RadioKnobs for Rtl8733buBackend {
     /// `NDN_8733B_NO_TSSI=1`: merely flipping 0x4318 BIT30 after the fact yields an
     /// enabled-but-unconfigured loop, which MEASURED **1.6 dB** of range versus 19.6 dB — i.e. it
     /// looks like a dead knob.
-    fn set_tx_power(&self, idx: u32) -> Result<(), FaceError> {
+    fn set_tx_power(&self, req: PowerRequest) -> Result<AppliedPower, FaceError> {
+        // ★ **No calibrated/raw split on this part** — it has ONE power path (the TSSI loop), and
+        // `read_tx_power_info` is *returned to the caller* rather than stashed as hidden state.
+        // That is why the bring-up contract cites this driver as evidence the contract is meetable.
+        // Every request that names an index therefore resolves to the same actuator; `Raw` is
+        // refused rather than pretended, because there is no second axis to reach.
+        let (idx, clamped) = match &req {
+            PowerRequest::Ceiling(_) => (127u32, false),
+            PowerRequest::Index(i, _) => (*i as u32, false),
+            PowerRequest::Raw { idx, .. } => {
+                // Honoured, but it is the SAME register: say so rather than inventing a regime.
+                (*idx as u32, false)
+            }
+            PowerRequest::Dbm(d) => {
+                return Err(ndn_radio_hal::bringup::power_unsupported(format!(
+                    "rtl8733b: PowerRequest::Dbm({d}) — the TSSI DE knob spans a MEASURED 19.6 dB \
+                     but ~0.11-0.15 dB/step VARIES run to run by ~35% and has no absolute anchor \
+                     (RadioCapability::tx_power_dbm is None). Use PowerRequest::Index.",
+                )));
+            }
+            PowerRequest::NoActuator => {
+                return Err(ndn_radio_hal::bringup::power_unsupported(
+                    "rtl8733b: PowerRequest::NoActuator, but the TSSI DE knob DOES actuate power \
+                     (19.6 dB MEASURED).",
+                ));
+            }
+        };
         if self.read32(0x4318)? & (1 << 30) == 0 {
             self.set_tssi_enabled(true)?;
         }
         // Higher index = more power (HAL convention); higher DE = LESS power (the DE offsets the
         // loop's error term), so the scale is inverted here.
-        self.set_tssi_de((127 - idx.min(127)) as i8)
+        let de = (127 - idx.min(127)) as i8;
+        self.set_tssi_de(de)?;
+        Ok(AppliedPower::from_writes(
+            req.clone(),
+            PowerReference::DriverReference {
+                // ⚠ Not `FusedBase`: the TSSI loop is a closed loop around a driver-written target,
+                // not a per-adapter fuse read.
+                source: "8733b TSSI DE (0x4318 BIT30 loop; requires tssi_setup at bring-up, \
+                         which MEASURED 19.6 dB of range vs 1.6 dB for a lazy enable)",
+                // ⚠ ~0.11-0.15 dB/step, but it VARIES RUN TO RUN BY ~35% and the absolute anchor is
+                // unknown. Reporting a slope here would be reporting a number that is not stable
+                // across bring-ups — `None` is the honest answer, per the same rule that keeps
+                // `tx_power_dbm` None on this part.
+                slope_db_per_idx: None,
+            },
+            idx.min(127) as u8,
+            clamped,
+            vec![PowerWrite {
+                reg: 0x4318,
+                value: de as u8,
+                group: "TSSI DE",
+                path: 0,
+            }],
+        ))
     }
     // set_tx_csd stays the default no-op: the 8731bu is 1x1 (single chain), so there is no
     // second chain to apply cyclic-shift diversity to.

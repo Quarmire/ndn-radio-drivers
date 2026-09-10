@@ -21,3 +21,8 @@ CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
 CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
 CONFIG_LOG_DEFAULT_LEVEL_NONE=y
 CONFIG_ESP_TASK_WDT_INIT=n
+
+# Channel State Information. The blob gates esp_wifi_set_csi() on this flag and returns ESP_FAIL
+# silently without it, so the whole CSI sensor is one line away. Costs ~10 KB of RAM (it is sized by
+# CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM), shared with NimBLE's heap.
+CONFIG_ESP_WIFI_CSI_ENABLED=y

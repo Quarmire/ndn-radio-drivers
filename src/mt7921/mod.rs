@@ -132,6 +132,11 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use rusb::{Context, DeviceHandle};
 
+use ndn_radio_hal::bringup::{
+    AppliedPower, Assert, BringUp, BringUpFailure, BringUpReport, Ctx, Degradation, Deviation,
+    Fact, Guards, Plan, PlanId, PlanRun, PowerRequest, ProofRequirement, PumpPolicy, RadioState,
+    Role, Stage, Step, StepClass, StepId, StepOutcome,
+};
 use ndn_radio_hal::{
     Band, Bandwidth, CsiSupport, RadioCapability, RadioKind, RadioKnobs, RadioProfile, RadioTime,
     RateCapability, TxDiscipline,
@@ -459,6 +464,18 @@ pub struct Mt7921uBackend {
     /// drain each other's counter — two consumers sampling at different cadences would
     /// otherwise each see a fraction of the traffic and neither would look wrong.
     rx_ok_window: AtomicU64,
+    /// The bring-up bulk-IN drain, owned for **exactly** the rungs it covered before the plan
+    /// existed (M5): started by `rx_drain`, dropped by `rx_drain_stop`, and cleared
+    /// unconditionally by [`bring_up_planned`](Mt7921uBackend::bring_up_planned) so a failure
+    /// partway up the ladder does not leak the thread.
+    ///
+    /// ★ It is NOT a `StepOutcome::Guard`: a guard is owned by the returned handle, which would
+    /// silently extend the drain across `tune_channel` and `monitor_rx` — rungs it never covered —
+    /// and leave a thread reading `0x84` for the life of the process.
+    bringup_drain: Mutex<Option<DrainGuard>>,
+    /// `NDN_RADIO_FORCE_FW`, read ONCE at the wrapper boundary (LAW 1) and stashed here for the
+    /// one rung that branches on it.
+    force_cold_fw: AtomicBool,
 }
 
 /// Stops the bring-up bulk-IN drain on **every** exit path, including the error ones.
@@ -540,6 +557,8 @@ impl Mt7921uBackend {
             rx_undecodable: AtomicU64::new(0),
             rx_accepted: AtomicU64::new(0),
             rx_ok_window: AtomicU64::new(0),
+            bringup_drain: Mutex::new(None),
+            force_cold_fw: AtomicBool::new(false),
         })
     }
 
@@ -645,158 +664,101 @@ impl Mt7921uBackend {
 
     // ── Bring-up ────────────────────────────────────────────────────────────
 
-    /// Full bring-up: power the chip, program the USB DMA engine, download the ROM patch and
-    /// the RAM firmware, start it, and do the post-firmware MAC programming.
+    /// **The full bring-up — [`PLAN_MT7921AU`], `Role::TransmitAndReceive`.** A thin wrapper over
+    /// [`bring_up_planned`](Self::bring_up_planned); the sequence lives in the plan, where every
+    /// rung states why it is there and a reviewer sees the whole ladder at once.
     ///
-    /// Cold sequence, with upstream lines:
-    /// 1. [`mcu::power_up`](crate::connac2::mcu::power_up) — chip-id check, then
-    ///    `mt792xu_wfsys_reset` **only if firmware was already running**, then
-    ///    `mt792xu_mcu_power_on` (`mt7921/usb.c:214-226`). ★ That order is easy to get
-    ///    backwards: the reset clears `FW_PWR_ON`, so a power-on that ran first would be
-    ///    undone and every later register access would read a chip that is off.
-    /// 2. [`dma_init`](Self::dma_init) — `mt792xu_dma_init` (`mt792x_usb.c:393-422`).
-    ///    Upstream runs this *between* power-on and `mcu_init`, and
-    ///    [`mcu::run_firmware`](crate::connac2::mcu::run_firmware)'s own doc flags its
-    ///    absence as making the download "not a clean experiment". It is implemented here
-    ///    because it is bus programming, not MCU protocol.
-    /// 3. [`mcu::run_firmware`](crate::connac2::mcu::run_firmware) — `SWDEF_NORMAL_MODE`,
-    ///    `MT_FW_DL_EN`, `NIC_POWER_CTRL`, patch, RAM, `FW_START_REQ`, the `FW_N9_RDY` poll,
-    ///    `MT_FW_DL_EN` off (`mt7921/usb.c:63-85` + `mt792x_core.c:980-1036`).
-    /// 4. `mt7921_mcu_set_eeprom` (`mt7921/init.c:100`) — take calibration from the efuse.
-    ///    Skip it and the PHY runs uncalibrated, which on the neighbouring Realtek parts is
-    ///    exactly the "TX works, decode is marginal" failure that cost this bench weeks.
-    /// 5. `mac_init` — `mt7921_mac_init` + `mt792x_mac_init_band`.
-    /// 6. `mt76_connac_mcu_set_mac_enable` (`mt76_connac_mcu.c:216-231`).
-    /// 7. Read the factory MAC out of the efuse (needs firmware).
+    /// Power the chip, program the USB DMA engine, download the ROM patch and the RAM firmware,
+    /// start it, do the post-firmware MAC programming, pin EDCA, **tune, and put the MAC into
+    /// promiscuous monitor RX** — the last two being the M5 change.
     ///
-    /// **Warm re-open.** If [`firmware_running`](Self::firmware_running) says the MCU already
-    /// holds the chip, steps 1 and 3 are skipped and only the idempotent register/command
-    /// programming re-runs. `NDN_RADIO_FORCE_FW=1` forces the cold path on a device you are
-    /// willing to replug. Note upstream does **not** do this — `mt7921u_probe` resets and
-    /// reloads unconditionally (`mt7921/usb.c:218-226`) — and the divergence is deliberate;
-    /// see [`firmware_running`](Self::firmware_running).
+    /// ★ **This arm is where the ordering defect §5-M5 names actually bit.** `setup_monitor_rx`
+    /// REFUSES outright while the channel is still 0 ("the sniffer carries its own copy of the
+    /// channel and has nothing to be told"), and `open_named_radio`'s MT7921AU arm called it
+    /// BEFORE `set_channel` — so the factory returned an error for EVERY caller and was simply
+    /// broken for this part until 2026-09-01. It was found by trying to use the factory, not by
+    /// reading it: the other arms tuned first and this one drifted. That is the cost of five
+    /// hand-written bring-up sequences with no shared checklist, and it is why the tune and the
+    /// monitor call are now rungs with a DECLARED ordering that fails at plan construction.
     ///
-    /// # ★ The bulk-IN drain, and why it does not cover the whole of bring-up
+    /// ⚠ **`self: &Arc<Self>`, not `&self`** (M5) — [`Step::run`] takes `&Arc<B>`.
     ///
-    /// On both older mt76 parts, if nobody reads the data bulk-IN the device's USB DMA backs
-    /// up and **the MCU stops consuming inband commands** — they are accepted into the FIFO
-    /// and never processed, so the *next* command's bulk-out times out rather than the
-    /// offending one (MEASURED on the MT7610U as `command 0x0c seq 0 bulk-out (200 B):
-    /// Operation timed out` partway through `init_hardware`, on a device whose registers
-    /// were all answering). The MT7610U and MT7612U backends both carry a background drain
-    /// for the duration of bring-up, with a `DrainGuard` that stops it on every error path.
-    /// That pattern is copied here — with one **deliberate difference, stated loudly**:
-    ///
-    /// The drain starts **after** the firmware download, not before it. On the mt76x0 the
-    /// drain is unconditionally safe because the command-response pipe (`0x85`) is a
-    /// different pipe from the data pipe (`0x84`). On connac2 that is *undetermined*: the
-    /// MCU response endpoint is discovered by [`mcu::Connac2Mcu`] on the first waited
-    /// command, and if it lands on `0x84` a drain reading `0x84` eats responses. So:
-    ///
-    ///   * **Phase A — power-up, DMA init, firmware download: no drain.** Nothing is being
-    ///     received here (no channel, no MAC enable, and `MT_FW_DL_EN` has AC_BE wired to
-    ///     the firmware queue), so the pipe has nothing to back up *with*; and this is
-    ///     precisely the phase whose first waited command determines the latch. Upstream
-    ///     submits no RX URBs during download either.
-    ///   * **Phase B — eeprom, MAC init, mac-enable and everything after: drain, but only
-    ///     if the latch came out on `0x85`.** That is the mt76x0-equivalent situation and
-    ///     the phase where the older parts actually stalled. If the latch is `0x84` the
-    ///     drain is skipped and a warning is logged, because reading that pipe would break
-    ///     every subsequent command instead of protecting it.
-    ///
-    /// The MEASURED failure mode is a *stalled command*, which is loud. Silently eating an
-    /// MCU response is quiet. Given a choice between the two, the loud one wins.
-    pub fn bring_up(&self) -> Result<(), FaceError> {
-        let force = std::env::var_os("NDN_RADIO_FORCE_FW").is_some();
-        let warm = !force && self.firmware_running();
+    /// ⚠ **`NDN_RADIO_FORCE_FW` is no longer read inside the ladder** (LAW 1): once, here.
+    pub fn bring_up(self: &Arc<Self>, channel: u8) -> Result<BringUpReport, FaceError> {
+        // ★ M8: ONE reader. `NDN_RADIO_FORCE_FW` is read by
+        // `crate::open_radio::mt76_force_cold_from_env`, which `BringUpRequest::from_env` also
+        // calls — so this wrapper and the factory can never disagree about it.
+        let force_cold = crate::open_radio::mt76_force_cold_from_env();
+        self.bring_up_planned(
+            channel,
+            Role::TransmitAndReceive,
+            force_cold,
+            None,
+            ProofRequirement::BestAvailable,
+        )
+        .map(|(report, guards)| {
+            debug_assert!(guards.is_empty(), "this plan produces no guards");
+            report
+        })
+        .map_err(drop_partial_report)
+    }
 
-        if warm {
-            tracing::info!(
-                target: "named_radio",
-                chip = "MT7921AU",
-                "firmware already running (MT_CONN_ON_MISC & FW_N9_RDY) — warm re-open, \
-                 skipping the power-up and the firmware download",
-            );
-            // ★ `resume = true`, which is upstream's own parameter and not a shortcut:
-            // `mt792xu_dma_init(dev, true)` re-applies the WFDMA/UDMA register values (they
-            // are values, not a sequence, so this is idempotent) and **stops before**
-            // `mt792xu_dma_rx_evt_ep4` and `mt792xu_epctl_rst_opt` (`mt792x_usb.c:411-421`).
-            // That matters here: `dma_rx_evt_ep4` drops and re-raises `RX_DMA_EN` on a chip
-            // whose firmware is live and may be mid-transfer, which is exactly the class of
-            // disturbance a warm re-open exists to avoid.
-            self.dma_init(true)?;
-        } else {
-            let chip = mcu::power_up(&self.usb)?;
-            self.dma_init(false)?;
-            mcu::run_firmware(
-                &self.mcu,
-                &self.usb,
-                chip.hw_rev,
-                mcu::MT7961_PATCH,
-                mcu::MT7961_RAM,
-            )?;
-            tracing::info!(
-                target: "named_radio",
-                chip = "MT7921AU",
-                hw_rev = format_args!("{:#010x}", chip.hw_rev),
-                was_running = chip.was_running,
-                mcu_response_ep = ?self.mcu.response_ep().map(|e| format!("{e:#04x}")),
-                "mt7921u: firmware up",
-            );
+    /// **The one entry point.** Everything else is a wrapper over this.
+    // The `Err` is large BECAUSE it carries the partial report — §3's whole point.
+    #[allow(clippy::result_large_err)]
+    pub fn bring_up_planned(
+        self: &Arc<Self>,
+        channel: u8,
+        role: Role,
+        force_cold: bool,
+        deviation: Option<Deviation>,
+        proof: ProofRequirement,
+    ) -> Result<(BringUpReport, Guards), BringUpFailure> {
+        self.force_cold_fw.store(force_cold, Ordering::Relaxed);
+        let mut run = PlanRun::new(
+            "MT7921AU",
+            ndn_radio_hal::DeviceAddress::Usb(self.usb.usb_addr().to_string()),
+            self.initial_state(channel, role),
+        )
+        .with_proof(proof);
+        if let Some(d) = deviation {
+            run = run.with_deviation(d);
         }
+        // UFCS: the inherent `bring_up(channel)` above shadows the trait method of the same name.
+        let out = <Self as BringUp>::bring_up(self, &run);
+        // ★ Belt over the `rx_drain_stop` rung: a Required failure anywhere above it returns
+        // before that rung runs, and the drain thread would then read `0x84` for the life of the
+        // process. This is what `DrainGuard`'s `Drop` used to do from the enclosing scope.
+        drop(
+            self.bringup_drain
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take(),
+        );
+        let (report, guards) = out?;
+        Ok((
+            report.with_capability(ndn_radio_hal::RadioProfile::capability(self.as_ref())),
+            guards,
+        ))
+    }
 
-        // ── Phase B: the drain may run from here (see the doc above) ────────
-        let _drain = self.spawn_bringup_drain();
-
-        mcu::set_eeprom_efuse_mode(&self.mcu, &self.usb)?;
-        self.mac_init()?;
-        mcu::set_mac_enable(&self.mcu, &self.usb, 0, true)?;
-
-        // The efuse read needs firmware, so it lives here and not in `open`. Not fatal:
-        // this address is never put on air (the named-radio doctrine forbids a host identity
-        // in the source field), so a failure costs a log line, not a radio.
-        match mcu::read_mac_addr(&self.mcu, &self.usb) {
-            Ok(mac) => {
-                *self.mac_addr.lock().unwrap_or_else(|e| e.into_inner()) = Some(mac);
-                tracing::info!(
-                    target: "named_radio",
-                    chip = "MT7921AU",
-                    mac = format_args!(
-                        "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-                        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
-                    ),
-                    "mt7921u: factory MAC (diagnostic only — never transmitted)",
-                );
-            }
-            Err(e) => tracing::warn!(
-                target: "named_radio",
-                chip = "MT7921AU",
-                error = %e,
-                "mt7921u: could not read the factory MAC from the efuse; continuing",
-            ),
+    /// The regime a plan starts from — what the caller asked for, which the rungs fill in.
+    fn initial_state(&self, channel: u8, role: Role) -> RadioState {
+        RadioState {
+            channel,
+            bw: Bandwidth::Bw20,
+            format: "RawNdn (see with_format)",
+            role,
+            // ★ MEASURED: this part has NO power actuator at all. `power_actuated == false` is the
+            // declarative half of the same fact; this is the applied half, and it is why
+            // `PowerRequest::NoActuator` exists as a request rather than being inferred.
+            power: AppliedPower::no_actuator(PowerRequest::NoActuator),
+            rate: ndn_radio_hal::RateState::unreported(),
+            warm: None,
+            contention: None,
+            pump: PumpPolicy::CallerOwns,
+            facts: Vec::new(),
         }
-
-        // ★★ Pin EDCA to a KNOWN posture. USB never power-cycles the chip between processes and
-        // the warm path above deliberately does NOT reload firmware state, so contention was
-        // simply whatever the previous run left. MEASURED on the sibling MT7610U, five consecutive
-        // processes: a run that set no posture returned 2724 or 6706 f/s — a **2.5x swing decided
-        // purely by run order**. This part is worse placed to notice, because its EDCA lives behind
-        // `MCU_CE_CMD(SET_EDCA_PARMS)` firmware state that no register read reveals.
-        //
-        // `restore_edca` was written for exactly this and had **zero callers in the workspace** —
-        // the same shape as the capability leak: the mechanism existed and nothing invoked it.
-        // Non-fatal on purpose: a contention write failing must not turn a working radio into no
-        // radio. See `mt76x0::bring_up` for the measurement and `coverage::CONTENTION_PINNED`.
-        if let Err(e) = self.restore_edca() {
-            tracing::warn!(
-                target: "named_radio",
-                chip = "MT7921AU",
-                error = %e,
-                "mt7921u: EDCA not pinned — contention posture is whatever the previous process \
-                 left; pin NDN_POSTURE before trusting any throughput figure",
-            );
-        }
-        Ok(())
     }
 
     /// Start the bring-up bulk-IN drain, if it is safe to (see [`bring_up`](Self::bring_up)).
@@ -1187,97 +1149,99 @@ impl Mt7921uBackend {
 
     // ── Monitor RX ──────────────────────────────────────────────────────────
 
-    /// Put the part into promiscuous monitor receive.
-    ///
-    /// In order:
-    /// 1. `mt7921_mcu_set_sniffer(enable)` (`mt7921/mcu.c:1151-1178`) — the actual
-    ///    monitor-mode switch; mac80211 reaches it from `mt7921_config` on
-    ///    `IEEE80211_CONF_CHANGE_MONITOR` (`mt7921/main.c:610`).
-    /// 2. `mt7921_mcu_config_sniffer` (`:1181-1247`) — the sniffer's **own copy** of the
-    ///    channel. The PHY retune ([`RadioKnobs::set_channel`]) is not sufficient on its own.
-    /// 3. `mt7921_mcu_set_rxfilter` (`:1477-1497`) with everything through.
-    ///
-    /// # Why the RX filter goes through the MCU and not `MT_WF_RFCR`
-    ///
-    /// `MT_WF_RFCR` is a real register at `0x820e5000` and `MT_VEND_WRITE_EXT` reaches it,
-    /// so writing the drop bits directly looks like one EP0 write instead of a bulk command.
-    /// It is wrong here for one reason: **the firmware owns that register** and rewrites it
-    /// on every channel switch, sniffer enable and BSS update (`mt7921/mcu.c:1106-1123`
-    /// reaches for the same command just to flip `DROP_OTHER_BEACON`). A host-side write
-    /// would be silently reverted at the next firmware event — RX that works until you
-    /// retune, which is the worst failure shape there is.
-    ///
-    /// # ★ FCS-failed frames come through, and are dropped in software
-    ///
-    /// Default is [`mcu::RX_FILTER_PROMISCUOUS`] (`ENABLE | FCSFAIL | CONTROL | OTHER_BSS`)
-    /// with the sniffer's `drop_err = 0`. Dropping bad-FCS frames *in hardware* makes a
-    /// marginal link and a quiet channel look identical, which is the exact ambiguity the
-    /// occupancy counters exist to resolve; carrying the verdict per frame
-    /// ([`mac::Rxd::fcs_err`]) lets `parse_transfer` **count** them and then drop them.
-    ///
-    /// ⚠ And that is precisely the trap the LR2021 testbed spent a campaign inside — every
-    /// on-air result there turned out to be CRC-failing frames. The rule here: the *counter*
-    /// is evidence about the channel, the *payload path* never sees one.
-    /// `NDN_RADIO_RX_STRICT=1` switches to [`mcu::RX_FILTER_PROMISCUOUS_VALID`] and
-    /// `drop_err = 1` (upstream's own setting) for a run where that must be true in hardware
-    /// too.
-    ///
-    /// # ★ What makes RXD group 2 — the timestamp — present
-    ///
-    /// **Nothing does, and that is the honest answer.** The *only* RXD-group gate anywhere
-    /// in the upstream tree is `MT_DMA_DCR0_RXD_G5_EN` for group 5 (`mt792x_mac.c:304`,
-    /// `mt7915/main.c:507`); groups 1-4 have no enable register. The evidence points to a
-    /// per-frame, content-dependent bitmap — group 1 tracks `SEC_MODE`, group 4 tracks
-    /// header translation — with group 2 apparently always on for a normal frame.
-    ///
-    /// So this method does the two things that are actually in its power, and then *watches*:
-    ///   * it leaves header translation **off** (`mac_init` departure 1),
-    ///     since group 4's presence tracks it and a translated frame is a different
-    ///     descriptor shape;
-    ///   * it turns group 5 **on**, which is the one group bit that is settable at all, so a
-    ///     later "group N is missing" question can be asked against a known configuration;
-    ///   * and `parse_transfer` counts [`RxStats::stamped`] separately from
-    ///     [`RxStats::units`], so a missing timestamp is **visible in one number** instead of
-    ///     silently absent. [`rx_health`](Self::rx_health) prints both.
-    ///
-    /// If a capture ever shows group 2 missing, the place to look is the firmware
-    /// `CHIP_CONFIG` / RX-header-translation MCU commands, not a register in this file.
-    pub fn setup_monitor_rx(&self) -> Result<(), FaceError> {
-        let ch = self.channel.load(Ordering::Relaxed);
-        if ch == 0 {
-            return Err(io_err(
-                "mt7921u: setup_monitor_rx before set_channel — the sniffer carries its own \
-                 copy of the channel and has nothing to be told"
-                    .into(),
-            ));
-        }
-        let strict = std::env::var_os("NDN_RADIO_RX_STRICT").is_some();
+    rung! {
+        /// Put the part into promiscuous monitor receive.
+        ///
+        /// In order:
+        /// 1. `mt7921_mcu_set_sniffer(enable)` (`mt7921/mcu.c:1151-1178`) — the actual
+        ///    monitor-mode switch; mac80211 reaches it from `mt7921_config` on
+        ///    `IEEE80211_CONF_CHANGE_MONITOR` (`mt7921/main.c:610`).
+        /// 2. `mt7921_mcu_config_sniffer` (`:1181-1247`) — the sniffer's **own copy** of the
+        ///    channel. The PHY retune ([`RadioKnobs::set_channel`]) is not sufficient on its own.
+        /// 3. `mt7921_mcu_set_rxfilter` (`:1477-1497`) with everything through.
+        ///
+        /// # Why the RX filter goes through the MCU and not `MT_WF_RFCR`
+        ///
+        /// `MT_WF_RFCR` is a real register at `0x820e5000` and `MT_VEND_WRITE_EXT` reaches it,
+        /// so writing the drop bits directly looks like one EP0 write instead of a bulk command.
+        /// It is wrong here for one reason: **the firmware owns that register** and rewrites it
+        /// on every channel switch, sniffer enable and BSS update (`mt7921/mcu.c:1106-1123`
+        /// reaches for the same command just to flip `DROP_OTHER_BEACON`). A host-side write
+        /// would be silently reverted at the next firmware event — RX that works until you
+        /// retune, which is the worst failure shape there is.
+        ///
+        /// # ★ FCS-failed frames come through, and are dropped in software
+        ///
+        /// Default is [`mcu::RX_FILTER_PROMISCUOUS`] (`ENABLE | FCSFAIL | CONTROL | OTHER_BSS`)
+        /// with the sniffer's `drop_err = 0`. Dropping bad-FCS frames *in hardware* makes a
+        /// marginal link and a quiet channel look identical, which is the exact ambiguity the
+        /// occupancy counters exist to resolve; carrying the verdict per frame
+        /// ([`mac::Rxd::fcs_err`]) lets `parse_transfer` **count** them and then drop them.
+        ///
+        /// ⚠ And that is precisely the trap the LR2021 testbed spent a campaign inside — every
+        /// on-air result there turned out to be CRC-failing frames. The rule here: the *counter*
+        /// is evidence about the channel, the *payload path* never sees one.
+        /// `NDN_RADIO_RX_STRICT=1` switches to [`mcu::RX_FILTER_PROMISCUOUS_VALID`] and
+        /// `drop_err = 1` (upstream's own setting) for a run where that must be true in hardware
+        /// too.
+        ///
+        /// # ★ What makes RXD group 2 — the timestamp — present
+        ///
+        /// **Nothing does, and that is the honest answer.** The *only* RXD-group gate anywhere
+        /// in the upstream tree is `MT_DMA_DCR0_RXD_G5_EN` for group 5 (`mt792x_mac.c:304`,
+        /// `mt7915/main.c:507`); groups 1-4 have no enable register. The evidence points to a
+        /// per-frame, content-dependent bitmap — group 1 tracks `SEC_MODE`, group 4 tracks
+        /// header translation — with group 2 apparently always on for a normal frame.
+        ///
+        /// So this method does the two things that are actually in its power, and then *watches*:
+        ///   * it leaves header translation **off** (`mac_init` departure 1),
+        ///     since group 4's presence tracks it and a translated frame is a different
+        ///     descriptor shape;
+        ///   * it turns group 5 **on**, which is the one group bit that is settable at all, so a
+        ///     later "group N is missing" question can be asked against a known configuration;
+        ///   * and `parse_transfer` counts [`RxStats::stamped`] separately from
+        ///     [`RxStats::units`], so a missing timestamp is **visible in one number** instead of
+        ///     silently absent. [`rx_health`](Self::rx_health) prints both.
+        ///
+        /// If a capture ever shows group 2 missing, the place to look is the firmware
+        /// `CHIP_CONFIG` / RX-header-translation MCU commands, not a register in this file.
+        fn setup_monitor_rx(&self) -> Result<(), FaceError> {
+            let ch = self.channel.load(Ordering::Relaxed);
+            if ch == 0 {
+                return Err(io_err(
+                    "mt7921u: setup_monitor_rx before set_channel — the sniffer carries its own \
+                     copy of the channel and has nothing to be told"
+                        .into(),
+                ));
+            }
+            let strict = std::env::var_os("NDN_RADIO_RX_STRICT").is_some();
 
-        mcu::set_sniffer(&self.mcu, &self.usb, 0, true)?;
-        // Carry the width the radio is actually tuned to, not a guess — see config_sniffer.
-        self.config_sniffer(
-            ch,
-            Bandwidth::from_code(self.bw.load(Ordering::Relaxed)),
-            strict,
-        )?;
-        let fif = if strict {
-            mcu::RX_FILTER_PROMISCUOUS_VALID
-        } else {
-            mcu::RX_FILTER_PROMISCUOUS
-        };
-        mcu::set_rx_filter(&self.mcu, &self.usb, fif, 0, 0)?;
-        self.monitor.store(true, Ordering::Relaxed);
+            mcu::set_sniffer(&self.mcu, &self.usb, 0, true)?;
+            // Carry the width the radio is actually tuned to, not a guess — see config_sniffer.
+            self.config_sniffer(
+                ch,
+                Bandwidth::from_code(self.bw.load(Ordering::Relaxed)),
+                strict,
+            )?;
+            let fif = if strict {
+                mcu::RX_FILTER_PROMISCUOUS_VALID
+            } else {
+                mcu::RX_FILTER_PROMISCUOUS
+            };
+            mcu::set_rx_filter(&self.mcu, &self.usb, fif, 0, 0)?;
+            self.monitor.store(true, Ordering::Relaxed);
 
-        if self.mcu.response_ep() == Some(self.usb.ep_in_data()) {
-            tracing::warn!(
-                target: "named_radio",
-                chip = "MT7921AU",
-                "mt7921u: MCU responses share the RX data pipe (0x84). Any MCU command \
-                 issued while the RX pump runs — a channel switch, a filter change — can \
-                 have its response consumed by a pump thread. Check RxStats::mcu_events.",
-            );
+            if self.mcu.response_ep() == Some(self.usb.ep_in_data()) {
+                tracing::warn!(
+                    target: "named_radio",
+                    chip = "MT7921AU",
+                    "mt7921u: MCU responses share the RX data pipe (0x84). Any MCU command \
+                     issued while the RX pump runs — a channel switch, a filter change — can \
+                     have its response consumed by a pump thread. Check RxStats::mcu_events.",
+                );
+            }
+            Ok(())
         }
-        Ok(())
     }
 
     /// Send the sniffer's copy of the channel — `mt7921_mcu_config_sniffer`
@@ -1866,7 +1830,6 @@ impl crate::rx_pump::Pumpable for Mt7921uBackend {
 
 #[async_trait]
 impl FrameIo for Mt7921uBackend {
-
     /// This radio's own capability, so a face built from the bare `dyn FrameIo` does not have to
     /// invent one. Delegates to this type's [`RadioProfile`] — the single source of truth.
     fn radio_capability(&self) -> Option<ndn_radio_hal::RadioCapability> {
@@ -2497,6 +2460,475 @@ pub fn declared_capability() -> RadioCapability {
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────
+
+// ─────────────────────────────────────────────────────────────────────────────
+// M5 · §1.4 — THE PLAN.  One sequence, executed by the shared runner.
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Specification: `docs/bringup-contract.md` §1.4/§1.5/§4/§5-M5.
+//
+// ★ **Every rung below is transcribed VERBATIM, IN ORDER, from the M2 `bring_up`, then the tune,
+// then `setup_monitor_rx`** — the three calls `open_named_radio`'s MT7921AU arm made back to back,
+// in that order, since the 2026-09-01 fix. Not one register write or MCU command moved, was added,
+// or was reordered.
+//
+// **Why the three collapse into one plan** (§5-M5): this is the arm where the ordering defect
+// actually bit. `setup_monitor_rx` REFUSES while the channel is 0, and the factory called it
+// before `set_channel` — so `open_named_radio` returned an error for every MT7921AU caller and the
+// part was simply unreachable through the factory. One plan turns "tune before monitor" from a
+// convention five hand-written sequences each had to remember into a `must_follow` checked at plan
+// construction.
+//
+// ⚠ **No on-air behaviour change.** This part declares no `TxInstrument` (see
+// `TX_UNPROVABLE_MT7921AU`), so the runner takes no transmit probe and the plan puts nothing on
+// the air the old three calls did not.
+
+/// Shorthand for the step tables below.
+type Mt7921 = Mt7921uBackend;
+
+// ── the rungs ────────────────────────────────────────────────────────────────
+
+fn s_firmware_ready(b: &Arc<Mt7921>, c: &mut Ctx<'_>) -> Result<StepOutcome, FaceError> {
+    let force = b.force_cold_fw.load(Ordering::Relaxed);
+    let warm = !force && b.firmware_running();
+    c.state().warm = Some(warm);
+    // LAW 6 — `StepOutcome` admits one variant per rung and the branch label is the
+    // operator-facing answer, so the fact goes straight into the state the runner would hoist it
+    // into. Warm/cold changes what everything after it means and no later register read reveals it.
+    let fact = Fact::Warm(warm);
+    if !c.state().facts.contains(&fact) {
+        c.state().facts.push(fact);
+    }
+    if warm {
+        tracing::info!(
+            target: "named_radio",
+            chip = "MT7921AU",
+            "firmware already running (MT_CONN_ON_MISC & FW_N9_RDY) — warm re-open, \
+             skipping the power-up and the firmware download",
+        );
+        // ★ `resume = true`, which is upstream's own parameter and not a shortcut:
+        // `mt792xu_dma_init(dev, true)` re-applies the WFDMA/UDMA register values (they are
+        // values, not a sequence, so this is idempotent) and **stops before**
+        // `mt792xu_dma_rx_evt_ep4` and `mt792xu_epctl_rst_opt` (`mt792x_usb.c:411-421`). That
+        // matters here: `dma_rx_evt_ep4` drops and re-raises `RX_DMA_EN` on a chip whose firmware
+        // is live and may be mid-transfer, which is exactly the class of disturbance a warm
+        // re-open exists to avoid.
+        b.dma_init(true)?;
+        return Ok(StepOutcome::Branch("warm"));
+    }
+    let chip = mcu::power_up(&b.usb)?;
+    b.dma_init(false)?;
+    mcu::run_firmware(
+        &b.mcu,
+        &b.usb,
+        chip.hw_rev,
+        mcu::MT7961_PATCH,
+        mcu::MT7961_RAM,
+    )?;
+    tracing::info!(
+        target: "named_radio",
+        chip = "MT7921AU",
+        hw_rev = format_args!("{:#010x}", chip.hw_rev),
+        was_running = chip.was_running,
+        mcu_response_ep = ?b.mcu.response_ep().map(|e| format!("{e:#04x}")),
+        "mt7921u: firmware up",
+    );
+    Ok(StepOutcome::Branch(if force {
+        "cold-forced"
+    } else {
+        "cold"
+    }))
+}
+
+fn s_rx_drain(b: &Arc<Mt7921>, _c: &mut Ctx<'_>) -> Result<StepOutcome, FaceError> {
+    match b.spawn_bringup_drain() {
+        Some(g) => {
+            *b.bringup_drain.lock().unwrap_or_else(|e| e.into_inner()) = Some(g);
+            Ok(StepOutcome::Done)
+        }
+        // The plan's own judgement from state it can see, not a deviation. `spawn_bringup_drain`
+        // logs which of the two cases fired.
+        None => Ok(StepOutcome::Skipped(
+            "the MCU response endpoint is the DATA pipe (or is not yet latched), so reading 0x84 \
+             here would consume MCU responses — see `spawn_bringup_drain`",
+        )),
+    }
+}
+
+fn s_set_eeprom(b: &Arc<Mt7921>, _c: &mut Ctx<'_>) -> Result<StepOutcome, FaceError> {
+    mcu::set_eeprom_efuse_mode(&b.mcu, &b.usb)?;
+    Ok(StepOutcome::Done)
+}
+
+fn s_mac_init(b: &Arc<Mt7921>, _c: &mut Ctx<'_>) -> Result<StepOutcome, FaceError> {
+    b.mac_init()?;
+    Ok(StepOutcome::Done)
+}
+
+fn s_mac_enable(b: &Arc<Mt7921>, _c: &mut Ctx<'_>) -> Result<StepOutcome, FaceError> {
+    mcu::set_mac_enable(&b.mcu, &b.usb, 0, true)?;
+    Ok(StepOutcome::Done)
+}
+
+fn s_factory_mac(b: &Arc<Mt7921>, _c: &mut Ctx<'_>) -> Result<StepOutcome, FaceError> {
+    let mac = mcu::read_mac_addr(&b.mcu, &b.usb)?;
+    *b.mac_addr.lock().unwrap_or_else(|e| e.into_inner()) = Some(mac);
+    tracing::info!(
+        target: "named_radio",
+        chip = "MT7921AU",
+        mac = format_args!(
+            "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+        ),
+        "mt7921u: factory MAC (diagnostic only — never transmitted)",
+    );
+    Ok(StepOutcome::Done)
+}
+
+fn s_pin_edca(b: &Arc<Mt7921>, _c: &mut Ctx<'_>) -> Result<StepOutcome, FaceError> {
+    b.restore_edca()?;
+    Ok(StepOutcome::Done)
+}
+
+fn s_rx_drain_stop(b: &Arc<Mt7921>, _c: &mut Ctx<'_>) -> Result<StepOutcome, FaceError> {
+    drop(
+        b.bringup_drain
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take(),
+    );
+    Ok(StepOutcome::Done)
+}
+
+fn s_tune_channel(b: &Arc<Mt7921>, c: &mut Ctx<'_>) -> Result<StepOutcome, FaceError> {
+    let (ch, bw) = (c.state_ref().channel, c.state_ref().bw);
+    ndn_radio_hal::RadioKnobs::set_channel(b.as_ref(), ch, bw)?;
+    Ok(StepOutcome::Done)
+}
+
+fn s_monitor_rx(b: &Arc<Mt7921>, _c: &mut Ctx<'_>) -> Result<StepOutcome, FaceError> {
+    b.setup_monitor_rx()?;
+    Ok(StepOutcome::Done)
+}
+
+// ── the rungs, as reviewable constants ───────────────────────────────────────
+
+const R_FIRMWARE_READY: Step<Mt7921> = Step {
+    id: StepId("firmware_ready"),
+    stage: Stage::Firmware,
+    class: StepClass::Required,
+    why: "★ The warm/cold decision AND both branches, in ONE rung — branching BETWEEN steps is not \
+          expressible (§1.4). Cold is upstream's order and the order is easy to get backwards: \
+          `power_up` (chip-id check, then `mt792xu_wfsys_reset` ONLY if firmware was already \
+          running, then `mcu_power_on`) — the reset clears FW_PWR_ON, so a power-on that ran first \
+          would be undone and every later register access would read a chip that is off — then \
+          `dma_init(false)`, then the patch + RAM + FW_START_REQ + the FW_N9_RDY poll. \
+          ⚠ **The warm/cold evidence here is a LATCH and that is deliberate, against M5's default \
+          rule** — see the ⚠ note on `PLAN_MT7921AU` and on `firmware_running`. `MT_CONN_ON_MISC`'s \
+          FW_N9_RDY is not a mailbox: it is set by the vendor power-on request and by the N9 core \
+          coming up, and nothing but a reset or a power cycle clears it, so it cannot go stale in \
+          the direction that matters. It is what upstream's own probe tests, and it MEASURED \
+          0x0000_0000 on a cold plug here — a known false state, which the MT7610U/MT7612U mailbox \
+          never had. **LAW 5**: `run_firmware` polls FW_N9_RDY after FW_START_REQ and returns Err \
+          on timeout.",
+    must_follow: &[],
+    must_precede: &[StepId("set_eeprom"), StepId("mac_init")],
+    run: s_firmware_ready,
+};
+
+const R_RX_DRAIN: Step<Mt7921> = Step {
+    id: StepId("rx_drain"),
+    stage: Stage::Attach,
+    class: StepClass::Required,
+    why: "★ Phase B of the bring-up drain, and its position is the whole point. On the MT7610U the \
+          drain is unconditionally safe because the command-response pipe (0x85) is a different \
+          pipe from the data pipe (0x84); on connac2 that is UNDETERMINED — the MCU response \
+          endpoint is discovered by `Connac2Mcu` on the first waited command, and if it lands on \
+          0x84 a drain reading 0x84 eats responses. So it starts AFTER the firmware download, not \
+          before: nothing is being received during power-up/DMA-init/download (no channel, no MAC \
+          enable, and `MT_FW_DL_EN` wires AC_BE to the firmware queue), that phase is precisely \
+          where the latch is determined, and upstream submits no RX URBs during download either. \
+          The MEASURED failure it guards — on the older mt76 parts, the MCU stops CONSUMING inband \
+          commands when nobody reads, so the NEXT command times out rather than the offending one \
+          — is loud; silently eating an MCU response is quiet. Given the choice, the loud one wins.",
+    must_follow: &[StepId("firmware_ready")],
+    must_precede: &[StepId("set_eeprom")],
+    run: s_rx_drain,
+};
+
+const R_SET_EEPROM: Step<Mt7921> = Step {
+    id: StepId("set_eeprom"),
+    stage: Stage::PhyInit,
+    class: StepClass::Required,
+    why: "`mt7921_mcu_set_eeprom` (mt7921/init.c:100) — take calibration from the efuse. Skip it \
+          and the PHY runs UNCALIBRATED, which on the neighbouring Realtek parts is exactly the \
+          'TX works, decode is marginal' failure that cost this bench weeks. Required for that \
+          reason and because the old ladder propagated it with `?`.",
+    must_follow: &[StepId("firmware_ready")],
+    must_precede: &[],
+    run: s_set_eeprom,
+};
+
+const R_MAC_INIT: Step<Mt7921> = Step {
+    id: StepId("mac_init"),
+    stage: Stage::MacInit,
+    class: StepClass::Required,
+    why: "`mt7921_mac_init` + `mt792x_mac_init_band`. ⚠ It deliberately leaves RX header \
+          translation OFF, and that departure is load-bearing for the RX descriptor shape: RXD \
+          group 4's presence tracks header translation, and a translated frame is a different \
+          descriptor from the one `parse_transfer` walks.",
+    must_follow: &[StepId("firmware_ready")],
+    must_precede: &[],
+    run: s_mac_init,
+};
+
+const R_MAC_ENABLE: Step<Mt7921> = Step {
+    id: StepId("mac_enable"),
+    stage: Stage::MacInit,
+    class: StepClass::Required,
+    why: "`mt76_connac_mcu_set_mac_enable` (mt76_connac_mcu.c:216-231) — the firmware-side MAC \
+          enable for band 0. On this part the MAC is enabled through the MCU, not through a \
+          register a host write could set, which is why there is no `MT_MAC_SYS_CTRL`-shaped \
+          assert for it (see `ASSERTS_MT7921AU`).",
+    must_follow: &[StepId("mac_init")],
+    must_precede: &[],
+    run: s_mac_enable,
+};
+
+const R_FACTORY_MAC: Step<Mt7921> = Step {
+    id: StepId("factory_mac"),
+    stage: Stage::MacInit,
+    class: StepClass::BestEffort(Degradation::new(
+        "the factory MAC is unknown, so `mac_addr()` stays `None` and any diagnostic that prints \
+         the adapter's identity has nothing to print",
+        "everything — this address is NEVER put on air (the named-data doctrine forbids a host \
+         identity in the source field), so its absence costs a log line and not a radio",
+    )),
+    why: "The efuse read needs firmware, which is why it lives here and not in `open`. Best \
+          effort, transcribed from the old ladder's `match … Err(e) => tracing::warn!` — the \
+          sequence is unchanged; what changed is that the loss is now stated instead of discarded \
+          into a log line.",
+    must_follow: &[StepId("mac_enable")],
+    must_precede: &[],
+    run: s_factory_mac,
+};
+
+const R_PIN_EDCA: Step<Mt7921> = Step {
+    id: StepId("pin_edca"),
+    stage: Stage::Posture,
+    class: StepClass::BestEffort(Degradation::new(
+        "the contention posture is whatever the PREVIOUS process left — USB never power-cycles \
+         this chip, and the warm branch deliberately does not reload firmware state",
+        "RX capture and functional link work; NOT any absolute throughput or airtime figure, which \
+         on this family MEASURED a 2.5x swing decided purely by run order",
+    )),
+    why: "★★ MEASURED on the sibling MT7610U, five consecutive processes: a run that set no \
+          posture returned 2724 OR 6706 f/s — a 2.5x swing decided purely by run order. This part \
+          is WORSE placed to notice, because its EDCA lives behind `MCU_CE_CMD(SET_EDCA_PARMS)` \
+          firmware state that no register read reveals: you cannot even look. `restore_edca` was \
+          written for exactly this and had ZERO callers in the workspace — the same capability \
+          leak this contract exists to close. Best effort: a contention write failing must not \
+          turn a working radio into no radio.",
+    must_follow: &[StepId("mac_enable")],
+    must_precede: &[],
+    run: s_pin_edca,
+};
+
+const R_RX_DRAIN_STOP: Step<Mt7921> = Step {
+    id: StepId("rx_drain_stop"),
+    stage: Stage::RxEnable,
+    class: StepClass::Required,
+    why: "Ends the Phase-B drain at exactly the point the old `DrainGuard` dropped — the last \
+          statement of `bring_up`, BEFORE the tune and the monitor rung. It has to stop here: past \
+          `monitor_rx` the chip delivers real frames and a drain thread reading the data pipe \
+          would compete with the RX pump for them; and if the MCU latched its responses onto that \
+          same pipe, a drain running across `tune_channel` would eat the channel-switch response \
+          for a command the firmware actually executed. Making the drain a `StepOutcome::Guard` \
+          would have handed it to the returned handle and done both, for the life of the process.",
+    must_follow: &[StepId("rx_drain")],
+    must_precede: &[StepId("tune_channel"), StepId("monitor_rx")],
+    run: s_rx_drain_stop,
+};
+
+const R_TUNE_CHANNEL: Step<Mt7921> = Step {
+    id: StepId("tune_channel"),
+    stage: Stage::Tune,
+    class: StepClass::Required,
+    why: "★★ THE ORDERING §5-M5 EXISTS FOR, now a constraint instead of a convention. \
+          `set_channel` is the PHY retune (`CHANNEL_SWITCH` + the band-dependent SIFS, 10 µs on \
+          2.4 GHz and 16 on 5) and it MUST run before `monitor_rx`, which refuses outright while \
+          the channel is still 0 — 'the sniffer carries its own copy of the channel and has \
+          nothing to be told'. `open_named_radio`'s arm had these two backwards and therefore \
+          returned an error for EVERY caller of this part until 2026-09-01. Fatal on purpose: an \
+          untuned monitor receives nothing.",
+    must_follow: &[StepId("firmware_ready")],
+    must_precede: &[StepId("monitor_rx")],
+    run: s_tune_channel,
+};
+
+const R_MONITOR_RX: Step<Mt7921> = Step {
+    id: StepId("monitor_rx"),
+    stage: Stage::RxEnable,
+    class: StepClass::Required,
+    why: "★ THE RUNG §5-M5 EXISTS FOR: `set_sniffer` + `config_sniffer` + `set_rx_filter`, all \
+          three through the MCU because on this part the RX filter is FIRMWARE state — the \
+          firmware rewrites `MT_WF_RFCR` on every channel switch and sniffer enable, so a \
+          host-side register write would be silently reverted at the next firmware event, giving \
+          RX that works until you retune. ★★ `config_sniffer` runs after the PHY retune and \
+          SILENTLY OVERRIDES it: MEASURED 2026-08-27, with `set_channel(36, Bw80)` sending \
+          CMD_CBW_80MHZ and the TXD carrying BW=2, a witness still reported every PPDU as \
+          'MCS 8 ... 20 MHz', because this command hard-coded bw=0 and centre=control. The width \
+          now travels from the caller so the two cannot disagree — and only a witness settled it.",
+    must_follow: &[StepId("tune_channel"), StepId("mac_enable")],
+    must_precede: &[],
+    run: s_monitor_rx,
+};
+
+const MT7921AU_STEPS: &[Step<Mt7921>] = &[
+    R_FIRMWARE_READY,
+    R_RX_DRAIN,
+    R_SET_EEPROM,
+    R_MAC_INIT,
+    R_MAC_ENABLE,
+    R_FACTORY_MAC,
+    R_PIN_EDCA,
+    R_RX_DRAIN_STOP,
+    R_TUNE_CHANNEL,
+    R_MONITOR_RX,
+];
+
+const MT7921AU_PLAN: Plan<Mt7921> = Plan {
+    id: PlanId {
+        part: "mt7921",
+        name: "monitor",
+        // v1 was the M2 hand-filled `bring_up` report, which stopped before the tune and the
+        // monitor call and reported `channel: 0`. v2 is the executed plan.
+        ver: 2,
+    },
+    role: Role::TransmitAndReceive,
+    steps: MT7921AU_STEPS,
+    excluded: &[
+        (
+            Stage::PowerOn,
+            "no PowerOn rung. `mcu::power_up` IS the power sequence and it lives inside \
+             `firmware_ready`, because the warm branch must skip it and the cold branch must run \
+             it — and branching between rungs is not expressible (§1.4). The stage label follows \
+             the rung, not the other way round (Appendix A.2).",
+        ),
+        (
+            Stage::Calibrate,
+            "no Calibrate rung. On connac2 the calibration is the FIRMWARE's: `set_eeprom` hands \
+             it the efuse and the N9 core runs its own cals across a channel switch. There is no \
+             host-driven IQK/DPK/LCK ladder here at all, which is the single largest structural \
+             difference from the Realtek parts in this crate.",
+        ),
+        (
+            Stage::Power,
+            "no Power rung, and no power actuator at all. MEASURED: this part has none. It carries \
+             a `max_tx_power` only because `RadioCapability` demands one, and \
+             `power_actuated == false` is the declarative half of the same fact.",
+        ),
+        (
+            Stage::Verify,
+            "no Verify rung. §4's transmit question is answered `Unprovable` with the reason \
+             quoted, and the one thing worth reading back on this part — the RX filter — is \
+             FIRMWARE state with no host-readable register (see `ASSERTS_MT7921AU`, which is \
+             empty and says why).",
+        ),
+    ],
+};
+
+// ★ A malformed plan is a compile error, not a runtime one. In particular, swapping
+// `tune_channel` and `monitor_rx` stops the crate building — the defect that made
+// `open_named_radio` return an error for every MT7921AU caller is now enforced by the compiler.
+const _: () = MT7921AU_PLAN.check_or_panic();
+
+/// The MT7921AU plan — `bring_up` + the tune + `setup_monitor_rx`, as one reviewable sequence.
+///
+/// ⚠ **This part keeps a latch for the warm/cold decision, against M5's default rule, and here is
+/// the argument.** The rule exists because `MT_MCU_COM_REG0` on the two mt76x02 parts beside this
+/// one is a MAILBOX the firmware reuses: it goes stale, it was MEASURED wrong in both directions,
+/// and each mistake cost a physical replug. `MT_CONN_ON_MISC`'s `FW_N9_RDY` is a different kind of
+/// thing — `FW_PWR_ON | FW_N9_ON`, set by the vendor power-on request and by the N9 core coming
+/// up, cleared by nothing but a subsystem reset or a power cycle, and never a destination the
+/// firmware writes a message into. It is what upstream's own probe tests, and it MEASURED
+/// `0x0000_0000` on a cold plug here, so it has a known false state.
+///
+/// Adding a connac2 round trip would mean choosing an MCU command nobody has ever issued at this
+/// point in this sequence, on a part that is currently wedged, with no hardware at the keyboard to
+/// try it on — which is precisely the reasoning-about-radios this contract exists to stop. It is
+/// recorded as an **open item**, not as a decision that a round trip is unnecessary: the honest
+/// statement is that the latch's failure mode here is the SAFE direction (a chip that says warm
+/// takes the non-destructive path), and that "firmware loaded but the MCU does not answer us" —
+/// the MT7612U's third outcome — has no detector on this part today.
+pub static PLAN_MT7921AU: Plan<Mt7921> = MT7921AU_PLAN;
+
+/// §1.5 — read back every gate you write. **Empty on this part, in writing.**
+///
+/// The two gates this ladder writes that would be worth reading back — the MAC enable and the RX
+/// filter — are both **firmware state reached through `MCU_CE_CMD`**, with no host-readable
+/// register behind them: `mt7921_mcu_set_rxfilter` owns `MT_WF_RFCR` and the firmware rewrites it
+/// on every channel switch and sniffer enable, which is exactly why this driver does not write it
+/// directly. An assert that read a register the firmware owns would be reading something it does
+/// not control, and one that read a register nobody has confirmed answers on this silicon would be
+/// worse — `MT_TOP_MISC` is the standing example in [`crate::connac2::regs`]: a bench note saying
+/// "MT_TOP_MISC = 0" turned out to be a read of an unnamed CB-TOP word at a different address.
+///
+/// So: no asserts, and the reason is written down rather than left as a blank cell.
+/// [`Mt7921uBackend::rx_health`] is where the corresponding evidence lives, on demand.
+const ASSERTS_MT7921AU: &[Assert<Mt7921>] = &[];
+
+/// §4 — what this part can prove about its own transmitter: **nothing at bring-up, and it says
+/// why.**
+///
+/// §4's table names `mt_mib_sdr14`/`sdr15` as this part's instrument and flags them **UNMEASURED**:
+/// nobody has checked whether they sit behind the `mt_mib_scr1` duration gate, so a zero may not
+/// mean "did not transmit". A probe whose zero is ambiguous is worse than no probe — it would let
+/// `MacKeyedOrFail` refuse a working radio — so the instrument stays undeclared until someone
+/// differences it across a known number of injects on silicon.
+const TX_UNPROVABLE_MT7921AU: &str = "no transmit counter is read at bring-up. The candidate pair, mt_mib_sdr14/sdr15 \
+     (connac2/regs.rs), is UNMEASURED in the one way that decides whether a reading means \
+     anything: nobody has checked whether they sit behind the mt_mib_scr1 duration gate, so a zero \
+     may not mean 'did not transmit'. Declaring it would let a hard proof requirement refuse a \
+     working radio on an ambiguous zero. Difference it across a known number of injects on \
+     silicon first; prove (B) with a witness.";
+
+impl BringUp for Mt7921uBackend {
+    fn plan(role: Role) -> Option<&'static Plan<Self>> {
+        match role {
+            Role::TransmitAndReceive => Some(&PLAN_MT7921AU),
+            // ★ Named refusals, not silent downgrades. One plan is all this part has ever run, and
+            // `mac_enable` + the sniffer commands are what make it either transmit or receive at
+            // all; an RX-only or TX-only variant would be an unmeasured ladder.
+            Role::ReceiveOnly | Role::TransmitOnly => None,
+        }
+    }
+
+    fn asserts() -> &'static [Assert<Self>] {
+        ASSERTS_MT7921AU
+    }
+
+    /// Empty — see [`TX_UNPROVABLE_MT7921AU`].
+    fn tx_instruments() -> &'static [ndn_radio_hal::TxInstrument] {
+        &[]
+    }
+
+    fn tx_unprovable_reason() -> Option<&'static str> {
+        Some(TX_UNPROVABLE_MT7921AU)
+    }
+}
+
+/// The cost of the pre-M8 wrapper signature: `FaceError` cannot carry a partial report, so it is
+/// **emitted before it is dropped**.
+fn drop_partial_report(f: BringUpFailure) -> FaceError {
+    f.report.emit();
+    eprintln!(
+        "mt7921u bring-up FAILED at `{}` — the partial report:\n{}",
+        f.failed_at,
+        f.report.render()
+    );
+    f.source
+}
 
 #[cfg(test)]
 mod tests {

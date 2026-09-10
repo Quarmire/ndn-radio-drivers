@@ -98,52 +98,54 @@ fn parse_hdr(fw: &[u8]) -> FwHdr {
 }
 
 impl Rtl8821cuBackend {
-    /// Download the vendored firmware and wait for the FW-ready handshake.
-    pub fn download_firmware(&self) -> Result<(), FaceError> {
-        let fw = FIRMWARE;
-        if fw.len() < FW_HDR_SIZE {
-            return Err(init_err("8821cu fw too small".into()));
+    rung! {
+        /// Download the vendored firmware and wait for the FW-ready handshake.
+        fn download_firmware(&self) -> Result<(), FaceError> {
+            let fw = FIRMWARE;
+            if fw.len() < FW_HDR_SIZE {
+                return Err(init_err("8821cu fw too small".into()));
+            }
+            let hdr = parse_hdr(fw);
+
+            // Validate the file image is hdr + per-region (size + 8B checksum).
+            let dmem = hdr.dmem_size as usize + FW_HDR_CHKSUM_SIZE;
+            let imem = hdr.imem_size as usize + FW_HDR_CHKSUM_SIZE;
+            let emem = if hdr.emem_present {
+                hdr.emem_size as usize + FW_HDR_CHKSUM_SIZE
+            } else {
+                0
+            };
+            if FW_HDR_SIZE + dmem + imem + emem != fw.len() {
+                return Err(init_err(format!(
+                    "8821cu fw size mismatch: hdr+{dmem}+{imem}+{emem} != {}",
+                    fw.len()
+                )));
+            }
+
+            self.wlan_cpu_enable(false)?;
+            let bckp = self.dlfw_reg_backup()?;
+            self.dlfw_reset_platform()?;
+
+            // start_download_firmware: enable FWDL (preserve CPU_CLK_SEL bits).
+            let v = (self.read16(REG_MCUFW_CTRL)? & 0x3800) | BIT_MCUFWDL_EN;
+            self.write16(REG_MCUFW_CTRL, v)?;
+
+            // DMEM, IMEM, then EMEM — each region's source steps past hdr + prior
+            // regions (sizes include the 8B trailing checksum the HW verifies).
+            let mut cur = FW_HDR_SIZE;
+            self.download_region(&fw[cur..cur + dmem], hdr.dmem_addr & !(1 << 31))?;
+            cur += dmem;
+            self.download_region(&fw[cur..cur + imem], hdr.imem_addr & !(1 << 31))?;
+            cur += imem;
+            if hdr.emem_present {
+                self.download_region(&fw[cur..cur + emem], hdr.emem_addr & !(1 << 31))?;
+            }
+
+            self.dlfw_reg_restore(&bckp)?;
+            self.dlfw_end_flow()?;
+            self.wlan_cpu_enable(true)?;
+            self.dlfw_validate()
         }
-        let hdr = parse_hdr(fw);
-
-        // Validate the file image is hdr + per-region (size + 8B checksum).
-        let dmem = hdr.dmem_size as usize + FW_HDR_CHKSUM_SIZE;
-        let imem = hdr.imem_size as usize + FW_HDR_CHKSUM_SIZE;
-        let emem = if hdr.emem_present {
-            hdr.emem_size as usize + FW_HDR_CHKSUM_SIZE
-        } else {
-            0
-        };
-        if FW_HDR_SIZE + dmem + imem + emem != fw.len() {
-            return Err(init_err(format!(
-                "8821cu fw size mismatch: hdr+{dmem}+{imem}+{emem} != {}",
-                fw.len()
-            )));
-        }
-
-        self.wlan_cpu_enable(false)?;
-        let bckp = self.dlfw_reg_backup()?;
-        self.dlfw_reset_platform()?;
-
-        // start_download_firmware: enable FWDL (preserve CPU_CLK_SEL bits).
-        let v = (self.read16(REG_MCUFW_CTRL)? & 0x3800) | BIT_MCUFWDL_EN;
-        self.write16(REG_MCUFW_CTRL, v)?;
-
-        // DMEM, IMEM, then EMEM — each region's source steps past hdr + prior
-        // regions (sizes include the 8B trailing checksum the HW verifies).
-        let mut cur = FW_HDR_SIZE;
-        self.download_region(&fw[cur..cur + dmem], hdr.dmem_addr & !(1 << 31))?;
-        cur += dmem;
-        self.download_region(&fw[cur..cur + imem], hdr.imem_addr & !(1 << 31))?;
-        cur += imem;
-        if hdr.emem_present {
-            self.download_region(&fw[cur..cur + emem], hdr.emem_addr & !(1 << 31))?;
-        }
-
-        self.dlfw_reg_restore(&bckp)?;
-        self.dlfw_end_flow()?;
-        self.wlan_cpu_enable(true)?;
-        self.dlfw_validate()
     }
 
     fn wlan_cpu_enable(&self, enable: bool) -> Result<(), FaceError> {

@@ -127,13 +127,22 @@ pub const KNOWN: &[Var] = &[
         "NDN_RADIO_TX_RATE",
         "TX rate code (4 = legacy 6M, the broadcast-safe choice)",
     ),
+    dbg_(
+        "NDN_RF_UNRESTRICTED",
+        "\"<operator>:<reason>\" — ⚠ REGULATORY OVERRIDE. The only way, outside `feature = \"bench\"`, \
+         to mint an `RfAuthority` and reach `PowerRequest::Raw`: the raw chip TXAGC axis, \
+         calibration bypassed on the RTL8812AU, possibly above licensed EIRP. \
+         The operator's words are printed verbatim in every report of the run, and any measurement \
+         taken with it set is NOT comparable with a calibrated one",
+    ),
     cfg(
         "NDN_RADIO_TXPWR",
         "TXAGC index 0..63 — read natively ONLY by the 8821c bring-up; campaign tools apply it via RadioKnobs::set_tx_power (a81a/8812au honor the knob, not the var)",
     ),
     cfg(
         "NDN_TX_PWR",
-        "Realtek TXAGC index 0..63 applied by open_named_radio's 8812au arm — NOT LoRa, which this \
+        "Realtek TXAGC index 0..63 read by BringUpRequest::from_env into PowerRequest::Index and \
+         applied by open_radio — NOT LoRa, which this \
          entry claimed until 2026-09-01. It exists for the USB brownout: a full-power 2-chain TX can \
          brown the PA out so the TX FIFO never drains",
     ),
@@ -162,11 +171,73 @@ pub const KNOWN: &[Var] = &[
         "NDN_ATH9K_FW",
         "path to htc_9271.fw — the AR9271 firmware is not embedded and open fails without this",
     ),
-    cfg("NDN_ATH9K_PUMP", "start the RX pump on the AR9271 arm (off by default there)"),
-    cfg("NDN_8733B_RX_ONLY", "stop the 8733b bring-up at monitor RX, skipping the TX calibration"),
-    cfg("NDN_RADIO_DEV", "select the radio by USB bus:port (stable across replugs)"),
+    cfg(
+        "NDN_ATH9K_PUMP",
+        "start the RX pump on the AR9271 arm (off by default there)",
+    ),
+    // ★ M6 promoted the five AR9271 knobs out of KNOWN_UNREGISTERED. They used to be read inside
+    // the ladder; `open_ath9k` now reads each ONCE at the caller boundary and turns it into an
+    // `Ath9kBringUpOpts` field or a `RadioState` field, which is the shape the KNOWN_UNREGISTERED
+    // comment below says every remaining entry should eventually take.
+    cfg(
+        "NDN_ATH9K_RX_ONLY",
+        "bring the AR9271 up as Role::ReceiveOnly (PLAN_AR9271_RX): rx_enable instead of \
+         wmi_start + start_receive, no IC_UPDATE, no monitor vif/node, no TX calibration — the \
+         ath9k spelling of NDN_8733B_RX_ONLY",
+    ),
+    cfg(
+        "NDN_ATH9K_HIGHPWR",
+        "force the AR9271's HIGH-power TX gain table regardless of the EEPROM txGainType. \
+         MEASURED: a high-power module on the NORMAL table radiates ~50 dB low",
+    ),
+    cfg(
+        "NDN_ATH9K_NORMPWR",
+        "force the AR9271's NORMAL gain table, i.e. SKIP the ~50 dB high-power fix, and skip the \
+         board/OLPC cal with it. A bench arm, and the shape of every pre-fix on-air number",
+    ),
+    cfg(
+        "NDN_ATH9K_HT40",
+        "bring the AR9271's PHY up at 40 MHz (HT40+). ⚠ EXPERIMENTAL on this HT20-class part: \
+         cal convergence at 40 MHz is unverified",
+    ),
+    cfg(
+        "NDN_ATH9K_SETBOARD",
+        "run the AR9271's EEPROM board + OLPC power cal even on a normal-power module (it is \
+         default-ON for a high-power one, where it IS the fix). ⚠ NDN_ATH9K_SETPOWER, which \
+         open_ath9k's pre-M6 doc comment advertised for this, is NOT read and never was",
+    ),
+    cfg(
+        "NDN_ATH9K_NO_CAL",
+        "skip the AR9271's board + OLPC power cal, leaving the PA on the initval-default gain and \
+         the report with no absolute dBm anchor",
+    ),
+    cfg(
+        "NDN_8733B_RX_ONLY",
+        "stop the 8733b bring-up at monitor RX, skipping the TX calibration",
+    ),
+    // ★ M8. `BringUpRequest::from_env` (ndn-radio-drivers/src/open_radio.rs) is the ONE place a
+    // bring-up's configuration is read from the environment — LAW 1 of the bring-up contract —
+    // and these two are the knobs that door added.
+    cfg(
+        "NDN_RADIO_RX_ONLY",
+        "bring EVERY part up as Role::ReceiveOnly, the part-agnostic spelling of          NDN_8733B_RX_ONLY / NDN_ATH9K_RX_ONLY. ⚠ A part with no ReceiveOnly plan (the RTL8812AU)          then refuses BY NAME at plan selection rather than quietly transmitting — which is why          the two per-part spellings are kept and are NOT synonyms for this one",
+    ),
+    dbg_(
+        "NDN_BRINGUP_DEVIATE",
+        "depart from a part's canonical plan, on the record: '<question>|skip:<step-id>[=<why>]' \
+         (also 'stop-after:<stage>'). The departure lands in the report's provenance AND in \
+         plan_digest, so a deviated run can never be silently compared with a canonical one. \
+         ☠ CONFOUNDER: any on-air number from a run with this set describes a different bring-up",
+    ),
+    cfg(
+        "NDN_RADIO_DEV",
+        "select the radio by USB bus:port (stable across replugs)",
+    ),
     cfg("NDN_USB_ADDR", "select the radio by USB address"),
-    cfg("NDN_RADIO_RX_STRICT", "drop RX units the parser cannot fully account for, rather than best-effort"),
+    cfg(
+        "NDN_RADIO_RX_STRICT",
+        "drop RX units the parser cannot fully account for, rather than best-effort",
+    ),
     dbg_(
         "NDN_RADIO_FORCE_RESET",
         "issue a blind USB port reset on open. ☠ A failed reset marks the hub port disabled and the \
@@ -465,15 +536,15 @@ mod registry_ratchet {
     /// Entries are listed rather than described because a wrong description is worse than an
     /// absent one — several of these are per-chip bisect switches whose exact effect needs the
     /// bench, and inventing text for them would put fiction in the run record.
+    /// ★ `NDN_AU_TXAGC12` LEFT THIS LIST on 2026-09-03 by having its reader DELETED, not
+    /// registered: it was read from inside `Rtl8812auBackend::set_tx_power` and silently turned 10
+    /// register writes into 24 (MEASURED: 5 groups = 246 f/s on air, 12 groups = 1 f/s). A knob
+    /// whose meaning depends on the environment is hidden state by another name, so it became
+    /// `RateGroupPolicy` on the `PowerRequest` and now appears in the bring-up report instead. That
+    /// is the shape every remaining entry here should eventually take.
     const KNOWN_UNREGISTERED: &[&str] = &[
         "NDN_8733B_NO_TSSI",
         "NDN_AF_RCVBUF",
-        "NDN_ATH9K_HIGHPWR",
-        "NDN_ATH9K_HT40",
-        "NDN_ATH9K_NORMPWR",
-        "NDN_ATH9K_NO_CAL",
-        "NDN_ATH9K_SETBOARD",
-        "NDN_AU_TXAGC12",
         "NDN_AU_TXRPT",
         "NDN_C2H_DBG",
         "NDN_GUARD_LIVE_LINK",
@@ -486,7 +557,9 @@ mod registry_ratchet {
     ];
 
     fn rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
-        let Ok(rd) = std::fs::read_dir(dir) else { return };
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return;
+        };
         for e in rd.flatten() {
             let p = e.path();
             if p.is_dir() {
@@ -510,7 +583,9 @@ mod registry_ratchet {
                 if let Some(end) = src[a..].find('"') {
                     let name = &src[a..a + end];
                     if name.starts_with("NDN_")
-                        && name.bytes().all(|c| c.is_ascii_uppercase() || c == b'_' || c.is_ascii_digit())
+                        && name
+                            .bytes()
+                            .all(|c| c.is_ascii_uppercase() || c == b'_' || c.is_ascii_digit())
                     {
                         v.push(name.to_string());
                     }
@@ -545,7 +620,9 @@ mod registry_ratchet {
 
         let mut fresh: Vec<String> = Vec::new();
         for f in &files {
-            let Ok(src) = std::fs::read_to_string(f) else { continue };
+            let Ok(src) = std::fs::read_to_string(f) else {
+                continue;
+            };
             for name in reads(&src) {
                 if !registered.contains(name.as_str()) && !allowed.contains(name.as_str()) {
                     fresh.push(format!("{name}  ({})", f.display()));

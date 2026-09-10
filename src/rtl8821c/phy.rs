@@ -195,14 +195,15 @@ impl Rtl8821cuBackend {
     }
 
     /// Write the per-rate TX-power index into the `0x1d00` TXAGC block (path A),
-    /// for CCK / OFDM / HT-1SS / VHT-1SS. Uniform index for now (see module doc);
-    /// `NDN_RADIO_TXPWR=<0..63>` overrides. This is the radiate gate.
-    pub(super) fn set_tx_power(&self, _channel: u8) -> Result<(), FaceError> {
-        let idx = std::env::var("NDN_RADIO_TXPWR")
-            .ok()
-            .and_then(|s| s.parse::<u8>().ok())
-            .unwrap_or(0x2d)
-            .min(0x3f) as u32;
+    /// for CCK / OFDM / HT-1SS / VHT-1SS. Uniform index (see module doc). This is the radiate gate.
+    ///
+    /// ★ **`idx` is a parameter, not an environment read.** It used to read `NDN_RADIO_TXPWR` from
+    /// inside this function — the same shape as `NDN_AU_TXAGC12` inside the 8812au's
+    /// `set_tx_power`, and the same defect: a power writer whose meaning depends on the
+    /// environment. The caller now supplies the value, so it is visible at the call site and in the
+    /// bring-up report. (`tests/power_has_one_meaning.rs` fails the build if it comes back.)
+    pub(super) fn set_tx_power(&self, idx: u8) -> Result<(), FaceError> {
+        let idx = idx.min(0x3f) as u32;
         let packed = idx | (idx << 8) | (idx << 16) | (idx << 24);
         // 0x1d00 + (rate & 0xfc) for each 4-rate group.
         for off in [

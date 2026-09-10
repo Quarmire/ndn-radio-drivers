@@ -1,3 +1,7 @@
 target/
 Cargo.lock
 .DS_Store
+
+# Python tooling caches
+__pycache__/
+*.pyc

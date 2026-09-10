@@ -621,12 +621,14 @@ impl Mt76Usb {
         Ok(())
     }
 
-    /// The `MT_VEND_POWER_ON` request (`0x04`). Not used by the mt76x0/x2 USB
-    /// bring-up — those power up through `MT_WLAN_MTC_CTRL` — but part of the
-    /// request vocabulary and used by the newer parts (`mt792x_usb.c:218`).
-    pub fn power_on(&self, value: u16) -> Result<(), FaceError> {
-        self.vendor_write(REQ_OUT, MT_VEND_POWER_ON, value, 0, &[])?;
-        Ok(())
+    rung! {
+        /// The `MT_VEND_POWER_ON` request (`0x04`). Not used by the mt76x0/x2 USB
+        /// bring-up — those power up through `MT_WLAN_MTC_CTRL` — but part of the
+        /// request vocabulary and used by the newer parts (`mt792x_usb.c:218`).
+        fn power_on(&self, value: u16) -> Result<(), FaceError> {
+            self.vendor_write(REQ_OUT, MT_VEND_POWER_ON, value, 0, &[])?;
+            Ok(())
+        }
     }
 
     // ── USB DMA config: the one family divergence ───────────────────────────

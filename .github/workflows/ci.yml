@@ -97,10 +97,10 @@ jobs:
           workspaces: ndn-radio-drivers
           shared-key: test
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      # `--lib --test tier0_golden` rather than plain `cargo test`: the latter
-      # also compiles every example (the hardware probe binaries excluded above
-      # by design). tier0_golden is the three-way Tier-0 wire gate (LR2021
-      # firmware include! + ath9k C copy via `cc` + the shared golden vectors
-      # ndn-ext generates) — it runs on the host and must stay in CI.
-      - name: unit tests + tier0 golden vectors
-        run: cargo test -p ndn-radio-drivers --lib --test tier0_golden
+      # `--lib --tests` (not plain `cargo test`) runs the unit + integration
+      # suites WITHOUT compiling examples (the hardware probe binaries excluded
+      # above by design). The feature matrix mirrors the developer gate:
+      #   serial-radio (BW16/C5), lora (SX12xx), bench (per-rung bring-up examples).
+      # (The old `tier0_golden` gate was removed with the retired in-frame filter.)
+      - name: unit + integration tests (feature matrix)
+        run: cargo test -p ndn-radio-drivers --lib --tests --features serial-radio,lora,bench

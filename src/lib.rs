@@ -1,8 +1,7 @@
 //! Userspace USB Wi-Fi monitor-mode driver backends over the `ndn-radio-hal` contract.
 //!
 //! Split out of `ndn-face-monitor-wifi` so drivers have a dedicated home; each
-//! backend implements `FrameIo` + `WifiRadio` against the HAL and does no NDN
-//! forwarding.
+//! backend implements `FrameIo` against the HAL and does no NDN forwarding.
 
 // Re-export the contract surface the backend modules reference as `crate::…`
 // (they were written as modules of ndn-face-monitor-wifi, which re-exported these).
@@ -11,11 +10,10 @@ pub use ndn_frame_io::{
     MAX_RELIABLE_MCS, McsDescriptor, McsPolicy, Reach, Reliability, TxIntent, frame, mcs_for_rssi,
     mcs_phy_rate_bps, radiotap,
 };
-// #78: the capability traits `OpenRadio` hands out. Re-exported so a caller of `open_named_radio`
-// needs exactly one import to use everything the opener returns.
-// #78: `OpenRadio` and the capability traits it carries live in the HAL, beside the traits they
+// #78: `OpenRadio` and the capability traits it hands out live in the HAL, beside the traits they
 // aggregate — a driver crate builds one and a face crate consumes one, so neither should need a
-// dependency on the other to name it.
+// dependency on the other to name it. Re-exported here so a caller of `open_named_radio` needs
+// exactly one import to use everything the opener returns.
 pub use ndn_radio_hal::{OpenRadio, RadioKnobs, RadioProfile, RadioTime};
 // ★ M8: the bring-up contract's own vocabulary, re-exported.
 //
@@ -70,9 +68,6 @@ macro_rules! rung {
 // below them silently puts every rung back to `pub`, so keep it first.
 
 pub mod mt76;
-/// Shared MediaTek mt76x02 layer: the register map, USB transport and the MEASURED knob
-/// implementations common to the mt76x0 (MT7610U) and mt76x2 (MT7612U) parts. The two families
-/// ship one register header upstream, so a knob validated on either is validated for both.
 pub mod realtek_contention;
 
 /// Selecting one dongle among several identical ones (by index or USB bus:port) + a guard against

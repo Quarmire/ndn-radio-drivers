@@ -35,15 +35,19 @@ serial-radio = ["dep:serialport"]
 # The Waveshare USB-TO-LoRa (SX1262) serial-bridged sub-GHz backend (raw libc termios, no serialport).
 lora = []
 
-# BW16 examples need the `bw16` backend — gate them so `cargo build --examples`
-# (default features) skips them instead of failing on the unresolved import.
+# Feature-gated examples. Both import `LoraSerialBackend`, which the `lora`
+# feature provides; gating them keeps `cargo build --examples` (default
+# features) and `cargo test -p ndn-radio-drivers` from compiling them
+# unconditionally and failing on the unresolved import. (The rest of examples/
+# is excluded from CI by design.)
 [[example]]
 name = "lora_link"
 required-features = ["lora"]
 
-# Same `lora` gate as lora_link above — it imports `LoraSerialBackend`, which the feature gates.
-# Without this entry cargo built it unconditionally, so `cargo test -p ndn-radio-drivers` failed to
-# compile and the crate's tests never ran at all.
+[[example]]
+name = "ndr_node_report"
+required-features = ["lora"]
+
 [workspace]
 members = [
     "crates/ndn-radio-hal",
@@ -79,7 +83,3 @@ async-trait = "0.1"
 tokio       = { version = "1", default-features = false }
 libc        = "0.2"
 proptest    = "1"
-
-[[example]]
-name = "ndr_node_report"
-required-features = ["lora"]

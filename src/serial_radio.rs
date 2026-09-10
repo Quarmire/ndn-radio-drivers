@@ -979,7 +979,8 @@ impl RadioKnobs for SerialRadioBackend {
                 path: 0,
             }],
         ))
-    }    fn read_channel_activity(&self) -> Result<Option<u16>, FaceError> {
+    }
+    fn read_channel_activity(&self) -> Result<Option<u16>, FaceError> {
         // Both firmwares emit their free-running frame counter as T_OCC ~5×/s; the reader caches the
         // latest. u32::MAX = no report yet (an older firmware, or one still booting) → honestly None.
         let v = self.activity.load(std::sync::atomic::Ordering::Relaxed);
@@ -1315,7 +1316,8 @@ impl RadioKnobs for Bw16SerialBackend {
         TxDiscipline::ScheduledAt {
             granularity_ns: 20_000,
         }
-    }    fn read_channel_activity(&self) -> Result<Option<u16>, FaceError> {
+    }
+    fn read_channel_activity(&self) -> Result<Option<u16>, FaceError> {
         RadioKnobs::read_channel_activity(self.inner.as_ref())
     }
 }
@@ -1554,7 +1556,7 @@ impl RadioKnobs for Esp32SerialBackend {
         };
         let q = want.clamp(8, 84);
         self.inner.set_txpower(q as u8)?;
-        let mut p = AppliedPower::from_writes(
+        let p = AppliedPower::from_writes(
             req.clone(),
             PowerReference::AbsoluteDbm,
             q as u8,
@@ -1607,7 +1609,8 @@ impl RadioKnobs for Esp32SerialBackend {
         TxDiscipline::ScheduledAt {
             granularity_ns: 200_000,
         }
-    }    fn read_channel_activity(&self) -> Result<Option<u16>, FaceError> {
+    }
+    fn read_channel_activity(&self) -> Result<Option<u16>, FaceError> {
         RadioKnobs::read_channel_activity(self.inner.as_ref())
     }
 

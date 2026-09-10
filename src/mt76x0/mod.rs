@@ -511,7 +511,7 @@ fn decode_rx_unit(buf: &[u8]) -> Option<RxUnit> {
     // usb.c:471 — the DMA length is the LOW 16 bits of the header, counting everything
     // after it; it must be non-zero, 4-aligned, and fit in the transfer.
     let dma_len = u16::from_le_bytes([buf[0], buf[1]]) as usize;
-    if dma_len == 0 || dma_len % 4 != 0 || dma_len + MT_DMA_HDR_LEN > buf.len() {
+    if dma_len == 0 || !dma_len.is_multiple_of(4) || dma_len + MT_DMA_HDR_LEN > buf.len() {
         return None;
     }
     let rxinfo = u32::from_le_bytes(buf[RXWI_RXINFO..RXWI_RXINFO + 4].try_into().ok()?);

@@ -50,9 +50,7 @@ use ndn_radio_hal::{
 };
 use ndn_transport::FaceError;
 
-use crate::ath9k_htc_structs::{
-    ATH9K_HTC_NORMAL, ATH9K_KEY_TYPE_CLEAR, TX_FRAME_HDR_SIZE, TxFrameHdr,
-};
+use crate::ath9k_htc_structs::{TX_FRAME_HDR_SIZE, TxFrameHdr};
 use crate::{CapturedFrame, FrameFormat, FrameIo, InjectFrame, McsDescriptor};
 
 /// Bytes before the `ath_htc_rx_status` on the WLAN-RX bulk pipe: the 8-byte HTC frame header
@@ -506,7 +504,7 @@ impl Ath9kHtcBackend {
     pub fn open() -> Result<Self, FaceError> {
         let ctx = Context::new().map_err(|e| usb_err("libusb init", e))?;
 
-        let mut handle = Self::find_and_open(&ctx)?;
+        let handle = Self::find_and_open(&ctx)?;
 
         // Per-device RX-stamp clock domain (bus<<8 | address), for the FreeRunRxStamp M2 clock.
         let d = handle.device();
@@ -603,7 +601,7 @@ impl Ath9kHtcBackend {
                     continue;
                 }
                 match dev.open() {
-                    Ok(mut h) => {
+                    Ok(h) => {
                         // ⛔ Deliberately NOT `set_auto_detach_kernel_driver(true)`. That flag
                         // makes libusb **re-attach** the kernel driver when the interface is
                         // released, so the moment our process exits `ath9k_htc` probes, fails its
@@ -617,12 +615,9 @@ impl Ath9kHtcBackend {
                         // Consequence worth knowing: handing the device *back* to `ath9k_htc`
                         // still requires a replug, because its download cannot succeed while our
                         // firmware is running. Userspace iteration is free; switching back is not.
-                        match h.kernel_driver_active(0) {
-                            Ok(true) => {
-                                h.detach_kernel_driver(0)
-                                    .map_err(|e| usb_err("detach kernel driver", e))?;
-                            }
-                            _ => {}
+                        if let Ok(true) = h.kernel_driver_active(0) {
+                            h.detach_kernel_driver(0)
+                                .map_err(|e| usb_err("detach kernel driver", e))?;
                         }
                         return Ok(h);
                     }
@@ -1075,7 +1070,7 @@ impl Ath9kHtcBackend {
     ///   response:  u16 status | u16 count | count * { u32 addr, u32 value }
     /// ```
     fn access_memory(&self, addr: u32, vals: &[u32], write: bool) -> Result<Vec<u32>, FaceError> {
-        if addr % 4 != 0 {
+        if !addr.is_multiple_of(4) {
             return Err(err(format!(
                 "ath9k_htc: target address {addr:#010x} is not 4-byte aligned"
             )));
@@ -3733,7 +3728,8 @@ impl RadioKnobs for Ath9kHtcBackend {
     /// today they are two unrelated slot maps (µs here, TU there).
     fn tx_discipline(&self) -> ndn_radio_hal::TxDiscipline {
         ndn_radio_hal::TxDiscipline::BestEffort
-    }}
+    }
+}
 
 /// The AR9271 IQ-mismatch fixed-point correction (`ar9002_hw_iqcalibrate`,
 /// ar9002_calib.c:192-267), for one chain. Inputs are the accumulated
@@ -4359,7 +4355,6 @@ impl BringUp for Ath9kHtcBackend {
     }
 }
 
-
 /// 2.4 GHz Wi-Fi channel number -> centre frequency (MHz). Ch14 is the 2484 special case; the rest
 /// are `2407 + 5*ch` (ch1 = 2412, ch6 = 2437, ch11 = 2462).
 ///
@@ -4384,7 +4379,7 @@ pub fn ath9k_mhz_to_channel(mhz: u16) -> Option<u8> {
     if mhz == 2484 {
         return Some(14);
     }
-    if mhz < 2412 || mhz > 2472 || (mhz - 2407) % 5 != 0 {
+    if !(2412..=2472).contains(&mhz) || !(mhz - 2407).is_multiple_of(5) {
         return None;
     }
     Some(((mhz - 2407) / 5) as u8)

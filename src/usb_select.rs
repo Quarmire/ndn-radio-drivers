@@ -66,10 +66,10 @@ impl DeviceSelect {
         if s.is_empty() {
             return DeviceSelect::First;
         }
-        if let Some(idx) = s.strip_prefix('#') {
-            if let Ok(i) = idx.trim().parse() {
-                return DeviceSelect::Index(i);
-            }
+        if let Some(idx) = s.strip_prefix('#')
+            && let Ok(i) = idx.trim().parse()
+        {
+            return DeviceSelect::Index(i);
         }
         DeviceSelect::Addr(s.to_string())
     }

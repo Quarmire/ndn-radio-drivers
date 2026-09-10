@@ -86,17 +86,15 @@ const LADDER: &[&str] = &[
 /// **The exemptions ARE the review**, and each names ONE function, not a file. Each entry must
 /// carry a reason a reader can check; an unexplained entry is the thing this file exists to
 /// prevent.
-const EXEMPT: &[(&str, &str, &str)] = &[
-    (
-        "ath9k_hw_reset.rs",
-        "main",
-        "This instrument IS `hw_reset`: it runs the rung in isolation and repeatedly, to answer \
+const EXEMPT: &[(&str, &str, &str)] = &[(
+    "ath9k_hw_reset.rs",
+    "main",
+    "This instrument IS `hw_reset`: it runs the rung in isolation and repeatedly, to answer \
          whether a reset on a live chip recovers it. A plan runs a rung once, in sequence, which \
          is the opposite of the question. ⚠ Listed against `main` and not `run` because the \
          ladder is SPLIT across the two — main downloads the firmware, run does hw_reset and \
          wmi_start — which is the shape the call expansion above exists to see.",
-    ),
-];
+)];
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Source scanning — the lexer and the function splitter live in `tests/common/mod.rs`, shared

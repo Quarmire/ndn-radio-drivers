@@ -4404,7 +4404,7 @@ impl Rtl8733buBackend {
     /// [`reset_phy_counters`](Self::reset_phy_counters) to zero them.
     pub fn read_phy_counters(&self) -> Result<PhyCounters, FaceError> {
         let _g = self.phy_ctr_sel.lock().unwrap_or_else(|e| e.into_inner());
-        let mut read = |sel: u32| -> Result<u16, FaceError> {
+        let read = |sel: u32| -> Result<u16, FaceError> {
             let v = self.read32(0x664)?;
             self.write32(0x664, (v & 0x0FFF_FFFF) | (sel << 28))?;
             Ok((self.read32(0x664)? & 0xffff) as u16)
@@ -4809,7 +4809,7 @@ impl Rtl8733buBackend {
                             snr_db: Some(b(24) >> 1),
                             // -128 is the hardware's "no measurement" sentinel (the vendor substitutes
                             // -25 dB); report None rather than a number that reads like data.
-                            evm_db: (evm != -128).then(|| evm / 2),
+                            evm_db: (evm != -128).then_some(evm / 2),
                             cfo_hz: Some(i32::from(b(20)) * 312_500 / 128),
                         }
                     });

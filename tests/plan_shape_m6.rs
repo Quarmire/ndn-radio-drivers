@@ -88,11 +88,7 @@ fn the_ar9271_plan_is_the_transcribed_ladder() {
 /// `open_ath9k` and nowhere else — so no example could be compared against it.
 #[test]
 fn the_ar9271_keeps_the_three_rungs_no_example_performs() {
-    for want in [
-        "select_gain_table",
-        "board_cal",
-        "power_cal",
-    ] {
+    for want in ["select_gain_table", "board_cal", "power_cal"] {
         assert!(
             ids(&PLAN_AR9271_MONITOR).contains(&want),
             "PLAN_AR9271_MONITOR lost `{want}` — §5-M6 names it as a step none of this part's ~20 \

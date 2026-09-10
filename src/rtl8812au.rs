@@ -4453,7 +4453,7 @@ impl Rtl8812auBackend {
     /// kernel netdev, so a named-radio face never silently grabs the host's live Wi-Fi link.
     pub fn open_select(sel: &crate::DeviceSelect) -> Result<Self, FaceError> {
         let device =
-            crate::usb_select::select_device(&RTL8812AU_PIDS, REALTEK_VID, sel, "RTL8812AU")?;
+            crate::usb_select::select_device(RTL8812AU_PIDS, REALTEK_VID, sel, "RTL8812AU")?;
         let pid = device.device_descriptor().map_err(usb_err)?.product_id();
         Self::claim(device, pid)
     }
@@ -6212,7 +6212,7 @@ impl Rtl8812auBackend {
         {
             static TXRPT_SN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             let seq = TXRPT_SN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if seq % n == 0 {
+            if seq.is_multiple_of(n) {
                 // rtw88 tx.c:171 tag layout: [7:2] sequence, [1:0] reserved for firmware.
                 Self::set_desc_bits(&mut d, 8, 19, 1, 1); // W2 SPE_RPT — report this frame
                 Self::set_desc_bits(&mut d, 24, 0, 12, ((seq / n) << 2) & 0xfc); // W6 SW_DEFINE

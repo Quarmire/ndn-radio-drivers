@@ -158,7 +158,7 @@ pub use libusb_rtl8733b::{
 
 // Serial-bridged 802.11 backend — a raw injector/capturer driven over USB-serial (the ND wire protocol),
 // backing a BW16 (RTL8720DN, firmware/bw16-ndn-bridge) or an ESP32-C5 (firmware/esp32c5-ndn), implementing
-// the same FrameIo/WifiRadio/RadioKnobs contract as the USB drivers.
+// the same FrameIo/RadioKnobs contract as the USB drivers.
 #[cfg(feature = "serial-radio")]
 mod serial_radio;
 #[cfg(feature = "serial-radio")]
@@ -294,7 +294,7 @@ pub(crate) fn emit_bringup(report: &ndn_radio_hal::BringUpReport) {
 // The control-plane `RadioKnobs` impls for the driver backends. These live with
 // the driver types (the trait is from `ndn-radio-hal`, the types are declared
 // here) — the orphan rule requires the impl travel with the local type. The
-// data-plane `FrameIo`/`WifiRadio` impls live in each backend module.
+// data-plane `FrameIo` impls live in each backend module.
 mod radio_knobs {
     use ndn_radio_hal::{Bandwidth, RadioKnobs};
     use ndn_transport::FaceError;

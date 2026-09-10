@@ -4900,7 +4900,7 @@ impl LibUsbRtl88xxBackend {
         // HT-SIG / VHT-SIG PHY header from this code; 2-stream also needs the
         // 2SS TX path (`0x820=0x31`, set in `set_channel_bw20`).
         // `mcs` is the resolved 802.11 rate for this frame — from the frame's
-        // intent on the generic path, or an exact rate on the `WifiRadio` path.
+        // intent on the generic path, or an exact rate on the `inject_at` path.
         //
         // A `MostRobust`-intent frame (cooperative reports, discovery, control — anything the
         // worst receiver in range must decode) is forced to legacy 6 Mbps OFDM (DESC 0x04),
@@ -5661,7 +5661,7 @@ impl RadioProfile for LibUsbRtl88xxBackend {
     }
 }
 
-// `WifiRadio` is now a marker (a `dyn FrameIo` still names this as a Wi-Fi radio);
+// `WifiRadio` was removed (#83); a `dyn FrameIo` names this as a Wi-Fi radio;
 // `inject_at` is the derived HAL default (`set_rate` + `inject`), so the driver holds
 // rate as state and no longer implements a per-frame exact-rate path.
 

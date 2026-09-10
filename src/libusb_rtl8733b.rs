@@ -14,7 +14,7 @@
 //! Working and verified on hardware (OPi, RTL8733BU on bus 5): open + reg-I/O + chip
 //! identification, power-on, firmware download, MAC/BB/RF init, channel/bandwidth tuning,
 //! monitor-mode **RX capture**, and **inject-to-MAC** — the full
-//! [`FrameIo`](ndn_frame_io::FrameIo) / [`WifiRadio`](ndn_frame_io::WifiRadio) /
+//! [`FrameIo`](ndn_frame_io::FrameIo) /
 //! [`RadioKnobs`](ndn_radio_hal::RadioKnobs) contract for capture, injection, and control.
 //!
 //! One open item: **on-air TX radiation**. Injected frames reach and are accepted by the
@@ -3978,7 +3978,7 @@ impl Rtl8733buBackend {
 
     /// Build + send one 802.11 frame at an explicit `rate` (HwRate) and descriptor `flags`,
     /// without touching the shared [`set_tx_rate`](Self::set_tx_rate)/[`set_tx_flags`](Self::set_tx_flags)
-    /// state — the common core of `FrameIo::inject` (fixed rate) and `WifiRadio::inject_at`
+    /// state — the common core of `FrameIo::inject` (fixed rate) and `FrameIo::inject_at`
     /// (per-frame MCS), so per-frame rate control is race-free.
     async fn tx_dot11(&self, frame_in: InjectFrame, rate: u8, flags: u8) -> Result<(), FaceError> {
         let dot11 = frame::build_dot11(self.format, &frame_in)?;

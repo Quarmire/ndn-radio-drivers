@@ -1017,7 +1017,7 @@ impl Rtl8821cuBackend {
         txdesc_set(&mut buf, 2, 19, 1, 1); // W2 SPE_RPT
 
         // `mcs` is the resolved rate — from the frame's intent (generic path) or
-        // an exact rate (the `WifiRadio` path).
+        // an exact rate (the `inject_at` path).
         //
         // ★ INTENT OVERRIDES THE STORED RATE (2026-09-01). `resolved_mcs` only consults the frame's
         // intent when `cur_mcs` is unset, so once the control plane named a rate, cooperative

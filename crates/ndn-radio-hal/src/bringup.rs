@@ -431,7 +431,7 @@ impl AppliedPower {
 ///
 /// ★ **Unconstructible from library code, by the type system rather than by discipline.** The
 /// fields are private and there is no `Default`, no `new`, and no public struct literal: the only
-/// ways in are [`from_env`](Self::from_env) and, under `feature = "bench"`, [`bench`](Self::bench).
+/// ways in are [`from_env`](Self::from_env) and, under `feature = "bench"`, `bench`.
 /// So no `RadioPolicy`, no face, and no forwarder can reach the raw axis — the regulatory ceiling
 /// is enforced, not merely documented.
 ///

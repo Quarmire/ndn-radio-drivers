@@ -1238,7 +1238,7 @@ impl LibUsbRtl88xxBackend {
     /// block is isolated and never responds) and **OTP burst mode**
     /// (`REG_EFUSE_CTRL_1[19]`); the `REG_EFUSE_CTRL` field layout is the V1
     /// one — address in bits\[26:16\], ready flag at bit 29, data in \[15:0\].
-    /// Requires [`power_on`](Self::power_on). Bank select is a no-op on 8822E.
+    /// Requires `power_on`. Bank select is a no-op on 8822E.
     pub fn efuse_read(&self, offset: u16, buf: &mut [u8]) -> Result<(), FaceError> {
         const BIT_EF_RDY: u32 = 1 << 29;
         const MASK_EF_ADDR_V1: u32 = 0x7ff;
@@ -1758,7 +1758,7 @@ impl LibUsbRtl88xxBackend {
     /// TX-buffer boundary and the RF/antenna/cut configuration so its dynamic
     /// mechanisms and TX scheduling work. Sent in the kernel's init order
     /// (after MAC init, before BB/RF). Requires
-    /// [`download_firmware`](Self::download_firmware) + [`mac_init`](Self::mac_init).
+    /// `download_firmware` + `mac_init`.
     pub fn send_general_info(&self) -> Result<(), FaceError> {
         const SUB_GENERAL_INFO: u16 = 0x0d;
         const SUB_PHYDM_INFO: u16 = 0x11;

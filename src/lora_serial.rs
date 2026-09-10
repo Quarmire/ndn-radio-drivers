@@ -425,7 +425,7 @@ fn host_stamp() -> LinkStamp {
 ///
 /// Two dongles on one host are two different physical counters, so they MUST NOT share a domain —
 /// `ndn-time` would otherwise subtract stamps from unrelated oscillators and call the difference an
-/// offset. Same construction as [`crate::bw16_clock_domain`], tagged `"LR"`.
+/// offset. Same construction as `bw16_clock_domain`, tagged `"LR"`.
 pub fn lora_clock_domain(path: &str) -> ClockDomainId {
     let mut h: u32 = 0x811c_9dc5;
     for b in path.bytes() {

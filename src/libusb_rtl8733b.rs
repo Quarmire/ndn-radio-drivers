@@ -683,7 +683,7 @@ impl Rtl8733buBackend {
     }
 
     /// Full card-disable power-down (`POWER_OFF_8733B`, captured from the vendor `rmmod`).
-    /// Run before [`power_on`](Self::power_on) to clear residual analog/FSM state between
+    /// Run before `power_on` to clear residual analog/FSM state between
     /// bring-ups — the key to reliable on-air TX (a stale FSM leaves the synth locking on
     /// only a minority of boots).
     pub fn power_off(&self) -> Result<(), FaceError> {
@@ -1196,7 +1196,7 @@ impl Rtl8733buBackend {
         }
     }
 
-    /// Read a path-A RF register (for verifying [`rf_config`](Self::rf_config)) via the direct window.
+    /// Read a path-A RF register (for verifying `rf_config`) via the direct window.
     pub fn rf_read(&self, addr: u32) -> Result<u32, FaceError> {
         Ok(self.read32((0x3C00 + ((addr & 0xFF) << 2)) as u16)? & 0x000F_FFFF)
     }
@@ -1411,7 +1411,7 @@ impl Rtl8733buBackend {
     /// **M8**: inject a raw 802.11 frame at a fixed rate. Builds the 48-byte data TX
     /// descriptor (QSEL=MGT, USE_RATE + DISDATAFB fixed-rate, no encryption, SW seq)
     /// and sends `[desc][frame]` to the HIGH bulk-OUT endpoint (0x05). `rate` is a
-    /// HwRate code (0x00 = 1M CCK, 0x04 = 6M OFDM). Run after [`init_trx`](Self::init_trx).
+    /// HwRate code (0x00 = 1M CCK, 0x04 = 6M OFDM). Run after `init_trx`.
     pub fn inject_raw(&self, frame: &[u8], rate: u8, seq: u16) -> Result<(), FaceError> {
         let bcast = frame.len() > 4 && frame[4] & 0x01 != 0; // 802.11 addr1[0] group bit
         let desc = build_data_txdesc(
@@ -1646,7 +1646,7 @@ impl Rtl8733buBackend {
     /// the shared RF front-end to WiFi (`GNT_WL=1`). Frames injected after this **radiate**
     /// (verified against a witness radio: full/near-full capture of the injected stream).
     ///
-    /// Do NOT run [`tssi_setup`](Self::tssi_setup) after this — TSSI overwrites the datapath
+    /// Do NOT run `tssi_setup` after this — TSSI overwrites the datapath
     /// TXAGC with an uncalibrated DE and kills output. TX is currently keyed on the synth
     /// locking on that boot (a per-boot analog variance; not every bring-up radiates yet).
     pub fn enable_tx(&self, ch: u8) -> Result<(), FaceError> {
@@ -2693,7 +2693,7 @@ impl Rtl8733buBackend {
         }
     }
 
-    /// [`tssi_setup`](Self::tssi_setup) truncated after phase `upto` — for bisecting which phase
+    /// `tssi_setup` truncated after phase `upto` — for bisecting which phase
     /// kills the USB endpoint.
     ///
     /// A controlled A/B on a stable bus (2026-08-24) showed the full sequence is fatal: the same

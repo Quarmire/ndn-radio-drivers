@@ -758,7 +758,7 @@ impl Ath9kHtcBackend {
 
     /// Complete the HTC handshake: wait for READY, connect `WMI_CONTROL_SVC`, then SETUP_COMPLETE.
     ///
-    /// Must follow [`download_firmware`](Self::download_firmware) — the target sends READY
+    /// Must follow `download_firmware` — the target sends READY
     /// unprompted once the image is running, which doubles as proof the download took.
     pub fn htc_init(&self) -> Result<(), FaceError> {
         // 1. READY, unsolicited from the target.
@@ -2334,7 +2334,7 @@ impl Ath9kHtcBackend {
     /// Computes the base IMR (`TXERR|TXURN|RXERR|RXORN|BCNMISC|RXOK|TXOK`), ORs GTT
     /// into IMR_S2, and programs the INTR_SYNC cause/enable/mask. The **final** host
     /// IMR arming (the 0x81800964 value) is `ath9k_hw_set_interrupts`, done later in
-    /// [`wmi_start`](Self::wmi_start) — this is only the reset-time base.
+    /// `wmi_start` — this is only the reset-time base.
     pub fn init_interrupt_masks(&self) -> Result<(), FaceError> {
         use crate::ath9k_reg::*;
         let imr_reg = AR_IMR_TXERR
@@ -2473,7 +2473,7 @@ impl Ath9kHtcBackend {
     /// everything else, exactly as `ath9k_hw_reset()` does.
     ///
     /// This performs the reset + PHY/MAC bring-up only. `connect_data_services()`,
-    /// [`start_receive`](Self::start_receive) and [`wmi_start`](Self::wmi_start) are
+    /// [`start_receive`](Self::start_receive) and `wmi_start` are
     /// the separate post-reset RX-start steps (as `ath9k_htc_start` does).
     /// Bring the PHY up in **HT40 (40 MHz)** on `chan_mhz` (the control/primary channel; HT40+ uses
     /// the 20 MHz above). Sets the `ht40` flag so [`apply_initvals`](Self::apply_initvals) streams the
@@ -2567,7 +2567,7 @@ impl Ath9kHtcBackend {
     }
 
     /// **Start receive** — the host register side of `ath9k_hw_startpcureceive` +
-    /// `ath9k_hw_setrxfilter` + `ath9k_hw_rxena`, done AFTER [`hw_reset`](Self::hw_reset)
+    /// `ath9k_hw_setrxfilter` + `ath9k_hw_rxena`, done AFTER `hw_reset`
     /// (as `ath9k_htc_start` does). Sets the monitor RX filter (0xc03f), opens the
     /// multicast hash, clears the RX-disable/abort diag bits, and enables RX DMA
     /// (`AR_CR_RXE`). Opmode/STA and the RX-DMA burst config were already applied by

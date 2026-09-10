@@ -73,7 +73,7 @@ use ndn_transport::FaceError;
 // The RF-path enum is shared with the 8822E backend (an A/B selector).
 use crate::RfPath;
 
-/// Per-path convergence outcome of [`Rtl8812auBackend::iq_calibrate`]. A path
+/// Per-path convergence outcome of `Rtl8812auBackend::iq_calibrate`. A path
 /// "converges" when two IQK measurements agree within ±4; otherwise an
 /// identity-ish default is loaded and the flag is `false`.
 #[derive(Debug, Clone, Copy, Default)]
@@ -4674,7 +4674,7 @@ impl Rtl8812auBackend {
     }
 
     /// Bring the MAC power domain down to card-emulation (`ACT_TO_CARDEMU`).
-    /// Call on a *brought-up* device before re-running [`power_on`](Self::power_on)
+    /// Call on a *brought-up* device before re-running `power_on`
     /// so a repeated bring-up starts from a known state (the `CARDEMU_TO_ACT`
     /// poll never completes if the MAC is already active). Not auto-invoked by
     /// `power_on` — its BB-register writes fault on a freshly enumerated device
@@ -4952,7 +4952,7 @@ impl Rtl8812auBackend {
         }
     }
 
-    /// Read a baseband register (32-bit) — for verifying [`bb_config`](Self::bb_config).
+    /// Read a baseband register (32-bit) — for verifying `bb_config`.
     pub fn bb_read(&self, addr: u16) -> Result<u32, FaceError> {
         self.read32(addr)
     }
@@ -5012,7 +5012,7 @@ impl Rtl8812auBackend {
     /// Tune to a 2.4 GHz `channel` (1–14) at 20 MHz — the 5 GHz→2.4 GHz band
     /// switch (`PHY_SwitchWirelessBand8812`), the channel write to RF `0x18` on
     /// both paths, and the 20 MHz bandwidth set. Run after the PHY is configured
-    /// ([`rf_config`](Self::rf_config)). Verify by reading RF `0x18` back (byte 0
+    /// (`rf_config`). Verify by reading RF `0x18` back (byte 0
     /// = channel).  Assumes `rfe_type == 0` (the common generic-dongle RFE).
     pub fn set_channel(&self, channel: u8) -> Result<(), FaceError> {
         // Record the channel for the per-channel EFUSE-calibrated TX-power base.
@@ -5237,7 +5237,7 @@ impl Rtl8812auBackend {
     /// b6 BCNQ. [`TXPAUSE_DATA_QUEUES`](Self::TXPAUSE_DATA_QUEUES) = 0x3f gates every data and
     /// management queue while sparing the beacon queue.
     ///
-    /// Address provenance: `0x0522` is already written by [`lc_calibrate`](Self::lc_calibrate) in
+    /// Address provenance: `0x0522` is already written by `lc_calibrate` in
     /// this file, and the firmware image itself touches it at six sites — so this is not an
     /// address imported from another chip generation.
     ///
@@ -6083,7 +6083,7 @@ impl Rtl8812auBackend {
         }
     }
 
-    /// The current `REG_CR` value — read back after [`mac_init_queues`](Self::mac_init_queues) to
+    /// The current `REG_CR` value — read back after `mac_init_queues` to
     /// confirm the MAC TX/RX enable bits are set.
     pub fn read_cr(&self) -> Result<u16, FaceError> {
         self.read16(REG_CR)

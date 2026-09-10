@@ -2251,7 +2251,7 @@ impl Mt7612uBackend {
     /// tick" result read 0x1104, which is `MT_BKOFF_SLOT_CFG`; it reported the
     /// constant `0x114`, and this part still reads exactly that there.)
     ///
-    /// Call after [`setup_monitor_rx`](Self::setup_monitor_rx). Idempotent.
+    /// Call after `setup_monitor_rx`. Idempotent.
     pub fn arm_time_and_sense(&self) -> Result<(), FaceError> {
         use crate::mt76::knobs;
         knobs::enable_tsf(self)?;

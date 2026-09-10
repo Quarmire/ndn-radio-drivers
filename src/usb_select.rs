@@ -182,14 +182,11 @@ pub fn check_live_link(device: &Device<Context>, label: &str) -> Result<(), Face
         if state == "up" {
             let addr = usb_addr(device);
             if std::env::var_os("NDN_GUARD_LIVE_LINK").is_some() {
-                return Err(FaceError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!(
-                        "{label} at {addr} currently carries an UP kernel netdev ({iface}); refusing \
-                         to claim it (NDN_GUARD_LIVE_LINK is set). Pick the spare via NDN_USB_ADDR / \
-                         usb-addr, or bring {iface} down first."
-                    ),
-                )));
+                return Err(FaceError::Io(std::io::Error::other(format!(
+                    "{label} at {addr} currently carries an UP kernel netdev ({iface}); refusing \
+                     to claim it (NDN_GUARD_LIVE_LINK is set). Pick the spare via NDN_USB_ADDR / \
+                     usb-addr, or bring {iface} down first."
+                ))));
             }
             tracing::warn!(
                 target: "named_radio",
@@ -217,7 +214,8 @@ fn live_netdev(device: &Device<Context>) -> Option<(String, String)> {
         let Ok(nets) = std::fs::read_dir(entry.path().join("net")) else {
             continue;
         };
-        for net in nets.flatten() {
+        // The first netdev under this device's `net/` dir is the one we want.
+        if let Some(net) = nets.flatten().next() {
             let iface = net.file_name().to_string_lossy().into_owned();
             let state = std::fs::read_to_string(net.path().join("operstate"))
                 .map(|s| s.trim().to_string())

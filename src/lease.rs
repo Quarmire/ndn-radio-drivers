@@ -10,7 +10,7 @@
 //!
 //! # The hash is not a new one
 //!
-//! [`prefix_hash`](ndn_frame_io::prefix_hash) is the control plane's canonical name key (#44) —
+//! [`prefix_hash`] is the control plane's canonical name key (#44) —
 //! `SlotSchedule::owner_slot`, `HopSchedule`, demand, the sense bus and the consistency digest all key
 //! on it. It moved down into `ndn-frame-io` so a driver and the control plane share one
 //! implementation instead of two copies free to drift; see `ndn_frame_io::keyspace`. This module adds
@@ -114,7 +114,7 @@ impl std::error::Error for GridError {}
 /// Ownership arithmetic is bit-identical to `ndn_radio_cognition::SlotSchedule` at its default
 /// (`reserved_stride = 0`) — `owner_slot`, `epoch`, `current_slot`, `slot_start_us`,
 /// `slot_remaining_us`, `wait_us` and `superframe_us` are the same expressions, and the golden
-/// vectors in [`tests`] were taken from that type by running it. What this adds over it is the
+/// vectors in `tests` were taken from that type by running it. What this adds over it is the
 /// **guard**, which the control-plane type folds into `slot_us` and the bearer has to see separately
 /// in order to know when to stop transmitting inside a slot it owns.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

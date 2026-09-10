@@ -682,7 +682,7 @@ impl Rtl8733buBackend {
         }
     }
 
-    /// Full card-disable power-down ([`POWER_OFF_8733B`], captured from the vendor `rmmod`).
+    /// Full card-disable power-down (`POWER_OFF_8733B`, captured from the vendor `rmmod`).
     /// Run before [`power_on`](Self::power_on) to clear residual analog/FSM state between
     /// bring-ups — the key to reliable on-air TX (a stale FSM leaves the synth locking on
     /// only a minority of boots).
@@ -901,7 +901,7 @@ impl Rtl8733buBackend {
         ///
         /// Works on macOS too, after fixing two platform issues: (1) macOS caps bulk-OUT
         /// transfers at 4096 B, so a 4096-byte chunk (4136 with the txdesc) lost its tail —
-        /// fixed by [`FW_CHUNK`] = 2048. (2) The IDDMA registers (0x1200) appeared inert on
+        /// fixed by `FW_CHUNK` = 2048. (2) The IDDMA registers (0x1200) appeared inert on
         /// macOS because `DDMA_FUNC_EN` (BIT(17) of `REG_EXT_SYS_FUNC_EN`) was clear — the
         /// Linux/OPi chip had it set by power-on default, a fresh macOS-side chip did not —
         /// so `fw_dl_setup` now sets it explicitly. Verified on both: `MCUFW_CTRL=0xe079`.
@@ -1341,7 +1341,7 @@ impl Rtl8733buBackend {
 
     /// Decode the header-encoded physical efuse into the logical map (1/2-byte-header
     /// block format; word_en bit=0 → word present).
-    /// Public wrapper over [`Self::decode_efuse`] so a diagnostic can print the raw logical map
+    /// Public wrapper over `Self::decode_efuse` so a diagnostic can print the raw logical map
     /// next to the parse — a misparse is only obvious when the bytes are visible beside it.
     pub fn decode_efuse_pub(phys: &[u8]) -> Vec<u8> {
         Self::decode_efuse(phys)
@@ -1577,7 +1577,7 @@ impl Rtl8733buBackend {
     /// (893 frames over 15 s) with no fade. Call after [`enable_tx`](Self::enable_tx); the
     /// returned [`PowerTracker`] stops the loop when dropped. (This covers sustained TX. The
     /// separate "does this boot radiate at all" worry is retracted — 20/20 measured; see
-    /// [`bring_up_tx`](Self::bring_up_tx).)
+    /// `bring_up_tx`.)
     pub fn spawn_power_tracking(self: &Arc<Self>) -> PowerTracker {
         let stop = Arc::new(AtomicBool::new(false));
         let dev = Arc::clone(self);
@@ -2687,7 +2687,7 @@ impl Rtl8733buBackend {
         /// undefined/intermittent power. Ports anapar + rf-setting + txpwr-bb-common + DCK +
         /// slope + slope-cal + track + enable for the given band (5 GHz when `ch > 14`), minus
         /// the efuse-DE/thermal fine-offsets (thermal table left at hardware default). Call
-        /// after [`bring_up_monitor`](Self::bring_up_monitor) / [`tune_channel`](Self::tune_channel).
+        /// after `bring_up_monitor` / [`tune_channel`](Self::tune_channel).
         fn tssi_setup(&self, ch: u8) -> Result<(), FaceError> {
             self.tssi_setup_upto(ch, u8::MAX)
         }
@@ -3254,7 +3254,7 @@ impl Rtl8733buBackend {
 
     /// **M7**: full IQK calibration. Backup → AFE-on → preset → per-path
     /// (LOK → TXK → RXK) → apply coefficients → preset-restore → AFE-off →
-    /// restore. 1x1 path A, 2.4 GHz. Returns the measured [`IqkInfo`].
+    /// restore. 1x1 path A, 2.4 GHz. Returns the measured `IqkInfo`.
     pub fn phy_iq_calibrate(&self) -> Result<IqkInfo, FaceError> {
         let mut info = IqkInfo {
             band: 0,
@@ -4195,7 +4195,7 @@ impl Rtl8733buBackend {
     }
 
     /// Set the **per-frame transmit power offset** carried in every TX descriptor (`TXPWR_OFSET`,
-    /// dw5[30:28], 0-7). The vendor uses this field as its dynamic-power-training level.
+    /// dw5\[30:28\], 0-7). The vendor uses this field as its dynamic-power-training level.
     ///
     /// Distinct from every knob measured inert so far: those are gain *tables* the MAC consults by
     /// rate, whereas this rides in the descriptor of each frame, so it cannot be bypassed by the
@@ -4394,7 +4394,7 @@ impl Rtl8733buBackend {
     /// the format taxonomy this method was originally justified by.
     ///
     /// Selector table read out of the vendor's `rtw_get_mac_rx_counters` (`hal_com.c`), bits
-    /// [31:28], each counter in `[15:0]`:
+    /// \[31:28\], each counter in `[15:0]`:
     /// `0x0/0x1/0x2` OFDM ok/err/FA · `0x3/0x4/0x5` CCK ok/err/FA · `0x6/0x7/0x9` HT ok/err/FA.
     /// Only `0x0`/`0x1` produce data here — see the measurement above.
     ///
@@ -4650,7 +4650,7 @@ impl Rtl8733buBackend {
     /// readback: after `bring_up_tx`, `RF 0x01` reads `0x1c` and stays `0x1c` whether you write
     /// 0x00, 0x0a, 0x1a or 0x1f. The `rf_set` path itself is fine — `RF 0x18`, written the same way
     /// by `tune_channel`, lands correctly (`0x11d24` on ch36; low byte 0x24 = channel 36). The
-    /// reason is already recorded in [`bring_up_monitor`](Self::bring_up_monitor): **the hardware
+    /// reason is already recorded in `bring_up_monitor`: **the hardware
     /// sets the TX AGC per-transmit**, so it overwrites this register continuously, and the vendor
     /// reads 0 here at idle too.
     ///

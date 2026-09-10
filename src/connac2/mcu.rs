@@ -182,7 +182,7 @@
 //!   * **`mt7921_mcu_fw_log_2_host(dev, 1)`** (`mt7921/mcu.c:644`,
 //!     `mt7921/mcu.c:674`) — turns on firmware logging *into the event pipe*.
 //!     We share that pipe with the command responses, so enabling it would add
-//!     unbounded unsolicited traffic for [`Connac2Mcu::wait_event`] to filter.
+//!     unbounded unsolicited traffic for `Connac2Mcu::wait_event` to filter.
 //!     Left off. Turn it on deliberately if a download ever fails opaquely.
 //!   * **`mt7921_mac_init`** (`mt7921/init.c:64`), `mt792x_mac_init_band`, the
 //!     WTBL wipe, `MCU_EXT_CMD(SET_RTS_THRESH)` — MAC-block bring-up, which
@@ -704,7 +704,7 @@ const MT_RXD0_PKT_FLAG: u32 = 0x000f_0000;
 /// unsolicited firmware event.
 pub const PKT_TYPE_RX_EVENT: u8 = 7;
 /// `PKT_TYPE_NORMAL` — a received 802.11 frame. Named here only so
-/// [`Connac2Mcu::wait_event`] can say *why* it is discarding something when the
+/// `Connac2Mcu::wait_event` can say *why* it is discarding something when the
 /// event pipe turns out to be the data pipe.
 pub const PKT_TYPE_NORMAL: u8 = 2;
 
@@ -837,7 +837,7 @@ const RESP_EP_UNKNOWN: u8 = 0;
 /// nothing upstream states which pipe actually carries a command response. No
 /// register comment, no commit message, no dev_dbg settles it.
 ///
-/// So [`Self::wait_event`] **finds out**: the first wait tries
+/// So `Self::wait_event` **finds out**: the first wait tries
 /// [`Connac2Usb::ep_in_resp`], falls back to [`Connac2Usb::ep_in_data`], and
 /// latches whichever answered. Every later command uses the latched pipe, so
 /// the cost is one wrong-pipe timeout, once, during bring-up — before any RX
@@ -1188,7 +1188,7 @@ impl PatchHeader {
 /// One patch section (`mt76_connac2_patch_sec`), again big endian.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PatchSection {
-    /// `type`. Low 16 bits must be [`PATCH_SEC_TYPE_INFO`]; upstream refuses
+    /// `type`. Low 16 bits must be `PATCH_SEC_TYPE_INFO`; upstream refuses
     /// the whole blob otherwise (`mt76_connac_mcu.c:3278-3282`).
     pub sec_type: u32,
     /// `offs` — where the section's bytes start in the file. MEASURED 160,
@@ -1316,7 +1316,7 @@ pub struct FwRegion {
     pub addr: u32,
     /// Byte count.
     pub len: u32,
-    /// `feature_set` — [`FW_FEATURE_NON_DL`] and [`FW_FEATURE_OVERRIDE_ADDR`]
+    /// `feature_set` — `FW_FEATURE_NON_DL` and `FW_FEATURE_OVERRIDE_ADDR`
     /// are the two bits that matter here.
     pub feature_set: u8,
     /// `type` — [`FW_TYPE_CLC`] on the one `NON_DL` region.
@@ -1439,7 +1439,7 @@ pub fn gen_dl_mode(feature_set: u8, is_wa: bool) -> u32 {
 /// section's download mode, derived from its `sec_key_idx`.
 ///
 /// MEASURED: our section's `sec_key_idx` is 0, i.e. `PLAIN`, so this returns
-/// bare [`DL_MODE_NEED_RSP`]. The AES and scramble branches are ported because
+/// bare `DL_MODE_NEED_RSP`. The AES and scramble branches are ported because
 /// a re-vendored blob could use them, and are untested for the same reason.
 pub fn patch_data_mode(sec_key_idx: u32) -> Result<u32, FaceError> {
     let mut mode = DL_MODE_NEED_RSP;

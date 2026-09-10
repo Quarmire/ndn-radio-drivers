@@ -5,12 +5,12 @@
 //! The defect this closes is [`coverage`](crate::coverage)'s defect one layer down. That table
 //! made a missing *trait impl* a visible row; this one makes a missing *sequence* a visible row.
 //! Before it, a part that could not do a role said so by returning `None` from
-//! [`BringUp::plan`] — sometimes with a paragraph of reasoning beside the match arm
+//! `BringUp::plan` — sometimes with a paragraph of reasoning beside the match arm
 //! (`LibUsbRtl88xxBackend`, `Rtl8812auBackend`, the mt76 family all wrote one), and sometimes with
 //! nothing at all: `Nrc7292BringUp` and `Mm6108BringUp` spell their whole answer as
 //! `(role == Role::TransmitAndReceive).then_some(&PLAN_NRC7292)`, which refuses two roles without
 //! naming either. A caller that asked for [`Role::ReceiveOnly`] on a HaLow radio got
-//! [`PlanError::NoPlan`] and no reason, and nothing in the tree said whether that was a decision
+//! `PlanError::NoPlan` and no reason, and nothing in the tree said whether that was a decision
 //! or an omission.
 //!
 //! ## What each cell means

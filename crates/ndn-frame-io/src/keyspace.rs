@@ -16,7 +16,7 @@
 //! lives: [`siphash24`](crate::siphash24) sits here for exactly this reason. So the function moved
 //! down and `ndn_radio::mac::prefix_hash` is now a re-export of this — one implementation, two paths.
 //!
-//! ⚠ It is pinned by golden vectors ([`tests`]) taken from the pre-move implementation by running it,
+//! ⚠ It is pinned by golden vectors (`tests`) taken from the pre-move implementation by running it,
 //! not by reading it. A hash whose value changes silently re-slots every name in the fleet while
 //! every unit test still passes, so the move had to be checked against output, not against source.
 //!
@@ -24,7 +24,7 @@
 //!
 //! Both hash a name; they answer different questions and have different adversaries.
 //!
-//! * The in-frame prefix-set filter ([`siphash24`] under a [`GroupKey`](crate::GroupKey)) is a
+//! * The in-frame prefix-set filter ([`siphash24`](crate::frame::siphash24) under a [`GroupKey`](crate::GroupKey)) is a
 //!   **pre-parse admission** test an outsider would like to forge or collide with. It must be a PRF
 //!   under a secret, or a private group's receive filter can be flooded by anyone who watched a few
 //!   frames.

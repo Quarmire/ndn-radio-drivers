@@ -1,6 +1,6 @@
 //! The **connac2 / MT7921 (MT7961) register map**, resolved to literal `u32` values.
 //!
-//! This serves the **MT7921AU** (`0e8d:7961`) userspace port in [`crate::mt7921`] — MediaTek's
+//! This serves the **MT7921AU** (`0e8d:7961`) userspace port in `crate::mt7921` — MediaTek's
 //! 2×2 **802.11ax** USB part, and the first radio in this crate with (a) an HE actuator and
 //! (b) a **per-frame hardware RX timestamp**. It is a sibling of, and shares nothing with,
 //! [`crate::mt76::regs`]: connac2 is a different MAC generation from mt76x02, with a different
@@ -337,7 +337,7 @@ pub const MT_WL_RX_FLUSH: u32 = 0x0008_0000; // BIT(19) — mt792x_regs.h:476
 /// ★ 1 µs tick enable. Set in `mt792xu_dma_init` (`mt792x_usb.c:401-403`). The
 /// name says the UDMA timebase is microseconds; whether this is the same
 /// timebase as the RXD group-2 timestamp is **undetermined** and matters for
-/// [`crate::mt7921`]'s clock claim — settle it by measurement, not by reading.
+/// `crate::mt7921`'s clock claim — settle it by measurement, not by reading.
 pub const MT_TICK_1US_EN: u32 = 0x0010_0000; // BIT(20) — mt792x_regs.h:477
 /// RX aggregation enable. ⚠ mt7663u sets it (`mt7615/usb_sdio.c:268`); the
 /// mt792x USB path **does not** (`mt792x_usb.c:401-403` omits it), which is the
@@ -1330,7 +1330,7 @@ pub const MT_PSE_BASE: u32 = 0x820c_8000; // mt792x_regs.h:28
 /// The `*_PHYS` companions are **our derivation**, obtained by inverting the
 /// matching `fixed_map` row, and are **untested on silicon**. The one exception
 /// is the WFDMA0 block, for which upstream supplies its own physical alias —
-/// use [`super::MT_UWFDMA0_GLO_CFG`] and friends, not a `_PHYS` constant.
+/// use `super::MT_UWFDMA0_GLO_CFG` and friends, not a `_PHYS` constant.
 pub mod pcie_only {
     /// PCIe-mapped base of WFDMA0. Physical equivalent: `0x7c02_4000`, and
     /// upstream names it [`super::MT_UWFDMA0_BASE`] — use that.

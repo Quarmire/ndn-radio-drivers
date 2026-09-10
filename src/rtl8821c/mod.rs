@@ -1402,7 +1402,7 @@ impl FrameIo for Rtl8821cuBackend {
 /// capability is a static fact about the part, which is why it is safe to declare from the datasheet
 /// while a control knob is not.
 impl Rtl8821cuBackend {
-    /// The part's capability as a free function — see [`Mt7612uBackend::declared_capability`] for
+    /// The part's capability as a free function — see `Mt7612uBackend::declared_capability` for
     /// why this is not behind `&self`. It matters more here: no 8821c is attached to either OPi, so
     /// a hardware-only assertion would be entirely unchecked.
     pub fn declared_capability() -> RadioCapability {
@@ -2181,16 +2181,16 @@ const _: () = P_IBSS.check_or_panic();
 
 /// The canonical RTL8821CU monitor plan — the sequence this part has always run by default.
 pub static PLAN_8821CU_MONITOR: Plan<Rtl8821c> = P_MONITOR;
-/// ☠ TX-radiate hypothesis #1 — `NDN_RADIO_STA`. Untested; see [`R_FW_STA_EMULATE`].
+/// ☠ TX-radiate hypothesis #1 — `NDN_RADIO_STA`. Untested; see `R_FW_STA_EMULATE`.
 pub static PLAN_8821CU_FW_STA: Plan<Rtl8821c> = P_FW_STA;
 /// ☠ TX-radiate hypothesis #2, inverted — `NDN_RADIO_NO_TXEN`. Untested; see
-/// [`R_TXEN_GOLDEN_BLOCK`], which ships ENABLED and is therefore the one hypothesis the default
+/// `R_TXEN_GOLDEN_BLOCK`, which ships ENABLED and is therefore the one hypothesis the default
 /// carries.
 pub static PLAN_8821CU_NO_TXEN: Plan<Rtl8821c> = P_NO_TXEN;
-/// ☠ TX-radiate hypothesis #3 — `NDN_RADIO_STAREGS`. Untested; see [`R_STATION_IDENTITY_REGS`].
+/// ☠ TX-radiate hypothesis #3 — `NDN_RADIO_STAREGS`. Untested; see `R_STATION_IDENTITY_REGS`.
 pub static PLAN_8821CU_STATION_REGS: Plan<Rtl8821c> = P_STATION_REGS;
 /// ☠ TX-radiate hypothesis #4 — `NDN_RADIO_IBSS`. Untested, and the only one that also changes
-/// what goes on air; see [`R_IBSS_OPMODE`].
+/// what goes on air; see `R_IBSS_OPMODE`.
 pub static PLAN_8821CU_IBSS: Plan<Rtl8821c> = P_IBSS;
 
 /// §1.5 — read back every gate you write. **Empty on this part, in writing.**
@@ -2239,7 +2239,7 @@ impl BringUp for Rtl8821cuBackend {
         ASSERTS_8821CU
     }
 
-    /// Empty — see [`TX_UNPROVABLE_8821CU`].
+    /// Empty — see `TX_UNPROVABLE_8821CU`.
     fn tx_instruments() -> &'static [ndn_radio_hal::TxInstrument] {
         &[]
     }

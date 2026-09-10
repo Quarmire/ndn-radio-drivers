@@ -686,7 +686,7 @@ impl Mt7612uBackend {
     /// This is the check upstream makes before every ROM-patch download and we did not, which is
     /// the whole of the difference between "reopening the radio is free" and "reopening the radio
     /// costs a physical replug". The latch is set by the patch activation and survives until the
-    /// chip loses power, so it answers the question the [`MT_MCU_COM_REG0`] mailbox cannot.
+    /// chip loses power, so it answers the question the `MT_MCU_COM_REG0` mailbox cannot.
     pub fn rom_patch_applied(&self) -> bool {
         matches!(self.rr(MT_MCU_CLOCK_CTL), Ok(v) if v & 1 != 0)
     }
@@ -1356,7 +1356,7 @@ impl Mt7612uBackend {
         }
     }
 
-    /// Tune the RF/BB to the monitor channel by replaying [`CHANSET_REPLAY`] (the
+    /// Tune the RF/BB to the monitor channel by replaying `CHANSET_REPLAY` (the
     /// kernel's `set monitor; set channel 6` op-stream: 194 RF/BB register writes
     /// and 32 calibration MCU commands). `bring_up` only does init (firmware + MAC/
     /// BB), which leaves the RF untuned — without this the receiver delivers no
@@ -1367,7 +1367,7 @@ impl Mt7612uBackend {
     }
 
     /// Tune the RF/BB to **5GHz channel 36 @ 80MHz (VHT80)** by replaying
-    /// [`CHANSET_REPLAY_5G80`]. This is the throughput channel: 5GHz is far less
+    /// `CHANSET_REPLAY_5G80`. This is the throughput channel: 5GHz is far less
     /// congested than 2.4GHz ch6 (removing ~200µs of per-frame CSMA from the 337µs
     /// fixed TX overhead), and 80MHz bandwidth carries 4× the bits/symbol of HT20.
     /// Pair with a VHT TXWI ([`McsDescriptor::vht`]) and the 80MHz bandwidth bit
@@ -1511,7 +1511,7 @@ impl Mt7612uBackend {
     }
 
     /// Transmit a bare 802.11 frame at a specific [`McsDescriptor`] rate (builds
-    /// the TXWI rate field via [`mt76_rate_val`]). For TX rate/format diagnostics.
+    /// the TXWI rate field via `mt76_rate_val`). For TX rate/format diagnostics.
     pub fn transmit_mcs(&self, frame: &[u8], mcs: &McsDescriptor) -> Result<(), FaceError> {
         let buf = self.build_tx_bulk(frame, Some(mcs));
         self.handle
@@ -1749,7 +1749,7 @@ impl Mt7612uBackend {
         self.build_data_bulk_at(frame, mt76_rate_val(mcs))
     }
 
-    /// The same, at an explicit raw TXWI rate word — what [`TxIntent::needs_basic_rate`] needs, so
+    /// The same, at an explicit raw TXWI rate word — what `TxIntent::needs_basic_rate` needs, so
     /// a `MostRobust` frame can be forced to legacy OFDM regardless of the stored `McsDescriptor`.
     pub fn build_data_bulk_at(&self, frame: &[u8], rate: u16) -> Vec<u8> {
         let mut txwi = TXWI_DATA;
@@ -1997,7 +1997,7 @@ impl Mt7612uBackend {
     ///
     /// * **It leaked the backend.** Each thread captured a strong `Arc<Self>` and looped forever
     ///   with no exit, so the backend could never be dropped, the USB handle never released, and the
-    ///   threads never joined — live on the NDN path, since [`bringup_ndn`](Self::bringup_ndn) calls
+    ///   threads never joined — live on the NDN path, since `bringup_ndn` calls
     ///   this. The shared pump holds a `Weak` and breaks when the backend goes away.
     /// * **A 16 KB read buffer.** The shared pump uses 32 KB precisely because a USB-aggregated
     ///   bulk-IN transfer can exceed 16 KB, and a short buffer truncates it.
@@ -2737,7 +2737,7 @@ impl BringUp for Mt7612uBackend {
         ASSERTS_MT7612U
     }
 
-    /// Empty — see [`TX_UNPROVABLE_MT7612U`].
+    /// Empty — see `TX_UNPROVABLE_MT7612U`.
     fn tx_instruments() -> &'static [ndn_radio_hal::TxInstrument] {
         &[]
     }

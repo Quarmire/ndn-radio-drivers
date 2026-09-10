@@ -599,7 +599,7 @@ mod radio_knobs {
         /// slot, charged to a name that did not cause them. That default's own doc says it — "the
         /// default must never be 'pretend it worked'".
         ///
-        /// See [`Rtl8812auBackend::set_tx_pause`] for the MEASURED hold-not-drop semantics a
+        /// See `Rtl8812auBackend::set_tx_pause` for the MEASURED hold-not-drop semantics a
         /// caller must design around.
         fn set_tx_hold(&self, hold: bool) -> Result<(), FaceError> {
             let mask = if hold {
@@ -618,7 +618,7 @@ mod radio_knobs {
         /// RX sensitivity as a posture, via the Jaguar1 initial-gain index.
         ///
         /// ★ Unlike every other `set_rx_gain` in this crate, this part's axis is **absolute dBm**:
-        /// `floor_dBm = IGI - 110`. See [`Rtl8812auBackend::set_rx_floor_dbm`], which cognition
+        /// `floor_dBm = IGI - 110`. See `Rtl8812auBackend::set_rx_floor_dbm`, which cognition
         /// should prefer — this posture form exists so the generic seam works.
         fn set_rx_gain(&self, gain: ndn_radio_hal::RxGain) -> Result<(), FaceError> {
             use ndn_radio_hal::RxGain;

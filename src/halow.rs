@@ -29,7 +29,7 @@
 //!   FLAGS|RATE|CHANNEL|DBM_ANTSIGNAL|ANTENNA|RX_FLAGS. **No TSFT bit and no S1G TLV**, on
 //!   224/224 frames. That is the driver's monitor path never being entered, so `nrc_radiotap_hdr`
 //!   is not what reaches userspace at all.
-//! * ★ Consequence: [`linux::Nrc7292FrameIo`] returns `stamp: None` and `mcs_index: None` on every
+//! * ★ Consequence: `linux::Nrc7292FrameIo` returns `stamp: None` and `mcs_index: None` on every
 //!   frame (MEASURED 0/120 and 0/3), so composing [`crate::nrc7292::Nrc7292Clock`] via
 //!   `with_clock` relates a read-now counter to per-frame stamps **that do not exist** through this
 //!   vif. `rssi_dbm` is the one metadata field that survives, and only on genuine receives — the

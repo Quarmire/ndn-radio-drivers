@@ -4,8 +4,8 @@
 //!
 //! The loop is identical across chips — keep `depth` bulk-IN transfers in flight, parse each into a
 //! shared queue, wake the consumer — only the per-transfer *parse* differs. So a backend embeds an
-//! [`RxPumpState`], implements [`Pumpable`] (its handle, endpoint, and parse), and calls
-//! [`spawn_rx_pump`]; `recv_frame` then drains the queue via [`RxPumpState::recv`]. One
+//! `RxPumpState`, implements `Pumpable` (its handle, endpoint, and parse), and calls
+//! `spawn_rx_pump`; `recv_frame` then drains the queue via `RxPumpState::recv`. One
 //! implementation, every Realtek USB backend.
 
 use crate::CapturedFrame;
@@ -108,7 +108,7 @@ pub trait Pumpable: Send + Sync + 'static {
 }
 
 /// Spawn `depth` reader threads that keep `depth` bulk-IN transfers in flight (the async-URB path),
-/// each parsing a transfer into the shared queue. The threads hold a [`Weak`](std::sync::Weak) ref,
+/// each parsing a transfer into the shared queue. The threads hold a [`Weak`] ref,
 /// so they exit when the backend is dropped. Returns their join handles.
 pub fn spawn_rx_pump<B: Pumpable>(backend: &Arc<B>, depth: usize) -> Vec<JoinHandle<()>> {
     backend.pump_state().mark_pumped();

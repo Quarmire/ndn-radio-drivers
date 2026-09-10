@@ -1,8 +1,8 @@
 //! The **shared mt76x02 register map**, resolved to literal `u32` values.
 //!
 //! One map serves both parts on this rig: the **MT7610U** (`0e8d:7610`,
-//! `mt76x0u`, 1×1 dual-band) ported in [`crate::mt76x0`], and the **MT7612U**
-//! (`0e8d:7612`, `mt76x2u`, 2×2) already live in [`crate::mt7612`]. MediaTek's
+//! `mt76x0u`, 1×1 dual-band) ported in `crate::mt76x0`, and the **MT7612U**
+//! (`0e8d:7612`, `mt76x2u`, 2×2) already live in `crate::mt7612`. MediaTek's
 //! `mt76x02` core is literally the same MAC/BBP block on both, which is why the
 //! knob layer in [`super::knobs`] can be written once against
 //! [`Mt76Regs`](super::Mt76Regs) instead of twice.
@@ -376,7 +376,7 @@ pub const MT_FCE_WLAN_FLOW_CONTROL1: u32 = 0x0824; // mt76x02_regs.h:257
 pub const MT_TX_CPU_FROM_FCE_BASE_PTR: u32 = 0x09a0; // mt76x02_regs.h:259
 pub const MT_TX_CPU_FROM_FCE_MAX_COUNT: u32 = 0x09a4; // mt76x02_regs.h:260
 /// Descriptor-index doorbell: written 1 after each firmware chunk to hand it to
-/// the FCE. The [`crate::mt7612`] backend calls this same register
+/// the FCE. The `crate::mt7612` backend calls this same register
 /// `MT_FCE_PSE_CTRL_GO`; the upstream name is the one below and both refer to
 /// 0x09a8. mt76x02_regs.h:261
 pub const MT_TX_CPU_FROM_FCE_CPU_DESC_IDX: u32 = 0x09a8;

@@ -30,7 +30,7 @@
 //!
 //! So the mechanism moves here, keeps a floor, and becomes something a scheduler can ask for by
 //! name. The measured capability it was reaching for — an 8812au that stops being out-competed by
-//! an a81a on a busy channel — is [`ContentionPosture::Owned`], now with a legal window.
+//! an a81a on a busy channel — is `ContentionPosture::Owned`, now with a legal window.
 //!
 //! ## MEASURED 2026-08-28, RTL8812AU on mds-o5p-0, ch36, an a81a saturating the same channel
 //!
@@ -43,7 +43,7 @@
 //! | 200 B, `Throughput` | 1311, 1257 f/s | 1418, 1416 f/s | **+10.4 %** |
 //!
 //! ★ The percentage is the less interesting half. In the short-frame arm the period went
-//! **779 µs → 706 µs, a 73 µs saving, against the 72 µs that [`ContentionApplied::medium_access_us`]
+//! **779 µs → 706 µs, a 73 µs saving, against the 72 µs that `ContentionApplied::medium_access_us`
 //! predicts** for 110 → 38 µs of medium access. The DCF budget is not a model of this knob, it is
 //! an accurate account of it, to within a microsecond.
 //!

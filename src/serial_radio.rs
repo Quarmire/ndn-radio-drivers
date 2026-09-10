@@ -363,7 +363,7 @@ impl SerialRadioBackend {
         self.send_framed(T_CHANNEL, &[channel])
     }
 
-    /// Pin the on-air TX rate. On the RTL8720DN this is a [`rate`] MGN code, re-asserted by the
+    /// Pin the on-air TX rate. On the RTL8720DN this is a `rate` MGN code, re-asserted by the
     /// firmware before every inject (a band or channel change resets the driver's copy, so a
     /// set-once knob would silently revert the first time cognition retuned). On the ESP32-C5 it is
     /// a `wifi_phy_rate_t`. Both were MEASURED on air against a witness's per-frame PHY metadata.
@@ -404,7 +404,7 @@ impl SerialRadioBackend {
     /// Set this radio's **BLE share** of airtime: `fraction` (0.0–1.0) of the scan interval spent scanning
     /// for BLE, the rest left to the concurrent promiscuous Wi-Fi RX (both bearers share one radio via coex).
     /// The NDR way to split the two — **not** a firmware constant but a lever cognition drives from measured
-    /// per-bearer demand (see [`auto_coex_share`](Self::auto_coex_share)). `itvl` is the scan interval in
+    /// per-bearer demand (see `auto_coex_share`). `itvl` is the scan interval in
     /// 0.625 ms units (256 ≈ 160 ms); window = `fraction·itvl`, clamped to [4, itvl].
     pub fn set_ble_share(&self, fraction: f32, itvl: u16) -> Result<(), FaceError> {
         let window = ((fraction.clamp(0.0, 1.0) * itvl as f32) as u16).clamp(4, itvl.max(4));
@@ -566,7 +566,7 @@ impl SerialRadioBackend {
     ///
     /// Worth having beside the fine knob because it is applied through the driver's own percentage
     /// path, so the DM power-tracking watchdog will not silently reprogram it away — whereas direct
-    /// TXAGC writes are stomped unless tracking is disabled (which [`set_txpower`] does).
+    /// TXAGC writes are stomped unless tracking is disabled (which `set_txpower` does).
     pub fn set_tx_power_pct(&self, idx: u8) -> Result<(), FaceError> {
         self.send_framed(T_POWER_PCT, &[idx.min(4)])
     }
@@ -671,7 +671,7 @@ impl SerialRadioBackend {
         self.send_framed(T_INJECT_ABS, &payload)
     }
 
-    /// **Read the device's schedule clock** (ESP32-C5 esp_timer µs) — the same domain [`inject_at_abs`]
+    /// **Read the device's schedule clock** (ESP32-C5 esp_timer µs) — the same domain `inject_at_abs`
     /// targets, so a caller reads it, computes a slot instant, and schedules against it. Sends
     /// `T_READCLOCK` and awaits the `T_CLOCK` reply. `None` on the BW16 (it has no such clock) or timeout.
     pub async fn read_schedule_clock(&self) -> Option<u64> {
@@ -1059,7 +1059,7 @@ pub struct ChannelProfile {
 }
 
 /// A stable per-device clock domain for an RTL8720DN, derived from its port path (as
-/// [`c5_clock_domain`] does for the C5) so two boards on one host never share a timeline.
+/// `c5_clock_domain` does for the C5) so two boards on one host never share a timeline.
 ///
 /// ⚠ **Not used to stamp received frames**, and do not re-wire it to. [`Bw16SerialBackend`] opens
 /// the transport unclocked because this board's per-frame timestamp is taken by software inside a
@@ -1223,7 +1223,7 @@ impl Bw16SerialBackend {
     pub fn set_channel(&self, channel: u8) -> Result<(), FaceError> {
         self.inner.set_channel(channel)
     }
-    /// Pin the management-TX rate to a [`rate`] MGN code (`rate::AUTO` gives it back to the driver).
+    /// Pin the management-TX rate to a `rate` MGN code (`rate::AUTO` gives it back to the driver).
     pub fn set_tx_rate(&self, code: u8) -> Result<(), FaceError> {
         self.inner.set_tx_rate(code)
     }

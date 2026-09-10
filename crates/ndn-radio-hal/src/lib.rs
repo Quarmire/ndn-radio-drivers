@@ -4,8 +4,8 @@
 //! built on: [`TxIntent`] states *what* a transmit should achieve, a backend
 //! resolves it to its PHY (802.11 maps it to an [`McsDescriptor`] via
 //! [`McsDescriptor::for_intent`]); [`InjectFrame`]/[`CapturedFrame`] are the
-//! inject/capture units; [`FrameIo`] is the radio trait, and [`WifiRadio`] the
-//! WiFi-only escape hatch for injecting at an exact 802.11 rate. Pure types +
+//! inject/capture units; [`FrameIo`] is the radio trait, with
+//! [`inject_at`](FrameIo::inject_at) the escape hatch for injecting at an exact 802.11 rate. Pure types +
 //! traits — no I/O, no framing. The on-air framing, radiotap codec, and the
 //! reusable AF_PACKET/loopback backends live in `ndn-frame-io`, which re-exports
 //! this contract so its public surface is unchanged.
@@ -85,7 +85,7 @@ pub struct McsDescriptor {
     pub ldpc: bool,
     /// Transmit as **802.11ax (HE)** instead of HT/VHT — the mode that unlocks the two HE reach levers
     /// below. Selected like [`vht`](Self::vht) selects 11ac; a non-HE bearer ignores it (falls back to
-    /// its best mode). Only meaningful when the radio advertises [`RateCapability::he_cap`].
+    /// its best mode). Only meaningful when the radio advertises [`RadioCapability::he_cap`].
     pub he: bool,
     /// **HE Dual-Carrier Modulation** — map each data bit onto two widely-spaced subcarriers. Halves the
     /// rate but buys frequency diversity + ~a few dB of robustness against narrowband fades: a pure
@@ -308,7 +308,7 @@ impl McsDescriptor {
     /// conservative mid rate, `Throughput` → the top validated rate + short GI.
     /// This is the 802.11 mapping of the transmit intent; another bearer maps it
     /// differently. An exact WiFi rate (fixed-rate benches, the cognitive face)
-    /// travels the [`WifiRadio::inject_at`] path instead — not on the seam.
+    /// travels the [`FrameIo::inject_at`] path instead — not on the seam.
     ///
     /// `he_cap` unlocks the two 802.11ax reach levers for `MostRobust`: on an HE radio the base rate goes
     /// out as **HE ER-SU + DCM** (~2–4 dB more reach than HT+STBC+LDPC). Since only an HE receiver can
@@ -709,7 +709,7 @@ pub trait FrameIo: Send + Sync + 'static {
     /// `inject` yourself, or you get the default body and the aggregation silently disappears.
     ///
     /// It lives on `FrameIo` (not `WifiRadio`) precisely because faces hold `Arc<dyn FrameIo>`;
-    /// see the note on [`WifiRadio`].
+    /// see the note on `WifiRadio`.
     async fn inject_batch_at(
         &self,
         frames: Vec<(InjectFrame, McsDescriptor)>,
@@ -725,7 +725,7 @@ pub trait FrameIo: Send + Sync + 'static {
     /// named airtime lease. `target_tick` is a value in `domain` (a clock the radio exposes via
     /// [`RadioTime`]); the backend transmits when its own clock reaches it, so the frame lands in its
     /// slot without the host's sleep+inject jitter. This is the write-once seam the scheduler
-    /// ([`FaceScheduler`]) actuates for any radio that offers hardware scheduling — the ESP32-C5 over
+    /// (`FaceScheduler`) actuates for any radio that offers hardware scheduling — the ESP32-C5 over
     /// its `T_INJECT_ABS`, an ath9k over quiet-time, a PIO/optical face over its timer.
     ///
     /// **Default = inject now**, ignoring the schedule: a radio with no scheduled-TX engine relies on
@@ -745,7 +745,7 @@ pub trait FrameIo: Send + Sync + 'static {
     /// **Place a frame on air `delay_us` from now**, timed on the *device's own* clock — the relative,
     /// reconcile-free sibling of [`inject_at_clock`](Self::inject_at_clock). Because the delay is applied
     /// against the radio's own timebase, no host↔device clock-offset conversion is needed, which is what
-    /// lets [`FaceScheduler::slot_wait`] drive a hardware-scheduled bearer directly. `delay_us == 0` is
+    /// lets `FaceScheduler::slot_wait` drive a hardware-scheduled bearer directly. `delay_us == 0` is
     /// inject-now. **Default = inject now** (a radio with no scheduled-TX engine ignores the delay; the
     /// scheduler's software gate has already waited for it). The ESP32-C5 backs it with its `T_INJECT_AT`.
     async fn inject_after(&self, frame: InjectFrame, _delay_us: u64) -> Result<(), FaceError> {
@@ -1044,7 +1044,7 @@ mod bandwidth_axis {
 /// honest default makes the false "applied" record impossible for free.
 ///
 /// The one deliberate exception is
-/// [`configure_name_filter`](Self::configure_name_filter), whose contract names a real fallback
+/// `configure_name_filter`, whose contract names a real fallback
 /// (the host filters in software), so its `Ok(())` is a behaviour rather than a pretence. Per-frame
 /// rate/STBC/LDPC/short-GI/NSS is NOT here; that travels with each
 /// [`InjectFrame`]`.mcs` on the data plane.
@@ -2080,7 +2080,7 @@ pub struct RadioCapability {
     /// fleet obeyed**: MEASURED 0.22 dB/step on the a81a and 0.111–0.155 on the RTL8733BU, so a
     /// decided 18 dB back-off was rendered as 1.5–5 dB of actual back-off, silently, and
     /// differently per part. A policy that reasons in dB must convert with the part's own number
-    /// or not convert at all — hence `Option`, and hence [`RadioPolicy`] declining to guess when
+    /// or not convert at all — hence `Option`, and hence `RadioPolicy` declining to guess when
     /// it is `None` rather than substituting a plausible one.
     pub db_per_power_idx: Option<f32>,
     /// **Does the power knob reach silicon?** `false` = the radio reports a power range it cannot
@@ -2503,7 +2503,7 @@ impl RadioCapability {
     /// PHY: narrow channels, single stream, and a longer link budget for range.
     /// `channels` are the driver's US alias numbers (e.g. 161 = 925 MHz). The
     /// NRC7292 supports S1G MCS 0–10; rate is set by the on-chip MAC, so the
-    /// injection radiotap names no MCS ([`FrameFormat::RawNdnS1g`]).
+    /// injection radiotap names no MCS (`FrameFormat::RawNdnS1g`).
     pub fn wifi_halow_s1g(channels: Vec<u8>) -> Self {
         Self {
             kind: RadioKind::WifiMonitor,

@@ -107,7 +107,7 @@ pub const REALTEK_VID: u16 = 0x0bda;
 /// same host. `0x881a` is the RTL8812AU-VS on the test rig.
 pub const RTL8812AU_PIDS: &[u16] = &[0x8812, 0x881a, 0x881b, 0x881c, 0x8813];
 
-/// A product id that selects the RTL8812AU arm of [`open_radio`](crate::open_radio).
+/// A product id that selects the RTL8812AU arm of [`open_radio`](crate::open_radio()).
 ///
 /// The arm keys on membership of [`RTL8812AU_PIDS`] and `open_select` then scans the whole set, so
 /// any member names the part; this is the one to write when a caller has no PID of its own.
@@ -4389,7 +4389,7 @@ pub struct Rtl8812auBackend {
     tsf_domain: ClockDomainId,
     /// Latest **mesh** common-view observation (#75) — a locally-administered neighbour's HW-TSF-stamped
     /// timing beacon + our RXTSFL + its advertised belief. Lets an 8812au (e.g. an Alfa) be a leaf node
-    /// in the network-time tree (receive-only). See [`mesh_common_view`](<Self as FrameIo>::mesh_common_view).
+    /// in the network-time tree (receive-only). See `mesh_common_view`.
     mesh_cv: std::sync::Mutex<Option<ndn_radio_hal::MeshCv>>,
     /// Current channel (set by [`set_channel`](Self::set_channel)). The EFUSE-calibrated
     /// TX-power base is per-channel, so `set_tx_power` needs it. 0 = not yet tuned.
@@ -4664,7 +4664,7 @@ impl Rtl8812auBackend {
 
     rung! {
         /// Bring the MAC power domain up (card-emulation → active) by running the
-        /// 8812A [`CARDEMU_TO_ACT`] sequence. Run once after [`open`](Self::open),
+        /// 8812A `CARDEMU_TO_ACT` sequence. Run once after [`open`](Self::open),
         /// before [`download_firmware`](Self::download_firmware).
         fn power_on(&self) -> Result<(), FaceError> {
             // Release REG_RSV_CTRL so MCU-IO-wrapper register writes take effect.
@@ -4673,7 +4673,7 @@ impl Rtl8812auBackend {
         }
     }
 
-    /// Bring the MAC power domain down to card-emulation ([`ACT_TO_CARDEMU`]).
+    /// Bring the MAC power domain down to card-emulation (`ACT_TO_CARDEMU`).
     /// Call on a *brought-up* device before re-running [`power_on`](Self::power_on)
     /// so a repeated bring-up starts from a known state (the `CARDEMU_TO_ACT`
     /// poll never completes if the MAC is already active). Not auto-invoked by
@@ -6405,7 +6405,7 @@ impl Rtl8812auBackend {
     }
 
     /// Read the EFUSE and parse this adapter's per-rate TX-power calibration into
-    /// [`Self::tx_power_info`] (port of `LoadTxPowerInfo`). After this, `set_tx_power`
+    /// `Self::tx_power_info` (port of `LoadTxPowerInfo`). After this, `set_tx_power`
     /// references the chip's *fused* full-power point per channel/rate. Best-effort:
     /// on a USB error the info stays unset and `set_tx_power` uses the flat fallback.
     /// Run after the MAC is up (needs register access). Idempotent.
@@ -6525,7 +6525,7 @@ impl Rtl8812auBackend {
     ///
     /// **LAW 3 — no environment read.** `NDN_AU_TXAGC12` used to be read from *inside this
     /// function* and silently turned 10 register writes into 24; it is now
-    /// [`RateGroupPolicy`] on the request and appears in [`AppliedPower::writes`].
+    /// `RateGroupPolicy` on the request and appears in [`AppliedPower::writes`].
     ///
     /// On the calibrated scale `idx = 63` **is** the fused regulatory base (`offset = idx − 63`),
     /// which is why `RadioCapability::max_tx_power` stays 63 and is not renumbered to ~27 — see
@@ -6777,7 +6777,7 @@ impl Rtl8812auBackend {
     /// writing `group` into `REG_MACID`. Non-matching frames are dropped by the
     /// chip and never traverse USB — the data-centric equivalent of a NIC's
     /// multicast address filter, so the host wakes only for its name-group. `None`
-    /// restores promiscuous monitor RX ([`MONITOR_RCR`]).
+    /// restores promiscuous monitor RX (`MONITOR_RCR`).
     ///
     /// (`APM` exact-matches `addr1` against `REG_MACID`; for a group/multicast
     /// name-group MAC verify on-air that it still matches — if not, use a
@@ -7922,7 +7922,7 @@ impl BringUp for Rtl8812auBackend {
         ASSERTS_8812AU
     }
 
-    /// Empty, and that is the measured answer — see [`TX_UNPROVABLE_8812AU`].
+    /// Empty, and that is the measured answer — see `TX_UNPROVABLE_8812AU`.
     fn tx_instruments() -> &'static [TxInstrument] {
         &[]
     }

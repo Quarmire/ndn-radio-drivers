@@ -948,7 +948,7 @@ impl Mt7610uBackend {
     /// MT7610U twin, written against the same reasoning:
     ///
     /// * it sends a command that requires the MCU to **compose a response** —
-    ///   [`mcu::rd_rp`] is `CMD_RANDOM_READ`, which upstream itself always waits on
+    ///   `mcu::rd_rp` is `CMD_RANDOM_READ`, which upstream itself always waits on
     ///   (`mt76x02_usb_mcu.c:198`) because there is nowhere else for the value to come from. A
     ///   fire-and-forget command would "succeed" against a dead MCU and tell us nothing;
     /// * it reads a register we already know (`MT_MCU_CLOCK_CTL`) so the *value* is irrelevant
@@ -1325,7 +1325,7 @@ impl Mt7610uBackend {
         phy::calibrate(self, ch, full)
     }
 
-    /// Take and clear the software RX counters — see [`RxStats`].
+    /// Take and clear the software RX counters — see `RxStats`.
     pub fn rx_stats_reset(&self) -> RxStats {
         RxStats {
             units: self.rx_units.swap(0, Ordering::Relaxed),
@@ -1479,7 +1479,7 @@ impl Mt7610uBackend {
     ///
     /// Each thread locks the receiver only for a fast `recv`, then does the slow `write_bulk`
     /// OUTSIDE the lock, so up to `depth` transfers are in flight and the host controller
-    /// pipelines them. Endpoint selection still goes through [`tx_endpoint`](Self::tx_endpoint),
+    /// pipelines them. Endpoint selection still goes through `tx_endpoint`,
     /// so `NDN_TX_QUEUES` round-robin composes with this. Call after `bring_up`.
     ///
     /// Frame order across threads is not preserved — fine for connectionless NDN broadcast,
@@ -2145,9 +2145,9 @@ impl FrameIo for Mt7610uBackend {
         .map_err(|e| io_err(format!("mt7610u TX: join {e}")))?
     }
 
-    /// Rate as bearer state: the exact TXWI rate word every subsequent [`inject`] uses.
+    /// Rate as bearer state: the exact TXWI rate word every subsequent `inject` uses.
     ///
-    /// Clamped to what a 1×1 part can build — see [`mt76_rate_val`]. A `MostRobust` frame
+    /// Clamped to what a 1×1 part can build — see `mt76_rate_val`. A `MostRobust` frame
     /// still overrides this with legacy OFDM 6 Mbps, so control traffic stays decodable by
     /// a legacy-only neighbour no matter what the control plane set.
     fn set_rate(&self, mcs: McsDescriptor) -> Result<(), FaceError> {
@@ -2212,7 +2212,7 @@ impl FrameIo for Mt7610uBackend {
 impl RadioKnobs for Mt7610uBackend {
     /// Tune to `channel` at 20, 40 or 80 MHz.
     ///
-    /// ★ 20/40/80 are all MEASURED on air by a witness receiver (2026-08-31); [`declared_capability`]
+    /// ★ 20/40/80 are all MEASURED on air by a witness receiver (2026-08-31); `declared_capability`
     /// reports `max_bw: 2` to match. 40 and 80 MHz live in the RF/BBP switch tables and in
     /// `mt76x0_phy_set_channel`, but selecting either needs the control-channel offset
     /// (`chandef->center_freq1`, `mt76x0/phy.c:949-968`) to compute `ch_group_index`, and
@@ -2397,7 +2397,7 @@ impl RadioKnobs for Mt7610uBackend {
 
     /// TX power on the absolute dBm scale, returning what was actually applied.
     ///
-    /// ⚠ **Implemented, but [`declared_capability`] still reports `tx_power_dbm: None`**,
+    /// ⚠ **Implemented, but `declared_capability` still reports `tx_power_dbm: None`**,
     /// and the two are not in contradiction. The EEPROM does carry a factory per-rate power
     /// calibration in half-dB units, so `phy::set_tx_power` has a real scale to resolve
     /// against — but nothing on *this* silicon has been measured against a meter, and
@@ -3163,7 +3163,7 @@ impl BringUp for Mt7610uBackend {
         ASSERTS_MT7610U
     }
 
-    /// Empty — see [`TX_UNPROVABLE_MT7610U`].
+    /// Empty — see `TX_UNPROVABLE_MT7610U`.
     fn tx_instruments() -> &'static [ndn_radio_hal::TxInstrument] {
         &[]
     }

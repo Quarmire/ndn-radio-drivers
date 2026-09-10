@@ -233,7 +233,7 @@ const REQ_OUT_UHW: u8 = 0x5e;
 ///
 /// ⇒ The register window stays [`Plain`](VendorTag::Plain); the non-register
 /// vendor requests that the bootrom gates on the recipient field — currently
-/// just `MT_VEND_POWER_ON` — send [`REQ_OUT_UPSTREAM`] explicitly. The wrong
+/// just `MT_VEND_POWER_ON` — send `REQ_OUT_UPSTREAM` explicitly. The wrong
 /// recipient neither stalls nor errors; the device ACKs the setup packet and
 /// does nothing, which is the worst failure mode there is and presented four
 /// layers away as "the firmware download timed out".
@@ -1313,7 +1313,7 @@ impl Connac2Usb {
 
     /// [`bulk_out`](Self::bulk_out) with a caller-chosen timeout — for the
     /// firmware-download path, where a chunk legitimately takes longer than
-    /// [`BULK_TIMEOUT`].
+    /// `BULK_TIMEOUT`.
     pub fn bulk_out_timeout(&self, ep: u8, buf: &[u8], timeout: Duration) -> Result<(), FaceError> {
         let n = self
             .handle

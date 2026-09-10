@@ -22,7 +22,7 @@
 //! and keeps carrying the kernel Wi-Fi mesh. So a node can run its fleet mesh on one dongle and a
 //! named-radio monitor face on the other at the same time; that is the supported configuration.
 //!
-//! The failure it guards against is claiming the *wrong* one. [`check_live_link`] looks up the target
+//! The failure it guards against is claiming the *wrong* one. `check_live_link` looks up the target
 //! device's kernel netdev `operstate` in sysfs before claiming: if it is `up` it **warns** (and, with
 //! `NDN_GUARD_LIVE_LINK=1`, **refuses**), so an automated bring-up never silently drops the live mesh —
 //! it tells the operator to pin the spare with `address`/`NDN_USB_ADDR`. Warn-by-default keeps the

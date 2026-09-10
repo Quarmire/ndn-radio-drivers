@@ -469,7 +469,7 @@ impl LibUsbRtl88xxBackend {
     /// beacon body; `our_rxtsfl` is our hardware RX stamp of that same frame. `count` increments per
     /// beacon (poll it to detect a fresh observation); `bssid` lets a caller lock onto one AP so two
     /// nodes discipline to the *same* reference. Disciplining a clock to `beacon_tsf − our_rxtsfl`
-    /// gives cross-node common-view at the RX-stamp floor (~µs, #41). See [`beacon_cv`](Self::beacon_cv).
+    /// gives cross-node common-view at the RX-stamp floor (~µs, #41). See `beacon_cv`.
     pub fn beacon_common_view(&self) -> Option<(u64, u64, u64, [u8; 6])> {
         self.beacon_cv.lock().ok().and_then(|g| *g)
     }
@@ -1538,7 +1538,7 @@ impl LibUsbRtl88xxBackend {
     /// TSF at each transmit, so every receiver that hardware-RX-stamps it common-views this node's clock
     /// at the RX-stamp floor. Place the TimeToken there zeroed; the hardware fills it. Once armed the MAC
     /// re-transmits it every `interval_tu` (TBTT); pair with [`stop_timing_beacon`](Self::stop_timing_beacon)
-    /// for on-demand control, or use [`emit_timing_pulse`](Self::emit_timing_pulse) for a single shot.
+    /// for on-demand control, or use `emit_timing_pulse` for a single shot.
     ///
     /// **PROVEN ON AIR (#74, 2026-07-28): self-contained, sub-µs, no AP.** o5p-0 armed this; o5p-1's
     /// `beacon_cv` received our BSSID at **0.56 µs** first-diff jitter (3 µs spread) — our own node is a
@@ -2414,7 +2414,7 @@ impl LibUsbRtl88xxBackend {
     /// demodulates nothing and delivers no frames on bulk-IN (verified: raw RX
     /// reads stay 0 until these 34 registers are written, then the chip receives
     /// ~94% of reads non-empty). Captured from the working kernel driver via
-    /// usbmon; see [`RX_PATH_INIT`]. Run before the final `set_channel_bw20`,
+    /// usbmon; see `RX_PATH_INIT`. Run before the final `set_channel_bw20`,
     /// which re-tunes RF `0x18`.
     pub fn rx_path_init(&self) -> Result<(), FaceError> {
         for &(addr, val) in RX_PATH_INIT {
@@ -3772,12 +3772,12 @@ impl LibUsbRtl88xxBackend {
     /// reuse needs and the one the `RxGain` set could not previously express: every position was at
     /// or above the part's default, so no node could be told to hear less.
     ///
-    /// * [`RxGain::Reduced`] raises IGI by [`Self::IGI_REUSE_STEP`], clamped at the vendor's
+    /// * `RxGain::Reduced` raises IGI by [`Self::IGI_REUSE_STEP`], clamped at the vendor's
     ///   `IGI_MAX`. ⚠ The dB delta is **unmeasured** — do not convert it into link budget. For a
     ///   genuinely dBm-denominated defer threshold on this part use
     ///   [`RadioKnobs::set_edcca_threshold_dbm`](ndn_radio_hal::RadioKnobs::set_edcca_threshold_dbm).
-    /// * [`RxGain::Boosted`] lowers it toward `IGI_MIN`.
-    /// * [`RxGain::Auto`] restores the value found before the first command AND hands the front end
+    /// * `RxGain::Boosted` lowers it toward `IGI_MIN`.
+    /// * `RxGain::Auto` restores the value found before the first command AND hands the front end
     ///   back to the autonomous DIG walk.
     ///
     /// While a non-`Auto` posture is in force, [`dig_tick`](Self::dig_tick) stands down — otherwise
@@ -6393,7 +6393,7 @@ impl BringUp for LibUsbRtl88xxBackend {
         ASSERTS_A81A
     }
 
-    /// Empty, and that is the measured answer — see [`TX_UNPROVABLE_A81A`].
+    /// Empty, and that is the measured answer — see `TX_UNPROVABLE_A81A`.
     fn tx_instruments() -> &'static [TxInstrument] {
         &[]
     }

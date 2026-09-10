@@ -913,7 +913,7 @@ impl RadioKnobs for MorseKnobs {
     /// ★ Wired so that `PowerRequest` means something on a HaLow radio too, rather than falling
     /// through to the trait's `Unsupported` default: `Dbm` goes straight to
     /// [`set_tx_power_dbm`](RadioKnobs::set_tx_power_dbm), and `Ceiling` means the top of the
-    /// declared [`DbmRange`](ndn_radio_hal::DbmRange) — which on a part with a real dBm axis is the
+    /// declared [`DbmRange`] — which on a part with a real dBm axis is the
     /// honest reading of "as loud as this part will legally go". An index request is refused by
     /// name: this radio has no index scale, and inventing a mapping onto its dBm axis would be
     /// exactly the invented number the contract forbids.

@@ -449,7 +449,7 @@ pub fn lora_clock_domain(path: &str) -> ClockDomainId {
 /// the part. A v2 host reading a v3 node still decodes byte 1 correctly, because the part codes
 /// 0/1/2 never moved.
 ///
-/// It selects the register conventions the wire bytes use (see [`bw_to_fw`]) and, together with the
+/// It selects the register conventions the wire bytes use (see `bw_to_fw`) and, together with the
 /// current PHY, what the `CMD_SET_MOD` triple means.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LoraRadioKind {
@@ -484,7 +484,7 @@ impl LoraRadioKind {
     ///
     /// **3 still decodes**, to the same part: it was v2's "LR2021-LoRa", and a node running that
     /// firmware must keep opening. The mode half of it is recovered by
-    /// [`phy_from_v2_radio_kind`], which is where the 2-vs-3 distinction now lives.
+    /// `phy_from_v2_radio_kind`, which is where the 2-vs-3 distinction now lives.
     pub fn from_code(c: u8) -> Self {
         match c {
             0 => LoraRadioKind::Sx1262,
@@ -640,7 +640,7 @@ pub struct NodeProfile {
     /// is *reachable* on it however many the silicon supports.
     pub phy_bitmap: u32,
     /// **The modulation in effect right now** (`EVT_CAP[33]`, v3), or — on a v2 node — the mode
-    /// recovered from its `radio_kind` byte by [`phy_from_v2_radio_kind`].
+    /// recovered from its `radio_kind` byte by `phy_from_v2_radio_kind`.
     ///
     /// ★ Read every other field of this profile *in the context of this one*. `max_payload`, the
     /// SF span, the rate model, `sched_gran_ns` and the band are per-PHY, which is why a
@@ -660,7 +660,7 @@ impl NodeProfile {
     /// * A **v3** payload carries the real `phy_bitmap` and `phy_current` in its tail.
     /// * A **v2** payload (29 bytes) still parses, and must: the fleet has three firmwares and they
     ///   are not reflashed together. Its `phy_current` is recovered from the v2 `radio_kind` byte
-    ///   ([`phy_from_v2_radio_kind`] — 2 was "LR2021-FLRC", 3 was "LR2021-LoRa", 0/1 were LoRa
+    ///   (`phy_from_v2_radio_kind` — 2 was "LR2021-FLRC", 3 was "LR2021-LoRa", 0/1 were LoRa
     ///   modems) and its `phy_bitmap` is the **one-entry** set for that mode, because a v2 firmware
     ///   has no `CMD_SET_PHY` and therefore no second mode a host could actually reach.
     ///
@@ -832,7 +832,7 @@ impl NodeProfile {
     /// Does the `sf` byte of `CMD_SET_MOD`/`EVT_INFO` actually mean a spreading factor on this node?
     ///
     /// `false` for a fixed-rate modulation (FLRC), where the fleet's byte positions are reused with
-    /// chip-specific meanings — see [`LoraSerialBackend::send_mod`]. It gates the whole triple, not
+    /// chip-specific meanings — see `LoraSerialBackend::send_mod`. It gates the whole triple, not
     /// just the `sf` byte, because `cr` is re-keyed on such a node too.
     ///
     /// **Two declarations must agree, and the stricter one wins.** The node states a span *and* a
@@ -1486,7 +1486,7 @@ pub struct LoraParams {
     /// spreading factor (FLRC).
     pub sf: u8,
     /// **Host** bandwidth code: 0 = 125 kHz, 1 = 250 kHz, 2 = 500 kHz. Translated to the node's own
-    /// register convention by [`bw_to_fw`] — the two are NOT the same byte.
+    /// register convention by `bw_to_fw` — the two are NOT the same byte.
     pub bw: u8,
     /// Coding-rate code: 1 = 4/5 … 4 = 4/8.
     pub cr: u8,
@@ -1918,8 +1918,8 @@ impl LoraSerialBackend {
         self.device_domain
     }
 
-    /// **What this node's stamp counter runs on** — from its own [`CMD_GET_CLOCK_REF`] answer where
-    /// the firmware implements it, else the demote-only host fallback ([`assumed_clock_reference`]).
+    /// **What this node's stamp counter runs on** — from its own `CMD_GET_CLOCK_REF` answer where
+    /// the firmware implements it, else the demote-only host fallback (`assumed_clock_reference`).
     ///
     /// Surfaced so a bring-up tool can show the reference beside the latch point, which is the pair
     /// that decides `FaceTimeProfile::can_common_view`. A `RateWitness::NodeReported` measurement
@@ -2011,7 +2011,7 @@ impl LoraSerialBackend {
     /// **The FLRC rate ladder**, in the LR2021's own code space (`CMD_SET_MOD` on a fixed-rate node).
     ///
     /// The portable [`RadioKnobs`] rate knobs deliberately refuse on a node with no spreading factor
-    /// (see [`send_mod`](Self::send_mod)): the fleet's `[sf, bw, cr]` byte positions carry
+    /// (see `send_mod`): the fleet's `[sf, bw, cr]` byte positions carry
     /// chip-specific meanings there, and composing them from a LoRa-shaped plan silently
     /// re-modulates the link. That leaves the LR2021's rate genuinely settable but unreachable
     /// through the typed API, so this is the reachable path — and it names the code space instead of
@@ -3336,7 +3336,7 @@ impl FrameIo for LoraSerialBackend {
 /// not the same at all: 0.81-1.86 us for two LR2021s and FLAT against the fit span, against
 /// 10.5-20.4 us for two Waveshares and GROWING with it. The difference is the reference — a crystal
 /// versus an 8 MHz internal RC — and it lives in [`RadioTimeSource::reference`], asked for over the
-/// wire with [`CMD_GET_CLOCK_REF`] and assumed conservatively when the node will not say.
+/// wire with `CMD_GET_CLOCK_REF` and assumed conservatively when the node will not say.
 impl RadioTime for LoraSerialBackend {
     fn time_sources(&self) -> Vec<RadioTimeSource> {
         let prof = self.profile();
@@ -3500,7 +3500,7 @@ impl RadioKnobs for LoraSerialBackend {
     }
 
     /// The index knob. This bearer's "index" has always been dBm in disguise (the wire byte is an
-    /// i8 dBm), so the returned [`AppliedPower`] reports [`PowerReference::AbsoluteDbm`] and a real
+    /// i8 dBm), so the returned [`AppliedPower`] reports `PowerReference::AbsoluteDbm` and a real
     /// `dbm` — on LoRa the absolute axis is not a fiction, it is the wire format.
     ///
     /// ⚠ There is no calibrated/raw split here and no raw axis to reach: `Raw` writes the same
@@ -3618,7 +3618,7 @@ impl RadioKnobs for LoraSerialBackend {
     }
 
     /// Channel bandwidth. Bearer-agnostic in principle, but it can only travel inside the
-    /// `CMD_SET_MOD` triple, so it inherits that opcode's gate — see [`Self::send_mod`].
+    /// `CMD_SET_MOD` triple, so it inherits that opcode's gate — see `Self::send_mod`.
     fn set_bandwidth_khz(&self, khz: u32) -> Result<(), FaceError> {
         if !self.profile().has_spreading_factor() {
             return Err(unsupported(

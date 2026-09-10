@@ -155,13 +155,13 @@ pub const MEDIATEK_VID: u16 = 0x0e8d;
 /// MT7921AU under MediaTek's own vendor id.
 pub const MT7921AU_PID: u16 = 0x7961;
 
-/// The product ids this backend claims **under [`MEDIATEK_VID`]**, and nothing else.
+/// The product ids this backend claims **under `MEDIATEK_VID`**, and nothing else.
 ///
 /// ★ Deliberately a *vid-scoped* list, because the flat `&[u16]` shape the rest of this
 /// crate uses for PID tables **cannot express this part's device table**. Four of the five
 /// boards upstream claims sit behind *other* vendor ids (`mt7921/usb.c:15-30`), so a bare
 /// PID list is either a lie (it implies `0e8d:6211` exists) or an under-claim. The honest
-/// model is [`MT7921U_BOARDS`]; this constant is the MediaTek-VID subset, kept because the
+/// model is `MT7921U_BOARDS`; this constant is the MediaTek-VID subset, kept because the
 /// crate's PID-dispatch and the [`crate::coverage`] table both want a `&'static [u16]`.
 ///
 /// A dispatcher that wants the rebadges must match on `(vid, pid)` — which is exactly what
@@ -1199,8 +1199,8 @@ impl Mt7921uBackend {
         ///     descriptor shape;
         ///   * it turns group 5 **on**, which is the one group bit that is settable at all, so a
         ///     later "group N is missing" question can be asked against a known configuration;
-        ///   * and `parse_transfer` counts [`RxStats::stamped`] separately from
-        ///     [`RxStats::units`], so a missing timestamp is **visible in one number** instead of
+        ///   * and `parse_transfer` counts `RxStats::stamped` separately from
+        ///     `RxStats::units`, so a missing timestamp is **visible in one number** instead of
         ///     silently absent. [`rx_health`](Self::rx_health) prints both.
         ///
         /// If a capture ever shows group 2 missing, the place to look is the firmware
@@ -1380,7 +1380,7 @@ impl Mt7921uBackend {
         ))
     }
 
-    /// Take and clear the software RX counters — see [`RxStats`].
+    /// Take and clear the software RX counters — see `RxStats`.
     pub fn rx_stats_reset(&self) -> RxStats {
         RxStats {
             units: self.rx_units.swap(0, Ordering::Relaxed),
@@ -1400,7 +1400,7 @@ impl Mt7921uBackend {
     /// ⚠ **Do not issue MCU commands while this runs if
     /// [`mcu_response_ep`](Self::mcu_response_ep) is the data pipe.** Two readers on one
     /// bulk pipe split the traffic and each sees half — the same hazard the MT7610U's
-    /// channel-time counters have, and just as silent. [`RxStats::mcu_events`] is the
+    /// channel-time counters have, and just as silent. `RxStats::mcu_events` is the
     /// detector: a non-zero count means firmware events really are arriving on `0x84`.
     pub fn spawn_rx_pump(self: &Arc<Self>, depth: usize) -> Vec<std::thread::JoinHandle<()>> {
         crate::rx_pump::spawn_rx_pump(self, depth)
@@ -1889,7 +1889,7 @@ impl FrameIo for Mt7921uBackend {
     /// `he: true` reaches a real `MT_TX_RATE_MODE` of `HE_SU` (8) or `HE_EXT_SU` (9), and
     /// `dcm` / `er_su` reach `MT_TX_RATE_DCM` / `MT_TX_RATE_SU_EXT_TONE`. On every other
     /// Wi-Fi backend in this crate those three fields are silently ignored, which is why
-    /// [`declared_capability`] setting `he_cap` is load-bearing rather than cosmetic:
+    /// `declared_capability` setting `he_cap` is load-bearing rather than cosmetic:
     /// cognition only builds an HE descriptor for a radio that claims one.
     ///
     /// ⚠ Bandwidth stays 20 MHz ([`mac::FixedRate::at`]) because that is the only width
@@ -1995,7 +1995,7 @@ impl RadioKnobs for Mt7921uBackend {
     ///    encodings; see [`mcu::SnifferChan`].
     ///
     /// Tunes 20/40/80 MHz, deriving the 802.11 centre channel from the control channel (see
-    /// [`centre_and_cbw`]), and [`declared_capability`] reports `max_bw: 2` to
+    /// `centre_and_cbw`), and `declared_capability` reports `max_bw: 2` to
     /// match. 40/80/160 MHz exist in [`mcu::ChannelReq`] and in the firmware, but selecting
     /// one needs the *centre* channel, which cannot be derived from a control channel alone
     /// (channel 36 at 80 MHz centres on 42; at 40 MHz it centres on 38 or 34 depending on
@@ -2908,7 +2908,7 @@ impl BringUp for Mt7921uBackend {
         ASSERTS_MT7921AU
     }
 
-    /// Empty — see [`TX_UNPROVABLE_MT7921AU`].
+    /// Empty — see `TX_UNPROVABLE_MT7921AU`.
     fn tx_instruments() -> &'static [ndn_radio_hal::TxInstrument] {
         &[]
     }

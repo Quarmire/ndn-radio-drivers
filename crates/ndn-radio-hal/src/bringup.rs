@@ -37,15 +37,15 @@
 //! ## Scope
 //!
 //! **M0 + M1 + M2** (the power vocabulary, the knob signature, the hand-filled report) live here;
-//! **§1.4 the plan, §1.5 the asserts, §1.6 the deviation, and the runner** live in [`plan`] and
+//! **§1.4 the plan, §1.5 the asserts, §1.6 the deviation, and the runner** live in [`plan`](crate::bringup::plan) and
 //! are re-exported from this module.
 //!
-//! Every part now runs a [`Plan`](plan::Plan) (M3-M7), and §1.1's `BringUpRequest` — the one place
+//! Every part now runs a [`Plan`](crate::bringup::plan::Plan) (M3-M7), and §1.1's `BringUpRequest` — the one place
 //! allowed to read the environment — exists as of M8.
 //!
 //! ⚠ It lives in `ndn-radio-drivers`, not here, and the reason is written out on it: its
 //! `PartOpts` names driver-owned types (the AR9271 gain table and cal policy, the RTL8821CU plan
-//! variant) and this crate must not depend on the driver crate. [`PlanRun`](plan::PlanRun) stays
+//! variant) and this crate must not depend on the driver crate. [`PlanRun`](crate::bringup::plan::PlanRun) stays
 //! the runner's input and is that request's projection.
 //!
 //! Types marked **UNWIRED** have no consumer and are named as such rather than left to be
@@ -627,9 +627,9 @@ pub enum StepOutcomeRecord {
     /// **LAW 6: every `Fact` must land in [`RadioState::facts`].**
     Established(Fact),
     /// A live guard the handle owns (the 8733b `PowerTracker`), by name. The live value moves
-    /// into [`Guards`](plan::Guards) on the handle; the report keeps only the name.
+    /// into [`Guards`] on the handle; the report keeps only the name.
     Guard(&'static str),
-    /// Why it did not run. Owned, because a [`Deviation`](plan::Deviation)'s `why` is the
+    /// Why it did not run. Owned, because a [`Deviation`]'s `why` is the
     /// operator's own words and arrives as a `String`.
     Skipped(String),
     /// The step failed. Carries the rendered error, so a partial report is readable without the
@@ -713,7 +713,7 @@ pub struct AssertRecord {
 /// generic over `B` and destroy the runtime PID dispatch; typed insertion lives in `bench`).
 ///
 /// [`Skip`](Self::Skip) and [`StopAfter`](Self::StopAfter) are **applied** by
-/// [`run_plan`](plan::run_plan). [`Poke`](Self::Poke) and
+/// [`run_plan`]. [`Poke`](Self::Poke) and
 /// [`RegulatoryOverride`](Self::RegulatoryOverride) are **recorded but not executed by the
 /// runner** — a poke needs register access the HAL cannot name, and the override is consumed by
 /// [`PowerRequest::Raw`] at the knob. Both still change the digest, which is the part that
@@ -1379,7 +1379,7 @@ impl std::fmt::Display for Difference {
 /// ★ A failed bring-up carries **the partial report**: which step, in which stage, with everything
 /// established up to it. Today a failed bring-up is a bare `FaceError` and a day of bisection.
 ///
-/// ★ Produced by [`run_plan`](plan::run_plan) on a [`StepClass::Required`] failure. ⚠ The M2
+/// ★ Produced by [`run_plan`] on a [`StepClass::Required`] failure. ⚠ The M2
 /// `bring_up_*` functions still return `Result<_, FaceError>` and do not yet produce one — no
 /// driver has adopted a `Plan` (that is M3+).
 #[derive(Debug)]

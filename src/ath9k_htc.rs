@@ -72,7 +72,7 @@ pub const ATHEROS_VID: u16 = 0x0cf3;
 
 /// AR9271 product IDs. `0x9271` is the reference part (the one on o5p-1); the others are
 /// vendor-rebadged AR9271 dongles carried by `ath9k_htc`'s id table.
-/// A product id that selects the AR9271 arm of [`open_radio`](crate::open_radio).
+/// A product id that selects the AR9271 arm of [`open_radio`](crate::open_radio()).
 ///
 /// The arm keys on membership of [`AR9271_IDS`] and `Ath9kHtcBackend::open` then scans the whole
 /// set, so any member names the part; this is the one to write when a caller has no PID of its own
@@ -261,7 +261,7 @@ const WMI_EVENT_BASE: u16 = 0x1001;
 /// `WMI_ACCESS_MEMORY_MAX_TUPLES` of 8 — which does not fit: 8 + 4 + 4 + 8*8 = 80 > 64.
 ///
 /// **5, not 6.** A reply can carry a 4-byte HTC receive trailer (measured: flags=0x02,
-/// control[0]=4), and 8 + 4 + 4 + 6*8 + 4 = 68 > 64. Six tuples fit only as long as no trailer is
+/// control\[0\]=4), and 8 + 4 + 4 + 6*8 + 4 = 68 > 64. Six tuples fit only as long as no trailer is
 /// attached, which is not something the host gets to decide.
 pub const NDR_MEM_MAX_TUPLES: usize = 5;
 
@@ -292,11 +292,11 @@ pub struct ResetStatus {
     /// Raw `AR_SREV` (0x4020) after reset — the authoritative value. On the AR9271 this reads
     /// `0x00_14_11_ff`: the low byte is `0xFF`, so ath9k sources macVersion (0x140) from the HTC
     /// device path rather than decoding this register (see `ath9k_reg.rs`); the silicon signature
-    /// is still present as bits[23:16] == 0x14 == (0x140 >> 4).
+    /// is still present as bits\[23:16\] == 0x14 == (0x140 >> 4).
     pub srev_raw: u32,
     /// `AR_SREV & 0xFF` — the ID byte. `0xFF` on the AR9271 (routes ath9k to the type2/HTC path).
     pub srev_id: u32,
-    /// bits[23:16] of `AR_SREV` — the AR9271 signature nibble-pair, `0x14` == `AR_SREV_VERSION_9271
+    /// bits\[23:16\] of `AR_SREV` — the AR9271 signature nibble-pair, `0x14` == `AR_SREV_VERSION_9271
     /// (0x140) >> 4`. (NB: this is *not* the naive AR9002 `MS(val, AR_SREV_VERSION)` decode, which is
     /// invalid here because the ID byte is 0xFF.)
     pub srev_version_field: u32,
@@ -356,7 +356,7 @@ pub struct CalStatus {
     pub agc_control: u32,
     /// `AR_PHY_CCA` (0x9864) after NF cal was started.
     pub phy_cca: u32,
-    /// Noise floor decoded from `AR_PHY_CCA` `MINCCA_PWR` (bits[28:20], 9-bit signed), in dBm.
+    /// Noise floor decoded from `AR_PHY_CCA` `MINCCA_PWR` (bits\[28:20\], 9-bit signed), in dBm.
     pub noise_floor_dbm: i32,
 }
 
@@ -577,7 +577,7 @@ impl Ath9kHtcBackend {
         })
     }
 
-    /// Record the channel number the PHY was brought up on (see [`Ath9kHtcBackend::channel`]).
+    /// Record the channel number the PHY was brought up on (see `Ath9kHtcBackend::channel`).
     /// Called by `open_ath9k` after `hw_reset`, so `RadioKnobs::set_channel` can validate applies.
     pub fn note_channel(&self, channel: u8) {
         self.channel
@@ -904,7 +904,7 @@ impl Ath9kHtcBackend {
         )
     }
 
-    /// Read one raw transfer from the bulk WLAN-RX pipe ([`EP_WLAN_RX`]).
+    /// Read one raw transfer from the bulk WLAN-RX pipe (`EP_WLAN_RX`).
     ///
     /// The target frames each received packet as `[HTC_FRAME_HDR 8B][ath_htc_rx_status 40B]
     /// [802.11…]`; stripping and parsing that is the caller's job (M1-done / M2). Returns the bytes
@@ -1625,7 +1625,7 @@ impl Ath9kHtcBackend {
     /// Returns the applied cal so a caller can verify + measure the TX-power change. M3 (the per-rate
     /// target-power / OLPC gain table) is still TODO — this is the analog config only.
     /// Read `txGainType` (0=normal, 1=high power) from the 4k EEPROM (base header byte 31). Drives the
-    /// gain-table choice in [`apply_initvals`]. Retries the read (glitch-tolerant). Best-effort: returns
+    /// gain-table choice in `apply_initvals`. Retries the read (glitch-tolerant). Best-effort: returns
     /// 0 if the EEPROM can't be validated (falls back to the normal table).
     pub fn eeprom_tx_gain_type(&self) -> u8 {
         for _ in 0..5 {
@@ -1645,7 +1645,7 @@ impl Ath9kHtcBackend {
         0
     }
 
-    /// Mark this as a high-power module so [`apply_initvals`] streams the HIGH_POWER gain table.
+    /// Mark this as a high-power module so `apply_initvals` streams the HIGH_POWER gain table.
     pub fn set_high_power(&self, on: bool) {
         self.high_power
             .store(on, std::sync::atomic::Ordering::Relaxed);
@@ -1798,7 +1798,7 @@ impl Ath9kHtcBackend {
     ///
     /// [`Self::set_bandwidth`] calls `apply_initvals`, which re-streams
     /// `AR9271MODES_{NORMAL,HIGH}_POWER_TX_GAIN_9271` — including the `0xa334..0xa354` rows that
-    /// [`Self::set_tx_gain_level`] writes and that the EEPROM board/OLPC cal programs. So after any
+    /// `Self::set_tx_gain_level` writes and that the EEPROM board/OLPC cal programs. So after any
     /// HT20↔HT40 change the radio silently reverted to the initval default gain and **never came
     /// back**, because `apply_knobs` dedupes on the request: cognition had already recorded that
     /// power index as applied and would not re-push it.
@@ -2188,7 +2188,7 @@ impl Ath9kHtcBackend {
     /// fetched; transcribed from the canonical mainline body). Programs the OFDM
     /// timing delta-slope mantissa/exponent for full-GI (`AR_PHY_TIMING3`) and
     /// half-GI (`AR_PHY_HALFGI`, 0.9× coefficient). `coef = (100 MHz << 24) /
-    /// synth_center`. Uses [`delta_slope_vals`] (ath9k_hw_get_delta_slope_vals,
+    /// synth_center`. Uses `delta_slope_vals` (ath9k_hw_get_delta_slope_vals,
     /// hw.c:1297, transcribed exactly).
     pub fn set_delta_slope(&self, chan_mhz: u16) -> Result<(), FaceError> {
         use crate::ath9k_reg::*;
@@ -2478,7 +2478,7 @@ impl Ath9kHtcBackend {
     /// Bring the PHY up in **HT40 (40 MHz)** on `chan_mhz` (the control/primary channel; HT40+ uses
     /// the 20 MHz above). Sets the `ht40` flag so [`apply_initvals`](Self::apply_initvals) streams the
     /// 2G_HT40 column + keeps DYN2040 and [`rf_set_freq`](Self::rf_set_freq) offsets the synth centre;
-    /// injected MCS frames then carry the `2040` rate flag. Otherwise identical to [`hw_reset`].
+    /// injected MCS frames then carry the `2040` rate flag. Otherwise identical to `hw_reset`.
     /// ⚠ EXPERIMENTAL: 40 MHz cal convergence on this HT20-class part is unverified.
     pub fn hw_reset_ht40(&self, chan_mhz: u16) -> Result<(), FaceError> {
         self.ht40.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -3283,7 +3283,7 @@ impl FrameIo for Ath9kHtcBackend {
     /// injected frame's mgmt header (`pad` byte = `0x80|index` HT rate code), which our patched
     /// `ath_tgt_send_mgt` writes into the TX descriptor's rate series. MCS0-7 (this part is 1×1).
     /// On stock ath9k firmware the byte is ignored and the target picks the rate (hence the old
-    /// "inert" note); on ours it steers the on-air rate. See [`build_tx_frame`](Self::build_tx_frame).
+    /// "inert" note); on ours it steers the on-air rate. See `build_tx_frame`.
     fn set_rate(&self, mcs: McsDescriptor) -> Result<(), FaceError> {
         // Choosing an HT MCS supersedes any legacy override (#6) — exactly one rate mode is active.
         self.cur_legacy
@@ -3534,7 +3534,7 @@ fn fill_vpd_table(pwr_min: u8, pwr_max: u8, pwr_list: &[u8], vpd_list: &[u8], re
 
 impl Ath9kHtcBackend {
     /// Write the top TX-gain LUT registers to ladder `level` (0 = min power, `LADDER.len()-1` = max /
-    /// the reset default) — the AR9271's actual TX-power actuator. See [`TX_GAIN_LADDER`].
+    /// the reset default) — the AR9271's actual TX-power actuator. See `TX_GAIN_LADDER`.
     /// The TXAGC index → gain-ladder level map, shared by [`RadioKnobs::set_tx_power`] and
     /// [`Self::reapply_power_state`] so a retune restores the level the caller actually asked for
     /// rather than a recomputation that could drift from it.
@@ -3607,7 +3607,7 @@ impl RadioKnobs for Ath9kHtcBackend {
         }
     }
 
-    /// TX power as an opaque 0-63 index, actuated via the **gain LUT** ([`set_tx_gain_level`]) — the
+    /// TX power as an opaque 0-63 index, actuated via the **gain LUT** (`set_tx_gain_level`) — the
     /// real PA lever. (The per-frame `AR_XmitPower` header byte and `AR_PHY_POWER_TX_RATE` are inert on
     /// this part — the EEPROM OLPC cal is skipped — MEASURED 0 dB; do NOT read a set XmitPower as an
     /// actuated one.) `idx = 63` = the reset-default max; lower = lower.
@@ -3617,7 +3617,7 @@ impl RadioKnobs for Ath9kHtcBackend {
     /// MEASURED with a B210 on the clean channel (ch14, no ambient): a CCK 1 Mbps flood is FLAT across
     /// all 11 levels (< 1 dB); an OFDM 6 Mbps flood spans ~12.5 dB (levels 10→5 = 20→7.5 dBm, anchor
     /// L10 = datasheet max; levels 4-0 fall below the SDR noise floor). So this knob only bites when the
-    /// frame goes out OFDM ([`set_legacy_rate`] ≥ Ofdm6, or an HT MCS) — see [`MEASURED_DBM_BY_LEVEL`].
+    /// frame goes out OFDM (`set_legacy_rate` ≥ Ofdm6, or an HT MCS) — see `MEASURED_DBM_BY_LEVEL`.
     fn set_tx_power(&self, req: PowerRequest) -> Result<AppliedPower, FaceError> {
         // ⚠ There is no calibrated/raw split on this part: the gain LUT is the only PA lever, so
         // `Raw` reaches the same ladder. `Dbm` routes to the B210-measured curve below.
@@ -3670,11 +3670,11 @@ impl RadioKnobs for Ath9kHtcBackend {
         // `PowerRequest::Dbm` to get the measured value back.
     }
 
-    /// TX power on the dBm scale, from the **B210-measured** OFDM power curve ([`MEASURED_DBM_BY_LEVEL`]):
+    /// TX power on the dBm scale, from the **B210-measured** OFDM power curve (`MEASURED_DBM_BY_LEVEL`):
     /// pick the gain level whose measured output is closest to the request, and echo back that level's
     /// measured dBm. This is a real SDR-calibrated map (not the old naive linear spread), but two honest
     /// caveats remain: (1) it is **OFDM-only** — CCK power does not move with the LUT (see
-    /// [`set_tx_power`]); (2) the absolute anchor is the datasheet max at top gain and the curve was
+    /// `set_tx_power`); (2) the absolute anchor is the datasheet max at top gain and the curve was
     /// measured on ONE chip, so true **per-chip** absolute dBm (accounting for part-to-part + temp + freq
     /// variation) still needs the OLPC/PDADC EEPROM cal port. The *relative* ladder is SDR-measured truth.
     fn set_tx_power_dbm(&self, dbm: i8) -> Result<i8, FaceError> {

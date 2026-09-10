@@ -175,7 +175,7 @@ pub fn build(format: FrameFormat, frame: &InjectFrame) -> Result<Vec<u8>, FaceEr
 
 /// Like [`build`], but at an explicit `mcs` — the radiotap TX header carries this
 /// exact rate instead of resolving `frame.tx`. The counterpart of
-/// [`WifiRadio::inject_at`](crate::WifiRadio::inject_at) for the AF_PACKET path.
+/// [`FrameIo::inject_at`](crate::FrameIo::inject_at) for the AF_PACKET path.
 pub fn build_at(
     format: FrameFormat,
     frame: &InjectFrame,

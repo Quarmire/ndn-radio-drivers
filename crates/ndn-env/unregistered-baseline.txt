@@ -6,12 +6,27 @@
 # describe() run headers) or added here in the same commit, deliberately. Shrink this
 # file by registering names and regenerating it (tools/env_census.py --write-baseline);
 # never grow it silently.
+#
+# NDN_* names read somewhere in the workspace (env::var / env::var_os in .rs files)
+# This is FROZEN DEBT, enforced by tools/env_census.py in CI: a new NDN_* read must
+# but NOT registered in the ndn-env classification table (crates/ndn-env/src/lib.rs).
+# describe() run headers) or added here in the same commit, deliberately. Shrink this
+# either be registered in ndn-env (preferred — it becomes visible to snapshot()/
+# file by registering names and regenerating it (tools/env_census.py --write-baseline);
+# never grow it silently.
 NDN_2T
+NDN_8733B_NO_TSSI
+NDN_AB_ARMS
+NDN_AB_PID
+NDN_AB_SEED
+NDN_AF_RCVBUF
 NDN_AGG_K
 NDN_ATH9K_FW
+NDN_AU_TXRPT
 NDN_BCN_SPACE
 NDN_BENCH
 NDN_BLAST
+NDN_C2H_DBG
 NDN_CH
 NDN_CONTTX
 NDN_CXX_LIB
@@ -27,6 +42,8 @@ NDN_HALOW_SIZE
 NDN_LBT
 NDN_LORA_FEC
 NDN_MODE
+NDN_MT7921_IFACE
+NDN_MT7921_VENDOR_TAG
 NDN_NO_CARRIER
 NDN_NO_TONE
 NDN_PIB
@@ -39,6 +56,10 @@ NDN_RADIO_SECS
 NDN_RATE_HZ
 NDN_RELAY_PREFIXES
 NDN_ROLE
+NDN_SB_NO_ANT
+NDN_SB_NO_XPA
+NDN_SB_SKIP_GAIN
+NDN_SB_SKIP_OBDB
 NDN_SCHED_D1
 NDN_SCHED_NO_BACKOFF
 NDN_SKIP_CAL

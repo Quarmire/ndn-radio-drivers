@@ -95,7 +95,7 @@ pub mod realtek_contention;
 /// Selecting one dongle among several identical ones (by index or USB bus:port) + a guard against
 /// claiming the device that currently carries a live kernel link. Shared by the Realtek backends.
 pub mod usb_select;
-pub use usb_select::{DeviceSelect, usb_addr};
+pub use usb_select::{DeviceSelect, UsbSelectable, select_device, usb_addr};
 
 /// Closed-loop frequency discipline: spend the time layer's skew estimate on a radio's clock trim.
 pub mod freq_discipline;

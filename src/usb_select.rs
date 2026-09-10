@@ -172,6 +172,45 @@ pub fn select_device(
     )))
 }
 
+/// A libusb radio backend that claims exactly **one** USB dongle.
+///
+/// Implement the three identity constants plus [`claim_device`](Self::claim_device) (the
+/// backend-specific endpoint discovery / kernel-driver detach / firmware bring-up), and get
+/// [`open_selected`](Self::open_selected) and [`open_first`](Self::open_first) for free. This is the
+/// ONE place device selection lives: every backend routes through [`select_device`] (index / USB
+/// `bus:port` address / first-match, with the [`check_live_link`] guard), so none reimplements
+/// `rusb` enumeration and a new backend gains address-pinning by writing three consts and a claim.
+pub trait UsbSelectable: Sized {
+    /// USB vendor id (e.g. `0x0bda` Realtek, `0x0e8d` MediaTek).
+    const VENDOR_ID: u16;
+    /// Product ids this backend drives (a device matches if `PIDS` contains its pid).
+    const PIDS: &'static [u16];
+    /// Chip-family name for logs/errors (e.g. `"MT7612U"`).
+    const LABEL: &'static str;
+
+    /// Claim an already-selected device — the backend-specific part (endpoints, `claim_interface`,
+    /// firmware). Called by [`open_selected`](Self::open_selected) with the device `select_device`
+    /// chose, so implementers never touch enumeration or the live-link guard.
+    fn claim_device(device: Device<Context>) -> Result<Self, FaceError>;
+
+    /// Open the dongle chosen by `sel` — the reusable selection path. Pins a specific device by USB
+    /// `bus:port` address or enumeration index (so a host with two identical dongles can dedicate the
+    /// spare and leave the other on the kernel), and runs the live-link guard before claiming.
+    fn open_selected(sel: &DeviceSelect) -> Result<Self, FaceError> {
+        Self::claim_device(select_device(
+            Self::PIDS,
+            Self::VENDOR_ID,
+            sel,
+            Self::LABEL,
+        )?)
+    }
+
+    /// Open the first matching dongle — the historical default (`open_selected(&First)`).
+    fn open_first() -> Result<Self, FaceError> {
+        Self::open_selected(&DeviceSelect::First)
+    }
+}
+
 /// **Live-link guard.** If the device about to be claimed currently backs a kernel netdev whose
 /// `operstate` is `up`, claiming it (which detaches the kernel driver) would drop that link. This
 /// **always warns**; with `NDN_GUARD_LIVE_LINK=1` set it **refuses** (returns an error) instead, so

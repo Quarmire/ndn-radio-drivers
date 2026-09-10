@@ -1314,6 +1314,18 @@ impl Rtl8821cuBackend {
     }
 }
 
+// Reusable USB device selection (index / bus:port address / first-match + live-link guard) via the
+// one shared `select_device` path — so this backend gains address-pinning without reimplementing
+// enumeration, and a host with two identical dongles can dedicate the spare.
+impl crate::usb_select::UsbSelectable for Rtl8821cuBackend {
+    const VENDOR_ID: u16 = REALTEK_VID;
+    const PIDS: &'static [u16] = RTL8821CU_PIDS;
+    const LABEL: &'static str = "RTL8821CU";
+    fn claim_device(device: rusb::Device<rusb::Context>) -> Result<Self, crate::FaceError> {
+        Self::claim(device)
+    }
+}
+
 #[async_trait]
 impl FrameIo for Rtl8821cuBackend {
     /// This radio's own capability, so a face built from the bare `dyn FrameIo` does not have to

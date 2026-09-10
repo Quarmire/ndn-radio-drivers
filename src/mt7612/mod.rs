@@ -2044,6 +2044,18 @@ impl Mt7612uBackend {
     }
 }
 
+// Reusable USB device selection (index / bus:port address / first-match + live-link guard) via the
+// one shared `select_device` path — so this backend gains address-pinning without reimplementing
+// enumeration, and a host with two identical dongles can dedicate the spare.
+impl crate::usb_select::UsbSelectable for Mt7612uBackend {
+    const VENDOR_ID: u16 = MEDIATEK_VID;
+    const PIDS: &'static [u16] = MT7612U_PIDS;
+    const LABEL: &'static str = "MT7612U";
+    fn claim_device(device: rusb::Device<rusb::Context>) -> Result<Self, crate::FaceError> {
+        Self::claim(device)
+    }
+}
+
 #[async_trait]
 impl FrameIo for Mt7612uBackend {
     /// This radio's own capability, so a face built from the bare `dyn FrameIo` does not have to

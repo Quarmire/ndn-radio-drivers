@@ -52,6 +52,7 @@ use crate::{
     FrameFormat, GainTableChoice, LibUsbRtl88xxBackend, MT7610U_PIDS, MT7612U_PIDS, MT7921U_PIDS,
     Mt7610uBackend, Mt7612uBackend, Mt7921uBackend, NDN_ETHERTYPE, RTL8733B_PIDS, RTL8812AU_PIDS,
     RTL8821CU_PIDS, Rtl8733buBackend, Rtl8812auBackend, Rtl8821cVariant, Rtl8821cuBackend,
+    UsbSelectable,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -539,7 +540,7 @@ pub fn open_radio(
     // block the cal zeroes) plus a background power-tracking loop. `Role::TransmitAndReceive` is
     // `PLAN_8733B_TX`, which is all of it; `Role::ReceiveOnly` is `PLAN_8733B_MONITOR`.
     if RTL8733B_PIDS.contains(&pid) {
-        return open_rtl8733b(req);
+        return open_rtl8733b(sel, req);
     }
 
     // ── MT7610U (mt76x0u, 1x1 dual-band 11ac) ────────────────────────────────────────────────
@@ -552,11 +553,11 @@ pub fn open_radio(
     }
     // ── MT7612U (mt76x2u, 2x2 802.11ac) ──────────────────────────────────────────────────────
     if MT7612U_PIDS.contains(&pid) {
-        return open_mt7612u(req);
+        return open_mt7612u(sel, req);
     }
     // ── RTL8821CU (rtw88 8821c/8811cu) ───────────────────────────────────────────────────────
     if RTL8821CU_PIDS.contains(&pid) {
-        return open_rtl8821cu(req);
+        return open_rtl8821cu(sel, req);
     }
     // ── RTL8822E (a81a) ──────────────────────────────────────────────────────────────────────
     if matches!(pid, 0xa81a | 0xa811 | 0x8814) {
@@ -658,11 +659,10 @@ fn open_ar9271(req: &BringUpRequest) -> Result<OpenRadio, BringUpFailure> {
     })
 }
 
-fn open_rtl8733b(req: &BringUpRequest) -> Result<OpenRadio, BringUpFailure> {
-    // No `DeviceSelect` arm: `Rtl8733buBackend::open` claims the first match and has no
-    // `open_select` sibling. Fine while a host carries one f72b; a second would need it added.
+fn open_rtl8733b(sel: &DeviceSelect, req: &BringUpRequest) -> Result<OpenRadio, BringUpFailure> {
+    // Address-pinning via the shared `UsbSelectable` seam (pin the spare f72b by USB address).
     let d = Arc::new(
-        Rtl8733buBackend::open()
+        Rtl8733buBackend::open_selected(sel)
             .map_err(|e| BringUpFailure::not_opened("RTL8733BU", "open_radio::8733b::open", e))?
             .with_format(req.format),
     );
@@ -734,12 +734,12 @@ fn open_mt7921au(sel: &DeviceSelect, req: &BringUpRequest) -> Result<OpenRadio, 
     finish(d, req, report, "MT7921AU", KnobSet::Full)
 }
 
-fn open_mt7612u(req: &BringUpRequest) -> Result<OpenRadio, BringUpFailure> {
-    // No `DeviceSelect` arm: `Mt7612uBackend::open` claims the first match and has no
-    // `open_select` sibling, so `NDN_USB_ADDR`/`NDN_USB_INDEX` do not reach this part. Stated
-    // rather than silently ignored — a host with two MT7612Us cannot pin one today.
+fn open_mt7612u(sel: &DeviceSelect, req: &BringUpRequest) -> Result<OpenRadio, BringUpFailure> {
+    // Address-pinning via the shared `UsbSelectable` seam: a host with two identical MT7612Us
+    // (e.g. the GCS, one on the kernel fleet-AP + one spare for the radio) can dedicate the spare
+    // with `address`/`NDN_USB_ADDR` and leave the AP dongle bound to the kernel driver.
     let d = Arc::new(
-        Mt7612uBackend::open()
+        Mt7612uBackend::open_selected(sel)
             .map_err(|e| BringUpFailure::not_opened("MT7612U", "open_radio::mt7612u::open", e))?
             .with_format(req.format),
     );
@@ -760,13 +760,13 @@ fn open_mt7612u(req: &BringUpRequest) -> Result<OpenRadio, BringUpFailure> {
     finish(d, req, report, "MT7612U", KnobSet::NoWidth)
 }
 
-fn open_rtl8821cu(req: &BringUpRequest) -> Result<OpenRadio, BringUpFailure> {
+fn open_rtl8821cu(sel: &DeviceSelect, req: &BringUpRequest) -> Result<OpenRadio, BringUpFailure> {
     // ☠ Read this before trusting a transmit result from this arm: the part has never been
     // observed to radiate, and the four mutually exclusive explanations are four named plan
     // variants, each an UNTESTED HYPOTHESIS awaiting one bench session against a witness.
     // Receiving is a different matter and does work — `bb_rx_path_enable` was the fix.
     let d = Arc::new(
-        Rtl8821cuBackend::open()
+        Rtl8821cuBackend::open_selected(sel)
             .map_err(|e| BringUpFailure::not_opened("RTL8821CU", "open_radio::8821cu::open", e))?
             .with_format(req.format),
     );

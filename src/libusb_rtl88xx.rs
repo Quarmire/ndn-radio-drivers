@@ -5656,6 +5656,7 @@ impl RadioProfile for LibUsbRtl88xxBackend {
             // floor so the policy never asks.
             min_tx_power: Some(20),
             power_actuated: true,
+            width_actuated: true,
             ..RadioCapability::wifi_monitor_5ghz(vec![36, 40, 44, 48, 149, 153, 157, 161])
         }
     }

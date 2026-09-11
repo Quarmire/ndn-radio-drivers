@@ -2439,6 +2439,7 @@ pub fn declared_capability() -> RadioCapability {
         min_tx_power: None,
         db_per_power_idx: None,
         power_actuated: false,
+        width_actuated: true,
         tx_power_dbm: None,
         retune_us: None,
         rx_only: false,

@@ -548,6 +548,7 @@ fn halow_base(channels: Vec<u8>, max_payload: usize) -> RadioCapability {
         // IEEE80211_CONF_MONITOR is on), which is exactly what this flag exists to prevent lying
         // about.
         power_actuated: false,
+        width_actuated: true,
         tx_power_dbm: None,
         retune_us: None,
         rx_only: false,

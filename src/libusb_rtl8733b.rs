@@ -5380,6 +5380,7 @@ impl RadioProfile for Rtl8733buBackend {
             // reproducible even where the absolute anchor is not.
             db_per_power_idx: Some(0.125),
             power_actuated: true,
+            width_actuated: true,
             ..RadioCapability::wifi_monitor_5ghz(vec![1, 6, 11, 36, 40, 44, 48, 149, 153, 157, 161])
         }
     }

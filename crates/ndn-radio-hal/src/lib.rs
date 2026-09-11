@@ -2114,6 +2114,18 @@ pub struct RadioCapability {
     /// *decision* — notably the contextual bandit's interference-footprint term — must gate on
     /// this, or they learn from an outcome the hardware never produced.
     pub power_actuated: bool,
+    /// **Is channel bandwidth an INDEPENDENT actuator, or coupled to the channel tune?**
+    /// `false` = this radio cannot change width without re-running its whole channel program, so
+    /// each channel offers exactly ONE width and cognition must not treat width as a free lever.
+    ///
+    /// ★ Mirrors [`power_actuated`](Self::power_actuated): a knob the radio reports but cannot act
+    /// on independently. MEASURED false on the MT7612U — its userspace tune is a captured op-stream
+    /// per (channel, width) pair (ch6/20, ch36/80), so "narrow the width" means "replay the whole
+    /// channel", which under live TX/RX races the bulk path and fails (field 2026-09-11: a width
+    /// oscillation drove a re-tune storm that never settled and starved RX). When `false`,
+    /// `tx_params` holds the channel's single captured width instead of narrowing under load, and
+    /// `apply_knobs` gates the (expensive) retune on channel change alone.
+    pub width_actuated: bool,
     /// Absolute TX-power control range in dBm, when the radio exposes one
     /// ([`RadioKnobs::set_tx_power_dbm`]). `None` = index-only control via
     /// [`max_tx_power`](Self::max_tx_power).
@@ -2427,6 +2439,7 @@ impl RadioCapability {
             min_tx_power: None,
             db_per_power_idx: None,
             power_actuated: true,
+            width_actuated: true,
             tx_power_dbm: None,
             retune_us: Some(16_000), // measured: set_channel is a ~16 ms blocking call (#97)
             rx_only: false,
@@ -2461,6 +2474,7 @@ impl RadioCapability {
             min_tx_power: None,
             db_per_power_idx: None,
             power_actuated: true,
+            width_actuated: true,
             tx_power_dbm: None,
             retune_us: Some(16_000), // measured: set_channel is a ~16 ms blocking call (#97)
             rx_only: false,
@@ -2543,6 +2557,7 @@ impl RadioCapability {
             min_tx_power: None,
             db_per_power_idx: None,
             power_actuated: true,
+            width_actuated: true,
             tx_power_dbm: None,
             retune_us: None, // not measured on the MM6108/NRC7292
             rx_only: false,
@@ -2596,6 +2611,7 @@ impl RadioCapability {
             min_tx_power: None,
             db_per_power_idx: None,
             power_actuated: true,
+            width_actuated: true,
             // SX126x PA span (the backend clamps to this and sends CMD_SET_PWR): absolute dBm, so the
             // policy backs off from the ceiling for spatial reuse just like on the Wi-Fi path.
             tx_power_dbm: Some(DbmRange::new(10, 22)),
@@ -2655,6 +2671,7 @@ impl RadioCapability {
             min_tx_power: None,
             db_per_power_idx: None,
             power_actuated: true,
+            width_actuated: true,
             tx_power_dbm: None, // attach only from a real declared range
             retune_us: None,    // not measured on any module in the sub-GHz fleet
             rx_only: false,
@@ -2682,6 +2699,7 @@ impl RadioCapability {
             min_tx_power: None,
             db_per_power_idx: None,
             power_actuated: true,
+            width_actuated: true,
             tx_power_dbm: None,
             retune_us: None, // not measured
             rx_only: true,

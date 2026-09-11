@@ -2189,6 +2189,10 @@ impl Mt7612uBackend {
             min_tx_power: None,
             db_per_power_idx: None,
             power_actuated: false,
+            // Coupled width: ch6→20 / ch36→80 are captured op-stream PAIRS; there is no independent
+            // bandwidth knob, so cognition must hold the channel's one width, not narrow it (which
+            // would replay the whole channel and, under live traffic, storm + fail).
+            width_actuated: false,
             // ★ MEASURED, not inherited (2026-08-31 audit). The spread below supplies
             // `max_payload: 1500` — the preset's unmeasured default — while `inject` guards at
             // `Self::MAX_MPDU_PAYLOAD` = 5650, "a real hardware limit, not a cautious guess".

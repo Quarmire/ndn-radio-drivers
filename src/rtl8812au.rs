@@ -5026,7 +5026,30 @@ impl Rtl8812auBackend {
         // ([`PROGS_5G`]). Untraced 5 GHz channels error (capture a trace to add one).
         if channel > 14 {
             return match PROGS_5G.iter().find(|(ch, _)| *ch == channel) {
-                Some((_, prog)) => self.apply_reg_program(prog),
+                Some((_, prog)) => {
+                    let r = self.apply_reg_program(prog);
+                    // ★ Channel-diagnosis read-backs (field 2026-09-14). Prove the PHY actually
+                    // reached the 5 GHz channel/power the golden trace intends, so a WORKING channel
+                    // (36) can be compared register-for-register to a DEAD one (149): RF 0x18 is the
+                    // LSSI channel word (low bits = channel #), 0x0c20/0x0e20 are the path-A/B TXAGC
+                    // words. A ch149 that reads back a wrong RF word => bad trace; a zero/low TXAGC
+                    // vs ch36 => the UNII-3 TX-power (EFUSE) path, not the trace.
+                    let rfa = self.rf_read(RfPath::A, 0x18).unwrap_or(0xFFFF_FFFF);
+                    let rfb = self.rf_read(RfPath::B, 0x18).unwrap_or(0xFFFF_FFFF);
+                    let agca = self.read32(0x0c20).unwrap_or(0xFFFF_FFFF);
+                    let agcb = self.read32(0x0e20).unwrap_or(0xFFFF_FFFF);
+                    tracing::info!(
+                        target: "face.radio",
+                        channel,
+                        applied_ok = r.is_ok(),
+                        rf_a_0x18 = format_args!("{rfa:#07x}"),
+                        rf_b_0x18 = format_args!("{rfb:#07x}"),
+                        txagc_a_0x0c20 = format_args!("{agca:#010x}"),
+                        txagc_b_0x0e20 = format_args!("{agcb:#010x}"),
+                        "5G set_channel readback",
+                    );
+                    r
+                }
                 None => Err(init_err(format!(
                     "rtl8812au: 5 GHz ch{channel} not traced (have {:?}); capture a golden trace",
                     PROGS_5G.iter().map(|(c, _)| *c).collect::<Vec<_>>()

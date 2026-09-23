@@ -47,7 +47,7 @@ fn rd(b: &[u8], i: &mut usize) -> Option<usize> {
     }
 }
 fn tag_of(pkt: &[u8]) -> Option<String> {
-    if pkt.first().map_or(true, |&t| t != 0x05 && t != 0x06) {
+    if pkt.first().is_none_or(|&t| t != 0x05 && t != 0x06) {
         return None;
     }
     let mut i = 0;
@@ -91,10 +91,9 @@ async fn arm(
         while tokio::time::Instant::now() < dl {
             if let Ok(Ok(c)) =
                 tokio::time::timeout(Duration::from_millis(300), rx.recv_frame()).await
+                && tag_of(&c.payload).as_deref() == Some(want.as_str())
             {
-                if tag_of(&c.payload).as_deref() == Some(want.as_str()) {
-                    g += 1
-                }
+                g += 1
             }
         }
         g

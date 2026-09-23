@@ -9,7 +9,6 @@
 //! Method: bracket by the FIRST and LAST stamped frame (never the capture window — a transmitter
 //! that stops early leaves dead time and inflates the result), and compare to the host clock.
 //! Needs a transmitter of our frame format on the channel.
-use ndn_radio_drivers::FrameIo;
 use std::time::Instant;
 
 #[tokio::main]

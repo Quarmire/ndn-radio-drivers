@@ -44,25 +44,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut raws: Vec<u64> = Vec::new();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(6);
     while tokio::time::Instant::now() < deadline {
-        match tokio::time::timeout(Duration::from_millis(500), dev.recv_frame()).await {
-            Ok(Ok(cap)) => {
-                got += 1;
-                if let Some(r) = cap.rssi_dbm {
-                    rssi_sum += r as i32;
-                }
-                if let Some(st) = &cap.stamp {
-                    raws.push(st.raw);
-                }
-                if got <= 3 {
-                    println!(
-                        "  RX #{got}: {} B, rssi {:?}, stamp {:?}",
-                        cap.payload.len(),
-                        cap.rssi_dbm,
-                        cap.stamp
-                    );
-                }
+        if let Ok(Ok(cap)) =
+            tokio::time::timeout(Duration::from_millis(500), dev.recv_frame()).await
+        {
+            got += 1;
+            if let Some(r) = cap.rssi_dbm {
+                rssi_sum += r as i32;
             }
-            _ => {}
+            if let Some(st) = &cap.stamp {
+                raws.push(st.raw);
+            }
+            if got <= 3 {
+                println!(
+                    "  RX #{got}: {} B, rssi {:?}, stamp {:?}",
+                    cap.payload.len(),
+                    cap.rssi_dbm,
+                    cap.stamp
+                );
+            }
         }
     }
     println!(

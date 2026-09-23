@@ -35,11 +35,12 @@ serial-radio = ["dep:serialport"]
 # The Waveshare USB-TO-LoRa (SX1262) serial-bridged sub-GHz backend (raw libc termios, no serialport).
 lora = []
 
-# Feature-gated examples. Both import `LoraSerialBackend`, which the `lora`
-# feature provides; gating them keeps `cargo build --examples` (default
-# features) and `cargo test -p ndn-radio-drivers` from compiling them
-# unconditionally and failing on the unresolved import. (The rest of examples/
-# is excluded from CI by design.)
+# Feature-gated examples. Each imports an item only its feature provides (the
+# LoRa / serial-bridged backends, or the `bench`-public bring-up rungs); gating
+# them keeps `cargo build --all-targets` on default features from compiling
+# them unconditionally and failing on the unresolved import / private method.
+# CI compiles every example with all features (they need hardware to RUN, not
+# to build), so none can rot unseen.
 [[example]]
 name = "lora_link"
 required-features = ["lora"]
@@ -47,6 +48,34 @@ required-features = ["lora"]
 [[example]]
 name = "ndr_node_report"
 required-features = ["lora"]
+
+[[example]]
+name = "ath9k_hw_reset"
+required-features = ["bench"]
+
+[[example]]
+name = "bw16_parity"
+required-features = ["serial-radio"]
+
+[[example]]
+name = "c5_bridge_test"
+required-features = ["serial-radio"]
+
+[[example]]
+name = "c5_rate_witness"
+required-features = ["serial-radio"]
+
+[[example]]
+name = "ndr_airtime_ab"
+required-features = ["serial-radio"]
+
+[[example]]
+name = "ndr_e2e"
+required-features = ["serial-radio"]
+
+[[example]]
+name = "ndr_parse_gate"
+required-features = ["serial-radio"]
 
 [workspace]
 members = [

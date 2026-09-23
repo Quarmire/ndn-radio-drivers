@@ -49,7 +49,7 @@ fn rd_var(b: &[u8], i: &mut usize) -> Option<usize> {
     }
 }
 fn parse_name(pkt: &[u8]) -> Option<String> {
-    if pkt.first().map_or(true, |&t| t != 0x05 && t != 0x06) {
+    if pkt.first().is_none_or(|&t| t != 0x05 && t != 0x06) {
         return None;
     }
     let mut i = 0;
@@ -86,13 +86,12 @@ async fn burst(rx: &Esp32SerialBackend, tx: &Esp32SerialBackend, n: u32) -> (u32
         while tokio::time::Instant::now() < deadline {
             if let Ok(Ok(cap)) =
                 tokio::time::timeout(Duration::from_millis(300), rx.recv_frame()).await
+                && let Some(nm) = parse_name(&cap.payload)
             {
-                if let Some(nm) = parse_name(&cap.payload) {
-                    if nm.starts_with("/ndn/keep/") {
-                        keep += 1;
-                    } else if nm.starts_with("/ndn/other/") {
-                        other += 1;
-                    }
+                if nm.starts_with("/ndn/keep/") {
+                    keep += 1;
+                } else if nm.starts_with("/ndn/other/") {
+                    other += 1;
                 }
             }
         }

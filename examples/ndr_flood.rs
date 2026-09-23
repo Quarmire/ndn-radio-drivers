@@ -8,7 +8,7 @@
 //! to be an observer's ~200 f/s RX limit, not on-air loss.)
 //!
 //!   sudo ./ndr_flood <pid-hex> <channel> <seconds> [payload]
-use ndn_frame_io::{FrameIo, InjectFrame, Reliability, TxIntent};
+use ndn_frame_io::{InjectFrame, Reliability, TxIntent};
 use std::time::{Duration, Instant};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

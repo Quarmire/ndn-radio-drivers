@@ -969,7 +969,7 @@ async fn run_rep(
     measure: Duration,
     min_samples: u64,
     strict: bool,
-    contention_seen: &mut Vec<Option<ContentionApplied>>,
+    contention_seen: &mut [Option<ContentionApplied>],
 ) -> (
     Rep,
     Applied,
@@ -1080,7 +1080,7 @@ async fn run_rep(
     }
     // A p50 of zero means the clock could not resolve the call — the harness, not the radio, is
     // what is being measured. Never divide by it.
-    if !(rep.p50 > 0.0) {
+    if rep.p50.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater) {
         why.push("p50 <= 0: the per-call period is below the clock's resolution".into());
     }
     // An arm-entry-to-arm-exit difference that is not the knob is a confound, not noise.
@@ -1309,7 +1309,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             p.extend_from_slice(&DEFAULT_SRC); // addr2
             p.extend_from_slice(&BROADCAST); // addr3
             p.extend_from_slice(&[0x00, 0x00]); // SeqCtrl
-            p.extend(std::iter::repeat(0x42).take(len));
+            p.extend(std::iter::repeat_n(0x42, len));
             p
         } else {
             vec![0x42u8; len]
@@ -1362,7 +1362,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut printed_apply = vec![false; arms.len()];
 
         println!(
-            "  {:>5} {:>9}  {:>7} {:>6} {:>6}  {:>7} {:>7} {:>7} {:>7} {:>8}  {:>7} {:>6}  {}",
+            "  {:>5} {:>9}  {:>7} {:>6} {:>6}  {:>7} {:>7} {:>7} {:>7} {:>8}  {:>7} {:>6}  buckets",
             "round",
             "arm",
             "ok",
@@ -1374,8 +1374,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "p99 us",
             "max us",
             "off f/s",
-            "act",
-            "buckets"
+            "act"
         );
 
         for (r, ord) in order.iter().enumerate() {

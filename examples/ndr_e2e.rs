@@ -119,20 +119,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         while tokio::time::Instant::now() < deadline {
             if let Ok(Ok(cap)) =
                 tokio::time::timeout(Duration::from_millis(300), prod.recv_frame()).await
+                && let Some((0x05, name)) = parse(&cap.payload)
+                && under_prefix(&name)
             {
-                if let Some((0x05, name)) = parse(&cap.payload) {
-                    if under_prefix(&name) {
-                        // relevance decided by parsing the name -> serve the Data for that exact name.
-                        let d = data(&name, b"ndr-e2e-content");
-                        let _ = prod
-                            .inject(InjectFrame::broadcast(
-                                Bytes::from(d),
-                                TxIntent::CONSERVATIVE,
-                            ))
-                            .await;
-                        served_c.fetch_add(1, Ordering::Relaxed);
-                    }
-                }
+                // relevance decided by parsing the name -> serve the Data for that exact name.
+                let d = data(&name, b"ndr-e2e-content");
+                let _ = prod
+                    .inject(InjectFrame::broadcast(
+                        Bytes::from(d),
+                        TxIntent::CONSERVATIVE,
+                    ))
+                    .await;
+                served_c.fetch_add(1, Ordering::Relaxed);
             }
         }
     });
@@ -159,13 +157,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             while tokio::time::Instant::now() < win {
                 if let Ok(Ok(cap)) =
                     tokio::time::timeout(Duration::from_millis(150), consumer.recv_frame()).await
+                    && let Some((0x06, dname)) = parse(&cap.payload)
+                    && dname == name
                 {
-                    if let Some((0x06, dname)) = parse(&cap.payload) {
-                        if dname == name {
-                            got = true;
-                            break 'req;
-                        }
-                    }
+                    got = true;
+                    break 'req;
                 }
             }
         }

@@ -72,7 +72,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if role != "rx" {
-        for seq in 0u32.. {
+        let mut seq = 0u32;
+        loop {
             let body = format!("LORA-NDN node={node} seq={seq}");
             let frame =
                 InjectFrame::broadcast(body.clone().into_bytes().into(), TxIntent::CONSERVATIVE);
@@ -81,6 +82,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 Err(e) => eprintln!("inject err: {e:?}"),
             }
             tokio::time::sleep(Duration::from_millis(2000)).await;
+            seq += 1;
         }
     } else {
         // rx-only: park forever while the reader task runs.

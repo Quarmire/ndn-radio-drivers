@@ -10,9 +10,11 @@ name: CI — ndn-radio-drivers
 # a sibling push cannot redden this repo's gate. When the repos are released,
 # switch the path deps to { git, tag } and drop the checkouts.
 #
-# Deliberately NOT built here:
-#   - examples/ — 70+ hardware probe binaries that need a radio on the USB bus
-#     to be useful; building them would dominate CI time for zero signal.
+# Built but not RUN here:
+#   - examples/ — hardware probe binaries that need a radio on the USB bus to be
+#     useful. They are compiled and linted (--all-targets --all-features) so an
+#     API change cannot silently break them; each declares its required-features.
+# Not built here:
 #   - firmware/* — independent embedded sub-workspaces (thumbv8m / Xtensa /
 #     nRF54) that need their own cross toolchains.
 #
@@ -39,7 +41,7 @@ env:
 
 jobs:
   lint:
-    name: clippy (lib + bins)
+    name: fmt + clippy (all targets, -D warnings)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -47,12 +49,12 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: ${{ github.repository_owner }}/ndn-rs
-          ref: 74beb638d3ba7c5654140f827010c6c22b57227f # pinned sibling; bump deliberately
+          ref: 2a5840be79098017965517e6c975874602d7f22a # pinned sibling; bump deliberately
           path: ndn-rs
       - uses: actions/checkout@v4
         with:
           repository: ${{ github.repository_owner }}/ndn-ext
-          ref: 6de852365eb73c0c5007bf4e26069d0afb8751a6 # pinned sibling; bump deliberately
+          ref: 27646a78bb0fd91a7f1fba1f295d5a9ad220fef6 # pinned sibling; bump deliberately
           path: ndn-ext
       - name: Install system dependencies (libusb)
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libusb-1.0-0-dev pkg-config
@@ -61,13 +63,15 @@ jobs:
           workspaces: ndn-radio-drivers
           shared-key: lint
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      # Plain clippy, not `-D warnings`: the lib carries pre-existing lints
-      # (needless_range_loop / result_large_err and friends in the Realtek
-      # backends). Escalate to `-- -D warnings` once those are burned down.
-      # Same feature matrix as the test job so the serial-radio / lora / bench
-      # code paths are linted too, not just the default-feature surface.
-      - name: clippy (lib + bins)
-        run: cargo clippy -p ndn-radio-drivers --lib --bins --features serial-radio,lora,bench
+      - name: rustfmt (this repo's packages; path-dep siblings gate their own)
+        run: |
+          PKGS=$(cargo metadata --no-deps --format-version 1 \
+            | python3 -c "import json,sys;print(' '.join('-p '+p['name'] for p in json.load(sys.stdin)['packages']))")
+          cargo fmt $PKGS -- --check
+      # Every target (lib, bins, tests, benches, examples) with every feature, so the
+      # serial-radio / lora / bench code paths and the examples are linted too.
+      - name: clippy (workspace, all targets, all features)
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
   test:
     name: host tests (lib + integration, feature matrix)
@@ -78,12 +82,12 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: ${{ github.repository_owner }}/ndn-rs
-          ref: 74beb638d3ba7c5654140f827010c6c22b57227f # pinned sibling; bump deliberately
+          ref: 2a5840be79098017965517e6c975874602d7f22a # pinned sibling; bump deliberately
           path: ndn-rs
       - uses: actions/checkout@v4
         with:
           repository: ${{ github.repository_owner }}/ndn-ext
-          ref: 6de852365eb73c0c5007bf4e26069d0afb8751a6 # pinned sibling; bump deliberately
+          ref: 27646a78bb0fd91a7f1fba1f295d5a9ad220fef6 # pinned sibling; bump deliberately
           path: ndn-ext
       # The NDN_* surface gate (#81): every env::var("NDN_…") read in the
       # checked-out repos must be either registered in crates/ndn-env/src/lib.rs

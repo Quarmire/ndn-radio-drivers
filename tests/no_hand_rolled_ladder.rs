@@ -118,8 +118,8 @@ fn own_hits(body: &str) -> Vec<&'static str> {
 ///
 /// This is what stops a ladder hiding behind a helper — see the module header. `seen` breaks
 /// recursion (a mutually recursive pair is a fixed point, not a hang).
-fn effective_hits<'a>(
-    fns: &'a [(String, usize, String)],
+fn effective_hits(
+    fns: &[(String, usize, String)],
     idx: usize,
     seen: &mut Vec<usize>,
 ) -> Vec<&'static str> {

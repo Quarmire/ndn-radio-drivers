@@ -5096,7 +5096,7 @@ mod tests {
         );
         // 7E-A5 frames a single-byte length, and CMD_TX_AT prepends 4 delay bytes: the largest
         // payload must still fit a scheduled transmit.
-        assert!(MAX_LORA_PAYLOAD + 4 <= 255, "247 + delay word still frames");
+        const { assert!(MAX_LORA_PAYLOAD + 4 <= 255, "247 + delay word still frames") };
 
         // A node at the ceiling gets the ceiling…
         assert_eq!(RadioKindHint::HeltecSx1276.profile().frame_budget(), 247);

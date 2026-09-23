@@ -1594,8 +1594,10 @@ mod tests {
     #[test]
     fn the_morse_payload_cap_is_the_measured_one() {
         assert_eq!(mm6108_capability(vec![]).max_payload, 1546);
-        assert!(MM6108_MAX_PAYLOAD < ndn_frame_io::MONITOR_MTU);
-        assert!(MM6108_AMSDU_BODY < ndn_frame_io::DEFAULT_AMSDU_BODY);
+        const {
+            assert!(MM6108_MAX_PAYLOAD < ndn_frame_io::MONITOR_MTU);
+            assert!(MM6108_AMSDU_BODY < ndn_frame_io::DEFAULT_AMSDU_BODY);
+        }
         assert_eq!(
             MM6108_MAX_MPDU - MM6108_MAX_PAYLOAD,
             38,

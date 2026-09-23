@@ -1752,7 +1752,7 @@ mod tests {
         );
         // ⚠ MT_WFSYS_SW_RST_B is quarantined for a different reason (wrong
         // *method*, not wrong address), so it is legitimately a high address.
-        assert!(pcie_only::MT_WFSYS_SW_RST_B > 0x0010_0000);
+        const { assert!(pcie_only::MT_WFSYS_SW_RST_B > 0x0010_0000) };
         assert_ne!(pcie_only::MT_WFSYS_SW_RST_B, MT_CBTOP_RGU_WF_SUBSYS_RST);
 
         // Everything a USB bring-up touches is a real physical address.

@@ -317,7 +317,8 @@ fn mt7921_tunes_before_monitor_and_declares_it() {
 /// process.
 #[test]
 fn the_bringup_drain_is_bracketed_and_stops_before_rx() {
-    for (id, p) in [("mt76x0", &PLAN_MT7610U)] {
+    {
+        let (id, p) = ("mt76x0", &PLAN_MT7610U);
         let (start, stop) = (at(p, "rx_drain"), at(p, "rx_drain_stop"));
         assert!(start < stop, "{id}: the drain must start before it stops");
         assert!(

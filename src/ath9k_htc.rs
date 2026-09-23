@@ -4483,10 +4483,13 @@ mod tests {
 
     #[test]
     fn service_ids_match_make_service_id() {
-        // MAKE_SERVICE_ID(group, index) == (group << 8) | index
-        assert_eq!(HtcService::CtrlRsvd as u16, (0 << 8) | 1);
-        assert_eq!(HtcService::WmiControl as u16, (1 << 8) | 0);
-        assert_eq!(HtcService::DataBe as u16, (1 << 8) | 7);
+        /// `MAKE_SERVICE_ID(group, index)` from the firmware's `htc.h`.
+        const fn make_service_id(group: u16, index: u16) -> u16 {
+            (group << 8) | index
+        }
+        assert_eq!(HtcService::CtrlRsvd as u16, make_service_id(0, 1));
+        assert_eq!(HtcService::WmiControl as u16, make_service_id(1, 0));
+        assert_eq!(HtcService::DataBe as u16, make_service_id(1, 7));
     }
 
     /// The WMI enum in `wmi.h` is dense from 0x0001, so these are positional. If someone inserts a
@@ -4567,11 +4570,13 @@ mod tests {
     #[test]
     fn max_echo_fits_the_register_pipe() {
         assert_eq!(MAX_ECHO_LEN, 51);
-        assert!(HTC_HDR_LEN + WMI_HDR_LEN + 1 + MAX_ECHO_LEN <= REG_PIPE_MAX);
-        assert!(
-            HTC_HDR_LEN + WMI_HDR_LEN + 1 + 53 > REG_PIPE_MAX,
-            "the firmware constant overflows"
-        );
+        const {
+            assert!(HTC_HDR_LEN + WMI_HDR_LEN + 1 + MAX_ECHO_LEN <= REG_PIPE_MAX);
+            assert!(
+                HTC_HDR_LEN + WMI_HDR_LEN + 1 + 53 > REG_PIPE_MAX,
+                "the firmware constant overflows"
+            );
+        }
     }
 
     /// IQ-mismatch fixed-point correction (`ar9002_hw_iqcalibrate`). Hand-computed against
@@ -4785,7 +4790,7 @@ mod tests {
         assert_eq!(&mpdu[0..2], &[0x08, 0x00], "FC: type=Data subtype=0");
         assert_eq!(&mpdu[4..10], &DST, "addr1 = dst");
         assert_eq!(&mpdu[10..16], &SRC, "addr2 = src");
-        assert_eq!(mpdu.ends_with(payload), true, "payload rides last");
+        assert!(mpdu.ends_with(payload), "payload rides last");
     }
 
     /// A synthetic RX transfer must map to a `CapturedFrame` with the payload recovered after

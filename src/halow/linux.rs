@@ -1012,6 +1012,6 @@ mod tests {
     #[test]
     fn the_measured_payload_cap_is_byte_exact() {
         assert_eq!(MM6108_MAX_PAYLOAD, 1546);
-        assert!(MM6108_AMSDU_BODY >= MM6108_MAX_PAYLOAD);
+        const { assert!(MM6108_AMSDU_BODY >= MM6108_MAX_PAYLOAD) };
     }
 }
